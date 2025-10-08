@@ -11,7 +11,8 @@ from fastapi.staticfiles import StaticFiles
 # ==============================================
 app = FastAPI(title="Pipedrive SQL Batch Cleaner (OAuth + SQL)")
 
-app.mount("/static", StaticFiles(directory="static"), name="static")
+if os.path.isdir("static"):
+    app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # ==============================================
 # 🔐 Konfiguration
