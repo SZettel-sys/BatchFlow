@@ -1,39 +1,127 @@
 import os
-import re
 import httpx
 import asyncpg
-from fastapi import FastAPI, Request, Body
-from fastapi.responses import HTMLResponse, RedirectResponse
+import pandas as pd
+from fastapi import FastAPI, Form, HTTPException
+from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from rapidfuzz import fuzz
 
+# ==============================================
+# ⚙️ FastAPI Setup
+# ==============================================
+app = FastAPI(title="Pipedrive SQL Batch Cleaner (OAuth + SQL)")
 
-app = FastAPI(title="Pipedrive Batch Export")
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
-# ================== Konfiguration ==================
-CLIENT_ID = os.getenv("PD_CLIENT_ID")
-CLIENT_SECRET = os.getenv("PD_CLIENT_SECRET")
-BASE_URL = os.getenv("BASE_URL")
-if not BASE_URL:
-    raise ValueError("❌ BASE_URL fehlt")
+# ==============================================
+# 🔐 Konfiguration
+# ==============================================
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise ValueError("❌ DATABASE_URL fehlt (Neon Connection String)")
 
+PD_CLIENT_ID = os.getenv("PD_CLIENT_ID")
+PD_CLIENT_SECRET = os.getenv("PD_CLIENT_SECRET")
+BASE_URL = os.getenv("BASE_URL", "https://deine-app.onrender.com")
 REDIRECT_URI = f"{BASE_URL}/oauth/callback"
+
 OAUTH_AUTHORIZE_URL = "https://oauth.pipedrive.com/oauth/authorize"
 OAUTH_TOKEN_URL = "https://oauth.pipedrive.com/oauth/token"
 PIPEDRIVE_API_URL = "https://api.pipedrive.com/v1"
 
-user_tokens = {}
+user_tokens = {}  # access_token pro Benutzer (Session)
 
-app.mount("/static", StaticFiles(directory="static"), name="static")
+# ==============================================
+# 🔌 Hilfsfunktionen
+# ==============================================
+async def get_conn():
+    """Verbindung zur Neon-Datenbank"""
+    return await asyncpg.connect(DATABASE_URL)
 
-# ================== OAuth ==================
+async def fetch_filter_data(filter_id: int, headers: dict):
+    """Lädt Daten aus einem Pipedrive-Filter"""
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            f"{PIPEDRIVE_API_URL}/persons",
+            params={"filter_id": filter_id, "limit": 500},
+            headers=headers
+        )
+        resp.raise_for_status()
+        return resp.json().get("data", []) or []
+
+async def load_into_temp_table(conn, table_name: str, data: list):
+    """Schreibt ein JSON-Ergebnis in eine temporäre Tabelle"""
+    await conn.execute(f"""
+        CREATE TEMP TABLE {table_name} (
+            contact_id BIGINT,
+            name TEXT,
+            email TEXT,
+            org_name TEXT,
+            batch_id TEXT
+        );
+    """)
+    rows = [
+        (
+            p.get("id"),
+            p.get("name"),
+            str(p.get("email")),
+            str(p.get("org_name")),
+            str(p.get("batch_id"))
+        )
+        for p in data
+    ]
+    if rows:
+        await conn.executemany(
+            f"INSERT INTO {table_name}(contact_id, name, email, org_name, batch_id) VALUES ($1,$2,$3,$4,$5)",
+            rows
+        )
+
+async def clean_batch(conn, exclude_tables: list):
+    """Löscht alle Kontakte aus main_batch, die in anderen Tabellen vorkommen"""
+    deleted_total = 0
+    for t in exclude_tables:
+        result = await conn.execute(f"""
+            DELETE FROM main_batch
+            WHERE contact_id IN (SELECT contact_id FROM {t});
+        """)
+        # result sieht aus wie 'DELETE <anzahl>'
+        try:
+            deleted = int(result.split()[-1])
+        except Exception:
+            deleted = 0
+        deleted_total += deleted
+    return deleted_total
+
+async def export_result(conn, batch_id: str):
+    """Exportiert das Endergebnis aus main_batch"""
+    records = await conn.fetch("SELECT * FROM main_batch ORDER BY contact_id;")
+    if not records:
+        raise HTTPException(status_code=404, detail="Kein bereinigtes Ergebnis gefunden")
+
+    df = pd.DataFrame(records, columns=["contact_id", "name", "email", "org_name", "batch_id"])
+    filename = f"cleaned_batch_{batch_id}.xlsx"
+    df.to_excel(filename, index=False)
+    return filename, len(df)
+
+def get_headers():
+    """Header für Pipedrive-Requests erzeugen"""
+    token = user_tokens.get("default")
+    if not token:
+        raise HTTPException(status_code=401, detail="Nicht eingeloggt")
+    return {"Authorization": f"Bearer {token}"}
+
+# ==============================================
+# 🌐 OAuth Routes
+# ==============================================
 @app.get("/login")
 def login():
-    url = f"{OAUTH_AUTHORIZE_URL}?client_id={CLIENT_ID}&redirect_uri={REDIRECT_URI}"
+    """Startet OAuth-Login bei Pipedrive"""
+    url = f"{OAUTH_AUTHORIZE_URL}?client_id={PD_CLIENT_ID}&redirect_uri={REDIRECT_URI}"
     return RedirectResponse(url)
 
 @app.get("/oauth/callback")
 async def oauth_callback(code: str):
+    """Empfängt OAuth-Callback von Pipedrive"""
     async with httpx.AsyncClient() as client:
         token_resp = await client.post(
             OAUTH_TOKEN_URL,
@@ -41,8 +129,8 @@ async def oauth_callback(code: str):
                 "grant_type": "authorization_code",
                 "code": code,
                 "redirect_uri": REDIRECT_URI,
-                "client_id": CLIENT_ID,
-                "client_secret": CLIENT_SECRET,
+                "client_id": PD_CLIENT_ID,
+                "client_secret": PD_CLIENT_SECRET,
             },
         )
     token_data = token_resp.json()
@@ -52,118 +140,115 @@ async def oauth_callback(code: str):
     user_tokens["default"] = access_token
     return RedirectResponse("/overview")
 
-def get_headers():
-    token = user_tokens.get("default")
-    return {"Authorization": f"Bearer {token}"} if token else {}
-
-# ================== Batch-Werte abrufen ==================
-@app.get("/batch-list")
-async def batch_list():
-    """Liest alle vorhandenen Werte aus dem Feld 'Batch ID' von Kontakten."""
-    headers = get_headers()
-    if not headers:
-        raise HTTPException(status_code=401, detail="Nicht eingeloggt")
-
-    batches = set()
-    async with httpx.AsyncClient() as client:
-        # Wir holen z. B. bis zu 500 Kontakte
-        resp = await client.get(f"{PIPEDRIVE_API_URL}/persons", params={"limit": 500}, headers=headers)
-        resp.raise_for_status()
-        data = resp.json().get("data", [])
-        for person in data:
-            val = person.get("batch_id") or person.get("Batch ID")
-            if val:
-                if isinstance(val, str):
-                    batches.add(val.strip())
-                elif isinstance(val, list):
-                    for v in val:
-                        if isinstance(v, str):
-                            batches.add(v.strip())
-    return {"batches": sorted(batches)}
-
-
-# ================== Übersicht / Frontend ==================
+# ==============================================
+# 🧭 Frontend
+# ==============================================
 @app.get("/overview", response_class=HTMLResponse)
-async def overview():
-    headers = get_headers()
-    if not headers:
-        return HTMLResponse("<h3>Bitte zuerst <a href='/login'>mit Pipedrive einloggen</a>.</h3>")
-
-    # Batch-Werte holen
-    async with httpx.AsyncClient() as client:
-        try:
-            resp = await client.get(f"{BASE_URL}/batch-list")
-            batches = resp.json().get("batches", [])
-        except Exception:
-            batches = []
-
-    # HTML Dropdown
-    options_html = "\n".join(f"<option value='{b}'>{b}</option>" for b in batches)
-
-    html = f"""
+def overview():
+    html = """
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Pipedrive Batch Export</title>
+        <title>Pipedrive Batch Cleaner (OAuth + SQL)</title>
         <style>
-            body {{ font-family: Arial; margin: 60px auto; max-width: 600px; }}
-            h1 {{ color: #2a5bd7; }}
-            input, select, button {{ padding: 8px; width: 100%; margin-top: 8px; }}
-            button {{ background: #2a5bd7; color: white; border: none; cursor: pointer; }}
-            button:hover {{ background: #1e46a1; }}
+            body { font-family: Arial; margin: 60px auto; max-width: 600px; }
+            h1 { color: #2a5bd7; }
+            input, button { padding: 8px; width: 100%; margin-top: 8px; }
+            button { background: #2a5bd7; color: white; border: none; cursor: pointer; }
+            button:hover { background: #1e46a1; }
         </style>
     </head>
     <body>
-        <h1>📊 Batch-Export</h1>
+        <h1>📊 Pipedrive Batch Cleaner (SQL)</h1>
         <form action="/process" method="post">
-            <label>Filter ID:</label>
-            <input type="number" name="filter_id" value="1917" required>
+            <label>Hauptfilter ID (Batch):</label>
+            <input type="number" name="filter_id_main" placeholder="z. B. 1917" required>
 
-            <label>Batch ID auswählen:</label>
-            <select name="batch_id" required>
-                <option value="">-- bitte wählen --</option>
-                {options_html}
-            </select>
+            <label>Batch ID:</label>
+            <input type="text" name="batch_id" placeholder="z. B. B434_E-Mail_2025" required>
 
-            <button type="submit">➡️ Export starten</button>
+            <label>Weitere Filter IDs (kommasepariert):</label>
+            <input type="text" name="exclude_filters" placeholder="z. B. 1918,1919,1920">
+
+            <button type="submit">➡️ Verarbeitung starten</button>
         </form>
+        <p style="margin-top:2em;"><a href="/login">🔐 Login mit Pipedrive</a></p>
     </body>
     </html>
     """
     return HTMLResponse(content=html)
 
-# ================== Verarbeitung ==================
-@app.post("/process")
-async def process(filter_id: int = Form(...), batch_id: str = Form(...)):
-    """Exportiert alle Kontakte aus Filter, deren Batch ID dem gewählten Wert entspricht."""
+# ==============================================
+# 🔁 Hauptprozess
+# ==============================================
+@app.post("/process", response_class=HTMLResponse)
+async def process(
+    filter_id_main: int = Form(...),
+    batch_id: str = Form(...),
+    exclude_filters: str = Form("")
+):
     headers = get_headers()
-    if not headers:
-        raise HTTPException(status_code=401, detail="Nicht eingeloggt")
+    conn = await get_conn()
 
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(f"{PIPEDRIVE_API_URL}/persons",
-                                params={"filter_id": filter_id, "limit": 500},
-                                headers=headers)
-        resp.raise_for_status()
-        data = resp.json().get("data", [])
+    try:
+        # === 1️⃣ Hauptdaten laden
+        main_data = await fetch_filter_data(filter_id_main, headers)
+        if not main_data:
+            raise HTTPException(status_code=404, detail="Keine Hauptdaten gefunden")
 
-    if not data:
-        return HTMLResponse("<h3>❌ Keine Daten gefunden</h3>")
+        # Nur Einträge mit der richtigen Batch-ID
+        main_data = [p for p in main_data if str(p.get("batch_id", "")).strip() == batch_id]
+        await load_into_temp_table(conn, "main_batch", main_data)
+        print(f"✅ Hauptbatch geladen: {len(main_data)} Kontakte")
 
-    df = pd.json_normalize(data)
-    # Filter nach Batch ID
-    if "batch_id" in df.columns:
-        df = df[df["batch_id"].astype(str).str.fullmatch(batch_id, case=False, na=False)]
-    elif "Batch ID" in df.columns:
-        df = df[df["Batch ID"].astype(str).str.fullmatch(batch_id, case=False, na=False)]
+        # === 2️⃣ Weitere Filter (Abgleich)
+        exclude_tables = []
+        if exclude_filters.strip():
+            for i, fid in enumerate(exclude_filters.split(","), start=1):
+                fid = fid.strip()
+                if not fid:
+                    continue
+                data = await fetch_filter_data(int(fid), headers)
+                table_name = f"exclude_{i}"
+                await load_into_temp_table(conn, table_name, data)
+                exclude_tables.append(table_name)
+                print(f"📋 Filter {fid} geladen: {len(data)} Kontakte")
 
-    if df.empty:
-        return HTMLResponse(f"<h3>Keine Einträge mit Batch '{batch_id}' gefunden.</h3>")
+        # === 3️⃣ SQL-Abgleich durchführen
+        deleted_total = 0
+        if exclude_tables:
+            deleted_total = await clean_batch(conn, exclude_tables)
 
-    # Excel exportieren
-    filename = f"pipedrive_batch_{batch_id}.xlsx"
-    df.to_excel(filename, index=False)
+        # === 4️⃣ Endergebnis exportieren
+        filename, remaining = await export_result(conn, batch_id)
 
-    return FileResponse(filename,
-                        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        filename=filename)
+    finally:
+        await conn.close()
+
+    # === 5️⃣ Ergebnis-Seite anzeigen
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Batch-Ergebnis</title>
+        <style>
+            body {{ font-family: Arial; margin: 60px auto; max-width: 600px; }}
+            h1 {{ color: #2a5bd7; }}
+            a.button {{ background:#2a5bd7; color:white; padding:10px 16px; text-decoration:none; border-radius:6px; }}
+            a.button:hover {{ background:#1e46a1; }}
+            .info {{ margin-top:20px; }}
+        </style>
+    </head>
+    <body>
+        <h1>✅ Batch-Ergebnis</h1>
+        <p>Batch-ID: <b>{batch_id}</b></p>
+        <p>Gespeicherte Kontakte: <b>{remaining}</b></p>
+        <p>Gelöschte Datensätze: <b style="color:red;">{deleted_total}</b></p>
+        <div class="info">
+            <a href="/{filename}" download class="button">⬇️ Ergebnis herunterladen</a>
+        </div>
+        <p style="margin-top:2em;"><a href="/overview">🔁 Neuen Durchlauf starten</a></p>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html)
