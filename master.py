@@ -81,6 +81,7 @@ async def batch_list():
                             batches.add(v.strip())
     return {"batches": sorted(batches)}
 
+
 # ================== Übersicht / Frontend ==================
 @app.get("/overview", response_class=HTMLResponse)
 async def overview():
