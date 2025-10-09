@@ -325,25 +325,48 @@ async def overview(request: Request):
 
     html = """
     <!DOCTYPE html>
-    <html>
+    <html lang="de">
     <head>
-      <title>BatchFlow – Vorbereitung & Abgleich</title>
+      <meta charset="UTF-8">
+      <title>BatchFlow – Kampagnen Vorbereitung</title>
       <link rel="stylesheet" href="/static/style.css">
+      <style>
+        select {
+          width: 100%;
+          padding: 10px;
+          border: 1px solid #ccc;
+          border-radius: 8px;
+          font-size: 15px;
+          margin-bottom: 15px;
+        }
+        option { padding: 5px; }
+      </style>
     </head>
     <body>
-      <header><img src="/static/bizforward-Logo-Clean-2024.svg" alt="Logo"></header>
+      <header>
+        <img src="/static/bizforward-Logo-Clean-2024.svg" alt="Logo">
+      </header>
+
       <div class="container">
         <h1>📊 Erster Filter – Master aufbauen</h1>
         <div class="card">
           <form action="/preview" method="post">
-            <label>🔍 Pipedrive Filter-ID (Personen – Hauptfilter):</label>
-            <input type="number" name="filter_id" placeholder="z. B. 1917" required>
+            <label>🔍 Auswahl der Selektion:</label>
+            <select name="filter_id" required>
+              <option value="1914">🟢 Selektion Neukontakte</option>
+              <option value="1917">🟠 Selektion Nachfass</option>
+              <option value="2495">🔵 Selektion Refresh</option>
+            </select>
+
             <div class="form-actions">
-              <button class="btn-action" type="submit">Scan starten</button>
+              <button type="submit" class="btn-action">Scan starten</button>
             </div>
           </form>
         </div>
-        <p><a class="btn-secondary" href="/login">🔐 Neu anmelden</a></p>
+
+        <p style="margin-top:25px;">
+          <a href="/login" class="btn-secondary">🔐 Neu anmelden</a>
+        </p>
       </div>
     </body>
     </html>
