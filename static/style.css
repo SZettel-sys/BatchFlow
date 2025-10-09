@@ -1,33 +1,99 @@
+/* ---- Grundlayout ---- */
 body {
-    font-family: Arial, sans-serif;
-    margin: 2em;
-    background-color: #f8f9fa;
-    color: #333;
+  font-family: 'Source Sans Pro', Arial, sans-serif;
+  background: #f4f6f8;
+  margin: 0;
+  color: #333;
+}
+header {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  background: #ffffff;
+  padding: 15px;
+  border-bottom: 1px solid #ddd;
+}
+header img { height: 70px; }
+
+.container {
+  max-width: 1000px;
+  margin: 40px auto;
+  padding: 10px 20px;
 }
 
-h2 {
-    color: #0073e6;
-    margin-bottom: 1em;
+/* ---- Karten & Formulare ---- */
+.card {
+  background: white;
+  border: 1px solid #ddd;
+  border-radius: 12px;
+  padding: 25px;
+  box-shadow: 0 3px 8px rgba(0, 0, 0, 0.05);
+  margin-bottom: 20px;
+}
+label {
+  display: block;
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+input, select {
+  width: 100%;
+  padding: 10px;
+  border: 1px solid #ccc;
+  border-radius: 8px;
+  font-size: 15px;
+  margin-bottom: 15px;
+}
+button, .btn-action, .btn-secondary {
+  border: none;
+  border-radius: 8px;
+  padding: 10px 20px;
+  font-size: 15px;
+  cursor: pointer;
+  transition: all .2s ease;
+}
+.btn-action {
+  background: #009fe3;
+  color: white;
+}
+.btn-action:hover { background: #007bb8; }
+
+.btn-secondary {
+  background: #e6eef5;
+  color: #333;
+  text-decoration: none;
+}
+.btn-secondary:hover { background: #d2e0ec; }
+
+.form-actions {
+  text-align: right;
 }
 
-button {
-    padding: 10px 15px;
-    border: none;
-    border-radius: 5px;
-    background-color: #0073e6;
-    color: white;
-    font-size: 14px;
-    cursor: pointer;
+/* ---- Tabelle für Fachbereiche ---- */
+table.summary {
+  width: 100%;
+  border-collapse: collapse;
+  background: white;
+  border-radius: 10px;
+  overflow: hidden;
+  margin-top: 20px;
+}
+table.summary th, table.summary td {
+  padding: 10px 14px;
+  border: 1px solid #eee;
+}
+table.summary th {
+  background: #f0f6fb;
+  text-align: left;
+  font-weight: bold;
 }
 
-button:hover {
-    background-color: #005bb5;
+/* ---- Erfolg / Hinweis ---- */
+.alert {
+  background: #e6f3fb;
+  border: 1px solid #b7d4ec;
+  border-radius: 10px;
+  padding: 14px 18px;
+  margin-bottom: 20px;
+  color: #1a3c5a;
 }
-
-#results {
-    margin-top: 20px;
-    padding: 10px;
-    background: white;
-    border-radius: 8px;
-    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.1);
-}
+.alert b { color: #007bb8; }
