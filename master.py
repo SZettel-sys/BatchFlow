@@ -1,128 +1,87 @@
 import os
 import httpx
-import asyncpg
 import pandas as pd
-from fastapi import FastAPI, Form, HTTPException
+from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
-# ==============================================
-# ⚙️ FastAPI Setup
-# ==============================================
-app = FastAPI(title="Pipedrive SQL Batch Cleaner (OAuth + SQL)")
+# ======================================================
+# ⚙️ FastAPI App Setup
+# ======================================================
+app = FastAPI(title="BatchFlow – Kampagnenvorbereitung")
 
+# Static-Files (CSS, Logo)
 if os.path.isdir("static"):
     app.mount("/static", StaticFiles(directory="static"), name="static")
 
-# ==============================================
-# 🔐 Konfiguration
-# ==============================================
-DATABASE_URL = os.getenv("DATABASE_URL")
-if not DATABASE_URL:
-    raise ValueError("❌ DATABASE_URL fehlt (Neon Connection String)")
+# ======================================================
+# 🔐 Pipedrive OAuth Config
+# ======================================================
+CLIENT_ID = os.getenv("PD_CLIENT_ID")
+CLIENT_SECRET = os.getenv("PD_CLIENT_SECRET")
+BASE_URL = os.getenv("BASE_URL")
+if not BASE_URL:
+    raise ValueError("❌ BASE_URL fehlt")
 
-PD_CLIENT_ID = os.getenv("PD_CLIENT_ID")
-PD_CLIENT_SECRET = os.getenv("PD_CLIENT_SECRET")
-BASE_URL = os.getenv("BASE_URL", "https://deine-app.onrender.com")
 REDIRECT_URI = f"{BASE_URL}/oauth/callback"
-
 OAUTH_AUTHORIZE_URL = "https://oauth.pipedrive.com/oauth/authorize"
 OAUTH_TOKEN_URL = "https://oauth.pipedrive.com/oauth/token"
 PIPEDRIVE_API_URL = "https://api.pipedrive.com/v1"
 
-user_tokens = {}  # access_token pro Benutzer (Session)
+user_tokens = {}
 
-# ==============================================
-# 🔌 Hilfsfunktionen
-# ==============================================
-async def get_conn():
-    """Verbindung zur Neon-Datenbank"""
-    return await asyncpg.connect(DATABASE_URL)
-
-async def fetch_filter_data(filter_id: int, headers: dict):
-    """Lädt Daten aus einem Pipedrive-Filter"""
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(
-            f"{PIPEDRIVE_API_URL}/persons",
-            params={"filter_id": filter_id, "limit": 500},
-            headers=headers
-        )
-        resp.raise_for_status()
-        return resp.json().get("data", []) or []
-
-async def load_into_temp_table(conn, table_name: str, data: list):
-    """Schreibt ein JSON-Ergebnis in eine temporäre Tabelle"""
-    await conn.execute(f"""
-        CREATE TEMP TABLE {table_name} (
-            contact_id BIGINT,
-            name TEXT,
-            email TEXT,
-            org_name TEXT,
-            batch_id TEXT
-        );
-    """)
-    rows = [
-        (
-            p.get("id"),
-            p.get("name"),
-            str(p.get("email")),
-            str(p.get("org_name")),
-            str(p.get("batch_id"))
-        )
-        for p in data
-    ]
-    if rows:
-        await conn.executemany(
-            f"INSERT INTO {table_name}(contact_id, name, email, org_name, batch_id) VALUES ($1,$2,$3,$4,$5)",
-            rows
-        )
-
-async def clean_batch(conn, exclude_tables: list):
-    """Löscht alle Kontakte aus main_batch, die in anderen Tabellen vorkommen"""
-    deleted_total = 0
-    for t in exclude_tables:
-        result = await conn.execute(f"""
-            DELETE FROM main_batch
-            WHERE contact_id IN (SELECT contact_id FROM {t});
-        """)
-        # result sieht aus wie 'DELETE <anzahl>'
-        try:
-            deleted = int(result.split()[-1])
-        except Exception:
-            deleted = 0
-        deleted_total += deleted
-    return deleted_total
-
-async def export_result(conn, batch_id: str):
-    """Exportiert das Endergebnis aus main_batch"""
-    records = await conn.fetch("SELECT * FROM main_batch ORDER BY contact_id;")
-    if not records:
-        raise HTTPException(status_code=404, detail="Kein bereinigtes Ergebnis gefunden")
-
-    df = pd.DataFrame(records, columns=["contact_id", "name", "email", "org_name", "batch_id"])
-    filename = f"cleaned_batch_{batch_id}.xlsx"
-    df.to_excel(filename, index=False)
-    return filename, len(df)
-
+# ======================================================
+# 🔧 Hilfsfunktionen
+# ======================================================
 def get_headers():
-    """Header für Pipedrive-Requests erzeugen"""
     token = user_tokens.get("default")
     if not token:
         raise HTTPException(status_code=401, detail="Nicht eingeloggt")
     return {"Authorization": f"Bearer {token}"}
 
-# ==============================================
-# 🌐 OAuth Routes
-# ==============================================
+
+async def fetch_filter_data(filter_id: int, headers: dict):
+    """Lädt Personen aus Pipedrive-Filter."""
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            f"{PIPEDRIVE_API_URL}/persons",
+            params={"filter_id": filter_id, "limit": 500},
+            headers=headers,
+        )
+        resp.raise_for_status()
+        return resp.json().get("data", []) or []
+
+
+def clean_filter_data(df, fachbereich, limit, batch_id):
+    """Bereinigt Daten nach den Regeln."""
+    df = df[df["fachbereich_kampagne"] == fachbereich]
+    df = df[df["organisationsart"].isna() | (df["organisationsart"] == "")]
+    df = df.groupby("org_id").head(2)
+    df["channel"] = "Cold-Mail"
+    df["batch_id"] = batch_id
+    df = df.head(limit)
+    return df
+
+
+def export_to_excel(df, batch_id):
+    filename = f"{batch_id}_Bereinigt.xlsx"
+    df.to_excel(filename, index=False)
+    return filename
+
+
+# ======================================================
+# 🔐 OAuth Routes
+# ======================================================
 @app.get("/login")
 def login():
-    """Startet OAuth-Login bei Pipedrive"""
-    url = f"{OAUTH_AUTHORIZE_URL}?client_id={PD_CLIENT_ID}&redirect_uri={REDIRECT_URI}"
+    """Startet OAuth-Login bei Pipedrive."""
+    url = f"{OAUTH_AUTHORIZE_URL}?client_id={CLIENT_ID}&redirect_uri={REDIRECT_URI}"
     return RedirectResponse(url)
+
 
 @app.get("/oauth/callback")
 async def oauth_callback(code: str):
-    """Empfängt OAuth-Callback von Pipedrive"""
+    """OAuth Callback von Pipedrive."""
     async with httpx.AsyncClient() as client:
         token_resp = await client.post(
             OAUTH_TOKEN_URL,
@@ -130,8 +89,8 @@ async def oauth_callback(code: str):
                 "grant_type": "authorization_code",
                 "code": code,
                 "redirect_uri": REDIRECT_URI,
-                "client_id": PD_CLIENT_ID,
-                "client_secret": PD_CLIENT_SECRET,
+                "client_id": CLIENT_ID,
+                "client_secret": CLIENT_SECRET,
             },
         )
     token_data = token_resp.json()
@@ -141,115 +100,169 @@ async def oauth_callback(code: str):
     user_tokens["default"] = access_token
     return RedirectResponse("/overview")
 
-# ==============================================
-# 🧭 Frontend
-# ==============================================
+
+# ======================================================
+# 🏠 Übersicht (modernes Layout)
+# ======================================================
 @app.get("/overview", response_class=HTMLResponse)
-def overview():
+async def overview(request: Request):
+    if "default" not in user_tokens:
+        return RedirectResponse("/login")
+
     html = """
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Pipedrive Batch Cleaner (OAuth + SQL)</title>
-        <style>
-            body { font-family: Arial; margin: 60px auto; max-width: 600px; }
-            h1 { color: #2a5bd7; }
-            input, button { padding: 8px; width: 100%; margin-top: 8px; }
-            button { background: #2a5bd7; color: white; border: none; cursor: pointer; }
-            button:hover { background: #1e46a1; }
-        </style>
+      <title>BatchFlow – Kampagnen Vorbereitung</title>
+      <link rel="stylesheet" href="/static/style.css">
     </head>
     <body>
-        <h1>📊 Pipedrive Batch Cleaner (SQL)</h1>
-        <form action="/process" method="post">
-            <label>Hauptfilter ID (Batch):</label>
-            <input type="number" name="filter_id_main" placeholder="z. B. 1917" required>
+      <header>
+        <img src="/static/bizforward-Logo-Clean-2024.svg" alt="Logo">
+      </header>
 
-            <label>Batch ID:</label>
-            <input type="text" name="batch_id" placeholder="z. B. B434_E-Mail_2025" required>
+      <div class="container">
+        <h1>📊 Kampagnen-Vorbereitung</h1>
+        <p>Starte mit einem Pipedrive-Filter, um die Kontakte pro Fachbereich zu analysieren.</p>
 
-            <label>Weitere Filter IDs (kommasepariert):</label>
-            <input type="text" name="exclude_filters" placeholder="z. B. 1918,1919,1920">
+        <div class="card">
+          <form action="/preview" method="post">
+            <label>🔍 Pipedrive Filter-ID:</label>
+            <input type="number" name="filter_id" placeholder="z. B. 1917" required>
 
-            <button type="submit">➡️ Verarbeitung starten</button>
-        </form>
-        <p style="margin-top:2em;"><a href="/login">🔐 Login mit Pipedrive</a></p>
+            <div class="form-actions">
+              <button type="submit" class="btn-action">➡️ Scan starten</button>
+            </div>
+          </form>
+        </div>
+
+        <p style="margin-top:25px;">
+          <a href="/login" class="btn-secondary">🔐 Login mit Pipedrive</a>
+        </p>
+      </div>
     </body>
     </html>
     """
-    return HTMLResponse(content=html)
+    return HTMLResponse(html)
 
-# ==============================================
-# 🔁 Hauptprozess
-# ==============================================
-@app.post("/process", response_class=HTMLResponse)
-async def process(
-    filter_id_main: int = Form(...),
-    batch_id: str = Form(...),
-    exclude_filters: str = Form("")
-):
+
+# ======================================================
+# 📊 Vorschau: Fachbereiche anzeigen
+# ======================================================
+@app.post("/preview", response_class=HTMLResponse)
+async def preview(filter_id: int = Form(...)):
     headers = get_headers()
-    conn = await get_conn()
+    data = await fetch_filter_data(filter_id, headers)
+    if not data:
+        return HTMLResponse("<h3>❌ Keine Daten im Filter gefunden.</h3>")
 
-    try:
-        # === 1️⃣ Hauptdaten laden
-        main_data = await fetch_filter_data(filter_id_main, headers)
-        if not main_data:
-            raise HTTPException(status_code=404, detail="Keine Hauptdaten gefunden")
+    df = pd.json_normalize(data)
+    df.columns = [c.lower().replace(" ", "_") for c in df.columns]
 
-        # Nur Einträge mit der richtigen Batch-ID
-        main_data = [p for p in main_data if str(p.get("batch_id", "")).strip() == batch_id]
-        await load_into_temp_table(conn, "main_batch", main_data)
-        print(f"✅ Hauptbatch geladen: {len(main_data)} Kontakte")
+    if "fachbereich_kampagne" not in df.columns:
+        return HTMLResponse("<h3>❌ Feld 'Fachbereich-Kampagne' nicht gefunden.</h3>")
 
-        # === 2️⃣ Weitere Filter (Abgleich)
-        exclude_tables = []
-        if exclude_filters.strip():
-            for i, fid in enumerate(exclude_filters.split(","), start=1):
-                fid = fid.strip()
-                if not fid:
-                    continue
-                data = await fetch_filter_data(int(fid), headers)
-                table_name = f"exclude_{i}"
-                await load_into_temp_table(conn, table_name, data)
-                exclude_tables.append(table_name)
-                print(f"📋 Filter {fid} geladen: {len(data)} Kontakte")
+    summary = df.groupby("fachbereich_kampagne").size().reset_index(name="anzahl")
 
-        # === 3️⃣ SQL-Abgleich durchführen
-        deleted_total = 0
-        if exclude_tables:
-            deleted_total = await clean_batch(conn, exclude_tables)
+    rows = ""
+    for _, row in summary.iterrows():
+        rows += f"<tr><td>{row['fachbereich_kampagne']}</td><td>{row['anzahl']}</td></tr>"
 
-        # === 4️⃣ Endergebnis exportieren
-        filename, remaining = await export_result(conn, batch_id)
-
-    finally:
-        await conn.close()
-
-    # === 5️⃣ Ergebnis-Seite anzeigen
     html = f"""
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Batch-Ergebnis</title>
-        <style>
-            body {{ font-family: Arial; margin: 60px auto; max-width: 600px; }}
-            h1 {{ color: #2a5bd7; }}
-            a.button {{ background:#2a5bd7; color:white; padding:10px 16px; text-decoration:none; border-radius:6px; }}
-            a.button:hover {{ background:#1e46a1; }}
-            .info {{ margin-top:20px; }}
-        </style>
+      <title>BatchFlow – Vorschau</title>
+      <link rel="stylesheet" href="/static/style.css">
     </head>
     <body>
-        <h1>✅ Batch-Ergebnis</h1>
-        <p>Batch-ID: <b>{batch_id}</b></p>
-        <p>Gespeicherte Kontakte: <b>{remaining}</b></p>
-        <p>Gelöschte Datensätze: <b style="color:red;">{deleted_total}</b></p>
-        <div class="info">
-            <a href="/{filename}" download class="button">⬇️ Ergebnis herunterladen</a>
+      <header>
+        <img src="/static/bizforward-Logo-Clean-2024.svg" alt="Logo">
+      </header>
+
+      <div class="container">
+        <h1>📋 Fachbereich-Übersicht</h1>
+        <p>Filter: <b>{filter_id}</b></p>
+        <div class="card">
+          <table class="summary">
+            <thead><tr><th>Fachbereich-Kampagne</th><th>Anzahl</th></tr></thead>
+            <tbody>{rows}</tbody>
+          </table>
         </div>
-        <p style="margin-top:2em;"><a href="/overview">🔁 Neuen Durchlauf starten</a></p>
+
+        <div class="card">
+          <form action="/prepare" method="post">
+            <input type="hidden" name="filter_id" value="{filter_id}">
+            <label>🎯 Fachbereich auswählen:</label>
+            <input type="text" name="fachbereich" placeholder="z. B. Marketing" required>
+
+            <label>📦 Anzahl Datensätze (Limit):</label>
+            <input type="number" name="limit" value="900" required>
+
+            <label>🏷️ Batch-ID:</label>
+            <input type="text" name="batch_id" placeholder="z. B. B477" required>
+
+            <div class="form-actions">
+              <button type="submit" class="btn-action">📤 Bereinigen & Excel erzeugen</button>
+            </div>
+          </form>
+        </div>
+
+        <p><a href="/overview" class="btn-secondary">⬅️ Zurück</a></p>
+      </div>
     </body>
     </html>
     """
-    return HTMLResponse(content=html)
+    return HTMLResponse(html)
+
+
+# ======================================================
+# 🧮 Bereinigung & Export
+# ======================================================
+@app.post("/prepare")
+async def prepare(
+    filter_id: int = Form(...),
+    fachbereich: str = Form(...),
+    limit: int = Form(...),
+    batch_id: str = Form(...),
+):
+    headers = get_headers()
+    data = await fetch_filter_data(filter_id, headers)
+    df = pd.json_normalize(data)
+    df.columns = [c.lower().replace(" ", "_") for c in df.columns]
+
+    required = ["fachbereich_kampagne", "org_id", "organisationsart"]
+    for col in required:
+        if col not in df.columns:
+            raise HTTPException(status_code=400, detail=f"Spalte '{col}' fehlt in Filterdaten.")
+
+    df_clean = clean_filter_data(df, fachbereich, limit, batch_id)
+    filename = export_to_excel(df_clean, batch_id)
+    remaining = len(df_clean)
+
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <title>BatchFlow – Ergebnis</title>
+      <link rel="stylesheet" href="/static/style.css">
+    </head>
+    <body>
+      <header>
+        <img src="/static/bizforward-Logo-Clean-2024.svg" alt="Logo">
+      </header>
+
+      <div class="container">
+        <div class="alert">
+          ✅ <b>Bereinigung abgeschlossen!</b><br><br>
+          Batch-ID: <b>{batch_id}</b><br>
+          Fachbereich: <b>{fachbereich}</b><br>
+          Verbleibende Datensätze: <b>{remaining}</b>
+        </div>
+        <a href="/{filename}" download class="btn-action">⬇️ Excel herunterladen</a>
+        <p style="margin-top:20px;"><a href="/overview" class="btn-secondary">🔁 Neue Verarbeitung</a></p>
+      </div>
+    </body>
+    </html>
+    """
+    return HTMLResponse(html)
