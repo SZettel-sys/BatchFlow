@@ -78,7 +78,7 @@ async def oauth_callback(code: str):
 # ================== 🔍 Personen aus Filter abrufen ==================
 async def fetch_persons_by_filter(filter_id: int):
     headers = get_headers()
-    url = "https://api.pipedrive.com/v1/persons"
+    url = "https://api.pipedrive.com/v1/persons/list"
     params = {"filter_id": filter_id, "limit": 500}
 
     async with httpx.AsyncClient() as client:
