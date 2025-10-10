@@ -1,262 +1,175 @@
-# master.py – Version 3 (mit Neon/PostgreSQL-Integration)
 import os
-from typing import Dict, Any, Optional, List
+import ssl
 import httpx
-from fastapi import FastAPI, Form, Request
+import pandas as pd
+from fastapi import FastAPI, Request, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from fastapi.templating import Jinja2Templates
+from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
+from dotenv import load_dotenv
 
-# =========================================
-# Basis-Setup
-# =========================================
-app = FastAPI(title="BatchFlow – Master Aufbau mit Neon")
+# ========================================
+# 🔧 Grundkonfiguration
+# ========================================
+load_dotenv()
+app = FastAPI()
+app.mount("/static", StaticFiles(directory="static"), name="static")
+templates = Jinja2Templates(directory="static")
 
-if os.path.isdir("static"):
-    app.mount("/static", StaticFiles(directory="static"), name="static")
+PD_CLIENT_ID = os.getenv("PD_CLIENT_ID")
+PD_CLIENT_SECRET = os.getenv("PD_CLIENT_SECRET")
+PD_API_TOKEN = os.getenv("PD_API_TOKEN")
+BASE_URL = "https://api.pipedrive.com/v1"
 
-BASE_URL = os.getenv("BASE_URL", "").strip()
-if not BASE_URL:
-    raise ValueError("❌ BASE_URL fehlt!")
+# ========================================
+# 🧠 Neon Datenbankverbindung mit SSL-Handling
+# ========================================
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-if not DATABASE_URL:
-    raise ValueError("❌ DATABASE_URL fehlt! Bitte setze die Neon-Verbindungs-URL.")
+# async-kompatibel machen
+if DATABASE_URL and DATABASE_URL.startswith("postgresql://"):
+    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://")
 
-engine = create_async_engine(DATABASE_URL, echo=False, future=True)
+# SSL-Kontext einfügen, falls sslmode in URL enthalten
+ssl_context = None
+if DATABASE_URL and "sslmode=require" in DATABASE_URL:
+    DATABASE_URL = DATABASE_URL.replace("?sslmode=require", "")
+    ssl_context = ssl.create_default_context()
 
-API_URL = "https://api.pipedrive.com/v1"
-OAUTH_AUTHORIZE_URL = "https://oauth.pipedrive.com/oauth/authorize"
-OAUTH_TOKEN_URL = "https://oauth.pipedrive.com/oauth/token"
+connect_args = {"ssl": ssl_context} if ssl_context else {}
+engine = create_async_engine(DATABASE_URL, echo=False, future=True, connect_args=connect_args)
 
-CLIENT_ID = os.getenv("PD_CLIENT_ID", "").strip()
-CLIENT_SECRET = os.getenv("PD_CLIENT_SECRET", "").strip()
-API_TOKEN = os.getenv("PD_API_TOKEN", "").strip()
-USE_TOKEN = bool(API_TOKEN)
-user_tokens: Dict[str, str] = {}
-
-# =========================================
-# Pipedrive-Hilfsfunktionen
-# =========================================
-def oauth_headers() -> Dict[str, str]:
-    token = user_tokens.get("default")
-    return {"Authorization": f"Bearer {token}"} if token else {}
-
-def pd_params(base: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    base = dict(base or {})
-    if USE_TOKEN:
-        base["api_token"] = API_TOKEN
-    return base
-
-async def pd_get(path: str, params: Optional[Dict[str, Any]] = None) -> dict:
-    url = f"{API_URL}{path}"
-    headers = {} if USE_TOKEN else oauth_headers()
-    async with httpx.AsyncClient(timeout=90) as client:
-        r = await client.get(url, params=pd_params(params), headers=headers)
-        if r.status_code != 200:
-            raise RuntimeError(f"Fehler {r.status_code}: {r.text}")
-        return r.json()
-
-async def fetch_user_me() -> dict:
-    data = await pd_get("/users/me")
-    return data.get("data") or {}
-
-# =========================================
-# Pipedrive Personen holen (mit Pagination)
-# =========================================
-async def fetch_persons_by_filter(filter_id: int) -> List[dict]:
-    all_persons = []
-    start = 0
-    more = True
-
-    while more:
-        data = await pd_get(
-            "/persons/list",
-            params={"filter_id": filter_id, "start": start, "limit": 500}
-        )
-        persons = data.get("data") or []
-        all_persons.extend(persons)
-        pagination = data.get("additional_data", {}).get("pagination", {})
-        more = pagination.get("more_items_in_collection", False)
-        start = pagination.get("next_start", 0)
-
-    return all_persons
-
-def extract_email(person: dict) -> str:
-    emails = person.get("email") or []
-    if isinstance(emails, list) and emails:
-        for e in emails:
-            if e.get("primary"):
-                return e.get("value")
-        return emails[0].get("value")
-    return "-"
-
-# =========================================
-# Neon Datenbank-Funktionen
-# =========================================
-async def recreate_master_table():
-    """Erstellt oder leert die temporäre Master-Tabelle."""
-    async with engine.begin() as conn:
-        await conn.execute(text("""
-            DROP TABLE IF EXISTS master_temp;
-            CREATE TABLE master_temp (
-                person_id BIGINT,
-                name TEXT,
-                email TEXT,
-                org_name TEXT,
-                fachbereich TEXT,
-                batch_id TEXT,
-                channel TEXT
-            );
-        """))
-
-async def insert_master_data(persons: List[dict]):
-    """Speichert alle Personen in master_temp."""
-    async with AsyncSession(engine) as session:
-        for p in persons:
-            email = extract_email(p)
-            stmt = text("""
-                INSERT INTO master_temp (person_id, name, email, org_name, fachbereich, batch_id, channel)
-                VALUES (:id, :name, :email, :org, :fach, :batch, :channel)
-            """)
-            await session.execute(stmt, {
-                "id": p.get("id"),
-                "name": p.get("name") or "-",
-                "email": email,
-                "org": p.get("org_name") or "-",
-                "fach": p.get("fachbereich_kampagne") or "-",
-                "batch": p.get("batch_id") or "-",
-                "channel": p.get("channel") or "-"
-            })
-        await session.commit()
-
-# =========================================
-# Routing
-# =========================================
-@app.get("/", response_class=HTMLResponse)
-async def root():
-    return RedirectResponse("/overview")
+# ========================================
+# 🔐 OAuth2 Login
+# ========================================
+user_tokens = {}
 
 @app.get("/login")
-def login():
-    if USE_TOKEN:
-        return RedirectResponse("/overview")
-    return RedirectResponse(
-        f"{OAUTH_AUTHORIZE_URL}?client_id={CLIENT_ID}&redirect_uri={BASE_URL}/oauth/callback"
-    )
+async def login():
+    redirect_uri = "https://batchflow-4wbo.onrender.com/oauth/callback"
+    url = f"https://oauth.pipedrive.com/oauth/authorize?client_id={PD_CLIENT_ID}&redirect_uri={redirect_uri}"
+    return RedirectResponse(url)
 
 @app.get("/oauth/callback")
 async def oauth_callback(code: str):
-    if USE_TOKEN:
-        return RedirectResponse("/overview")
-
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(
-            OAUTH_TOKEN_URL,
-            data={
-                "grant_type": "authorization_code",
-                "code": code,
-                "redirect_uri": f"{BASE_URL}/oauth/callback",
-                "client_id": CLIENT_ID,
-                "client_secret": CLIENT_SECRET,
-            },
-        )
-    data = resp.json()
-    token = data.get("access_token")
-    if not token:
-        return HTMLResponse(f"<h3>❌ OAuth-Fehler:</h3><pre>{data}</pre>", status_code=400)
-
-    user_tokens["default"] = token
-    me = await fetch_user_me()
-    if "Sandbox" in (me.get("company_name") or ""):
-        user_tokens.clear()
-        return HTMLResponse("<h3>🚫 Sandbox erkannt – bitte Live-System wählen.</h3>", status_code=400)
+    token_url = "https://oauth.pipedrive.com/oauth/token"
+    async with httpx.AsyncClient() as client:
+        r = await client.post(token_url, data={
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": "https://batchflow-4wbo.onrender.com/oauth/callback",
+            "client_id": PD_CLIENT_ID,
+            "client_secret": PD_CLIENT_SECRET
+        })
+        data = r.json()
+        user_tokens["default"] = data.get("access_token")
     return RedirectResponse("/overview")
 
-# =========================================
-# Übersicht (Filter-Auswahl)
-# =========================================
+# ========================================
+# 🧩 Hilfsfunktionen
+# ========================================
+async def fetch_all_persons(filter_id: int, token: str):
+    """Lädt ALLE Personen aus einem Pipedrive-Filter (nicht nur 500)"""
+    persons = []
+    start = 0
+    limit = 500
+    async with httpx.AsyncClient() as client:
+        while True:
+            url = f"{BASE_URL}/persons?filter_id={filter_id}&start={start}&limit={limit}"
+            headers = {"Authorization": f"Bearer {token}"}
+            r = await client.get(url, headers=headers)
+            if r.status_code != 200:
+                raise Exception(f"Pipedrive API Fehler: {r.text}")
+            data = r.json().get("data", [])
+            if not data:
+                break
+            persons.extend(data)
+            start += limit
+    return persons
+
+async def save_temp_to_neon(df: pd.DataFrame, table_name: str):
+    """Speichert ein DataFrame als temporäre Tabelle in Neon"""
+    async with engine.begin() as conn:
+        await conn.run_sync(lambda sync_conn: df.to_sql(
+            table_name, sync_conn, if_exists='replace', index=False
+        ))
+
+# ========================================
+# 🧭 Frontend /overview
+# ========================================
 @app.get("/overview", response_class=HTMLResponse)
 async def overview(request: Request):
-    if not USE_TOKEN and "default" not in user_tokens:
+    if "default" not in user_tokens:
         return RedirectResponse("/login")
 
-    mode = "API-Token (Live)" if USE_TOKEN else "OAuth"
-    html = f"""
-    <html lang="de">
-    <head><meta charset="utf-8"><title>BatchFlow – Master</title>
-    <style>
-      body {{ font-family:Arial; background:#f7f9fb; }}
-      .container {{ max-width:700px; margin:60px auto; background:#fff; padding:30px; border-radius:10px; box-shadow:0 2px 6px rgba(0,0,0,0.1); }}
-      select {{ width:100%; padding:10px; border:1px solid #ccc; border-radius:6px; }}
-      button {{ background:#009fe3; color:white; border:none; padding:10px 20px; border-radius:6px; cursor:pointer; }}
-      button:hover {{ background:#007bb8; }}
-      .pill {{ background:#e6f2ff; color:#06487a; padding:3px 10px; border-radius:12px; font-size:12px; }}
-    </style></head>
+    html = """
+    <html>
+    <head>
+        <title>Erster Filter – Master aufbauen</title>
+        <style>
+            body { font-family: 'Source Sans Pro', Arial; background: #f4f6f8; margin: 0; color: #333; }
+            header { background: #fff; padding: 20px; border-bottom: 1px solid #ddd; text-align:center; font-size: 22px; font-weight: bold; }
+            .container { max-width: 800px; margin: 40px auto; background: #fff; padding: 30px; border-radius: 10px; box-shadow: 0 2px 6px rgba(0,0,0,0.1); }
+            input[type=text] { width: 100%; padding: 10px; border-radius: 6px; border: 1px solid #ccc; font-size: 15px; }
+            button { background: #009fe3; color: white; border: none; padding: 10px 20px; border-radius: 6px; font-size: 15px; cursor: pointer; }
+            button:hover { background: #007bb8; }
+            .error { color: red; font-weight: bold; margin-top: 20px; }
+        </style>
+    </head>
     <body>
-      <div class="container">
-        <h2>📊 Erster Filter – Master aufbauen <span class="pill">{mode}</span></h2>
-        <form method="post" action="/preview">
-          <label>🔍 Auswahl der Selektion:</label>
-          <select name="filter_id" required>
-            <option value="1914">🟢 Neukontakte (1914)</option>
-            <option value="1917">🟠 Nachfass (1917)</option>
-            <option value="2495">🔵 Refresh (2495)</option>
-          </select>
-          <button type="submit">Scan starten</button>
-        </form>
-        <p style="margin-top:15px;"><a href="/check">🔎 Verbindung prüfen</a></p>
-      </div>
-    </body></html>
+        <header>📊 Erster Filter – Master aufbauen</header>
+        <div class="container">
+            <form method="post" action="/preview">
+                <label>🔍 Pipedrive Filter-ID (Personen – Hauptfilter):</label><br>
+                <input type="text" name="filter_id" placeholder="z.B. 1914"><br><br>
+                <button type="submit">Scan starten</button>
+            </form>
+            <form action="/login" method="get">
+                <button style="margin-top:15px;background:#666;">🔑 Neu anmelden</button>
+            </form>
+        </div>
+    </body>
+    </html>
     """
     return HTMLResponse(html)
 
-# =========================================
-# Vorschau + Neon-Speicherung
-# =========================================
+# ========================================
+# 🧮 Vorschau /preview
+# ========================================
 @app.post("/preview", response_class=HTMLResponse)
-async def preview(filter_id: int = Form(...)):
+async def preview(request: Request, filter_id: str = Form(...)):
     try:
-        persons = await fetch_persons_by_filter(filter_id)
-        await recreate_master_table()
-        await insert_master_data(persons)
-    except Exception as e:
-        return HTMLResponse(f"<h3>❌ Fehler beim Abruf/Speichern:</h3><pre>{e}</pre>", status_code=500)
+        token = user_tokens.get("default", PD_API_TOKEN)
+        persons = await fetch_all_persons(int(filter_id), token)
 
-    html = f"""
-    <html><body style="font-family:Arial;margin:40px;">
-      <h2>✅ Master-Tabelle erfolgreich aufgebaut</h2>
-      <p>Filter-ID: <b>{filter_id}</b></p>
-      <p>Gespeicherte Datensätze: <b>{len(persons)}</b></p>
-      <p>Tabelle: <code>master_temp</code> (temporär in Neon)</p>
-      <p><a href="/overview">⬅️ Zurück</a></p>
-    </body></html>
-    """
-    return HTMLResponse(html)
+        # In DataFrame umwandeln
+        df = pd.DataFrame(persons)
+        df_display = df.head(50)[["id", "name", "email", "org_name"]] if not df.empty else None
 
-# =========================================
-# Verbindung prüfen
-# =========================================
-@app.get("/check", response_class=HTMLResponse)
-async def check():
-    mode = "API-Token (Live)" if USE_TOKEN else ("OAuth" if "default" in user_tokens else "nicht angemeldet")
-    try:
-        me = await fetch_user_me()
-        company = me.get("company_name") or "-"
-        user = me.get("name") or "-"
-        email = me.get("email") or "-"
-        msg = f"<p style='color:#0a7c3a'>✅ Verbindung OK</p>"
+        # Temporär speichern
+        await save_temp_to_neon(df, "temp_master")
+
+        # HTML-Vorschau
+        html = """
+        <html><body style="font-family:Arial;background:#f8fafc;">
+        <h2 style="text-align:center;">✅ Erste 50 Datensätze</h2>
+        <table border="1" cellspacing="0" cellpadding="6" style="margin:auto;border-collapse:collapse;">
+        <tr><th>Person-ID</th><th>Name</th><th>E-Mail</th><th>Organisation</th></tr>
+        """
+        for _, row in df_display.iterrows():
+            html += f"<tr><td>{row['id']}</td><td>{row['name']}</td><td>{row['email']}</td><td>{row['org_name']}</td></tr>"
+        html += "</table></body></html>"
+        return HTMLResponse(html)
+
     except Exception as e:
-        company = user = email = "-"
-        msg = f"<p style='color:#a10'>❌ Fehler:<br>{e}</p>"
-    html = f"""
-    <html><body style="font-family:Arial;margin:40px;">
-      <h2>Verbindungs-Check</h2>
-      <p><b>Modus:</b> {mode}</p>
-      <p><b>Unternehmen:</b> {company}</p>
-      <p><b>User:</b> {user} ({email})</p>
-      {msg}
-      <p><a href="/overview">Zurück</a></p>
-    </body></html>"""
-    return HTMLResponse(html)
+        return HTMLResponse(f"<h3 style='color:red;'>❌ Fehler beim Abruf/Speichern:</h3><p>{e}</p>")
+
+# ========================================
+# 🚀 Start (lokal)
+# ========================================
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("master:app", host="0.0.0.0", port=8000, reload=True)
