@@ -1,10 +1,5 @@
-# master.py – Version 3.1 (API-Token Fix + Filterauswahl)
+# master.py – Version 3.1.1 (API-Token + /overview Redirect + Neon Speicher)
 # Autor: ChatGPT – 2025-10-10
-# Funktionen:
-# - Auswahl aus drei Pipedrive-Filtern (Neukontakte, Nachfass, Refresh)
-# - Abfrage per API-Token (nicht OAuth)
-# - Speicherung in Neon (PostgreSQL async)
-# - Vorschau + Fehlermeldungen
 
 import os
 import httpx
@@ -15,9 +10,11 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy import text
-
-# .env Variablen laden
 from dotenv import load_dotenv
+
+# ---------------------------------------------------------------------
+# ENV Variablen laden
+# ---------------------------------------------------------------------
 load_dotenv()
 
 BASE_URL = "https://api.pipedrive.com/v1"
@@ -32,13 +29,11 @@ app = FastAPI()
 app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="templates")
 
-
-# -------------------------------
+# ---------------------------------------------------------------------
 # Hilfsfunktionen
-# -------------------------------
-
+# ---------------------------------------------------------------------
 async def fetch_all_persons(filter_id: int, token: str):
-    """Lädt ALLE Personen aus einem Pipedrive-Filter mit API-Token"""
+    """Lädt alle Personen aus Pipedrive-Filter mit API-Token"""
     persons = []
     start = 0
     limit = 500
@@ -57,20 +52,25 @@ async def fetch_all_persons(filter_id: int, token: str):
 
 
 async def save_to_neon(df: pd.DataFrame, table_name: str):
-    """Speichert DataFrame in Neon (temporäre Tabelle)"""
+    """Speichert DataFrame in Neon als temporäre Tabelle"""
     async with engine.begin() as conn:
         await conn.execute(text(f"DROP TABLE IF EXISTS {table_name};"))
         cols = ", ".join([f'"{c}" TEXT' for c in df.columns])
         await conn.execute(text(f"CREATE TABLE {table_name} ({cols});"))
         for _, row in df.iterrows():
-            values = ", ".join([f"'{str(v).replace("'", "''")}'" for v in row])
+            values = ", ".join([f"'{str(v).replace(\"'\", \"''\")}'" for v in row])
             await conn.execute(text(f"INSERT INTO {table_name} VALUES ({values});"))
         await conn.commit()
 
-
-# -------------------------------
+# ---------------------------------------------------------------------
 # Webrouten
-# -------------------------------
+# ---------------------------------------------------------------------
+
+@app.get("/overview", response_class=HTMLResponse)
+async def overview_redirect(request: Request):
+    """Leitet Pipedrive-Redirect /overview zur Startseite weiter"""
+    return templates.TemplateResponse("index.html", {"request": request})
+
 
 @app.get("/", response_class=HTMLResponse)
 async def home(request: Request):
@@ -80,7 +80,7 @@ async def home(request: Request):
 @app.post("/preview", response_class=HTMLResponse)
 async def preview(request: Request, filter_type: str = Form(...)):
     try:
-        # Filter-IDs nach Typ
+        # Filter IDs definieren
         filters = {
             "Neukontakte": 1914,
             "Nachfass": 1917,
@@ -88,21 +88,36 @@ async def preview(request: Request, filter_type: str = Form(...)):
         }
 
         filter_id = filters.get(filter_type)
-        persons = await fetch_all_persons(filter_id, PD_API_TOKEN)
+        if not filter_id:
+            raise Exception("Ungültiger Filter-Typ ausgewählt.")
 
+        persons = await fetch_all_persons(filter_id, PD_API_TOKEN)
         if not persons:
-            raise Exception("Keine Datensätze gefunden.")
+            raise Exception("Keine Datensätze gefunden oder Filter leer.")
 
         df = pd.DataFrame(persons)
         await save_to_neon(df, "temp_master")
 
-        # Nur relevante Felder für Vorschau
-        preview_df = df[["id", "name", "email", "org_name"]] if "email" in df.columns else df.head(50)
+        # E-Mail & Organisation schön extrahieren, falls vorhanden
+        if "email" in df.columns:
+            df["E-Mail"] = df["email"].apply(lambda x: x[0]["value"] if isinstance(x, list) and x else None)
+        if "org_name" in df.columns:
+            df.rename(columns={"org_name": "Organisation"}, inplace=True)
+
+        # Nur ausgewählte Felder anzeigen, wenn vorhanden
+        cols = [c for c in ["id", "name", "E-Mail", "Organisation"] if c in df.columns]
+        preview_df = df[cols] if cols else df.head(50)
+
         html_table = preview_df.head(50).to_html(classes="table table-striped", index=False)
 
         return templates.TemplateResponse(
             "preview.html",
-            {"request": request, "filter_type": filter_type, "table": html_table, "count": len(df)}
+            {
+                "request": request,
+                "filter_type": filter_type,
+                "table": html_table,
+                "count": len(df)
+            }
         )
 
     except Exception as e:
@@ -110,3 +125,7 @@ async def preview(request: Request, filter_type: str = Form(...)):
             f"<h3 style='color:red;'>❌ Fehler beim Abruf/Speichern:</h3><pre>{str(e)}</pre>",
             status_code=500
         )
+
+# ---------------------------------------------------------------------
+# Ende der Datei
+# ---------------------------------------------------------------------
