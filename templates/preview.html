@@ -1,0 +1,14 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <title>Vorschau – {{ filter_type }}</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <h2>✅ Ergebnis für: {{ filter_type }}</h2>
+    <p><b>{{ count }}</b> Datensätze geladen und temporär gespeichert (Neon DB).</p>
+    <div>{{ table | safe }}</div>
+    <a href="/">↩️ Zurück</a>
+</body>
+</html>
