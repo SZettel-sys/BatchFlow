@@ -50,17 +50,24 @@ async def fetch_all_persons(filter_id: int, token: str):
             start += limit
     return persons
 
-
-async def save_to_neon(df: pd.DataFrame, table_name: str):
-    """Speichert DataFrame in Neon als temporäre Tabelle"""
+    async def save_to_neon(df: pd.DataFrame, table_name: str):
+        """Speichert DataFrame in Neon als temporäre Tabelle"""
     async with engine.begin() as conn:
         await conn.execute(text(f"DROP TABLE IF EXISTS {table_name};"))
         cols = ", ".join([f'"{c}" TEXT' for c in df.columns])
         await conn.execute(text(f"CREATE TABLE {table_name} ({cols});"))
+
         for _, row in df.iterrows():
-            values = ", ".join([f"'{str(v).replace(\"'\", \"''\")}'" for v in row])
-            await conn.execute(text(f"INSERT INTO {table_name} VALUES ({values});"))
+            values = []
+            for v in row:
+                val = str(v).replace("'", "''") if v is not None else ""
+                values.append(f"'{val}'")
+            values_str = ", ".join(values)
+            await conn.execute(text(f"INSERT INTO {table_name} VALUES ({values_str});"))
+
         await conn.commit()
+
+
 
 # ---------------------------------------------------------------------
 # Webrouten
