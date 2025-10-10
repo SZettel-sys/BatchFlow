@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <title>Erster Filter – Master aufbauen</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="card">
+    <h2>🧩 Erster Filter – Master aufbauen</h2>
+    <form action="/preview" method="post">
+        <label>🔍 Auswahl Filter:</label>
+        <select name="filter_type" required>
+            <option value="">-- bitte wählen --</option>
+            <option value="Neukontakte">Neukontakte (1914)</option>
+            <option value="Nachfass">Nachfass (1917)</option>
+            <option value="Refresh">Refresh (2495)</option>
+        </select>
+        <br><br>
+        <button type="submit">Scan starten</button>
+    </form>
+</div>
+</body>
+</html>
