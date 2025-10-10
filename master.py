@@ -11,6 +11,7 @@ from sqlalchemy import text
 # =========================================
 # Basis-Setup
 # =========================================
+print("DATABASE_URL used by SQLAlchemy:", os.getenv("DATABASE_URL"))
 app = FastAPI(title="BatchFlow – Master Aufbau mit Neon")
 
 if os.path.isdir("static"):
