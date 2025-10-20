@@ -1,28 +1,34 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="de">
 <head>
-  <meta charset="UTF-8" />
+  <meta charset="utf-8">
   <title>Neukontakte – Vorschau</title>
-  <link rel="stylesheet" href="/static/style.css" />
+  <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-  <div class="card">
-    <h2>Vorschau</h2>
-    <p><b>{{ count }}</b> Datensätze in der Auswahl.</p>
+<header class="bf-header">
+  <img src="/static/bizforward-Logo-Clean-2024.svg" alt="bizforward">
+</header>
 
+<main class="container">
+  <div class="toolbar">
+    <div class="left-hint">Vorschau</div>
+    <div class="right-hint">Auswahl: <b>{{ count }}</b> Datensätze</div>
+  </div>
+
+  <div class="card">
     <div class="table-wrap">
       {{ table | safe }}
     </div>
 
-    <hr />
-    <form action="/neukontakte/run" method="post">
-      <input type="hidden" name="fachbereich_value" value="{{ fachbereich_value }}" />
-      <input type="hidden" name="batch_id" value="{{ batch_id }}" />
-      <input type="hidden" name="take_count" value="{{ take_count }}" />
-      <button type="submit">Abgleich starten</button>
+    <form action="/neukontakte/run" method="post" class="form-actions">
+      <input type="hidden" name="fachbereich_value" value="{{ fachbereich_value }}">
+      <input type="hidden" name="batch_id" value="{{ batch_id }}">
+      <input type="hidden" name="take_count" value="{{ take_count }}">
+      <button class="btn btn-primary" type="submit">Abgleich starten</button>
+      <a class="btn" href="/neukontakte">Zurück</a>
     </form>
-    <br />
-    <a href="/neukontakte">↩️ Zurück</a>
   </div>
+</main>
 </body>
 </html>
