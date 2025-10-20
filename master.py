@@ -1,6 +1,8 @@
 import os
 import re
 import asyncio
+from typing import Optional
+
 import httpx
 import asyncpg
 import pandas as pd
@@ -12,7 +14,7 @@ from fastapi.templating import Jinja2Templates
 
 # ========= Konfiguration =========
 PD_API_TOKEN = os.getenv("PD_API_TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL")  # postgresql://... ?sslmode=require
+DATABASE_URL = os.getenv("DATABASE_URL")  # Format: postgresql://... ?sslmode=require
 
 if not PD_API_TOKEN:
     raise ValueError("PD_API_TOKEN fehlt")
@@ -46,7 +48,6 @@ async def save_df(df: pd.DataFrame, table: str):
     try:
         await conn.execute(f'DROP TABLE IF EXISTS "{table}"')
         if df.empty:
-            # trotzdem Tabelle anlegen (leer)
             await conn.execute(f'CREATE TABLE "{table}" ("_empty" TEXT)')
             return
         cols = ", ".join([f'"{c}" TEXT' for c in df.columns])
@@ -76,6 +77,15 @@ def extract_email(value):
             return first.get("value") or None
         return str(first) if first is not None else None
     return str(value) if value is not None else None
+
+def to_int(v, default=0) -> int:
+    try:
+        if v is None: 
+            return default
+        s = str(v).strip()
+        return int(s) if s != "" else default
+    except:
+        return default
 
 # ========= Pipedrive =========
 async def get_person_fields():
@@ -190,9 +200,11 @@ async def neukontakte_preview(
     request: Request,
     fachbereich_value: str = Form(...),
     batch_id: str = Form(...),
-    take_count: int = Form(0)
+    take_count: Optional[str] = Form(None)   # <-- robust gegen leer/fehlend
 ):
     try:
+        take_n = to_int(take_count, 0)
+
         fields = await get_person_fields()
         wanted_norm = _norm(FIELD_NAME_FACHBEREICH)
         fach = fields.get(wanted_norm) or fields.get(FIELD_NAME_FACHBEREICH) or fields.get("Fachbereich – Kampagne")
@@ -204,8 +216,8 @@ async def neukontakte_preview(
 
         persons = await fetch_persons_by_filter(FILTER_NEUKONTAKTE)
         filtered = [p for p in persons if key_fach in p and (str(p[key_fach]) == str(fachbereich_value))]
-        if take_count and int(take_count) > 0:
-            filtered = filtered[: int(take_count)]
+        if take_n and int(take_n) > 0:
+            filtered = filtered[: int(take_n)]
 
         df = pd.DataFrame(filtered)
         if df.empty:
@@ -233,7 +245,7 @@ async def neukontakte_preview(
                 "count": len(df),
                 "fachbereich_value": fachbereich_value,
                 "batch_id": batch_id,
-                "take_count": take_count,
+                "take_count": take_n,
             },
         )
     except Exception as e:
@@ -245,9 +257,11 @@ async def neukontakte_run(
     request: Request,
     fachbereich_value: str = Form(...),
     batch_id: str = Form(...),
-    take_count: int = Form(0)
+    take_count: Optional[str] = Form(None)  # <-- robust gegen leer/fehlend
 ):
     try:
+        take_n = to_int(take_count, 0)
+
         fields = await get_person_fields()
         wanted_norm = _norm(FIELD_NAME_FACHBEREICH)
         fach = fields.get(wanted_norm) or fields.get(FIELD_NAME_FACHBEREICH) or fields.get("Fachbereich – Kampagne")
@@ -261,8 +275,8 @@ async def neukontakte_run(
 
         persons = await fetch_persons_by_filter(FILTER_NEUKONTAKTE)
         data = [p for p in persons if key_fach in p and (str(p[key_fach]) == str(fachbereich_value))]
-        if take_count and int(take_count) > 0:
-            data = data[: int(take_count)]
+        if take_n and int(take_n) > 0:
+            data = data[: int(take_n)]
 
         if not data:
             return HTMLResponse("<div class='card'><h3>Keine Datensätze für diese Auswahl.</h3></div>")
