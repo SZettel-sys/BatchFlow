@@ -1,35 +1,52 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="de">
 <head>
-  <meta charset="UTF-8" />
-  <title>Neukontakte – Auswahl</title>
-  <link rel="stylesheet" href="/static/style.css" />
+  <meta charset="utf-8">
+  <title>Neukontakte – Bizforward</title>
+  <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
+<header class="bf-header">
+  <img src="/static/bizforward-Logo-Clean-2024.svg" alt="bizforward">
+</header>
+
+<main class="container">
+  <div class="toolbar">
+    <button class="btn btn-primary" disabled>🧩 Neukontakte (Filter 2998)</button>
+    <div class="right-hint">Gesamt im Filter: <b>{{ total }}</b></div>
+  </div>
+
   <div class="card">
-    <h2>🧩 Neukontakte (Filter 2998)</h2>
+    <form action="/neukontakte/preview" method="post" class="form-grid">
+      <div class="form-row">
+        <label for="fach">Fachbereich</label>
+        <select id="fach" name="fachbereich_value" required>
+          <option value="">-- bitte wählen --</option>
+          {% for o in options %}
+            <option value="{{ o.id }}">{{ o.label }} ({{ o.count }})</option>
+          {% endfor %}
+        </select>
+        <small class="muted">Die Zahl in Klammern zeigt die vorhandenen Datensätze im Filter.</small>
+      </div>
 
-    <form action="/neukontakte/preview" method="post">
-      <label>Fachbereich_Kampagne:</label><br />
-      <select name="fachbereich_value" required>
-        <option value="">-- bitte wählen --</option>
-        {% for opt in options %}
-          <option value="{{ opt.id }}">{{ opt.label }} ({{ opt.count or 0 }})</option>
-        {% endfor %}
-      </select>
-      <br /><br />
+      <div class="form-row two">
+        <div>
+          <label for="take">Wie viele Datensätze nehmen?</label>
+          <input type="number" id="take" name="take_count" min="1" placeholder="z. B. 900">
+          <small class="muted">Leer lassen = alle Datensätze des gewählten Fachbereichs.</small>
+        </div>
+        <div>
+          <label for="batch">Batch ID</label>
+          <input id="batch" name="batch_id" placeholder="Bxxx" required>
+          <small class="muted">Beispiel: B477</small>
+        </div>
+      </div>
 
-      <label>Wie viele Datensätze nehmen? (max. nach Auswahl)</label><br />
-      <input type="number" name="take_count" min="1" placeholder="z. B. 900" style="width:200px;" />
-      <small>Leer lassen = alle aus diesem Fachbereich</small>
-      <br /><br />
-
-      <label>Batch ID (z. B. B477):</label><br />
-      <input type="text" name="batch_id" placeholder="Bxxx" required />
-      <br /><br />
-
-      <button type="submit">Vorschau laden</button>
+      <div class="form-actions">
+        <button class="btn btn-primary" type="submit">Vorschau laden</button>
+      </div>
     </form>
   </div>
+</main>
 </body>
 </html>
