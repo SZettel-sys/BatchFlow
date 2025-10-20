@@ -1,5 +1,10 @@
 # master.py – Abschnitt 1 "Neukontakte" (Filter 2998)
 # Stack: FastAPI + httpx + asyncpg + pandas
+# Routen:
+#   /neukontakte           -> Formular (Dropdown + Zähler + "Wie viele?")
+#   /neukontakte/preview   -> Vorschau + Speichern roh -> nk_master
+#   /neukontakte/run       -> Abgleich (Batch/Channel schreiben) + Cleanup + Speichern -> nk_master_final
+#   / , /overview          -> Redirect zu /neukontakte
 
 import os
 import re
@@ -7,6 +12,7 @@ import asyncio
 import httpx
 import asyncpg
 import pandas as pd
+import numpy as np
 from fastapi import FastAPI, Request, Form
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -42,7 +48,7 @@ templates = Jinja2Templates(directory="templates")
 
 # ====== Utils ======
 def _norm(s: str) -> str:
-    """Robuste Feld-Namens-Normalisierung (bindestriche/unterstriche/Leerzeichen egal)."""
+    """Robuste Feld-Namens-Normalisierung (Bindestriche/Unterstriche/Leerzeichen egal)."""
     return re.sub(r'[^a-z0-9]+', '', (s or '').lower())
 
 async def get_conn():
@@ -68,7 +74,7 @@ async def save_df(df: pd.DataFrame, table: str):
 
 # ====== Pipedrive Helpers ======
 async def get_person_fields():
-    """Liefert Mapping für Original- und normalisierte Feldnamen -> {key, options, name}."""
+    """Mapping für Original- und normalisierte Feldnamen -> {key, options, name}."""
     url = f"{PIPEDRIVE_API}/personFields?api_token={PD_API_TOKEN}"
     async with httpx.AsyncClient(timeout=60.0) as client:
         r = await client.get(url)
@@ -102,9 +108,21 @@ async def fetch_persons_by_filter(filter_id: int):
     return persons
 
 def extract_email(value):
-    if isinstance(value, list) and value:
-        return value[0].get("value")
-    return None
+    """Robust: akzeptiert list/tuple/dict/np.array/NaN."""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    if isinstance(value, np.ndarray):
+        value = value.tolist()
+    if isinstance(value, dict):
+        return value.get("value") or None
+    if isinstance(value, (list, tuple)):
+        if len(value) == 0:
+            return None
+        first = value[0]
+        if isinstance(first, dict):
+            return first.get("value") or None
+        return str(first) if first is not None else None
+    return str(value) if value is not None else None
 
 def extract_unique_options_from_persons(persons, field_key):
     """Wenn Feld kein Enum ist: distinct Werte aus Personen (String) als Dropdown erzeugen."""
@@ -143,7 +161,7 @@ def apply_basic_cleanup(df: pd.DataFrame, key_orgart: str) -> pd.DataFrame:
     return df
 
 
-# ====== Routes ======
+# ====== Redirects ======
 @app.get("/", response_class=HTMLResponse)
 async def root_redirect():
     return HTMLResponse('<meta http-equiv="refresh" content="0;url=/neukontakte">')
@@ -153,38 +171,54 @@ async def old_redirect():
     return HTMLResponse('<meta http-equiv="refresh" content="0;url=/neukontakte">')
 
 
+# ====== Formular: Dropdown + Zähler je Fachbereich + gewünschte Menge ======
 @app.get("/neukontakte", response_class=HTMLResponse)
 async def neukontakte_form(request: Request):
-    # Feldoptionen für Fachbereich laden (per /personFields)
     fields = await get_person_fields()
 
-    # Feld robust finden (egal ob "_" / " – " / Leerzeichen)
     wanted_norm = _norm(FIELD_NAME_FACHBEREICH)
     fach = fields.get(wanted_norm) or fields.get(FIELD_NAME_FACHBEREICH) or fields.get("Fachbereich – Kampagne")
-
     if not fach:
         return HTMLResponse(
             "<h3 style='color:red'>❌ Feld „Fachbereich_Kampagne“ nicht gefunden. Bitte Feldbezeichnung in Pipedrive prüfen.</h3>",
             status_code=500
         )
 
-    options = fach.get("options") or []
-    if not options:
-        # dynamisch aus Filter 2998 extrahieren
-        persons = await fetch_persons_by_filter(FILTER_NEUKONTAKTE)
-        options = extract_unique_options_from_persons(persons, fach["key"])
+    # Personen aus Filter 2998 laden, um Zähler aufzubauen
+    persons = await fetch_persons_by_filter(FILTER_NEUKONTAKTE)
+
+    # Optionen aus Feld (Enum) oder dynamisch aus Personen
+    options = fach.get("options") or extract_unique_options_from_persons(persons, fach["key"])
+
+    # Zähler je Fachbereich (id/label vergleichen über String)
+    counts = {}
+    for p in persons:
+        val = p.get(fach["key"])
+        # bei Enum liefert Pipedrive i. d. R. int/str; bei Textfeld String
+        s = str(val).strip() if val is not None else ""
+        if s:
+            counts[s] = counts.get(s, 0) + 1
+
+    # Options um count anreichern (id als string matchen)
+    enriched_options = []
+    for opt in options:
+        oid, label = str(opt["id"]), opt["label"]
+        c = counts.get(oid, counts.get(label, 0))  # versuche id, sonst label
+        enriched_options.append({"id": opt["id"], "label": label, "count": c})
 
     return templates.TemplateResponse(
         "neukontakte_form.html",
-        {"request": request, "options": options}
+        {"request": request, "options": enriched_options}
     )
 
 
+# ====== Vorschau ======
 @app.post("/neukontakte/preview", response_class=HTMLResponse)
 async def neukontakte_preview(
     request: Request,
     fachbereich_value: str = Form(...),
-    batch_id: str = Form(...)
+    batch_id: str = Form(...),
+    take_count: int = Form(...)
 ):
     try:
         fields = await get_person_fields()
@@ -196,13 +230,15 @@ async def neukontakte_preview(
             return HTMLResponse("<h3 style='color:red'>❌ Feld „Fachbereich_Kampagne“ nicht gefunden.</h3>", status_code=500)
 
         key_fach   = fach_meta["key"]
-        key_batch  = (fields.get(_norm(FIELD_NAME_BATCH)) or fields.get(FIELD_NAME_BATCH) or {}).get("key")
         key_chan   = (fields.get(_norm(FIELD_NAME_CHANNEL)) or fields.get(FIELD_NAME_CHANNEL) or {}).get("key")
-        key_orgart = (fields.get(_norm(FIELD_NAME_ORGART))  or fields.get(FIELD_NAME_ORGART)  or {}).get("key")
 
-        # Personen aus Filter 2998 laden und clientseitig filtern
+        # Personen laden & filtern
         persons = await fetch_persons_by_filter(FILTER_NEUKONTAKTE)
         filtered = [p for p in persons if key_fach in p and (str(p[key_fach]) == str(fachbereich_value))]
+
+        # gewünschte Menge begrenzen
+        if take_count and take_count > 0:
+            filtered = filtered[:take_count]
 
         df = pd.DataFrame(filtered)
         if df.empty:
@@ -232,17 +268,20 @@ async def neukontakte_preview(
                 "count": len(df),
                 "fachbereich_value": fachbereich_value,
                 "batch_id": batch_id,
+                "take_count": take_count,
             },
         )
     except Exception as e:
         return HTMLResponse(f"<h3 style='color:red;'>❌ Fehler beim Abruf/Speichern:</h3><pre>{e}</pre>", status_code=500)
 
 
+# ====== Abgleich / Schreiben ======
 @app.post("/neukontakte/run", response_class=HTMLResponse)
 async def neukontakte_run(
     request: Request,
     fachbereich_value: str = Form(...),
-    batch_id: str = Form(...)
+    batch_id: str = Form(...),
+    take_count: int = Form(...)
 ):
     try:
         fields = await get_person_fields()
@@ -252,12 +291,15 @@ async def neukontakte_run(
             return HTMLResponse("<h3 style='color:red'>❌ Feld „Fachbereich_Kampagne“ nicht gefunden.</h3>", status_code=500)
 
         key_fach   = fach_meta["key"]
-        key_batch  = (fields.get(_norm(FIELD_NAME_BATCH)) or fields.get(FIELD_NAME_BATCH) or {}).get("key")
+        key_batch  = (fields.get(_norm(FIELD_NAME_BATCH))   or fields.get(FIELD_NAME_BATCH)   or {}).get("key")
         key_chan   = (fields.get(_norm(FIELD_NAME_CHANNEL)) or fields.get(FIELD_NAME_CHANNEL) or {}).get("key")
         key_orgart = (fields.get(_norm(FIELD_NAME_ORGART))  or fields.get(FIELD_NAME_ORGART)  or {}).get("key")
 
         persons = await fetch_persons_by_filter(FILTER_NEUKONTAKTE)
         data = [p for p in persons if key_fach in p and (str(p[key_fach]) == str(fachbereich_value))]
+        if take_count and take_count > 0:
+            data = data[:take_count]
+
         if not data:
             return HTMLResponse("<h3>Keine Datensätze für diesen Fachbereich.</h3>")
 
@@ -271,7 +313,7 @@ async def neukontakte_run(
             status, _txt = await update_person(p["id"], payload)
             return status
 
-        sem = asyncio.Semaphore(8)  # moderates parallelisieren
+        sem = asyncio.Semaphore(8)  # moderat parallelisieren
         async def guarded(p):
             async with sem:
                 return await _upd(p)
@@ -285,7 +327,6 @@ async def neukontakte_run(
             df["E-Mail"] = df["email"].apply(extract_email)
         if "org_name" in df.columns:
             df.rename(columns={"org_name": "Organisation"}, inplace=True)
-        # key_orgart in Klartextspalte für Cleanup
         if key_orgart and key_orgart in df.columns:
             df.rename(columns={key_orgart: "Organisationsart"}, inplace=True)
 
@@ -298,7 +339,7 @@ async def neukontakte_run(
         <ul>
           <li>Fachbereich: <b>{fachbereich_value}</b></li>
           <li>Batch ID gesetzt: <b>{batch_id}</b></li>
-          <li>Personen geladen: <b>{len(data)}</b></li>
+          <li>Personen ausgewählt: <b>{len(data)}</b> (vor Cleanup)</li>
           <li>In Pipedrive aktualisiert: <b>{updated}</b></li>
           <li>Nach Regeln behalten: <b>{len(df)}</b> (Organisationsart leer, max. 2 Kontakte/Organisation)</li>
           <li>Neon Tabellen: <code>nk_master</code> (Roh) & <code>nk_master_final</code> (final)</li>
