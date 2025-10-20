@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8" />
+  <title>Neukontakte – Auswahl</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div class="card">
+    <h2>🧩 Neukontakte (Filter 2998)</h2>
+
+    <form action="/neukontakte/preview" method="post">
+      <label>Fachbereich_Kampagne:</label><br />
+      <select name="fachbereich_value" required>
+        <option value="">-- bitte wählen --</option>
+        {% for opt in options %}
+          <option value="{{ opt.id }}">{{ opt.label }}</option>
+        {% endfor %}
+      </select>
+      <br /><br />
+
+      <label>Batch ID (z. B. B477):</label><br />
+      <input type="text" name="batch_id" placeholder="Bxxx" required />
+      <br /><br />
+
+      <button type="submit">Vorschau laden</button>
+    </form>
+  </div>
+</body>
+</html>
