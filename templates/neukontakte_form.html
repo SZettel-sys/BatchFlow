@@ -14,9 +14,14 @@
       <select name="fachbereich_value" required>
         <option value="">-- bitte wählen --</option>
         {% for opt in options %}
-          <option value="{{ opt.id }}">{{ opt.label }}</option>
+          <option value="{{ opt.id }}">{{ opt.label }} ({{ opt.count or 0 }})</option>
         {% endfor %}
       </select>
+      <br /><br />
+
+      <label>Wie viele Datensätze nehmen? (max. nach Auswahl)</label><br />
+      <input type="number" name="take_count" min="1" placeholder="z. B. 900" style="width:200px;" />
+      <small>Leer lassen = alle aus diesem Fachbereich</small>
       <br /><br />
 
       <label>Batch ID (z. B. B477):</label><br />
