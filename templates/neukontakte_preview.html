@@ -9,7 +9,11 @@
   <div class="card">
     <h2>Vorschau</h2>
     <p><b>{{ count }}</b> Datensätze für die Auswahl gefunden.</p>
-    <div>{{ table | safe }}</div>
+
+    <div class="table-wrap">
+      {{ table | safe }}
+    </div>
+
     <hr />
     <form action="/neukontakte/run" method="post">
       <input type="hidden" name="fachbereich_value" value="{{ fachbereich_value }}" />
