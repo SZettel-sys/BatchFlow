@@ -8,7 +8,7 @@
 <body>
   <div class="card">
     <h2>Vorschau</h2>
-    <p><b>{{ count }}</b> Datensätze für die Auswahl gefunden.</p>
+    <p><b>{{ count }}</b> Datensätze in der Auswahl.</p>
 
     <div class="table-wrap">
       {{ table | safe }}
@@ -18,6 +18,7 @@
     <form action="/neukontakte/run" method="post">
       <input type="hidden" name="fachbereich_value" value="{{ fachbereich_value }}" />
       <input type="hidden" name="batch_id" value="{{ batch_id }}" />
+      <input type="hidden" name="take_count" value="{{ take_count }}" />
       <button type="submit">Abgleich starten</button>
     </form>
     <br />
