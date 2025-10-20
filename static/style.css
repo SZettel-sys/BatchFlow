@@ -1,99 +1,49 @@
-/* ---- Grundlayout ---- */
-body {
-  font-family: 'Source Sans Pro', Arial, sans-serif;
-  background: #f4f6f8;
-  margin: 0;
-  color: #333;
-}
-header {
-  display: flex;
-  justify-content: center;
-  align-items: center;
-  background: #ffffff;
-  padding: 15px;
-  border-bottom: 1px solid #ddd;
-}
-header img { height: 70px; }
-
-.container {
-  max-width: 1000px;
-  margin: 40px auto;
-  padding: 10px 20px;
+/* Layout */
+:root{
+  --blue:#00a6ff;
+  --blue-700:#008dd8;
+  --bg:#f5f6f8;
+  --text:#1d2a36;
+  --muted:#6e8294;
+  --card:#ffffff;
+  --border:#e4e8ee;
 }
 
-/* ---- Karten & Formulare ---- */
-.card {
-  background: white;
-  border: 1px solid #ddd;
-  border-radius: 12px;
-  padding: 25px;
-  box-shadow: 0 3px 8px rgba(0, 0, 0, 0.05);
-  margin-bottom: 20px;
-}
-label {
-  display: block;
-  font-weight: 600;
-  margin-bottom: 6px;
-}
-input, select {
-  width: 100%;
-  padding: 10px;
-  border: 1px solid #ccc;
-  border-radius: 8px;
-  font-size: 15px;
-  margin-bottom: 15px;
-}
-button, .btn-action, .btn-secondary {
-  border: none;
-  border-radius: 8px;
-  padding: 10px 20px;
-  font-size: 15px;
-  cursor: pointer;
-  transition: all .2s ease;
-}
-.btn-action {
-  background: #009fe3;
-  color: white;
-}
-.btn-action:hover { background: #007bb8; }
+*{box-sizing:border-box}
+html,body{margin:0;padding:0;color:var(--text);background:var(--bg);font:14px/1.45 Inter,system-ui,Segoe UI,Arial}
+.bf-header{display:flex;align-items:center;gap:12px;background:#fff;border-bottom:1px solid var(--border);padding:10px 18px}
+.bf-header img{height:44px}
 
-.btn-secondary {
-  background: #e6eef5;
-  color: #333;
-  text-decoration: none;
-}
-.btn-secondary:hover { background: #d2e0ec; }
+.container{max-width:1200px;margin:24px auto;padding:0 16px}
+.toolbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:14px}
+.left-hint,.right-hint{color:var(--muted)}
 
-.form-actions {
-  text-align: right;
-}
+.card{background:var(--card);border:1px solid var(--border);border-radius:12px;box-shadow:0 2px 6px rgba(0,0,0,.05);padding:18px}
 
-/* ---- Tabelle für Fachbereiche ---- */
-table.summary {
-  width: 100%;
-  border-collapse: collapse;
-  background: white;
-  border-radius: 10px;
-  overflow: hidden;
-  margin-top: 20px;
-}
-table.summary th, table.summary td {
-  padding: 10px 14px;
-  border: 1px solid #eee;
-}
-table.summary th {
-  background: #f0f6fb;
-  text-align: left;
-  font-weight: bold;
-}
+/* Buttons */
+.btn{appearance:none;border:1px solid var(--border);background:#fff;color:var(--text);padding:9px 14px;border-radius:8px;cursor:pointer;text-decoration:none;display:inline-flex;gap:6px;align-items:center}
+.btn:hover{background:#f7f9fb}
+.btn-primary{background:var(--blue);border-color:var(--blue);color:#fff}
+.btn-primary:hover{background:var(--blue-700);border-color:var(--blue-700)}
 
-/* ---- Erfolg / Hinweis ---- */
-.alert {
-  background: #e6f3fb;
-  border: 1px solid #b7d4ec;
-  border-radius: 10px;
-  padding: 14px 18px;
-  margin-bottom: 20px;
-  color: #1a3c5a;
-}
-.alert b { color: #007bb8; }
+/* Form */
+.form-grid{display:flex;flex-direction:column;gap:16px}
+.form-row{display:flex;flex-direction:column;gap:6px}
+.form-row.two{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+label{font-weight:600}
+input,select{border:1px solid var(--border);border-radius:8px;padding:10px;font:inherit;background:#fff}
+.muted{color:var(--muted);font-size:12px}
+.form-actions{display:flex;gap:10px;justify-content:flex-end;margin-top:8px}
+
+/* Table */
+.table-wrap{overflow:auto;border:1px solid var(--border);border-radius:10px}
+table.grid{border-collapse:collapse;width:100%;background:#fff}
+table.grid th, table.grid td{border-bottom:1px solid var(--border);padding:10px 12px;text-align:left;font-size:13px}
+table.grid th{background:#f3f7fb;font-weight:700}
+
+/* Result bar */
+.result-bar{display:flex;justify-content:space-between;align-items:center;background:#f0f7ff;border:1px solid #d4e7ff;border-radius:10px;padding:12px 14px;margin-bottom:12px}
+.result-bar .stats{display:flex;gap:16px;flex-wrap:wrap}
+
+/* Errors */
+.error{background:#fff3f3;border:1px solid #ffc6c6;color:#8a1f1f;border-radius:10px;padding:16px;margin:16px}
