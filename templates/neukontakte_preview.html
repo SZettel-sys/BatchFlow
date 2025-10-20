@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8" />
+  <title>Neukontakte – Vorschau</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div class="card">
+    <h2>Vorschau</h2>
+    <p><b>{{ count }}</b> Datensätze für die Auswahl gefunden.</p>
+    <div>{{ table | safe }}</div>
+    <hr />
+    <form action="/neukontakte/run" method="post">
+      <input type="hidden" name="fachbereich_value" value="{{ fachbereich_value }}" />
+      <input type="hidden" name="batch_id" value="{{ batch_id }}" />
+      <button type="submit">Abgleich starten</button>
+    </form>
+    <br />
+    <a href="/neukontakte">↩️ Zurück</a>
+  </div>
+</body>
+</html>
