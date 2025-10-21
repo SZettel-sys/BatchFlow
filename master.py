@@ -1,7 +1,7 @@
 import os
 import re
 import time
-from typing import Optional
+from typing import Optional, Tuple
 
 import httpx
 import asyncpg
@@ -26,10 +26,12 @@ FILTER_NEUKONTAKTE = 2998  # Personen-Filter für Neukontakte
 
 # Feldnamen (sichtbare Namen in Pipedrive)
 FIELD_NAME_FACHBEREICH = "Fachbereich_Kampagne"
-FIELD_NAME_BATCH       = "Batch ID"      # nur im Ergebnis-DF, NICHT in Pipedrive
-FIELD_NAME_CHANNEL     = "Channel"       # nur im Ergebnis-DF, NICHT in Pipedrive
-FIELD_NAME_ORGART      = "Organisationsart"  # für Cleanup (Spaltenname im DF)
+FIELD_NAME_BATCH       = "Batch ID"         # nur im Ergebnis-DF, NICHT in Pipedrive
+FIELD_NAME_CHANNEL     = "Channel"          # nur im Ergebnis-DF, NICHT in Pipedrive
+FIELD_NAME_ORGART      = "Organisationsart" # für Cleanup (Spaltenname im DF)
+FIELD_NAME_IMPORT      = "Cold-Mailing Import"  # zusätzliche Spalte im Ergebnis
 CHANNEL_VALUE          = "Cold-Mail"
+IMPORT_VALUE           = "Ja"  # fester Marker für die 3. Spalte
 
 # Caching / Performance
 HTTP_TIMEOUT      = 60.0
@@ -148,6 +150,18 @@ async def get_person_fields():
     _person_fields_cache.update(data=mapping, ts=now)
     return mapping
 
+def _resolve_option_label(value: str, options: list) -> Tuple[str, str]:
+    """Hilfsfunktion: gibt (value, label) zurück (value bleibt unverändert),
+       label wird aus den Options ermittelt oder als value zurückgegeben."""
+    if not options:
+        return value, value
+    for o in options:
+        oid = str(o.get("id"))
+        lab = str(o.get("label", ""))
+        if value == oid or value == lab:
+            return value, lab or value
+    return value, value
+
 async def fetch_persons_by_filter(filter_id: int):
     """Alle Personen eines Filters (mit Cache & Pagination)."""
     now = time.time()
@@ -217,7 +231,9 @@ async def neukontakte_form(request: Request):
         for val, c in sorted(counts.items(), key=lambda x: x[0].lower()):
             display.append((val, f"{val} ({c})"))
 
-    options_html = "\n".join([f"<option value='{oid}'>{label}</option>" for oid, label in display])
+    # 1. Eintrag: bitte auswählen
+    options_html = "<option value='' selected>-- bitte auswählen --</option>\n"
+    options_html += "\n".join([f"<option value='{oid}'>{label}</option>" for oid, label in display])
 
     html = f"""
 <!doctype html>
@@ -248,7 +264,8 @@ async def neukontakte_form(request: Request):
     <div class="muted">Gesamt im Filter: <b>{total_count}</b></div>
   </div>
 
-  <form class="card" method="post" action="/neukontakte/preview">
+  <form class="card" method="post" action="/neukontakte/preview" id="nkform">
+    <input type="hidden" name="fachbereich_label" id="fachbereich_label" />
     <label for="fach">Fachbereich</label>
     <select id="fach" name="fachbereich_value" required>
       {options_html}
@@ -272,6 +289,16 @@ async def neukontakte_form(request: Request):
     </div>
   </form>
 </div>
+<script>
+// beim Absenden den sichtbaren Namen (ohne Klammerzahl) in ein Hidden-Feld schreiben
+document.getElementById("nkform").addEventListener("submit", function(){
+  const sel = document.getElementById("fach");
+  const txt = sel.options[sel.selectedIndex]?.text || "";
+  // "Marketing (1234)" -> "Marketing"
+  const lbl = txt.replace(/\\s*\\(.*\\)\\s*$/,"").trim();
+  document.getElementById("fachbereich_label").value = lbl;
+});
+</script>
 </body></html>
 """
     return HTMLResponse(html)
@@ -284,7 +311,8 @@ async def neukontakte_preview(
     request: Request,
     fachbereich_value: str = Form(...),
     batch_id: str = Form(...),
-    take_count: Optional[str] = Form(None)
+    take_count: Optional[str] = Form(None),
+    fachbereich_label: Optional[str] = Form(None)
 ):
     try:
         take_n = to_int(take_count, 0)
@@ -295,6 +323,9 @@ async def neukontakte_preview(
             return HTMLResponse("<div style='padding:24px;color:#b00'>❌ Feld „Fachbereich_Kampagne“ nicht gefunden.</div>", status_code=500)
 
         key_fach = fach["key"]
+        # Label ermitteln (Fallback falls Hidden leer ist)
+        _, label_from_options = _resolve_option_label(str(fachbereich_value), fach.get("options") or [])
+        fach_label = fachbereich_label or label_from_options or str(fachbereich_value)
 
         persons = await fetch_persons_by_filter(FILTER_NEUKONTAKTE)
         sel = [p for p in persons if key_fach in p and (str(p[key_fach]) == str(fachbereich_value))]
@@ -306,21 +337,25 @@ async def neukontakte_preview(
 
         df = pd.DataFrame(sel)
 
-        # Lesbare Spalten für Vorschau
+        # Lesbare Spalten
         if "email" in df.columns:
             df["E-Mail"] = df["email"].apply(extract_email)
         if "org_name" in df.columns:
             df.rename(columns={"org_name": "Organisation"}, inplace=True)
         if "org_id" in df.columns and FIELD_NAME_ORGART not in df.columns:
-            # Optional: Organisationsart existiert häufig als eigener Custom-Key -> hier bleibt leer
             df[FIELD_NAME_ORGART] = ""
 
-        # Für Excel später: Batch + Channel im DF (aber NICHT in Pipedrive schreiben)
+        # Für Vorschau hinzufügen (aber nichts zu Pipedrive schreiben)
         df["Batch ID (Vorschau)"] = batch_id
         df["Channel (Vorschau)"]  = CHANNEL_VALUE
+        df[f"{FIELD_NAME_IMPORT}"] = IMPORT_VALUE
 
-        cols = [c for c in ["id", "name", "E-Mail", "Organisation", "Batch ID (Vorschau)", "Channel (Vorschau)"] if c in df.columns]
-        preview_df = df[cols] if cols else df
+        # Spaltenreihenfolge: 1) Batch, 2) Channel, 3) Cold-Mailing Import, danach Rest
+        first_cols = ["Batch ID (Vorschau)", "Channel (Vorschau)", FIELD_NAME_IMPORT]
+        rest_cols  = [c for c in df.columns if c not in first_cols]
+        preview_df = df[first_cols + rest_cols]
+
+        # Tabellendarstellung (erste 50)
         table_html = preview_df.head(50).to_html(classes="grid", index=False, border=0)
 
         html = f"""
@@ -343,12 +378,13 @@ async def neukontakte_preview(
   <div class="card row">
     <div>
       <b>Vorschau</b><br/>
-      Fachbereich: <b>{fachbereich_value}</b> &nbsp;|&nbsp;
+      Fachbereich: <b>{fach_label}</b> &nbsp;|&nbsp;
       Batch: <b>{batch_id}</b> &nbsp;|&nbsp;
       Datensätze: <b>{len(df)}</b>
     </div>
     <form method="post" action="/neukontakte/run">
       <input type="hidden" name="fachbereich_value" value="{fachbereich_value}"/>
+      <input type="hidden" name="fachbereich_label" value="{fach_label}"/>
       <input type="hidden" name="batch_id" value="{batch_id}"/>
       <input type="hidden" name="take_count" value="{take_n}"/>
       <button class="btn" type="submit">Abgleich starten</button>
@@ -374,7 +410,8 @@ async def neukontakte_run(
     request: Request,
     fachbereich_value: str = Form(...),
     batch_id: str = Form(...),
-    take_count: Optional[str] = Form(None)
+    take_count: Optional[str] = Form(None),
+    fachbereich_label: Optional[str] = Form(None)
 ):
     try:
         take_n = to_int(take_count, 0)
@@ -399,19 +436,26 @@ async def neukontakte_run(
             df["E-Mail"] = df["email"].apply(extract_email)
         if "org_name" in df.columns:
             df.rename(columns={"org_name": "Organisation"}, inplace=True)
-        # Falls die Spalte Organisationsart in Rohdaten unter Custom-Key steckt, bleibt sie leer:
         if FIELD_NAME_ORGART not in df.columns:
             df[FIELD_NAME_ORGART] = ""
 
         # Cleanup-Regeln
         df = apply_basic_cleanup(df)
 
-        # Für späteren Excel-Export im Ergebnis
-        df["Batch ID"] = batch_id
-        df["Channel"]  = CHANNEL_VALUE
+        # Ergebnis-Felder für Export
+        df[FIELD_NAME_BATCH]   = batch_id
+        df[FIELD_NAME_CHANNEL] = CHANNEL_VALUE
+        df[FIELD_NAME_IMPORT]  = IMPORT_VALUE
+
+        # Reihenfolge auch im gespeicherten Resultat: Batch, Channel, Import, dann Rest
+        first_cols = [FIELD_NAME_BATCH, FIELD_NAME_CHANNEL, FIELD_NAME_IMPORT]
+        rest_cols  = [c for c in df.columns if c not in first_cols]
+        df = df[first_cols + rest_cols]
 
         # In Neon speichern (Endergebnis)
         await save_df_text(df, "nk_master_final")
+
+        fach_label = fachbereich_label or _resolve_option_label(str(fachbereich_value), fach.get("options") or [])[1]
 
         html = f"""
 <!doctype html><html lang="de"><head>
@@ -427,7 +471,7 @@ async def neukontakte_run(
 <div class="wrap">
   <div class="card">
     <h3>✅ Abgleich abgeschlossen</h3>
-    <p>Fachbereich: <b>{fachbereich_value}</b><br>
+    <p>Fachbereich: <b>{fach_label}</b><br>
        Batch: <b>{batch_id}</b><br>
        Gespeicherte Zeilen (nach Cleanup): <b>{len(df)}</b>
     </p>
