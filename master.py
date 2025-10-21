@@ -1,485 +1,711 @@
+# master.py
 import os
 import re
-import time
-from typing import Optional, Tuple
+import json
+import math
+from typing import Optional, Dict, Any, List
 
+import numpy as np
+import pandas as pd
 import httpx
 import asyncpg
-import pandas as pd
-import numpy as np
-from fastapi import FastAPI, Request, Form
-from fastapi.responses import HTMLResponse
-from fastapi.middleware.gzip import GZipMiddleware
 
-# =========================
-#   Konfiguration
-# =========================
-PD_API_TOKEN = os.getenv("PD_API_TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL")  # postgresql://.../neondb?sslmode=require
-if not PD_API_TOKEN:
-    raise ValueError("PD_API_TOKEN fehlt")
-if not DATABASE_URL:
-    raise ValueError("DATABASE_URL fehlt")
+from fastapi import FastAPI, Request, Body
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from rapidfuzz import fuzz, process
 
-PIPEDRIVE_API = "https://api.pipedrive.com/v1"
-FILTER_NEUKONTAKTE = 2998  # Personen-Filter für Neukontakte
-
-# Feldnamen (sichtbare Namen in Pipedrive)
-FIELD_NAME_FACHBEREICH = "Fachbereich_Kampagne"
-FIELD_NAME_BATCH       = "Batch ID"         # nur im Ergebnis-DF, NICHT in Pipedrive
-FIELD_NAME_CHANNEL     = "Channel"          # nur im Ergebnis-DF, NICHT in Pipedrive
-FIELD_NAME_ORGART      = "Organisationsart" # für Cleanup (Spaltenname im DF)
-FIELD_NAME_IMPORT      = "Cold-Mailing Import"  # zusätzliche Spalte im Ergebnis
-CHANNEL_VALUE          = "Cold-Mail"
-IMPORT_VALUE           = "Ja"  # fester Marker für die 3. Spalte
-
-# Caching / Performance
-HTTP_TIMEOUT      = 60.0
-PERSON_FIELDS_TTL = 900     # 15 min
-FILTER_TTL        = 120     # 2 min
-
-# =========================
-#   App & Middleware
-# =========================
+# -----------------------------------------------------------------------------
+# Konfiguration
+# -----------------------------------------------------------------------------
 app = FastAPI()
-app.add_middleware(GZipMiddleware, minimum_size=500)
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
-# globaler HTTP-Client (Keep-Alive)
-http_client = httpx.AsyncClient(timeout=HTTP_TIMEOUT)
+BASE_URL = os.getenv("BASE_URL", "").rstrip("/")
+if not BASE_URL:
+    raise ValueError("❌ BASE_URL fehlt (z. B. https://deine-app.onrender.com)")
 
-# In-Memory Caches
-_person_fields_cache = {"data": None, "ts": 0.0}
-_filter_cache = {}  # {filter_id: {"data":[...], "ts": float}}
+# OAuth (optional)
+PD_CLIENT_ID = os.getenv("PD_CLIENT_ID", "")
+PD_CLIENT_SECRET = os.getenv("PD_CLIENT_SECRET", "")
+OAUTH_AUTHORIZE_URL = "https://oauth.pipedrive.com/oauth/authorize"
+OAUTH_TOKEN_URL = "https://oauth.pipedrive.com/oauth/token"
 
-# =========================
-#   Helpers
-# =========================
-def _norm(s: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
+# Fallback API Token (optional)
+PD_API_TOKEN = os.getenv("PD_API_TOKEN", "")
 
-def to_int(v, default=0) -> int:
-    try:
-        if v is None:
-            return default
-        s = str(v).strip()
-        return int(s) if s != "" else default
-    except:
-        return default
+# Pipedrive API Root
+PIPEDRIVE_API = "https://api.pipedrive.com/v1"
 
+# Neon / Postgres
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+
+# Felder
+FILTER_NEUKONTAKTE = 2998
+FIELD_FACHBEREICH_HINT = "fachbereich"     # Such-Substring für Field-Namen
+FIELD_ORGART_HINT = "organisationsart"     # Such-Substring für Field-Namen
+
+# Visual / Vorgaben
+DEFAULT_CHANNEL = "Cold-Mail"
+COLD_MAILING_IMPORT_LABEL = "Cold-Mailing Import"
+
+# Tokens im Speicher (einfacher)
+user_tokens: Dict[str, str] = {}
+
+# -----------------------------------------------------------------------------
+# HTTP Client (shared)
+# -----------------------------------------------------------------------------
+http_client = httpx.AsyncClient(timeout=60.0)
+
+# -----------------------------------------------------------------------------
+# DB helpers
+# -----------------------------------------------------------------------------
 async def get_conn():
+    if not DATABASE_URL:
+        raise ValueError("DATABASE_URL fehlt")
     return await asyncpg.connect(DATABASE_URL)
 
+async def ensure_table_text(conn: asyncpg.Connection, table: str, cols: List[str]):
+    col_defs = ", ".join([f'"{c}" TEXT' for c in cols])
+    await conn.execute(f'CREATE TABLE IF NOT EXISTS "{table}" ({col_defs})')
+
+async def clear_table(conn: asyncpg.Connection, table: str):
+    await conn.execute(f'DROP TABLE IF EXISTS "{table}"')
+
 async def save_df_text(df: pd.DataFrame, table: str):
-    """Speichert DataFrame mit TEXT-Spalten in Neon (einfach & robust)."""
     conn = await get_conn()
     try:
-        await conn.execute(f'DROP TABLE IF EXISTS "{table}"')
+        await clear_table(conn, table)
+        await ensure_table_text(conn, table, list(df.columns))
         if df.empty:
-            await conn.execute(f'CREATE TABLE "{table}" ("_empty" TEXT)')
             return
-        cols = ", ".join([f'"{c}" TEXT' for c in df.columns])
-        await conn.execute(f'CREATE TABLE "{table}" ({cols})')
-
-        col_list = list(df.columns)
-        placeholders = ", ".join(f"${i+1}" for i in range(len(col_list)))
-        stmt = f'INSERT INTO "{table}" ({", ".join([f"""\"{c}\"""" for c in col_list])}) VALUES ({placeholders})'
-        records = [
-            tuple("" if pd.isna(row[c]) else str(row[c]) for c in col_list)
-            for _, row in df.iterrows()
-        ]
-        if records:
-            await conn.executemany(stmt, records)
+        cols = list(df.columns)
+        placeholders = ", ".join([f'${i+1}' for i in range(len(cols))])
+        insert = f'INSERT INTO "{table}" ({", ".join([f""""{c}"""" for c in cols])}) VALUES ({placeholders})'
+        async with conn.transaction():
+            for _, row in df.iterrows():
+                vals = ["" if pd.isna(v) else str(v) for v in row.tolist()]
+                await conn.execute(insert, *vals)
     finally:
         await conn.close()
 
-def extract_email(value):
-    """Robuster Email-Extractor für Pipedrive-Feld 'email' (Liste/Dict/NaN)."""
-    if value is None or (isinstance(value, float) and pd.isna(value)):
-        return None
-    if isinstance(value, np.ndarray):
-        value = value.tolist()
-    if isinstance(value, dict):
-        return value.get("value") or None
-    if isinstance(value, (list, tuple)):
-        if not value:
-            return None
-        first = value[0]
-        if isinstance(first, dict):
-            return first.get("value") or None
-        return str(first) if first is not None else None
-    return str(value) if value is not None else None
+async def load_df_text(table: str) -> pd.DataFrame:
+    conn = await get_conn()
+    try:
+        rows = await conn.fetch(f'SELECT * FROM "{table}"')
+        if not rows:
+            return pd.DataFrame()
+        cols = list(rows[0].keys())
+        data = [tuple(r[c] for c in cols) for r in rows]
+        df = pd.DataFrame(data, columns=cols).replace({"": np.nan})
+        return df
+    finally:
+        await conn.close()
 
-def apply_basic_cleanup(df: pd.DataFrame) -> pd.DataFrame:
-    """Bereinigung laut Vorgabe:
-       - Wenn in Spalte 'Organisationsart' ein Wert steht → Zeile entfernen
-       - Pro Organisation maximal 2 Kontakte
-    """
-    # 1) Organisationsart
-    if FIELD_NAME_ORGART in df.columns:
-        df = df[df[FIELD_NAME_ORGART].isna() | (df[FIELD_NAME_ORGART] == "")]
+# -----------------------------------------------------------------------------
+# Auth / Headers
+# -----------------------------------------------------------------------------
+def get_headers() -> Dict[str, str]:
+    token = user_tokens.get("default", "")
+    if token:
+        return {"Authorization": f"Bearer {token}"}
+    return {}
 
-    # 2) max. 2 Kontakte je Organisation
-    org_col = "org_id" if "org_id" in df.columns else ("Organisation" if "Organisation" in df.columns else None)
-    if org_col and org_col in df.columns:
-        df["_rank"] = df.groupby(org_col).cumcount() + 1
-        df = df[df["_rank"] <= 2].drop(columns=["_rank"], errors="ignore")
+def append_token(url: str) -> str:
+    # Wenn kein OAuth-Token, aber PD_API_TOKEN vorhanden -> ?api_token=...
+    if "api_token=" in url:
+        return url
+    if user_tokens.get("default"):
+        return url
+    if PD_API_TOKEN:
+        sep = "&" if "?" in url else "?"
+        return f"{url}{sep}api_token={PD_API_TOKEN}"
+    return url
 
-    return df
-
-# =========================
-#   Pipedrive Zugriff
-# =========================
-async def get_person_fields():
-    """Feld-Definitionen der Personen (mit Cache)."""
-    now = time.time()
-    if _person_fields_cache["data"] and now - _person_fields_cache["ts"] < PERSON_FIELDS_TTL:
-        return _person_fields_cache["data"]
-
-    url = f"{PIPEDRIVE_API}/personFields?api_token={PD_API_TOKEN}"
-    r = await http_client.get(url)
+# -----------------------------------------------------------------------------
+# Pipedrive Field-Discovery
+# -----------------------------------------------------------------------------
+async def get_person_fields() -> List[dict]:
+    url = append_token(f"{PIPEDRIVE_API}/personFields")
+    r = await http_client.get(url, headers=get_headers())
     r.raise_for_status()
-    data = r.json().get("data") or []
+    return r.json().get("data") or []
 
-    mapping = {}
-    for f in data:
-        name, key = f.get("name"), f.get("key")
-        options = f.get("options") or []
-        mapping[name] = {"key": key, "options": options, "name": name}
-        mapping[_norm(name)] = {"key": key, "options": options, "name": name}
+async def get_field_key_by_hint(label_hint: str) -> Optional[str]:
+    """Suche nach einem Personenfeld, dessen Name (case-insensitive) label_hint enthält."""
+    fields = await get_person_fields()
+    hint = label_hint.lower()
+    for f in fields:
+        name = (f.get("name") or "").lower()
+        if hint in name:
+            return f.get("key")
+    return None
 
-    _person_fields_cache.update(data=mapping, ts=now)
-    return mapping
-
-def _resolve_option_label(value: str, options: list) -> Tuple[str, str]:
-    """Hilfsfunktion: gibt (value, label) zurück (value bleibt unverändert),
-       label wird aus den Options ermittelt oder als value zurückgegeben."""
-    if not options:
-        return value, value
-    for o in options:
-        oid = str(o.get("id"))
-        lab = str(o.get("label", ""))
-        if value == oid or value == lab:
-            return value, lab or value
-    return value, value
-
-async def fetch_persons_by_filter(filter_id: int):
-    """Alle Personen eines Filters (mit Cache & Pagination)."""
-    now = time.time()
-    c = _filter_cache.get(filter_id)
-    if c and now - c["ts"] < FILTER_TTL:
-        return c["data"]
-
-    persons, start, limit = [], 0, 500
+# -----------------------------------------------------------------------------
+# Pipedrive Fetcher
+# -----------------------------------------------------------------------------
+async def fetch_persons_by_filter(filter_id: int) -> List[dict]:
+    persons: List[dict] = []
+    start, limit = 0, 500
     while True:
-        url = f"{PIPEDRIVE_API}/persons?filter_id={filter_id}&start={start}&limit={limit}&api_token={PD_API_TOKEN}"
-        r = await http_client.get(url)
+        url = append_token(f"{PIPEDRIVE_API}/persons?filter_id={filter_id}&start={start}&limit={limit}&sort=name")
+        r = await http_client.get(url, headers=get_headers())
         if r.status_code != 200:
             raise Exception(f"Pipedrive API Fehler: {r.text}")
+        data = r.json()
+        items = data.get("data") or []
+        if not items:
+            break
+        persons.extend(items)
+        if len(items) < limit:
+            break
+        start += limit
+    return persons
+
+async def fetch_organizations_by_filter(filter_id: int) -> List[dict]:
+    orgs: List[dict] = []
+    start, limit = 0, 500
+    while True:
+        url = append_token(f"{PIPEDRIVE_API}/organizations?filter_id={filter_id}&start={start}&limit={limit}")
+        r = await http_client.get(url, headers=get_headers())
+        if r.status_code != 200:
+            raise Exception(f"Pipedrive API Fehler (Orgs {filter_id}): {r.text}")
         chunk = r.json().get("data") or []
         if not chunk:
             break
-        persons.extend(chunk)
+        orgs.extend(chunk)
         if len(chunk) < limit:
             break
         start += limit
+    return orgs
 
-    _filter_cache[filter_id] = {"data": persons, "ts": now}
-    return persons
+# -----------------------------------------------------------------------------
+# Normalizer & Similarity
+# -----------------------------------------------------------------------------
+def normalize_name(s: str) -> str:
+    if not s:
+        return ""
+    s = s.lower()
+    s = re.sub(r"\b(gmbh|ug|ag|kg|ohg|inc|ltd)\b", "", s)
+    s = re.sub(r"[^a-z0-9 ]", "", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
-# =========================
-#   Navigation / Landing
-# =========================
-@app.get("/", response_class=HTMLResponse)
-async def root_redirect():
-    return HTMLResponse('<meta http-equiv="refresh" content="0;url=/neukontakte">')
+def sim(a: str, b: str) -> int:
+    a = (a or "").strip()
+    b = (b or "").strip()
+    if not a or not b:
+        return 0
+    return fuzz.token_sort_ratio(a, b)
 
-@app.get("/overview", response_class=HTMLResponse)
-async def old_redirect():
-    return HTMLResponse('<meta http-equiv="refresh" content="0;url=/neukontakte">')
+# -----------------------------------------------------------------------------
+# OAuth & Routing
+# -----------------------------------------------------------------------------
+@app.get("/")
+def root():
+    return RedirectResponse("/neukontakte")
 
-# =========================
-#   UI: Formular „Neukontakte“
-# =========================
+@app.get("/login")
+def login():
+    if not PD_CLIENT_ID:
+        return HTMLResponse("<h3>CLIENT_ID fehlt. Bitte OAuth-Daten setzen oder PD_API_TOKEN nutzen.</h3>", 400)
+    redirect_uri = f"{BASE_URL}/oauth/callback"
+    url = f"{OAUTH_AUTHORIZE_URL}?client_id={PD_CLIENT_ID}&redirect_uri={redirect_uri}"
+    return RedirectResponse(url)
+
+@app.get("/oauth/callback")
+async def oauth_callback(code: str):
+    redirect_uri = f"{BASE_URL}/oauth/callback"
+    payload = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": redirect_uri,
+        "client_id": PD_CLIENT_ID,
+        "client_secret": PD_CLIENT_SECRET
+    }
+    r = await http_client.post(OAUTH_TOKEN_URL, data=payload)
+    tok = r.json()
+    if "access_token" not in tok:
+        return HTMLResponse(f"<h3>❌ OAuth Fehler: {tok}</h3>", 400)
+    user_tokens["default"] = tok["access_token"]
+    return RedirectResponse("/neukontakte")
+
+# -----------------------------------------------------------------------------
+# UI: Neukontakte – Form
+# -----------------------------------------------------------------------------
 @app.get("/neukontakte", response_class=HTMLResponse)
-async def neukontakte_form(request: Request):
-    fields = await get_person_fields()
-
-    fach = fields.get(_norm(FIELD_NAME_FACHBEREICH)) or fields.get(FIELD_NAME_FACHBEREICH)
-    if not fach:
-        return HTMLResponse("<div style='padding:24px;color:#b00'>❌ Feld „Fachbereich_Kampagne“ nicht gefunden.</div>", status_code=500)
-
-    # Optionen + Zähler (Zahl in Klammern)
-    persons = await fetch_persons_by_filter(FILTER_NEUKONTAKTE)
-    total_count = len(persons)
-
-    key_fach = fach["key"]
-    counts = {}
-    for p in persons:
-        v = p.get(key_fach)
-        s = str(v).strip() if v is not None else ""
-        if s:
-            counts[s] = counts.get(s, 0) + 1
-
-    options = fach.get("options") or []
-    display = []
-    if options:
-        for o in options:
-            lab, oid = o.get("label", ""), str(o.get("id"))
-            c = counts.get(oid, counts.get(lab, 0))
-            display.append((oid, f"{lab} ({c or 0})"))
-    else:
-        for val, c in sorted(counts.items(), key=lambda x: x[0].lower()):
-            display.append((val, f"{val} ({c})"))
-
-    # 1. Eintrag: bitte auswählen
-    options_html = "<option value='' selected>-- bitte auswählen --</option>\n"
-    options_html += "\n".join([f"<option value='{oid}'>{label}</option>" for oid, label in display])
+async def neukontakte(request: Request):
+    # leichte Nutzungsinfo: eingeloggt / nicht
+    authed = bool(user_tokens.get("default") or PD_API_TOKEN)
+    total = await count_persons_in_filter(FILTER_NEUKONTAKTE)
 
     html = f"""
-<!doctype html>
-<html lang="de"><head>
+<!doctype html><html lang="de">
+<head>
 <meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>Neukontakte (Filter {FILTER_NEUKONTAKTE})</title>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
 <style>
-  body{{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Inter,Arial,sans-serif;background:#f5f7fa;margin:0;color:#1f2937}}
+  body{{font-family: Inter, -apple-system, Segoe UI, Roboto, Arial, sans-serif;background:#f5f7fa;color:#1f2937;margin:0}}
+  header{{display:flex;justify-content:space-between;align-items:center;padding:18px 22px;background:#fff;border-bottom:1px solid #e5e7eb}}
   .wrap{{max-width:1180px;margin:28px auto;padding:0 16px}}
-  .bar{{display:flex;align-items:center;gap:12px}}
-  .pill{{background:#e6f2ff;color:#0a66c2;padding:8px 12px;border-radius:999px;font-weight:600}}
-  .card{{background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:22px;margin-top:16px;box-shadow:0 1px 3px rgba(0,0,0,.05)}}
-  label{{display:block;font-weight:600;margin:8px 0 6px}}
-  select,input{{width:100%;padding:10px 12px;border:1px solid #d1d5db;border-radius:8px;outline:none}}
-  select:focus,input:focus{{border-color:#0ea5e9;box-shadow:0 0 0 3px rgba(14,165,233,.25)}}
-  .row{{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px}}
-  .hint{{font-size:12px;color:#6b7280;margin-top:6px}}
+  .card{{background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:22px;box-shadow:0 1px 3px rgba(0,0,0,.05)}}
+  label{{display:block;margin:12px 0 6px;font-weight:600}}
+  select,input{{width:100%;padding:10px 12px;border:1px solid #cfd6df;border-radius:8px}}
+  .row{{display:grid;grid-template-columns:1fr 220px 220px auto;gap:16px;align-items:end}}
+  .muted{{color:#6b7280}}
   .btn{{background:#0ea5e9;border:none;color:#fff;border-radius:8px;padding:10px 16px;cursor:pointer}}
   .btn:hover{{background:#0284c7}}
-  .right{{text-align:right;margin-top:16px}}
-  .muted{{color:#6b7280}}
+  .badge{{background:#eef6ff;color:#0a66c2;padding:6px 10px;border-radius:999px;font-weight:600}}
+  .topbar{{display:flex;gap:10px;align-items:center}}
+  .link{{color:#0a66c2;text-decoration:none}}
+  .link:hover{{text-decoration:underline}}
+  /* Loading overlay */
+  #overlay{{display:none;position:fixed;inset:0;background:rgba(255,255,255,.7);backdrop-filter:blur(2px);z-index:9999;align-items:center;justify-content:center}}
+  .spinner{{width:48px;height:48px;border:4px solid #93c5fd;border-top-color:#1d4ed8;border-radius:50%;animation:spin 1s linear infinite}}
+  @keyframes spin{{to{{transform:rotate(360deg)}}}}
 </style>
-</head><body>
-<div class="wrap">
-  <div class="bar">
-    <a class="pill" href="/neukontakte">🌟 Neukontakte (Filter {FILTER_NEUKONTAKTE})</a>
-    <div class="muted">Gesamt im Filter: <b>{total_count}</b></div>
+</head>
+<body>
+<header>
+  <div class="topbar">
+    <span class="badge">Neukontakte (Filter {FILTER_NEUKONTAKTE})</span>
+    <span class="muted">Gesamt im Filter: <b>{total}</b></span>
   </div>
+  <div>
+    {"<span class='muted'>angemeldet</span>" if authed else "<a class='link' href='/login'>Anmelden</a>"}
+  </div>
+</header>
 
-  <form class="card" method="post" action="/neukontakte/preview" id="nkform">
-    <input type="hidden" name="fachbereich_label" id="fachbereich_label" />
-    <label for="fach">Fachbereich</label>
-    <select id="fach" name="fachbereich_value" required>
-      {options_html}
+<div class="wrap">
+  <div class="card">
+    <label>Fachbereich</label>
+    <select id="fachbereich">
+      <option value="">– bitte auswählen –</option>
     </select>
-    <div class="hint">Die Zahl in Klammern zeigt die vorhandenen Datensätze im Filter.</div>
+    <div class="muted" id="fbinfo" style="margin-top:6px;">Die Zahl in Klammern zeigt die vorhandenen Datensätze im Filter.</div>
 
-    <div class="row">
+    <div class="row" style="margin-top:14px;">
       <div>
-        <label for="take">Wie viele Datensätze nehmen?</label>
-        <input id="take" name="take_count" inputmode="numeric" placeholder="z. B. 900"/>
-        <div class="hint">Leer lassen = alle Datensätze des gewählten Fachbereichs.</div>
+        <label>Wie viele Datensätze nehmen?</label>
+        <input type="number" id="take_count" placeholder="z. B. 900" min="1"/>
+        <div class="muted">Leer lassen = alle Datensätze des gewählten Fachbereichs.</div>
       </div>
       <div>
-        <label for="batch">Batch ID</label>
-        <input id="batch" name="batch_id" placeholder="Bxxx" required/>
-        <div class="hint">Beispiel: B477</div>
+        <label>Batch ID</label>
+        <input id="batch_id" placeholder="Bxxx"/>
+        <div class="muted">Beispiel: B477</div>
       </div>
-      <div class="right" style="align-self:end">
-        <button class="btn" type="submit">Vorschau laden</button>
+      <div style="align-self:end;">
+        <button class="btn" id="btnPreview">Vorschau laden</button>
       </div>
     </div>
-  </form>
+  </div>
 </div>
+
+<div id="overlay"><div class="spinner"></div></div>
+
 <script>
-// beim Absenden den sichtbaren Namen (ohne Klammerzahl) in ein Hidden-Feld schreiben
-document.getElementById("nkform").addEventListener("submit", function(){
-  const sel = document.getElementById("fach");
-  const txt = sel.options[sel.selectedIndex]?.text || "";
-  // "Marketing (1234)" -> "Marketing"
-  const lbl = txt.replace(/\\s*\\(.*\\)\\s*$/,"").trim();
-  document.getElementById("fachbereich_label").value = lbl;
-});
+function showOverlay() {{
+  document.getElementById("overlay").style.display = "flex";
+}}
+function hideOverlay() {{
+  document.getElementById("overlay").style.display = "none";
+}}
+
+async function loadOptions(){{
+  showOverlay();
+  try {{
+    const r = await fetch('/neukontakte/options');
+    const data = await r.json();
+    const sel = document.getElementById('fachbereich');
+    // sicherstellen, dass die "bitte auswählen" oben bleibt:
+    sel.innerHTML = '<option value="">– bitte auswählen –</option>';
+    data.options.forEach(o => {{
+      const opt = document.createElement('option');
+      opt.value = o.value;
+      opt.textContent = o.label + ' (' + o.count + ')';
+      sel.appendChild(opt);
+    }});
+    const fbinfo = document.getElementById('fbinfo');
+    fbinfo.textContent = "Gesamt im Filter: " + data.total + " | Fachbereiche: " + data.options.length;
+  }} catch(e) {{
+    alert('Fehler beim Laden der Fachbereiche: ' + e);
+  }} finally {{
+    hideOverlay();
+  }}
+}}
+
+document.getElementById('btnPreview').addEventListener('click', async () => {{
+  const fb = document.getElementById('fachbereich').value;
+  const tc = document.getElementById('take_count').value || null;
+  const bid = document.getElementById('batch_id').value || null;
+
+  if(!fb) {{ alert('Bitte zuerst einen Fachbereich wählen.'); return; }}
+
+  showOverlay();
+  try {{
+    const r = await fetch('/neukontakte/preview', {{
+      method:'POST',
+      headers:{{'Content-Type':'application/json'}},
+      body: JSON.stringify({{ fachbereich: fb, take_count: tc ? parseInt(tc) : null, batch_id: bid }})
+    }});
+    const html = await r.text();
+    document.open(); document.write(html); document.close();
+  }} catch(e) {{
+    hideOverlay();
+    alert('Fehler: ' + e);
+  }}
+}});
+
+loadOptions();
 </script>
-</body></html>
+</body>
+</html>
 """
     return HTMLResponse(html)
 
-# =========================
-#   Vorschau (keine Writes)
-# =========================
+
+async def count_persons_in_filter(filter_id: int) -> int:
+    # Pipedrive liefert die Anzahl nicht direkt -> einfach einmal paginieren und zählen
+    start, limit, total = 0, 500, 0
+    while True:
+        url = append_token(f"{PIPEDRIVE_API}/persons?filter_id={filter_id}&start={start}&limit={limit}")
+        r = await http_client.get(url, headers=get_headers())
+        if r.status_code != 200:
+            return total
+        items = r.json().get("data") or []
+        if not items:
+            break
+        total += len(items)
+        if len(items) < limit:
+            break
+        start += limit
+    return total
+
+# -----------------------------------------------------------------------------
+# Optionen (Fachbereichswerte) – per AJAX
+# -----------------------------------------------------------------------------
+@app.get("/neukontakte/options")
+async def neukontakte_options():
+    # Feldschlüssel suchen
+    fb_key = await get_field_key_by_hint(FIELD_FACHBEREICH_HINT)
+    persons = await fetch_persons_by_filter(FILTER_NEUKONTAKTE)
+    total = len(persons)
+
+    counts: Dict[str, int] = {}
+    if fb_key:
+        for p in persons:
+            val = p.get(fb_key)
+            if isinstance(val, list):
+                # Mehrfachauswahl
+                for v in val:
+                    if v:
+                        counts[str(v)] = counts.get(str(v), 0) + 1
+            else:
+                if val:
+                    counts[str(val)] = counts.get(str(val), 0) + 1
+
+    options = [{"value": k, "label": k, "count": v} for k, v in sorted(counts.items(), key=lambda x: x[1], reverse=True)]
+    return JSONResponse({"total": total, "options": options})
+
+# -----------------------------------------------------------------------------
+# Vorschau – erzeugt nk_master_final
+# -----------------------------------------------------------------------------
 @app.post("/neukontakte/preview", response_class=HTMLResponse)
 async def neukontakte_preview(
-    request: Request,
-    fachbereich_value: str = Form(...),
-    batch_id: str = Form(...),
-    take_count: Optional[str] = Form(None),
-    fachbereich_label: Optional[str] = Form(None)
+    fachbereich: str = Body(...),
+    take_count: Optional[int] = Body(None),
+    batch_id: Optional[str] = Body(None),
 ):
     try:
-        take_n = to_int(take_count, 0)
-
-        fields = await get_person_fields()
-        fach = fields.get(_norm(FIELD_NAME_FACHBEREICH)) or fields.get(FIELD_NAME_FACHBEREICH)
-        if not fach:
-            return HTMLResponse("<div style='padding:24px;color:#b00'>❌ Feld „Fachbereich_Kampagne“ nicht gefunden.</div>", status_code=500)
-
-        key_fach = fach["key"]
-        # Label ermitteln (Fallback falls Hidden leer ist)
-        _, label_from_options = _resolve_option_label(str(fachbereich_value), fach.get("options") or [])
-        fach_label = fachbereich_label or label_from_options or str(fachbereich_value)
+        fb_key = await get_field_key_by_hint(FIELD_FACHBEREICH_HINT)
+        orgart_key = await get_field_key_by_hint(FIELD_ORGART_HINT)
 
         persons = await fetch_persons_by_filter(FILTER_NEUKONTAKTE)
-        sel = [p for p in persons if key_fach in p and (str(p[key_fach]) == str(fachbereich_value))]
-        if take_n > 0:
-            sel = sel[:take_n]
+        # Filter auf Fachbereich anwenden
+        sel: List[dict] = []
+        if fb_key:
+            for p in persons:
+                val = p.get(fb_key)
+                match = False
+                if isinstance(val, list):
+                    match = fachbereich in [str(x) for x in val if x]
+                else:
+                    match = str(val) == str(fachbereich)
+                if match:
+                    sel.append(p)
+        else:
+            sel = persons  # falls kein Feld, nimm alles
 
-        if not sel:
-            return HTMLResponse("<div style='padding:24px'>Keine Datensätze für diese Auswahl.</div>")
+        if take_count and take_count > 0:
+            sel = sel[: min(take_count, len(sel))]
 
-        df = pd.DataFrame(sel)
+        # Tabelle bauen
+        rows = []
+        for p in sel:
+            pid = p.get("id")
+            name = p.get("name") or ""
+            emails = p.get("email") or []
+            email_str = ", ".join([e.get("value") for e in emails if isinstance(e, dict) and e.get("value")])
 
-        # Lesbare Spalten
-        if "email" in df.columns:
-            df["E-Mail"] = df["email"].apply(extract_email)
-        if "org_name" in df.columns:
-            df.rename(columns={"org_name": "Organisation"}, inplace=True)
-        if "org_id" in df.columns and FIELD_NAME_ORGART not in df.columns:
-            df[FIELD_NAME_ORGART] = ""
+            org_name = "-"
+            org = p.get("org_id")
+            if isinstance(org, dict):
+                org_name = org.get("name") or "-"
 
-        # Für Vorschau hinzufügen (aber nichts zu Pipedrive schreiben)
-        df["Batch ID (Vorschau)"] = batch_id
-        df["Channel (Vorschau)"]  = CHANNEL_VALUE
-        df[f"{FIELD_NAME_IMPORT}"] = IMPORT_VALUE
+            row = {
+                "Batch ID": batch_id or "",
+                "Channel": DEFAULT_CHANNEL,
+                COLD_MAILING_IMPORT_LABEL: DEFAULT_CHANNEL,  # so gewünscht (3. Spalte)
+                "id": pid,
+                "name": name,
+                "E-Mail": email_str,
+                "Organisation": org_name,
+            }
+            # Organisationsart (falls später für Abgleich benötigt)
+            if orgart_key:
+                row["Organisationsart"] = p.get(orgart_key)
 
-        # Spaltenreihenfolge: 1) Batch, 2) Channel, 3) Cold-Mailing Import, danach Rest
-        first_cols = ["Batch ID (Vorschau)", "Channel (Vorschau)", FIELD_NAME_IMPORT]
-        rest_cols  = [c for c in df.columns if c not in first_cols]
-        preview_df = df[first_cols + rest_cols]
+            rows.append(row)
 
-        # Tabellendarstellung (erste 50)
-        table_html = preview_df.head(50).to_html(classes="grid", index=False, border=0)
+        df = pd.DataFrame(rows)
+
+        # Speichern als nk_master_final (Text)
+        await save_df_text(df, "nk_master_final")
+
+        # UI rendern
+        fb_name_shown = fachbereich  # wir zeigen den gewählten Namen
+        preview_table = (df.head(50).to_html(classes="grid", index=False, border=0) if not df.empty else "<i>Keine Daten</i>")
 
         html = f"""
-<!doctype html><html lang="de"><head>
-<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<!doctype html><html lang="de">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>Vorschau – Neukontakte</title>
 <style>
-  body{{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Inter,Arial,sans-serif;background:#f5f7fa;margin:0;color:#1f2937}}
+  body{{font-family: Inter, -apple-system, Segoe UI, Roboto, Arial, sans-serif;background:#f5f7fa;color:#1f2937;margin:0}}
+  header{{display:flex;justify-content:space-between;align-items:center;padding:18px 22px;background:#fff;border-bottom:1px solid #e5e7eb}}
   .wrap{{max-width:1180px;margin:28px auto;padding:0 16px}}
   .card{{background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:22px;margin-top:16px;box-shadow:0 1px 3px rgba(0,0,0,.05)}}
   .grid{{width:100%;border-collapse:collapse}}
   .grid th,.grid td{{border:1px solid #e5e7eb;padding:8px 10px;text-align:left}}
   .grid th{{background:#f3f4f6}}
-  .btn{{background:#0ea5e9;border:none;color:#fff;border-radius:8px;padding:10px 16px;cursor:pointer}}
+  .row{{display:flex;gap:10px;align-items:center;justify-content:space-between;flex-wrap:wrap}}
+  .btn{{background:#0ea5e9;border:none;color:#fff;border-radius:8px;padding:10px 16px;cursor:pointer;text-decoration:none}}
   .btn:hover{{background:#0284c7}}
-  .row{{display:flex;gap:10px;justify-content:space-between;align-items:center}}
   .muted{{color:#6b7280}}
-</style></head><body>
-<div class="wrap">
-  <div class="card row">
-    <div>
-      <b>Vorschau</b><br/>
-      Fachbereich: <b>{fach_label}</b> &nbsp;|&nbsp;
-      Batch: <b>{batch_id}</b> &nbsp;|&nbsp;
-      Datensätze: <b>{len(df)}</b>
-    </div>
-    <form method="post" action="/neukontakte/run">
-      <input type="hidden" name="fachbereich_value" value="{fachbereich_value}"/>
-      <input type="hidden" name="fachbereich_label" value="{fach_label}"/>
-      <input type="hidden" name="batch_id" value="{batch_id}"/>
-      <input type="hidden" name="take_count" value="{take_n}"/>
-      <button class="btn" type="submit">Abgleich starten</button>
-      <a class="btn" href="/neukontakte" style="background:#6b7280;margin-left:8px">Zurück</a>
-    </form>
+  #overlay{{display:none;position:fixed;inset:0;background:rgba(255,255,255,.7);backdrop-filter:blur(2px);z-index:9999;align-items:center;justify-content:center}}
+  .spinner{{width:48px;height:48px;border:4px solid #93c5fd;border-top-color:#1d4ed8;border-radius:50%;animation:spin 1s linear infinite}}
+  @keyframes spin{{to{{transform:rotate(360deg)}}}}
+</style>
+</head>
+<body>
+<header>
+  <div class="row">
+    <div><b>Vorschau</b> – Fachbereich: <b>{fb_name_shown}</b> | Batch: <b>{batch_id or "-"}</b> | Datensätze: <b>{len(df)}</b></div>
   </div>
+  <div class="row">
+    <a class="btn" href="/neukontakte">Zurück</a>
+    <button class="btn" id="btnReconcile">Abgleich durchführen</button>
+  </div>
+</header>
+
+<div class="wrap">
   <div class="card">
-    <div class="muted" style="margin-bottom:8px">Die ersten 50 Datensätze:</div>
-    {table_html}
+    <h3>Die ersten 50 Datensätze:</h3>
+    {preview_table}
   </div>
 </div>
-</body></html>
+
+<div id="overlay"><div class="spinner"></div></div>
+<script>
+function showOverlay(){{document.getElementById('overlay').style.display='flex';}}
+function hideOverlay(){{document.getElementById('overlay').style.display='none';}}
+document.getElementById('btnReconcile').addEventListener('click', async ()=>{
+  showOverlay();
+  try {{
+    const r = await fetch('/neukontakte/reconcile', {{method:'POST'}});
+    const html = await r.text();
+    document.open(); document.write(html); document.close();
+  }} catch(e) {{
+    hideOverlay();
+    alert('Fehler beim Abgleich: ' + e);
+  }}
+});
+</script>
+</body>
+</html>
 """
         return HTMLResponse(html)
     except Exception as e:
-        return HTMLResponse(f"<pre style='padding:24px;color:#b00'>❌ Fehler: {e}</pre>", status_code=500)
+        return HTMLResponse(f"<pre style='padding:24px;color:#b00'>❌ Fehler beim Abruf/Speichern:\n{e}</pre>", status_code=500)
 
-# =========================
-#   „Abgleich“ = nur speichern (keine Writes nach Pipedrive)
-# =========================
-@app.post("/neukontakte/run", response_class=HTMLResponse)
-async def neukontakte_run(
-    request: Request,
-    fachbereich_value: str = Form(...),
-    batch_id: str = Form(...),
-    take_count: Optional[str] = Form(None),
-    fachbereich_label: Optional[str] = Form(None)
-):
+# -----------------------------------------------------------------------------
+# Abgleich – schreibt nk_master_ready & nk_delete_log
+# -----------------------------------------------------------------------------
+@app.post("/neukontakte/reconcile", response_class=HTMLResponse)
+async def neukontakte_reconcile():
     try:
-        take_n = to_int(take_count, 0)
+        master = await load_df_text("nk_master_final")
+        if master.empty:
+            return HTMLResponse("<div style='padding:24px'>Keine Daten in nk_master_final.</div>")
 
-        fields = await get_person_fields()
-        fach = fields.get(_norm(FIELD_NAME_FACHBEREICH)) or fields.get(FIELD_NAME_FACHBEREICH)
-        if not fach:
-            return HTMLResponse("<div style='padding:24px;color:#b00'>❌ Feld „Fachbereich_Kampagne“ nicht gefunden.</div>", status_code=500)
+        # Spaltennamen ermitteln
+        col_person_id = "id" if "id" in master.columns else None
+        col_org_name = "Organisation" if "Organisation" in master.columns else None
+        col_orgart = "Organisationsart" if "Organisationsart" in master.columns else None
 
-        key_fach = fach["key"]
+        delete_log = []
 
-        persons = await fetch_persons_by_filter(FILTER_NEUKONTAKTE)
-        sel = [p for p in persons if key_fach in p and (str(p[key_fach]) == str(fachbereich_value))]
-        if take_n > 0:
-            sel = sel[:take_n]
-        if not sel:
-            return HTMLResponse("<div style='padding:24px'>Keine Datensätze für diese Auswahl.</div>")
+        # Regel 2 – Organisationsart gesetzt -> löschen
+        if col_orgart and col_orgart in master.columns:
+            mask_orgtype = master[col_orgart].notna() & (master[col_orgart].astype(str).str.strip() != "")
+            removed = master[mask_orgtype].copy()
+            for _, r in removed.iterrows():
+                delete_log.append({
+                    "reason": "organisationsart_set",
+                    "id": r.get(col_person_id),
+                    "name": r.get("name"),
+                    "org_name": r.get(col_org_name),
+                    "extra": str(r.get(col_orgart))
+                })
+            master = master[~mask_orgtype].copy()
 
-        # DataFrame bauen
-        df = pd.DataFrame(sel)
-        if "email" in df.columns:
-            df["E-Mail"] = df["email"].apply(extract_email)
-        if "org_name" in df.columns:
-            df.rename(columns={"org_name": "Organisation"}, inplace=True)
-        if FIELD_NAME_ORGART not in df.columns:
-            df[FIELD_NAME_ORGART] = ""
+        # Regel 1 – max. 2 Personen pro Organisation
+        if col_org_name and col_org_name in master.columns:
+            master["_rank"] = master.groupby(col_org_name).cumcount() + 1
+            over = master[master["_rank"] > 2].copy()
+            for _, r in over.iterrows():
+                delete_log.append({
+                    "reason": "limit_per_org",
+                    "id": r.get(col_person_id),
+                    "name": r.get("name"),
+                    "org_name": r.get(col_org_name),
+                    "extra": "über 2 pro Organisation"
+                })
+            master = master[master["_rank"] <= 2].drop(columns=["_rank"], errors="ignore")
 
-        # Cleanup-Regeln
-        df = apply_basic_cleanup(df)
+        # Regel 3 – Orga-Abgleich (Filter 1245, 851, 1521) >=95%
+        suspect_org_filters = [1245, 851, 1521]
+        if col_org_name and col_org_name in master.columns:
+            ext_names = []
+            for fid in suspect_org_filters:
+                orgs = await fetch_organizations_by_filter(fid)
+                ext_names.extend([o.get("name") for o in orgs if o.get("name")])
+            # dedupe
+            ext_names = list({(n or "").strip(): None for n in ext_names if isinstance(n, str) and n.strip()}.keys())
 
-        # Ergebnis-Felder für Export
-        df[FIELD_NAME_BATCH]   = batch_id
-        df[FIELD_NAME_CHANNEL] = CHANNEL_VALUE
-        df[FIELD_NAME_IMPORT]  = IMPORT_VALUE
+            if ext_names:
+                drop_idx = []
+                for idx, row in master.iterrows():
+                    cand = str(row.get(col_org_name) or "").strip()
+                    if not cand:
+                        continue
+                    best = process.extractOne(cand, ext_names, scorer=fuzz.token_sort_ratio)
+                    if best and best[1] >= 95:
+                        drop_idx.append(idx)
+                        delete_log.append({
+                            "reason": "org_match_95",
+                            "id": row.get(col_person_id),
+                            "name": row.get("name"),
+                            "org_name": cand,
+                            "extra": f"Best Match: {best[0]} ({best[1]}%)"
+                        })
+                if drop_idx:
+                    master = master.drop(index=drop_idx)
 
-        # Reihenfolge auch im gespeicherten Resultat: Batch, Channel, Import, dann Rest
-        first_cols = [FIELD_NAME_BATCH, FIELD_NAME_CHANNEL, FIELD_NAME_IMPORT]
-        rest_cols  = [c for c in df.columns if c not in first_cols]
-        df = df[first_cols + rest_cols]
+        # Regel 4 – Personen-Abgleich (Filter 1216, 1708) ID-Gleichheit
+        suspect_person_filters = [1216, 1708]
+        if col_person_id:
+            suspect_ids = set()
+            for fid in suspect_person_filters:
+                persons = await fetch_persons_by_filter(fid)
+                for p in persons:
+                    pid = p.get("id")
+                    if pid is not None:
+                        suspect_ids.add(str(pid))
+            if suspect_ids:
+                mask_pid = master[col_person_id].astype(str).isin(suspect_ids)
+                removed = master[mask_pid].copy()
+                for _, r in removed.iterrows():
+                    delete_log.append({
+                        "reason": "person_id_match",
+                        "id": r.get(col_person_id),
+                        "name": r.get("name"),
+                        "org_name": r.get(col_org_name),
+                        "extra": "ID in Filter 1216/1708"
+                    })
+                master = master[~mask_pid].copy()
 
-        # In Neon speichern (Endergebnis)
-        await save_df_text(df, "nk_master_final")
+        # Speichern
+        await save_df_text(master, "nk_master_ready")
+        log_df = pd.DataFrame(delete_log, columns=["reason","id","name","org_name","extra"])
+        await save_df_text(log_df, "nk_delete_log")
 
-        fach_label = fachbereich_label or _resolve_option_label(str(fachbereich_value), fach.get("options") or [])[1]
+        stats = {
+            "after": len(master),
+            "del_orgtype": log_df[log_df["reason"]=="organisationsart_set"].shape[0],
+            "del_limit": log_df[log_df["reason"]=="limit_per_org"].shape[0],
+            "del_orgmatch": log_df[log_df["reason"]=="org_match_95"].shape[0],
+            "del_pid": log_df[log_df["reason"]=="person_id_match"].shape[0],
+            "deleted_total": log_df.shape[0],
+        }
+        table_html = log_df.head(50).to_html(classes="grid", index=False, border=0) if not log_df.empty else "<i>keine</i>"
 
         html = f"""
 <!doctype html><html lang="de"><head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>Abgleich abgeschlossen</title>
+<title>Abgleich – Ergebnis</title>
 <style>
-  body{{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Inter,Arial,sans-serif;background:#f5f7fa;margin:0;color:#1f2937}}
+  body{{font-family: Inter, -apple-system, Segoe UI, Roboto, Arial, sans-serif;background:#f5f7fa;color:#1f2937;margin:0}}
   .wrap{{max-width:1180px;margin:28px auto;padding:0 16px}}
   .card{{background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:22px;margin-top:16px;box-shadow:0 1px 3px rgba(0,0,0,.05)}}
-  .btn{{background:#0ea5e9;border:none;color:#fff;border-radius:8px;padding:10px 16px;cursor:pointer}}
+  .grid{{width:100%;border-collapse:collapse}}
+  .grid th,.grid td{{border:1px solid #e5e7eb;padding:8px 10px;text-align:left}}
+  .grid th{{background:#f3f4f6}}
+  .pill{{background:#e6f2ff;color:#0a66c2;padding:8px 12px;border-radius:999px;font-weight:600}}
+  .row{{display:flex;gap:10px;flex-wrap:wrap;align-items:center}}
+  .btn{{background:#0ea5e9;border:none;color:#fff;border-radius:8px;padding:10px 16px;cursor:pointer;text-decoration:none}}
   .btn:hover{{background:#0284c7}}
-</style></head><body>
+  .muted{{color:#6b7280}}
+</style></head>
+<body>
 <div class="wrap">
   <div class="card">
-    <h3>✅ Abgleich abgeschlossen</h3>
-    <p>Fachbereich: <b>{fach_label}</b><br>
-       Batch: <b>{batch_id}</b><br>
-       Gespeicherte Zeilen (nach Cleanup): <b>{len(df)}</b>
+    <div class="row">
+      <span class="pill">Abgleich abgeschlossen</span>
+      <span>Ergebnis: <b>{stats["after"]}</b> Zeilen in <b>nk_master_ready</b></span>
+    </div>
+    <p class="muted">
+      Entfernt (Organisationsart gesetzt): <b>{stats["del_orgtype"]}</b><br/>
+      Entfernt (mehr als 2 pro Organisation): <b>{stats["del_limit"]}</b><br/>
+      Entfernt (Orga-Match ≥95% – Filter 1245/851/1521): <b>{stats["del_orgmatch"]}</b><br/>
+      Entfernt (Person-ID in Filtern 1216/1708): <b>{stats["del_pid"]}</b><br/>
+      <b>Summe entfernt:</b> {stats["deleted_total"]}
     </p>
-    <a class="btn" href="/neukontakte">Zurück</a>
+    <div class="row">
+      <a class="btn" href="/neukontakte">Zurück</a>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>Entfernte Datensätze (Top 50)</h3>
+    {table_html}
+    <p class="muted">Vollständiges Log in Neon: <b>nk_delete_log</b></p>
   </div>
 </div>
 </body></html>
 """
         return HTMLResponse(html)
     except Exception as e:
-        return HTMLResponse(f"<pre style='padding:24px;color:#b00'>❌ Fehler beim Speichern: {e}</pre>", status_code=500)
+        return HTMLResponse(f"<pre style='padding:24px;color:#b00'>❌ Fehler beim Abgleich: {e}</pre>", status_code=500)
+
+# -----------------------------------------------------------------------------
+# Uvicorn local
+# -----------------------------------------------------------------------------
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", "8000"))
+    uvicorn.run("master:app", host="0.0.0.0", port=port, reload=False)
