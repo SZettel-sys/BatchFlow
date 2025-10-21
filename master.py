@@ -1,8 +1,7 @@
 import os
 import re
 import time
-import asyncio
-from typing import Optional, List, Dict, Any
+from typing import Optional
 
 import httpx
 import asyncpg
@@ -10,43 +9,49 @@ import pandas as pd
 import numpy as np
 from fastapi import FastAPI, Request, Form
 from fastapi.responses import HTMLResponse
-from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.gzip import GZipMiddleware
 
-# ========= Konfiguration =========
+# =========================
+#   Konfiguration
+# =========================
 PD_API_TOKEN = os.getenv("PD_API_TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL")  # postgresql://... ?sslmode=require
-
+DATABASE_URL = os.getenv("DATABASE_URL")  # postgresql://.../neondb?sslmode=require
 if not PD_API_TOKEN:
-    raise ValueError("PD_API_TOKEN fehlt.")
+    raise ValueError("PD_API_TOKEN fehlt")
 if not DATABASE_URL:
-    raise ValueError("DATABASE_URL fehlt.")
+    raise ValueError("DATABASE_URL fehlt")
 
 PIPEDRIVE_API = "https://api.pipedrive.com/v1"
-FILTER_NEUKONTAKTE = 2998  # erster Abschnitt
+FILTER_NEUKONTAKTE = 2998  # Personen-Filter für Neukontakte
 
+# Feldnamen (sichtbare Namen in Pipedrive)
 FIELD_NAME_FACHBEREICH = "Fachbereich_Kampagne"
-FIELD_NAME_BATCH       = "Batch ID"
-FIELD_NAME_CHANNEL     = "Channel"
-FIELD_NAME_ORGART      = "Organisationsart"
+FIELD_NAME_BATCH       = "Batch ID"      # nur im Ergebnis-DF, NICHT in Pipedrive
+FIELD_NAME_CHANNEL     = "Channel"       # nur im Ergebnis-DF, NICHT in Pipedrive
+FIELD_NAME_ORGART      = "Organisationsart"  # für Cleanup (Spaltenname im DF)
 CHANNEL_VALUE          = "Cold-Mail"
 
-# ========= App / Middleware / Static =========
+# Caching / Performance
+HTTP_TIMEOUT      = 60.0
+PERSON_FIELDS_TTL = 900     # 15 min
+FILTER_TTL        = 120     # 2 min
+
+# =========================
+#   App & Middleware
+# =========================
 app = FastAPI()
 app.add_middleware(GZipMiddleware, minimum_size=500)
-app.mount("/static", StaticFiles(directory="static"), name="static")
 
-# ========= HTTP-Client (Keep-Alive) & kleiner Cache =========
-HTTP_TIMEOUT = 60.0
+# globaler HTTP-Client (Keep-Alive)
 http_client = httpx.AsyncClient(timeout=HTTP_TIMEOUT)
 
-_person_fields_cache: Dict[str, Any] = {"data": None, "ts": 0.0}
-PERSON_FIELDS_TTL = 900  # 15 Minuten
+# In-Memory Caches
+_person_fields_cache = {"data": None, "ts": 0.0}
+_filter_cache = {}  # {filter_id: {"data":[...], "ts": float}}
 
-_filter_cache: Dict[int, Dict[str, Any]] = {}
-FILTER_TTL = 120  # 2 Minuten
-
-# ========= Hilfsfunktionen =========
+# =========================
+#   Helpers
+# =========================
 def _norm(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
 
@@ -59,8 +64,34 @@ def to_int(v, default=0) -> int:
     except:
         return default
 
+async def get_conn():
+    return await asyncpg.connect(DATABASE_URL)
+
+async def save_df_text(df: pd.DataFrame, table: str):
+    """Speichert DataFrame mit TEXT-Spalten in Neon (einfach & robust)."""
+    conn = await get_conn()
+    try:
+        await conn.execute(f'DROP TABLE IF EXISTS "{table}"')
+        if df.empty:
+            await conn.execute(f'CREATE TABLE "{table}" ("_empty" TEXT)')
+            return
+        cols = ", ".join([f'"{c}" TEXT' for c in df.columns])
+        await conn.execute(f'CREATE TABLE "{table}" ({cols})')
+
+        col_list = list(df.columns)
+        placeholders = ", ".join(f"${i+1}" for i in range(len(col_list)))
+        stmt = f'INSERT INTO "{table}" ({", ".join([f"""\"{c}\"""" for c in col_list])}) VALUES ({placeholders})'
+        records = [
+            tuple("" if pd.isna(row[c]) else str(row[c]) for c in col_list)
+            for _, row in df.iterrows()
+        ]
+        if records:
+            await conn.executemany(stmt, records)
+    finally:
+        await conn.close()
+
 def extract_email(value):
-    """Robust: akzeptiert list/tuple/dict/np.array/NaN/str."""
+    """Robuster Email-Extractor für Pipedrive-Feld 'email' (Liste/Dict/NaN)."""
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return None
     if isinstance(value, np.ndarray):
@@ -76,39 +107,31 @@ def extract_email(value):
         return str(first) if first is not None else None
     return str(value) if value is not None else None
 
-async def get_conn():
-    return await asyncpg.connect(DATABASE_URL)
+def apply_basic_cleanup(df: pd.DataFrame) -> pd.DataFrame:
+    """Bereinigung laut Vorgabe:
+       - Wenn in Spalte 'Organisationsart' ein Wert steht → Zeile entfernen
+       - Pro Organisation maximal 2 Kontakte
+    """
+    # 1) Organisationsart
+    if FIELD_NAME_ORGART in df.columns:
+        df = df[df[FIELD_NAME_ORGART].isna() | (df[FIELD_NAME_ORGART] == "")]
 
-async def save_df_text(df: pd.DataFrame, table: str):
-    """Einfacher TEXT-Export nach Neon (robust & schnell genug)."""
-    conn = await get_conn()
-    try:
-        await conn.execute(f'DROP TABLE IF EXISTS "{table}"')
-        if df.empty:
-            await conn.execute(f'CREATE TABLE "{table}" ("_empty" TEXT)')
-            return
+    # 2) max. 2 Kontakte je Organisation
+    org_col = "org_id" if "org_id" in df.columns else ("Organisation" if "Organisation" in df.columns else None)
+    if org_col and org_col in df.columns:
+        df["_rank"] = df.groupby(org_col).cumcount() + 1
+        df = df[df["_rank"] <= 2].drop(columns=["_rank"], errors="ignore")
 
-        cols = ", ".join([f'"{c}" TEXT' for c in df.columns])
-        await conn.execute(f'CREATE TABLE "{table}" ({cols})')
+    return df
 
-        cols_list = list(df.columns)
-        placeholders = ", ".join(f"${i+1}" for i in range(len(cols_list)))
-        stmt = f'INSERT INTO "{table}" ({", ".join([f"""\"{c}\"""" for c in cols_list])}) VALUES ({placeholders})'
-        records = [
-            tuple("" if pd.isna(row[c]) else str(row[c]) for c in cols_list)
-            for _, row in df.iterrows()
-        ]
-        if records:
-            await conn.executemany(stmt, records)
-    finally:
-        await conn.close()
-
-# ========= Pipedrive: Felder & Personen =========
-async def get_person_fields() -> Dict[str, Dict[str, Any]]:
+# =========================
+#   Pipedrive Zugriff
+# =========================
+async def get_person_fields():
+    """Feld-Definitionen der Personen (mit Cache)."""
     now = time.time()
-    c = _person_fields_cache
-    if c["data"] and now - c["ts"] < PERSON_FIELDS_TTL:
-        return c["data"]
+    if _person_fields_cache["data"] and now - _person_fields_cache["ts"] < PERSON_FIELDS_TTL:
+        return _person_fields_cache["data"]
 
     url = f"{PIPEDRIVE_API}/personFields?api_token={PD_API_TOKEN}"
     r = await http_client.get(url)
@@ -117,8 +140,7 @@ async def get_person_fields() -> Dict[str, Dict[str, Any]]:
 
     mapping = {}
     for f in data:
-        name = f.get("name")
-        key = f.get("key")
+        name, key = f.get("name"), f.get("key")
         options = f.get("options") or []
         mapping[name] = {"key": key, "options": options, "name": name}
         mapping[_norm(name)] = {"key": key, "options": options, "name": name}
@@ -126,7 +148,8 @@ async def get_person_fields() -> Dict[str, Dict[str, Any]]:
     _person_fields_cache.update(data=mapping, ts=now)
     return mapping
 
-async def fetch_persons_by_filter(filter_id: int) -> List[Dict[str, Any]]:
+async def fetch_persons_by_filter(filter_id: int):
+    """Alle Personen eines Filters (mit Cache & Pagination)."""
     now = time.time()
     c = _filter_cache.get(filter_id)
     if c and now - c["ts"] < FILTER_TTL:
@@ -149,139 +172,113 @@ async def fetch_persons_by_filter(filter_id: int) -> List[Dict[str, Any]]:
     _filter_cache[filter_id] = {"data": persons, "ts": now}
     return persons
 
-async def update_person(person_id: int, payload: dict) -> int:
-    url = f"{PIPEDRIVE_API}/persons/{person_id}?api_token={PD_API_TOKEN}"
-    r = await http_client.put(url, json=payload)
-    return r.status_code
-
-# ========= Cleanups =========
-def apply_basic_cleanup(df: pd.DataFrame, key_orgart: str) -> pd.DataFrame:
-    # 1) Organisationsart != leer -> Drop
-    if key_orgart in df.columns:
-        df = df[df[key_orgart].isna() | (df[key_orgart] == "")]
-    # 2) Max. 2 Kontakte je Organisation
-    org_col = "org_id" if "org_id" in df.columns else ("org_name" if "org_name" in df.columns else None)
-    if org_col and org_col in df.columns:
-        df["_rank"] = df.groupby(org_col).cumcount() + 1
-        df = df[df["_rank"] <= 2].drop(columns=["_rank"], errors="ignore")
-    return df
-
-# ========= Redirects =========
+# =========================
+#   Navigation / Landing
+# =========================
 @app.get("/", response_class=HTMLResponse)
-async def root():
+async def root_redirect():
     return HTMLResponse('<meta http-equiv="refresh" content="0;url=/neukontakte">')
 
 @app.get("/overview", response_class=HTMLResponse)
-async def overview_redirect():
+async def old_redirect():
     return HTMLResponse('<meta http-equiv="refresh" content="0;url=/neukontakte">')
 
-# ========= UI-HTML-Snippets =========
-def base_css() -> str:
-    return """
-    <style>
-      :root{--blue:#0ba6ff;--bg:#f5f7fa;--card:#fff;--text:#222;--muted:#62738a;--border:#e5e9f0;}
-      *{box-sizing:border-box}
-      body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Inter,Arial;}
-      header{display:flex;align-items:center;gap:10px;justify-content:space-between;padding:18px 24px;border-bottom:1px solid var(--border);background:#fff}
-      header .left{display:flex;align-items:center;gap:12px}
-      .badge{background:#e8f6ff;color:#0a7dc0;border:1px solid #cbe9ff;padding:6px 12px;border-radius:10px;font-weight:600}
-      .container{max-width:1100px;margin:18px auto;padding:0 18px}
-      .card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:18px}
-      label{display:block;margin:8px 0 6px;font-weight:600}
-      select,input{width:100%;padding:10px 12px;border:1px solid var(--border);border-radius:8px;outline:none;background:#fff}
-      .row{display:grid;grid-template-columns:1fr 1fr;gap:14px}
-      .muted{color:var(--muted);font-size:12px;margin-top:6px}
-      .actions{display:flex;justify-content:flex-end;margin-top:16px}
-      .btn{display:inline-flex;align-items:center;gap:8px;background:var(--blue);color:#fff;border:none;padding:10px 16px;border-radius:8px;text-decoration:none;cursor:pointer}
-      .btn:hover{filter:brightness(.95)}
-      table{border-collapse:collapse;width:100%}
-      th,td{border:1px solid var(--border);padding:8px 10px;text-align:left}
-      th{background:#f4f7fb}
-      .grid{border:1px solid var(--border);border-radius:10px;overflow:hidden}
-      .error{background:#fff3f3;border:1px solid #ffdede;color:#c00;border-radius:10px;padding:12px}
-      .head-kpis{color:#64748b;font-size:14px}
-      .head-kpis b{color:#0f172a}
-      .pill{background:#eef6ff;border:1px solid #d7ecff;color:#0a6ba8;padding:6px 10px;border-radius:999px;font-weight:600}
-    </style>
-    """
-
-def header_html(total: Optional[int]) -> str:
-    total_html = f'<div class="head-kpis">Gesamt im Filter: <b>{total:,}</b></div>' if total else ""
-    return f"""
-    <header>
-      <div class="left">
-        <a class="pill" href="/neukontakte">Neukontakte (Filter {FILTER_NEUKONTAKTE})</a>
-      </div>
-      {total_html}
-    </header>
-    """
-
-# ========= /neukontakte (Form) =========
+# =========================
+#   UI: Formular „Neukontakte“
+# =========================
 @app.get("/neukontakte", response_class=HTMLResponse)
 async def neukontakte_form(request: Request):
     fields = await get_person_fields()
+
     fach = fields.get(_norm(FIELD_NAME_FACHBEREICH)) or fields.get(FIELD_NAME_FACHBEREICH)
     if not fach:
-        return HTMLResponse(base_css() + header_html(None) + "<div class='container'><div class='error'>❌ Feld „Fachbereich_Kampagne“ nicht gefunden.</div></div>", status_code=500)
+        return HTMLResponse("<div style='padding:24px;color:#b00'>❌ Feld „Fachbereich_Kampagne“ nicht gefunden.</div>", status_code=500)
 
-    # Optionen nur aus personFields (ohne Full-Fetch); Total ermitteln wir via fetch (gecached)
-    options = fach.get("options") or []
-    # Für die Totalzahl müssen wir einmal alle Personen holen (Cache 120s)
+    # Optionen + Zähler (Zahl in Klammern)
     persons = await fetch_persons_by_filter(FILTER_NEUKONTAKTE)
     total_count = len(persons)
 
-    # Counts pro Option (einmalig, aber schnell, da ohnehin persons im Cache sind)
-    counts = {}
     key_fach = fach["key"]
+    counts = {}
     for p in persons:
-        val = p.get(key_fach)
-        s = str(val).strip() if val is not None else ""
+        v = p.get(key_fach)
+        s = str(v).strip() if v is not None else ""
         if s:
             counts[s] = counts.get(s, 0) + 1
 
-    opts_html = ""
-    for o in options:
-        label = o.get("label") or ""
-        oid = o.get("id")
-        # Zahl in Klammern anzeigen
-        count = counts.get(str(oid), counts.get(label, 0)) or 0
-        opts_html += f'<option value="{oid}">{label} ({count})</option>'
+    options = fach.get("options") or []
+    display = []
+    if options:
+        for o in options:
+            lab, oid = o.get("label", ""), str(o.get("id"))
+            c = counts.get(oid, counts.get(lab, 0))
+            display.append((oid, f"{lab} ({c or 0})"))
+    else:
+        for val, c in sorted(counts.items(), key=lambda x: x[0].lower()):
+            display.append((val, f"{val} ({c})"))
+
+    options_html = "\n".join([f"<option value='{oid}'>{label}</option>" for oid, label in display])
 
     html = f"""
-    {base_css()}
-    {header_html(total_count)}
-    <div class="container">
-      <div class="card">
-        <form method="post" action="/neukontakte/preview">
-          <label>Fachbereich</label>
-          <select name="fachbereich_value" required>
-            {opts_html}
-          </select>
-          <div class="muted">Die Zahl in Klammern zeigt die vorhandenen Datensätze im Filter.</div>
+<!doctype html>
+<html lang="de"><head>
+<meta charset="utf-8"/>
+<title>Neukontakte (Filter {FILTER_NEUKONTAKTE})</title>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<style>
+  body{{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Inter,Arial,sans-serif;background:#f5f7fa;margin:0;color:#1f2937}}
+  .wrap{{max-width:1180px;margin:28px auto;padding:0 16px}}
+  .bar{{display:flex;align-items:center;gap:12px}}
+  .pill{{background:#e6f2ff;color:#0a66c2;padding:8px 12px;border-radius:999px;font-weight:600}}
+  .card{{background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:22px;margin-top:16px;box-shadow:0 1px 3px rgba(0,0,0,.05)}}
+  label{{display:block;font-weight:600;margin:8px 0 6px}}
+  select,input{{width:100%;padding:10px 12px;border:1px solid #d1d5db;border-radius:8px;outline:none}}
+  select:focus,input:focus{{border-color:#0ea5e9;box-shadow:0 0 0 3px rgba(14,165,233,.25)}}
+  .row{{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px}}
+  .hint{{font-size:12px;color:#6b7280;margin-top:6px}}
+  .btn{{background:#0ea5e9;border:none;color:#fff;border-radius:8px;padding:10px 16px;cursor:pointer}}
+  .btn:hover{{background:#0284c7}}
+  .right{{text-align:right;margin-top:16px}}
+  .muted{{color:#6b7280}}
+</style>
+</head><body>
+<div class="wrap">
+  <div class="bar">
+    <a class="pill" href="/neukontakte">🌟 Neukontakte (Filter {FILTER_NEUKONTAKTE})</a>
+    <div class="muted">Gesamt im Filter: <b>{total_count}</b></div>
+  </div>
 
-          <div class="row" style="margin-top:14px">
-            <div>
-              <label>Wie viele Datensätze nehmen?</label>
-              <input type="text" name="take_count" placeholder="z. B. 900">
-              <div class="muted">Leer lassen = alle Datensätze des gewählten Fachbereichs.</div>
-            </div>
-            <div>
-              <label>Batch ID</label>
-              <input type="text" name="batch_id" placeholder="Bxxx" required>
-              <div class="muted">Beispiel: B477</div>
-            </div>
-          </div>
+  <form class="card" method="post" action="/neukontakte/preview">
+    <label for="fach">Fachbereich</label>
+    <select id="fach" name="fachbereich_value" required>
+      {options_html}
+    </select>
+    <div class="hint">Die Zahl in Klammern zeigt die vorhandenen Datensätze im Filter.</div>
 
-          <div class="actions">
-            <button class="btn" type="submit">Vorschau laden</button>
-          </div>
-        </form>
+    <div class="row">
+      <div>
+        <label for="take">Wie viele Datensätze nehmen?</label>
+        <input id="take" name="take_count" inputmode="numeric" placeholder="z. B. 900"/>
+        <div class="hint">Leer lassen = alle Datensätze des gewählten Fachbereichs.</div>
+      </div>
+      <div>
+        <label for="batch">Batch ID</label>
+        <input id="batch" name="batch_id" placeholder="Bxxx" required/>
+        <div class="hint">Beispiel: B477</div>
+      </div>
+      <div class="right" style="align-self:end">
+        <button class="btn" type="submit">Vorschau laden</button>
       </div>
     </div>
-    """
+  </form>
+</div>
+</body></html>
+"""
     return HTMLResponse(html)
 
-# ========= /neukontakte/preview =========
+# =========================
+#   Vorschau (keine Writes)
+# =========================
 @app.post("/neukontakte/preview", response_class=HTMLResponse)
 async def neukontakte_preview(
     request: Request,
@@ -295,63 +292,83 @@ async def neukontakte_preview(
         fields = await get_person_fields()
         fach = fields.get(_norm(FIELD_NAME_FACHBEREICH)) or fields.get(FIELD_NAME_FACHBEREICH)
         if not fach:
-            return HTMLResponse(base_css() + header_html(None) + "<div class='container'><div class='error'>❌ Feld „Fachbereich_Kampagne“ nicht gefunden.</div></div>", status_code=500)
+            return HTMLResponse("<div style='padding:24px;color:#b00'>❌ Feld „Fachbereich_Kampagne“ nicht gefunden.</div>", status_code=500)
 
-        key_fach   = fach["key"]
-        key_chan   = (fields.get(_norm(FIELD_NAME_CHANNEL)) or fields.get(FIELD_NAME_CHANNEL) or {}).get("key")
+        key_fach = fach["key"]
 
         persons = await fetch_persons_by_filter(FILTER_NEUKONTAKTE)
-        filtered = [p for p in persons if key_fach in p and (str(p[key_fach]) == str(fachbereich_value))]
-        if take_n and take_n > 0:
-            filtered = filtered[:take_n]
+        sel = [p for p in persons if key_fach in p and (str(p[key_fach]) == str(fachbereich_value))]
+        if take_n > 0:
+            sel = sel[:take_n]
 
-        df = pd.DataFrame(filtered)
-        total = len(filtered)
-        if df.empty:
-            html = f"""{base_css()}{header_html(None)}<div class="container"><div class='card'><h3>Keine Datensätze für diese Auswahl.</h3><a class='btn' href="/neukontakte" style="margin-top:10px">Zurück</a></div></div>"""
-            return HTMLResponse(html)
+        if not sel:
+            return HTMLResponse("<div style='padding:24px'>Keine Datensätze für diese Auswahl.</div>")
 
+        df = pd.DataFrame(sel)
+
+        # Lesbare Spalten für Vorschau
         if "email" in df.columns:
             df["E-Mail"] = df["email"].apply(extract_email)
         if "org_name" in df.columns:
             df.rename(columns={"org_name": "Organisation"}, inplace=True)
-        df["Batch ID (Vorschau)"] = batch_id
-        if key_chan:
-            df["Channel (Vorschau)"] = CHANNEL_VALUE
+        if "org_id" in df.columns and FIELD_NAME_ORGART not in df.columns:
+            # Optional: Organisationsart existiert häufig als eigener Custom-Key -> hier bleibt leer
+            df[FIELD_NAME_ORGART] = ""
 
-        # kleine Vorschau
-        cols = [c for c in ["id", "name", "E-Mail", "Organisation", "Batch ID (Vorschau)"] if c in df.columns]
-        preview_df = df[cols] if cols else df.head(50)
+        # Für Excel später: Batch + Channel im DF (aber NICHT in Pipedrive schreiben)
+        df["Batch ID (Vorschau)"] = batch_id
+        df["Channel (Vorschau)"]  = CHANNEL_VALUE
+
+        cols = [c for c in ["id", "name", "E-Mail", "Organisation", "Batch ID (Vorschau)", "Channel (Vorschau)"] if c in df.columns]
+        preview_df = df[cols] if cols else df
         table_html = preview_df.head(50).to_html(classes="grid", index=False, border=0)
 
         html = f"""
-        {base_css()}
-        {header_html(None)}
-        <div class="container">
-          <div class="card">
-            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
-              <div><b>Vorschau</b></div>
-              <div class="muted">Auswahl: <b>{total}</b> Datensätze — Batch ID: <b>{batch_id}</b></div>
-            </div>
-            {table_html}
-            <form method="post" action="/neukontakte/run" style="margin-top:12px">
-              <input type="hidden" name="fachbereich_value" value="{fachbereich_value}">
-              <input type="hidden" name="batch_id" value="{batch_id}">
-              <input type="hidden" name="take_count" value="{take_n}">
-              <div class="actions">
-                <a class="btn" href="/neukontakte" style="background:#6b7280">Zurück</a>
-                <button class="btn" type="submit">Abgleich starten</button>
-              </div>
-            </form>
-          </div>
-        </div>
-        """
+<!doctype html><html lang="de"><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Vorschau – Neukontakte</title>
+<style>
+  body{{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Inter,Arial,sans-serif;background:#f5f7fa;margin:0;color:#1f2937}}
+  .wrap{{max-width:1180px;margin:28px auto;padding:0 16px}}
+  .card{{background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:22px;margin-top:16px;box-shadow:0 1px 3px rgba(0,0,0,.05)}}
+  .grid{{width:100%;border-collapse:collapse}}
+  .grid th,.grid td{{border:1px solid #e5e7eb;padding:8px 10px;text-align:left}}
+  .grid th{{background:#f3f4f6}}
+  .btn{{background:#0ea5e9;border:none;color:#fff;border-radius:8px;padding:10px 16px;cursor:pointer}}
+  .btn:hover{{background:#0284c7}}
+  .row{{display:flex;gap:10px;justify-content:space-between;align-items:center}}
+  .muted{{color:#6b7280}}
+</style></head><body>
+<div class="wrap">
+  <div class="card row">
+    <div>
+      <b>Vorschau</b><br/>
+      Fachbereich: <b>{fachbereich_value}</b> &nbsp;|&nbsp;
+      Batch: <b>{batch_id}</b> &nbsp;|&nbsp;
+      Datensätze: <b>{len(df)}</b>
+    </div>
+    <form method="post" action="/neukontakte/run">
+      <input type="hidden" name="fachbereich_value" value="{fachbereich_value}"/>
+      <input type="hidden" name="batch_id" value="{batch_id}"/>
+      <input type="hidden" name="take_count" value="{take_n}"/>
+      <button class="btn" type="submit">Abgleich starten</button>
+      <a class="btn" href="/neukontakte" style="background:#6b7280;margin-left:8px">Zurück</a>
+    </form>
+  </div>
+  <div class="card">
+    <div class="muted" style="margin-bottom:8px">Die ersten 50 Datensätze:</div>
+    {table_html}
+  </div>
+</div>
+</body></html>
+"""
         return HTMLResponse(html)
-
     except Exception as e:
-        return HTMLResponse(f"{base_css()}{header_html(None)}<div class='container'><div class='error'><h3>❌ Fehler beim Abruf:</h3><pre>{e}</pre></div></div>", status_code=500)
+        return HTMLResponse(f"<pre style='padding:24px;color:#b00'>❌ Fehler: {e}</pre>", status_code=500)
 
-# ========= /neukontakte/run =========
+# =========================
+#   „Abgleich“ = nur speichern (keine Writes nach Pipedrive)
+# =========================
 @app.post("/neukontakte/run", response_class=HTMLResponse)
 async def neukontakte_run(
     request: Request,
@@ -365,70 +382,60 @@ async def neukontakte_run(
         fields = await get_person_fields()
         fach = fields.get(_norm(FIELD_NAME_FACHBEREICH)) or fields.get(FIELD_NAME_FACHBEREICH)
         if not fach:
-            return HTMLResponse(base_css() + header_html(None) + "<div class='container'><div class='error'>❌ Feld „Fachbereich_Kampagne“ nicht gefunden.</div></div>", status_code=500)
+            return HTMLResponse("<div style='padding:24px;color:#b00'>❌ Feld „Fachbereich_Kampagne“ nicht gefunden.</div>", status_code=500)
 
-        key_fach   = fach["key"]
-        key_batch  = (fields.get(_norm(FIELD_NAME_BATCH))   or fields.get(FIELD_NAME_BATCH)   or {}).get("key")
-        key_chan   = (fields.get(_norm(FIELD_NAME_CHANNEL)) or fields.get(FIELD_NAME_CHANNEL) or {}).get("key")
-        key_orgart = (fields.get(_norm(FIELD_NAME_ORGART))  or fields.get(FIELD_NAME_ORGART)  or {}).get("key")
+        key_fach = fach["key"]
 
         persons = await fetch_persons_by_filter(FILTER_NEUKONTAKTE)
-        data = [p for p in persons if key_fach in p and (str(p[key_fach]) == str(fachbereich_value))]
-        if take_n and take_n > 0:
-            data = data[:take_n]
-        if not data:
-            return HTMLResponse(f"{base_css()}{header_html(None)}<div class='container'><div class='card'><h3>Keine Datensätze für diese Auswahl.</h3><a class='btn' href='/neukontakte' style='margin-top:10px'>Zurück</a></div></div>")
+        sel = [p for p in persons if key_fach in p and (str(p[key_fach]) == str(fachbereich_value))]
+        if take_n > 0:
+            sel = sel[:take_n]
+        if not sel:
+            return HTMLResponse("<div style='padding:24px'>Keine Datensätze für diese Auswahl.</div>")
 
-        # Pipedrive-Updates (concurrency begrenzen)
-        payload = {}
-        if key_batch: payload[key_batch] = batch_id
-        if key_chan:  payload[key_chan]  = CHANNEL_VALUE
-
-        sem = asyncio.Semaphore(6)
-        async def _upd(p):
-            async with sem:
-                return await update_person(p["id"], payload)
-
-        results = await asyncio.gather(*[_upd(p) for p in data])
-        updated = sum(1 for s in results if s == 200)
-
-        # Endergebnis aufbereiten + Cleanups + in Neon speichern
-        df = pd.DataFrame(data)
+        # DataFrame bauen
+        df = pd.DataFrame(sel)
         if "email" in df.columns:
             df["E-Mail"] = df["email"].apply(extract_email)
         if "org_name" in df.columns:
             df.rename(columns={"org_name": "Organisation"}, inplace=True)
-        if key_orgart and key_orgart in df.columns:
-            df.rename(columns={key_orgart: "Organisationsart"}, inplace=True)
+        # Falls die Spalte Organisationsart in Rohdaten unter Custom-Key steckt, bleibt sie leer:
+        if FIELD_NAME_ORGART not in df.columns:
+            df[FIELD_NAME_ORGART] = ""
 
-        df = apply_basic_cleanup(df, "Organisationsart")
+        # Cleanup-Regeln
+        df = apply_basic_cleanup(df)
+
+        # Für späteren Excel-Export im Ergebnis
+        df["Batch ID"] = batch_id
+        df["Channel"]  = CHANNEL_VALUE
+
+        # In Neon speichern (Endergebnis)
         await save_df_text(df, "nk_master_final")
 
         html = f"""
-        {base_css()}
-        {header_html(None)}
-        <div class="container">
-          <div class="card">
-            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
-              <b>✅ Abgleich abgeschlossen</b>
-              <div class="muted">Batch ID: <b>{batch_id}</b></div>
-            </div>
-            <div class="muted" style="margin-bottom:12px">
-              Ausgewählt: <b>{len(data)}</b> &nbsp;|&nbsp; Aktualisiert: <b>{updated}</b> &nbsp;|&nbsp; Nach Cleanup (Neon): <b>{len(df)}</b>
-            </div>
-            <a class="btn" href="/neukontakte">Zurück</a>
-          </div>
-        </div>
-        """
+<!doctype html><html lang="de"><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Abgleich abgeschlossen</title>
+<style>
+  body{{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Inter,Arial,sans-serif;background:#f5f7fa;margin:0;color:#1f2937}}
+  .wrap{{max-width:1180px;margin:28px auto;padding:0 16px}}
+  .card{{background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:22px;margin-top:16px;box-shadow:0 1px 3px rgba(0,0,0,.05)}}
+  .btn{{background:#0ea5e9;border:none;color:#fff;border-radius:8px;padding:10px 16px;cursor:pointer}}
+  .btn:hover{{background:#0284c7}}
+</style></head><body>
+<div class="wrap">
+  <div class="card">
+    <h3>✅ Abgleich abgeschlossen</h3>
+    <p>Fachbereich: <b>{fachbereich_value}</b><br>
+       Batch: <b>{batch_id}</b><br>
+       Gespeicherte Zeilen (nach Cleanup): <b>{len(df)}</b>
+    </p>
+    <a class="btn" href="/neukontakte">Zurück</a>
+  </div>
+</div>
+</body></html>
+"""
         return HTMLResponse(html)
-
     except Exception as e:
-        return HTMLResponse(f"{base_css()}{header_html(None)}<div class='container'><div class='error'><h3>❌ Fehler beim Abgleich:</h3><pre>{e}</pre></div></div>", status_code=500)
-
-# ========= Shutdown: HTTP-Client sauber schließen =========
-@app.on_event("shutdown")
-async def _shutdown_event():
-    try:
-        await http_client.aclose()
-    except:
-        pass
+        return HTMLResponse(f"<pre style='padding:24px;color:#b00'>❌ Fehler beim Speichern: {e}</pre>", status_code=500)
