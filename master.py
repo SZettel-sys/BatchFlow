@@ -79,15 +79,26 @@ async def save_df_text(df: pd.DataFrame, table: str):
         await ensure_table_text(conn, table, list(df.columns))
         if df.empty:
             return
+
         cols = list(df.columns)
-        placeholders = ", ".join([f'${i+1}' for i in range(len(cols))])
-        insert = f'INSERT INTO "{table}" ({", ".join([f""""{c}"""" for c in cols])}) VALUES ({placeholders})'
+        # Spaltenliste einmal sauber bauen (keine verschachtelten f-Strings!)
+        cols_sql = ", ".join(f'"{c}"' for c in cols)            # -> "col1", "col2", ...
+        placeholders = ", ".join(f'${i}' for i in range(1, len(cols) + 1))  # -> $1, $2, ...
+
+        insert_sql = f'INSERT INTO "{table}" ({cols_sql}) VALUES ({placeholders})'
+
+        # Werte vorbereiten (Strings, leere Strings statt NaN)
+        records = []
+        for _, row in df.iterrows():
+            vals = ["" if pd.isna(v) else str(v) for v in row.tolist()]
+            records.append(vals)
+
         async with conn.transaction():
-            for _, row in df.iterrows():
-                vals = ["" if pd.isna(v) else str(v) for v in row.tolist()]
-                await conn.execute(insert, *vals)
+            # schneller als einzelne execute()-Aufrufe
+            await conn.executemany(insert_sql, records)
     finally:
         await conn.close()
+
 
 async def load_df_text(table: str) -> pd.DataFrame:
     conn = await get_conn()
