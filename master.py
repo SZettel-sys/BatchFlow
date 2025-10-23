@@ -2,7 +2,7 @@
 import os
 import re
 import time
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -10,14 +10,16 @@ import httpx
 import asyncpg
 
 from fastapi import FastAPI, Request, Body
-from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.gzip import GZipMiddleware
 from rapidfuzz import fuzz, process
 
 # -----------------------------------------------------------------------------
 # Konfiguration
 # -----------------------------------------------------------------------------
 app = FastAPI()
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 BASE_URL = os.getenv("BASE_URL", "").rstrip("/")
@@ -50,6 +52,9 @@ FIELD_ORGART_HINT = "organisationsart"
 DEFAULT_CHANNEL = "Cold-Mail"
 COLD_MAILING_IMPORT_LABEL = "Cold-Mailing Import"
 
+# Paginierungs-Limit (kleiner = weniger RAM-Peaks)
+PAGE_LIMIT = 200
+
 # OAuth Tokens (einfach)
 user_tokens: Dict[str, str] = {}
 
@@ -64,11 +69,8 @@ def get_pool() -> asyncpg.Pool:
 
 @app.on_event("startup")
 async def _startup():
-    # HTTPX-Client mit Keep-Alive
     limits = httpx.Limits(max_keepalive_connections=10, max_connections=20)
     app.state.http = httpx.AsyncClient(timeout=60.0, limits=limits)
-
-    # AsyncPG-Verbindungspool (Neon)
     app.state.pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=4)
 
 @app.on_event("shutdown")
@@ -79,7 +81,7 @@ async def _shutdown():
         await app.state.pool.close()
 
 # -----------------------------------------------------------------------------
-# Health-Check (Render Health Check Path: /healthz)
+# Health-Check
 # -----------------------------------------------------------------------------
 @app.get("/healthz")
 async def healthz():
@@ -91,22 +93,16 @@ async def healthz():
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
 # -----------------------------------------------------------------------------
-# Hilfsfunktionen (robustes Parsing & Ähnlichkeit)
+# Hilfsfunktionen (Parsing, Normalisierung, Ähnlichkeit)
 # -----------------------------------------------------------------------------
 def _as_list_email(value) -> List[str]:
-    """
-    Robust gegen None / str / dict / list / tuple / numpy.ndarray.
-    Extrahiert E-Mail-Werte aus Pipedrive-Strukturen.
-    """
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return []
     if isinstance(value, np.ndarray):
         value = value.tolist()
-
     if isinstance(value, dict):
         v = value.get("value")
         return [v] if v else []
-
     if isinstance(value, (list, tuple)):
         out: List[str] = []
         for x in value:
@@ -117,7 +113,6 @@ def _as_list_email(value) -> List[str]:
             elif x is not None and not (isinstance(x, float) and pd.isna(x)):
                 out.append(str(x))
         return out
-
     return [str(value)]
 
 def normalize_name(s: str) -> str:
@@ -169,7 +164,6 @@ async def get_field_key_by_hint(label_hint: str) -> Optional[str]:
             return f.get("key")
     return None
 
-# --- Feld inkl. Optionen & Mapping (für Labels statt IDs) ---
 async def get_person_field_by_hint(label_hint: str) -> Optional[dict]:
     url = append_token(f"{PIPEDRIVE_API}/personFields")
     r = await http_client().get(url, headers=get_headers())
@@ -191,30 +185,12 @@ def field_options_id_to_label_map(field: dict) -> Dict[str, str]:
         mp[oid] = lab
     return mp
 
-async def fetch_persons_by_filter(filter_id: int) -> List[dict]:
-    persons: List[dict] = []
-    start, limit = 0, 500
-    while True:
-        url = append_token(f"{PIPEDRIVE_API}/persons?filter_id={filter_id}&start={start}&limit={limit}&sort=name")
-        r = await http_client().get(url, headers=get_headers())
-        if r.status_code != 200:
-            raise Exception(f"Pipedrive API Fehler: {r.text}")
-        chunk = r.json().get("data") or []
-        if not chunk:
-            break
-        persons.extend(chunk)
-        if len(chunk) < limit:
-            break
-        start += limit
-    return persons
-
 async def fetch_persons_until_match(
     filter_id: int,
     match_fn,
     max_collect: Optional[int] = None,
-    page_limit: int = 500
+    page_limit: int = PAGE_LIMIT,
 ) -> List[dict]:
-    """Paginierter Fetch, sammelt nur passende Personen und bricht früh ab."""
     collected: List[dict] = []
     start = 0
     while True:
@@ -225,23 +201,56 @@ async def fetch_persons_until_match(
         chunk = r.json().get("data") or []
         if not chunk:
             break
-
         for p in chunk:
             if match_fn(p):
                 collected.append(p)
                 if max_collect and len(collected) >= max_collect:
                     return collected
-
         if len(chunk) < page_limit:
             break
         start += page_limit
     return collected
 
-async def fetch_organizations_by_filter(filter_id: int) -> List[dict]:
-    orgs: List[dict] = []
-    start, limit = 0, 500
+# Streamender Zähler für Optionen (Memory-sparend)
+async def stream_count_person_field_values(
+    filter_id: int,
+    field_key: str,
+    page_limit: int = PAGE_LIMIT,
+) -> Tuple[int, Dict[str, int]]:
+    total = 0
+    counts: Dict[str, int] = {}
+    start = 0
     while True:
-        url = append_token(f"{PIPEDRIVE_API}/organizations?filter_id={filter_id}&start={start}&limit={limit}")
+        url = append_token(f"{PIPEDRIVE_API}/persons?filter_id={filter_id}&start={start}&limit={page_limit}")
+        r = await http_client().get(url, headers=get_headers())
+        if r.status_code != 200:
+            raise Exception(f"Pipedrive API Fehler: {r.text}")
+        chunk = r.json().get("data") or []
+        if not chunk:
+            break
+        for p in chunk:
+            total += 1
+            val = p.get(field_key)
+            if isinstance(val, np.ndarray):
+                val = val.tolist()
+            if isinstance(val, list):
+                for v in val:
+                    if v is not None and str(v).strip() != "":
+                        key = str(v)
+                        counts[key] = counts.get(key, 0) + 1
+            elif val is not None and str(val).strip() != "":
+                key = str(val)
+                counts[key] = counts.get(key, 0) + 1
+        if len(chunk) < page_limit:
+            break
+        start += page_limit
+    return total, counts
+
+async def fetch_organizations_by_filter(filter_id: int, page_limit: int = PAGE_LIMIT) -> List[dict]:
+    orgs: List[dict] = []
+    start = 0
+    while True:
+        url = append_token(f"{PIPEDRIVE_API}/organizations?filter_id={filter_id}&start={start}&limit={page_limit}")
         r = await http_client().get(url, headers=get_headers())
         if r.status_code != 200:
             raise Exception(f"Pipedrive API Fehler (Orgs {filter_id}): {r.text}")
@@ -249,9 +258,9 @@ async def fetch_organizations_by_filter(filter_id: int) -> List[dict]:
         if not chunk:
             break
         orgs.extend(chunk)
-        if len(chunk) < limit:
+        if len(chunk) < page_limit:
             break
-        start += limit
+        start += page_limit
     return orgs
 
 # -----------------------------------------------------------------------------
@@ -265,23 +274,19 @@ async def clear_table(conn: asyncpg.Connection, table: str):
     await conn.execute(f'DROP TABLE IF EXISTS "{table}"')
 
 async def save_df_text(df: pd.DataFrame, table: str):
-    """Speichert DataFrame als TEXT-Spalten per executemany (schnell & stabil)."""
     async with get_pool().acquire() as conn:
         await clear_table(conn, table)
         await ensure_table_text(conn, table, list(df.columns))
         if df.empty:
             return
-
         cols = list(df.columns)
         cols_sql = ", ".join(f'"{c}"' for c in cols)
         placeholders = ", ".join(f'${i}' for i in range(1, len(cols) + 1))
         insert_sql = f'INSERT INTO "{table}" ({cols_sql}) VALUES ({placeholders})'
-
         records: List[List[str]] = []
         for _, row in df.iterrows():
             vals = ["" if pd.isna(v) else str(v) for v in row.tolist()]
             records.append(vals)
-
         async with conn.transaction():
             await conn.executemany(insert_sql, records)
 
@@ -334,7 +339,7 @@ async def oauth_callback(code: str):
     return RedirectResponse("/neukontakte")
 
 # -----------------------------------------------------------------------------
-# Startseite (kurz)
+# Startseite
 # -----------------------------------------------------------------------------
 @app.get("/neukontakte", response_class=HTMLResponse)
 async def neukontakte(request: Request):
@@ -401,17 +406,17 @@ async function loadOptions(){{
   showOverlay();
   try {{
     const r = await fetch('/neukontakte/options');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
     const data = await r.json();
     const sel = document.getElementById('fachbereich');
     sel.innerHTML = '<option value="">– bitte auswählen –</option>';
     data.options.forEach(o => {{
       const opt = document.createElement('option');
-      opt.value = o.value;                   // option-id
-      opt.textContent = o.label + ' (' + o.count + ')';  // schönes Label
+      opt.value = o.value;
+      opt.textContent = o.label + ' (' + o.count + ')';
       sel.appendChild(opt);
     }});
-    const fbinfo = document.getElementById('fbinfo');
-    fbinfo.textContent = "Gesamt im Filter: " + data.total + " | Fachbereiche: " + data.options.length;
+    document.getElementById('fbinfo').textContent = "Gesamt im Filter: " + data.total + " | Fachbereiche: " + data.options.length;
   }} catch(e) {{
     alert('Fehler beim Laden der Fachbereiche: ' + e);
   }} finally {{
@@ -423,9 +428,7 @@ document.getElementById('btnPreview').addEventListener('click', async () => {{
   const fb = document.getElementById('fachbereich').value;
   const tc = document.getElementById('take_count').value || null;
   const bid = document.getElementById('batch_id').value || null;
-
   if(!fb) {{ alert('Bitte zuerst einen Fachbereich wählen.'); return; }}
-
   showOverlay();
   try {{
     const r = await fetch('/neukontakte/preview', {{
@@ -433,11 +436,13 @@ document.getElementById('btnPreview').addEventListener('click', async () => {{
       headers:{{'Content-Type':'application/json'}},
       body: JSON.stringify({{ fachbereich: fb, take_count: tc ? parseInt(tc) : null, batch_id: bid }})
     }});
+    if (!r.ok) throw new Error('HTTP ' + r.status);
     const html = await r.text();
     document.open(); document.write(html); document.close();
   }} catch(e) {{
-    hideOverlay();
     alert('Fehler: ' + e);
+  }} finally {{
+    hideOverlay();
   }}
 }});
 
@@ -448,9 +453,9 @@ loadOptions();
     return HTMLResponse(html)
 
 async def count_persons_in_filter(filter_id: int) -> int:
-    start, limit, total = 0, 500, 0
+    start, total = 0, 0
     while True:
-        url = append_token(f"{PIPEDRIVE_API}/persons?filter_id={filter_id}&start={start}&limit={limit}")
+        url = append_token(f"{PIPEDRIVE_API}/persons?filter_id={filter_id}&start={start}&limit={PAGE_LIMIT}")
         r = await http_client().get(url, headers=get_headers())
         if r.status_code != 200:
             return total
@@ -458,44 +463,28 @@ async def count_persons_in_filter(filter_id: int) -> int:
         if not items:
             break
         total += len(items)
-        if len(items) < limit:
+        if len(items) < PAGE_LIMIT:
             break
-        start += limit
+        start += PAGE_LIMIT
     return total
 
 # -----------------------------------------------------------------------------
-# Optionen (Fachbereichswerte) – Labels + Cache
+# Optionen (Labels + Cache, streamend gezählt)
 # -----------------------------------------------------------------------------
 @app.get("/neukontakte/options")
 async def neukontakte_options():
-    # Cache-Hit?
     now = time.time()
     if _OPTIONS_CACHE["options"] and (now - _OPTIONS_CACHE["ts"] < OPTIONS_TTL_SEC):
-        return JSONResponse({
-            "total": _OPTIONS_CACHE["total"],
-            "options": _OPTIONS_CACHE["options"]
-        })
+        return JSONResponse({"total": _OPTIONS_CACHE["total"], "options": _OPTIONS_CACHE["options"]})
 
     fb_field = await get_person_field_by_hint(FIELD_FACHBEREICH_HINT)
     if not fb_field:
         return JSONResponse({"total": 0, "options": []})
+
     fb_key = fb_field.get("key")
     id2label = field_options_id_to_label_map(fb_field)
 
-    persons = await fetch_persons_by_filter(FILTER_NEUKONTAKTE)
-    total = len(persons)
-
-    counts: Dict[str, int] = {}
-    for p in persons:
-        val = p.get(fb_key)
-        if isinstance(val, np.ndarray):
-            val = val.tolist()
-        if isinstance(val, list):
-            for v in val:
-                if v is not None and str(v).strip() != "":
-                    counts[str(v)] = counts.get(str(v), 0) + 1
-        elif val is not None and str(val).strip() != "":
-            counts[str(val)] = counts.get(str(val), 0) + 1
+    total, counts = await stream_count_person_field_values(FILTER_NEUKONTAKTE, fb_key)
 
     options = []
     for opt_id, cnt in counts.items():
@@ -507,7 +496,7 @@ async def neukontakte_options():
     return JSONResponse({"total": total, "options": options})
 
 # -----------------------------------------------------------------------------
-# Vorschau – **früher Abbruch** + Labelanzeige
+# Vorschau – früh abbrechen + Labelanzeige
 # -----------------------------------------------------------------------------
 @app.post("/neukontakte/preview", response_class=HTMLResponse)
 async def neukontakte_preview(
@@ -523,7 +512,6 @@ async def neukontakte_preview(
         id2label = field_options_id_to_label_map(fb_field)
         fb_label = id2label.get(str(fachbereich), str(fachbereich))
 
-        # Match-Funktion für den gewünschten Fachbereich (option-id)
         def _match(p: dict) -> bool:
             val = p.get(fb_key)
             if isinstance(val, np.ndarray):
@@ -539,14 +527,11 @@ async def neukontakte_preview(
         for p in sel:
             pid = p.get("id")
             name = p.get("name") or ""
-            emails_raw = p.get("email")
-            email_str = ", ".join(_as_list_email(emails_raw))
-
+            email_str = ", ".join(_as_list_email(p.get("email")))
             org_name = "-"
             org = p.get("org_id")
             if isinstance(org, dict):
                 org_name = org.get("name") or "-"
-
             rows.append({
                 "Batch ID": batch_id or "",
                 "Channel": DEFAULT_CHANNEL,
@@ -585,9 +570,14 @@ async def neukontakte_preview(
   </div>
 <script>
 document.getElementById('btnReconcile').addEventListener('click', async ()=>{{
-  const r = await fetch('/neukontakte/reconcile', {{method:'POST'}});
-  const html = await r.text();
-  document.open(); document.write(html); document.close();
+  try {{
+    const r = await fetch('/neukontakte/reconcile', {{method:'POST'}});
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const html = await r.text();
+    document.open(); document.write(html); document.close();
+  }} catch(e) {{
+    alert('Fehler beim Abgleich: ' + e);
+  }}
 }});
 </script>
 </body></html>
@@ -597,7 +587,7 @@ document.getElementById('btnReconcile').addEventListener('click', async ()=>{{
         return HTMLResponse(f"<pre style='padding:24px;color:#b00'>❌ Fehler beim Abruf/Speichern:\n{e}</pre>", status_code=500)
 
 # -----------------------------------------------------------------------------
-# Abgleich – schreibt nk_master_ready & nk_delete_log
+# Abgleich – schreibt nk_master_ready & nk_delete_log (optimierter Orga-Abgleich)
 # -----------------------------------------------------------------------------
 @app.post("/neukontakte/reconcile", response_class=HTMLResponse)
 async def neukontakte_reconcile():
@@ -628,35 +618,45 @@ async def neukontakte_reconcile():
                 delete_log.append({"reason":"limit_per_org","id":r.get(col_person_id),"name":r.get("name"),"org_name":r.get(col_org_name),"extra":"über 2 pro Organisation"})
             master = master[master["_rank"] <= 2].drop(columns=["_rank"], errors="ignore")
 
-        # Regel 3 – Orga-Abgleich (Filter 1245, 851, 1521) >=95%
+        # Regel 3 – Orga-Abgleich (Filter 1245, 851, 1521) >=95% mit Buckets
         suspect_org_filters = [1245, 851, 1521]
         if col_org_name and col_org_name in master.columns:
-            ext_names = []
+            # Namen normalisiert einlesen & nach erstem Buchstaben bucketen
+            ext_buckets: Dict[str, List[str]] = {}
             for fid in suspect_org_filters:
-                orgs = await fetch_organizations_by_filter(fid)
-                ext_names.extend([o.get("name") for o in orgs if o.get("name")])
-            # dedupe
-            ext_names = list({(n or "").strip(): None for n in ext_names if isinstance(n, str) and n.strip()}.keys())
-
-            if ext_names:
-                drop_idx = []
-                for idx, row in master.iterrows():
-                    cand = str(row.get(col_org_name) or "").strip()
-                    if not cand:
+                orgs = await fetch_organizations_by_filter(fid, page_limit=PAGE_LIMIT)
+                for o in orgs:
+                    n = normalize_name(o.get("name") or "")
+                    if not n:
                         continue
-                    best = process.extractOne(cand, ext_names, scorer=fuzz.token_sort_ratio)
-                    if best and best[1] >= 95:
-                        drop_idx.append(idx)
-                        delete_log.append({"reason":"org_match_95","id":row.get(col_person_id),"name":row.get("name"),"org_name":cand,"extra":f"Best Match: {best[0]} ({best[1]}%)"})
-                if drop_idx:
-                    master = master.drop(index=drop_idx)
+                    b = n[0]
+                    ext_buckets.setdefault(b, []).append(n)
+            # dedupe je Bucket
+            for b in list(ext_buckets.keys()):
+                ext_buckets[b] = list(dict.fromkeys(ext_buckets[b]))
+
+            drop_idx = []
+            for idx, row in master.iterrows():
+                cand = str(row.get(col_org_name) or "").strip()
+                cand_norm = normalize_name(cand)
+                if not cand_norm:
+                    continue
+                bucket = ext_buckets.get(cand_norm[0])
+                if not bucket:
+                    continue
+                best = process.extractOne(cand_norm, bucket, scorer=fuzz.token_sort_ratio)
+                if best and best[1] >= 95:
+                    drop_idx.append(idx)
+                    delete_log.append({"reason":"org_match_95","id":row.get(col_person_id),"name":row.get("name"),"org_name":cand,"extra":f"Best Match: {best[0]} ({best[1]}%)"})
+            if drop_idx:
+                master = master.drop(index=drop_idx)
 
         # Regel 4 – Personen-Abgleich (Filter 1216, 1708) ID-Gleichheit
         suspect_person_filters = [1216, 1708]
         if col_person_id:
             suspect_ids = set()
             for fid in suspect_person_filters:
-                persons = await fetch_persons_by_filter(fid)
+                persons = await fetch_persons_until_match(fid, lambda _p: True, max_collect=None, page_limit=PAGE_LIMIT)
                 for p in persons:
                     pid = p.get("id")
                     if pid is not None:
@@ -697,11 +697,14 @@ async def neukontakte_reconcile():
   .btn{{background:#0ea5e9;border:none;color:#fff;border-radius:8px;padding:10px 16px;cursor:pointer;text-decoration:none}}
   .btn:hover{{background:#0284c7}}
   .muted{{color:#6b7280}}
+  .row{{display:flex;gap:10px;flex-wrap:wrap;align-items:center}}
 </style></head>
 <body>
 <div class="wrap">
   <div class="card">
-    <div>Ergebnis: <b>{stats["after"]}</b> Zeilen in <b>nk_master_ready</b></div>
+    <div class="row">
+      <span>Ergebnis: <b>{stats["after"]}</b> Zeilen in <b>nk_master_ready</b></span>
+    </div>
     <p class="muted">
       Entfernt (Organisationsart gesetzt): <b>{stats["del_orgtype"]}</b><br/>
       Entfernt (mehr als 2 pro Organisation): <b>{stats["del_limit"]}</b><br/>
@@ -709,7 +712,9 @@ async def neukontakte_reconcile():
       Entfernt (Person-ID in Filtern 1216/1708): <b>{stats["del_pid"]}</b><br/>
       <b>Summe entfernt:</b> {stats["deleted_total"]}
     </p>
-    <p><a class="btn" href="/neukontakte">Zurück</a></p>
+    <div class="row">
+      <a class="btn" href="/neukontakte">Zurück</a>
+    </div>
   </div>
 
   <div class="card">
