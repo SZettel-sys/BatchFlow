@@ -81,24 +81,21 @@ async def save_df_text(df: pd.DataFrame, table: str):
             return
 
         cols = list(df.columns)
-        # Spaltenliste einmal sauber bauen (keine verschachtelten f-Strings!)
-        cols_sql = ", ".join(f'"{c}"' for c in cols)            # -> "col1", "col2", ...
+        # Spaltenliste + Platzhalter korrekt und ohne verschachtelte f-Strings bauen
+        cols_sql = ", ".join(f'"{c}"' for c in cols)                        # -> "col1", "col2", ...
         placeholders = ", ".join(f'${i}' for i in range(1, len(cols) + 1))  # -> $1, $2, ...
-
         insert_sql = f'INSERT INTO "{table}" ({cols_sql}) VALUES ({placeholders})'
 
-        # Werte vorbereiten (Strings, leere Strings statt NaN)
+        # Werte vorbereiten
         records = []
         for _, row in df.iterrows():
             vals = ["" if pd.isna(v) else str(v) for v in row.tolist()]
             records.append(vals)
 
         async with conn.transaction():
-            # schneller als einzelne execute()-Aufrufe
             await conn.executemany(insert_sql, records)
     finally:
         await conn.close()
-
 
 async def load_df_text(table: str) -> pd.DataFrame:
     conn = await get_conn()
@@ -257,24 +254,24 @@ async def neukontakte(request: Request):
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>Neukontakte (Filter {FILTER_NEUKONTAKTE})</title>
 <style>
-  body{{font-family: Inter, -apple-system, Segoe UI, Roboto, Arial, sans-serif;background:#f5f7fa;color:#1f2937;margin:0}}
-  header{{display:flex;justify-content:space-between;align-items:center;padding:18px 22px;background:#fff;border-bottom:1px solid #e5e7eb}}
-  .wrap{{max-width:1180px;margin:28px auto;padding:0 16px}}
-  .card{{background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:22px;box-shadow:0 1px 3px rgba(0,0,0,.05)}}
-  label{{display:block;margin:12px 0 6px;font-weight:600}}
-  select,input{{width:100%;padding:10px 12px;border:1px solid #cfd6df;border-radius:8px}}
-  .row{{display:grid;grid-template-columns:1fr 220px 220px auto;gap:16px;align-items:end}}
-  .muted{{color:#6b7280}}
-  .btn{{background:#0ea5e9;border:none;color:#fff;border-radius:8px;padding:10px 16px;cursor:pointer}}
-  .btn:hover{{background:#0284c7}}
-  .badge{{background:#eef6ff;color:#0a66c2;padding:6px 10px;border-radius:999px;font-weight:600}}
-  .topbar{{display:flex;gap:10px;align-items:center}}
-  .link{{color:#0a66c2;text-decoration:none}}
-  .link:hover{{text-decoration:underline}}
+  body{{{{font-family: Inter, -apple-system, Segoe UI, Roboto, Arial, sans-serif;background:#f5f7fa;color:#1f2937;margin:0}}}}
+  header{{{{display:flex;justify-content:space-between;align-items:center;padding:18px 22px;background:#fff;border-bottom:1px solid #e5e7eb}}}}
+  .wrap{{{{max-width:1180px;margin:28px auto;padding:0 16px}}}}
+  .card{{{{background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:22px;box-shadow:0 1px 3px rgba(0,0,0,.05)}}}}
+  label{{{{display:block;margin:12px 0 6px;font-weight:600}}}}
+  select,input{{{{width:100%;padding:10px 12px;border:1px solid #cfd6df;border-radius:8px}}}}
+  .row{{{{display:grid;grid-template-columns:1fr 220px 220px auto;gap:16px;align-items:end}}}}
+  .muted{{{{color:#6b7280}}}}
+  .btn{{{{background:#0ea5e9;border:none;color:#fff;border-radius:8px;padding:10px 16px;cursor:pointer}}}}
+  .btn:hover{{{{background:#0284c7}}}}
+  .badge{{{{background:#eef6ff;color:#0a66c2;padding:6px 10px;border-radius:999px;font-weight:600}}}}
+  .topbar{{{{display:flex;gap:10px;align-items:center}}}}
+  .link{{{{color:#0a66c2;text-decoration:none}}}}
+  .link:hover{{{{text-decoration:underline}}}}
   /* Loading overlay */
-  #overlay{{display:none;position:fixed;inset:0;background:rgba(255,255,255,.7);backdrop-filter:blur(2px);z-index:9999;align-items:center;justify-content:center}}
-  .spinner{{width:48px;height:48px;border:4px solid #93c5fd;border-top-color:#1d4ed8;border-radius:50%;animation:spin 1s linear infinite}}
-  @keyframes spin{{to{{transform:rotate(360deg)}}}}
+  #overlay{{{{display:none;position:fixed;inset:0;background:rgba(255,255,255,.7);backdrop-filter:blur(2px);z-index:9999;align-items:center;justify-content:center}}}}
+  .spinner{{{{width:48px;height:48px;border:4px solid #93c5fd;border-top-color:#1d4ed8;border-radius:50%;animation:spin 1s linear infinite}}}}
+  @keyframes spin{{{{to{{{{transform:rotate(360deg)}}}}}}}}
 </style>
 </head>
 <body>
@@ -496,20 +493,20 @@ async def neukontakte_preview(
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>Vorschau – Neukontakte</title>
 <style>
-  body{{font-family: Inter, -apple-system, Segoe UI, Roboto, Arial, sans-serif;background:#f5f7fa;color:#1f2937;margin:0}}
-  header{{display:flex;justify-content:space-between;align-items:center;padding:18px 22px;background:#fff;border-bottom:1px solid #e5e7eb}}
-  .wrap{{max-width:1180px;margin:28px auto;padding:0 16px}}
-  .card{{background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:22px;margin-top:16px;box-shadow:0 1px 3px rgba(0,0,0,.05)}}
-  .grid{{width:100%;border-collapse:collapse}}
-  .grid th,.grid td{{border:1px solid #e5e7eb;padding:8px 10px;text-align:left}}
-  .grid th{{background:#f3f4f6}}
-  .row{{display:flex;gap:10px;align-items:center;justify-content:space-between;flex-wrap:wrap}}
-  .btn{{background:#0ea5e9;border:none;color:#fff;border-radius:8px;padding:10px 16px;cursor:pointer;text-decoration:none}}
-  .btn:hover{{background:#0284c7}}
-  .muted{{color:#6b7280}}
-  #overlay{{display:none;position:fixed;inset:0;background:rgba(255,255,255,.7);backdrop-filter:blur(2px);z-index:9999;align-items:center;justify-content:center}}
-  .spinner{{width:48px;height:48px;border:4px solid #93c5fd;border-top-color:#1d4ed8;border-radius:50%;animation:spin 1s linear infinite}}
-  @keyframes spin{{to{{transform:rotate(360deg)}}}}
+  body{{{{font-family: Inter, -apple-system, Segoe UI, Roboto, Arial, sans-serif;background:#f5f7fa;color:#1f2937;margin:0}}}}
+  header{{{{display:flex;justify-content:space-between;align-items:center;padding:18px 22px;background:#fff;border-bottom:1px solid #e5e7eb}}}}
+  .wrap{{{{max-width:1180px;margin:28px auto;padding:0 16px}}}}
+  .card{{{{background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:22px;margin-top:16px;box-shadow:0 1px 3px rgba(0,0,0,.05)}}}}
+  .grid{{{{width:100%;border-collapse:collapse}}}}
+  .grid th,.grid td{{{{border:1px solid #e5e7eb;padding:8px 10px;text-align:left}}}}
+  .grid th{{{{background:#f3f4f6}}}}
+  .row{{{{display:flex;gap:10px;align-items:center;justify-content:space-between;flex-wrap:wrap}}}}
+  .btn{{{{background:#0ea5e9;border:none;color:#fff;border-radius:8px;padding:10px 16px;cursor:pointer;text-decoration:none}}}}
+  .btn:hover{{{{background:#0284c7}}}}
+  .muted{{{{color:#6b7280}}}}
+  #overlay{{{{display:none;position:fixed;inset:0;background:rgba(255,255,255,.7);backdrop-filter:blur(2px);z-index:9999;align-items:center;justify-content:center}}}}
+  .spinner{{{{width:48px;height:48px;border:4px solid #93c5fd;border-top-color:#1d4ed8;border-radius:50%;animation:spin 1s linear infinite}}}}
+  @keyframes spin{{{{to{{{{transform:rotate(360deg)}}}}}}}}
 </style>
 </head>
 <body>
@@ -532,19 +529,19 @@ async def neukontakte_preview(
 
 <div id="overlay"><div class="spinner"></div></div>
 <script>
-function showOverlay(){{document.getElementById('overlay').style.display='flex';}}
-function hideOverlay(){{document.getElementById('overlay').style.display='none';}}
-document.getElementById('btnReconcile').addEventListener('click', async ()=>{
+function showOverlay(){{{{document.getElementById('overlay').style.display='flex';}}}}
+function hideOverlay(){{{{document.getElementById('overlay').style.display='none';}}}}
+document.getElementById('btnReconcile').addEventListener('click', async ()=>{{{{
   showOverlay();
-  try {{
-    const r = await fetch('/neukontakte/reconcile', {{method:'POST'}});
+  try {{{{
+    const r = await fetch('/neukontakte/reconcile', {{{{method:'POST'}}}});
     const html = await r.text();
     document.open(); document.write(html); document.close();
-  }} catch(e) {{
+  }}}} catch(e) {{{{
     hideOverlay();
     alert('Fehler beim Abgleich: ' + e);
-  }}
-});
+  }}}}
+}}}});
 </script>
 </body>
 </html>
@@ -670,17 +667,17 @@ async def neukontakte_reconcile():
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>Abgleich – Ergebnis</title>
 <style>
-  body{{font-family: Inter, -apple-system, Segoe UI, Roboto, Arial, sans-serif;background:#f5f7fa;color:#1f2937;margin:0}}
-  .wrap{{max-width:1180px;margin:28px auto;padding:0 16px}}
-  .card{{background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:22px;margin-top:16px;box-shadow:0 1px 3px rgba(0,0,0,.05)}}
-  .grid{{width:100%;border-collapse:collapse}}
-  .grid th,.grid td{{border:1px solid #e5e7eb;padding:8px 10px;text-align:left}}
-  .grid th{{background:#f3f4f6}}
-  .pill{{background:#e6f2ff;color:#0a66c2;padding:8px 12px;border-radius:999px;font-weight:600}}
-  .row{{display:flex;gap:10px;flex-wrap:wrap;align-items:center}}
-  .btn{{background:#0ea5e9;border:none;color:#fff;border-radius:8px;padding:10px 16px;cursor:pointer;text-decoration:none}}
-  .btn:hover{{background:#0284c7}}
-  .muted{{color:#6b7280}}
+  body{{{{font-family: Inter, -apple-system, Segoe UI, Roboto, Arial, sans-serif;background:#f5f7fa;color:#1f2937;margin:0}}}}
+  .wrap{{{{max-width:1180px;margin:28px auto;padding:0 16px}}}}
+  .card{{{{background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:22px;margin-top:16px;box-shadow:0 1px 3px rgba(0,0,0,.05)}}}}
+  .grid{{{{width:100%;border-collapse:collapse}}}}
+  .grid th,.grid td{{{{border:1px solid #e5e7eb;padding:8px 10px;text-align:left}}}}
+  .grid th{{{{background:#f3f4f6}}}}
+  .pill{{{{background:#e6f2ff;color:#0a66c2;padding:8px 12px;border-radius:999px;font-weight:600}}}}
+  .row{{{{display:flex;gap:10px;flex-wrap:wrap;align-items:center}}}}
+  .btn{{{{background:#0ea5e9;border:none;color:#fff;border-radius:8px;padding:10px 16px;cursor:pointer;text-decoration:none}}}}
+  .btn:hover{{{{background:#0284c7}}}}
+  .muted{{{{color:#6b7280}}}}
 </style></head>
 <body>
 <div class="wrap">
