@@ -294,7 +294,7 @@ async def neukontakte(request: Request):
       <div>
         <label>Batch ID</label>
         <input id="batch_id" placeholder="Bxxx"/>
-        <div class="muted">Beispiel: B477</div>
+        <div class="muted">Beispiel: B111</div>
       </div>
       <div style="align-self:end;">
         <button class="btn" id="btnPreview">Vorschau laden</button>
