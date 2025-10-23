@@ -1,6 +1,7 @@
 # master.py
 import os
 import re
+import time
 from typing import Optional, Dict, List
 
 import numpy as np
@@ -72,7 +73,6 @@ async def _startup():
 
 @app.on_event("shutdown")
 async def _shutdown():
-    # sauber schließen
     try:
         await app.state.http.aclose()
     finally:
@@ -155,16 +155,41 @@ def append_token(url: str) -> str:
         return f"{url}{sep}api_token={PD_API_TOKEN}"
     return url
 
-async def get_field_key_by_hint(label_hint: str) -> Optional[str]:
+async def get_person_fields() -> List[dict]:
     url = append_token(f"{PIPEDRIVE_API}/personFields")
     r = await http_client().get(url, headers=get_headers())
     r.raise_for_status()
-    fields = r.json().get("data") or []
+    return r.json().get("data") or []
+
+async def get_field_key_by_hint(label_hint: str) -> Optional[str]:
+    fields = await get_person_fields()
     hint = label_hint.lower()
     for f in fields:
         if hint in (f.get("name") or "").lower():
             return f.get("key")
     return None
+
+# --- Feld inkl. Optionen & Mapping (für Labels statt IDs) ---
+async def get_person_field_by_hint(label_hint: str) -> Optional[dict]:
+    url = append_token(f"{PIPEDRIVE_API}/personFields")
+    r = await http_client().get(url, headers=get_headers())
+    r.raise_for_status()
+    fields = r.json().get("data") or []
+    hint = (label_hint or "").lower()
+    for f in fields:
+        name = (f.get("name") or "").lower()
+        if hint in name:
+            return f
+    return None
+
+def field_options_id_to_label_map(field: dict) -> Dict[str, str]:
+    opts = field.get("options") or []
+    mp: Dict[str, str] = {}
+    for o in opts:
+        oid = str(o.get("id"))
+        lab = str(o.get("label") or o.get("name") or oid)
+        mp[oid] = lab
+    return mp
 
 async def fetch_persons_by_filter(filter_id: int) -> List[dict]:
     persons: List[dict] = []
@@ -182,6 +207,35 @@ async def fetch_persons_by_filter(filter_id: int) -> List[dict]:
             break
         start += limit
     return persons
+
+async def fetch_persons_until_match(
+    filter_id: int,
+    match_fn,
+    max_collect: Optional[int] = None,
+    page_limit: int = 500
+) -> List[dict]:
+    """Paginierter Fetch, sammelt nur passende Personen und bricht früh ab."""
+    collected: List[dict] = []
+    start = 0
+    while True:
+        url = append_token(f"{PIPEDRIVE_API}/persons?filter_id={filter_id}&start={start}&limit={page_limit}")
+        r = await http_client().get(url, headers=get_headers())
+        if r.status_code != 200:
+            raise Exception(f"Pipedrive API Fehler: {r.text}")
+        chunk = r.json().get("data") or []
+        if not chunk:
+            break
+
+        for p in chunk:
+            if match_fn(p):
+                collected.append(p)
+                if max_collect and len(collected) >= max_collect:
+                    return collected
+
+        if len(chunk) < page_limit:
+            break
+        start += page_limit
+    return collected
 
 async def fetch_organizations_by_filter(filter_id: int) -> List[dict]:
     orgs: List[dict] = []
@@ -211,10 +265,7 @@ async def clear_table(conn: asyncpg.Connection, table: str):
     await conn.execute(f'DROP TABLE IF EXISTS "{table}"')
 
 async def save_df_text(df: pd.DataFrame, table: str):
-    """
-    Speichert DataFrame als TEXT-Spalten per executemany (schnell & stabil).
-    Nutzt den globalen Pool.
-    """
+    """Speichert DataFrame als TEXT-Spalten per executemany (schnell & stabil)."""
     async with get_pool().acquire() as conn:
         await clear_table(conn, table)
         await ensure_table_text(conn, table, list(df.columns))
@@ -243,6 +294,12 @@ async def load_df_text(table: str) -> pd.DataFrame:
     data = [tuple(r[c] for c in cols) for r in rows]
     df = pd.DataFrame(data, columns=cols).replace({"": np.nan})
     return df
+
+# -----------------------------------------------------------------------------
+# In-Memory-Cache für Optionen (10 Minuten)
+# -----------------------------------------------------------------------------
+_OPTIONS_CACHE: dict = {"ts": 0.0, "total": 0, "options": []}
+OPTIONS_TTL_SEC = 600  # 10 Minuten
 
 # -----------------------------------------------------------------------------
 # OAuth & Routing Basics
@@ -277,7 +334,7 @@ async def oauth_callback(code: str):
     return RedirectResponse("/neukontakte")
 
 # -----------------------------------------------------------------------------
-# Startseite (kurz & bündig)
+# Startseite (kurz)
 # -----------------------------------------------------------------------------
 @app.get("/neukontakte", response_class=HTMLResponse)
 async def neukontakte(request: Request):
@@ -307,12 +364,8 @@ async def neukontakte(request: Request):
 </head>
 <body>
 <header>
-  <div>
-    <b>Neukontakte (Filter {FILTER_NEUKONTAKTE})</b> · Gesamt: <b>{total}</b>
-  </div>
-  <div>
-    {"<span class='muted'>angemeldet</span>" if authed else "<a href='/login'>Anmelden</a>"}
-  </div>
+  <div><b>Neukontakte (Filter {FILTER_NEUKONTAKTE})</b> · Gesamt: <b>{total}</b></div>
+  <div>{"<span class='muted'>angemeldet</span>" if authed else "<a href='/login'>Anmelden</a>"}</div>
 </header>
 
 <div class="wrap">
@@ -353,8 +406,8 @@ async function loadOptions(){{
     sel.innerHTML = '<option value="">– bitte auswählen –</option>';
     data.options.forEach(o => {{
       const opt = document.createElement('option');
-      opt.value = o.value;
-      opt.textContent = o.label + ' (' + o.count + ')';
+      opt.value = o.value;                   // option-id
+      opt.textContent = o.label + ' (' + o.count + ')';  // schönes Label
       sel.appendChild(opt);
     }});
     const fbinfo = document.getElementById('fbinfo');
@@ -411,62 +464,76 @@ async def count_persons_in_filter(filter_id: int) -> int:
     return total
 
 # -----------------------------------------------------------------------------
-# Optionen (Fachbereichswerte)
+# Optionen (Fachbereichswerte) – Labels + Cache
 # -----------------------------------------------------------------------------
 @app.get("/neukontakte/options")
 async def neukontakte_options():
-    fb_key = await get_field_key_by_hint(FIELD_FACHBEREICH_HINT)
+    # Cache-Hit?
+    now = time.time()
+    if _OPTIONS_CACHE["options"] and (now - _OPTIONS_CACHE["ts"] < OPTIONS_TTL_SEC):
+        return JSONResponse({
+            "total": _OPTIONS_CACHE["total"],
+            "options": _OPTIONS_CACHE["options"]
+        })
+
+    fb_field = await get_person_field_by_hint(FIELD_FACHBEREICH_HINT)
+    if not fb_field:
+        return JSONResponse({"total": 0, "options": []})
+    fb_key = fb_field.get("key")
+    id2label = field_options_id_to_label_map(fb_field)
+
     persons = await fetch_persons_by_filter(FILTER_NEUKONTAKTE)
     total = len(persons)
 
     counts: Dict[str, int] = {}
-    if fb_key:
-        for p in persons:
-            val = p.get(fb_key)
-            if isinstance(val, np.ndarray):
-                val = val.tolist()
-            if isinstance(val, list):
-                for v in val:
-                    if v:
-                        counts[str(v)] = counts.get(str(v), 0) + 1
-            elif val:
-                counts[str(val)] = counts.get(str(val), 0) + 1
+    for p in persons:
+        val = p.get(fb_key)
+        if isinstance(val, np.ndarray):
+            val = val.tolist()
+        if isinstance(val, list):
+            for v in val:
+                if v is not None and str(v).strip() != "":
+                    counts[str(v)] = counts.get(str(v), 0) + 1
+        elif val is not None and str(val).strip() != "":
+            counts[str(val)] = counts.get(str(val), 0) + 1
 
-    options = [{"value": k, "label": k, "count": v} for k, v in sorted(counts.items(), key=lambda x: x[1], reverse=True)]
+    options = []
+    for opt_id, cnt in counts.items():
+        label = id2label.get(str(opt_id), str(opt_id))
+        options.append({"value": opt_id, "label": label, "count": cnt})
+    options.sort(key=lambda x: x["count"], reverse=True)
+
+    _OPTIONS_CACHE.update({"ts": now, "total": total, "options": options})
     return JSONResponse({"total": total, "options": options})
 
 # -----------------------------------------------------------------------------
-# Vorschau – erzeugt nk_master_final
+# Vorschau – **früher Abbruch** + Labelanzeige
 # -----------------------------------------------------------------------------
 @app.post("/neukontakte/preview", response_class=HTMLResponse)
 async def neukontakte_preview(
-    fachbereich: str = Body(...),
+    fachbereich: str = Body(...),             # option-id
     take_count: Optional[int] = Body(None),
     batch_id: Optional[str] = Body(None),
 ):
     try:
-        fb_key = await get_field_key_by_hint(FIELD_FACHBEREICH_HINT)
-        orgart_key = await get_field_key_by_hint(FIELD_ORGART_HINT)
+        fb_field = await get_person_field_by_hint(FIELD_FACHBEREICH_HINT)
+        if not fb_field:
+            return HTMLResponse("<div style='padding:24px;color:#b00'>❌ 'Fachbereich'-Feld nicht gefunden.</div>", 500)
+        fb_key = fb_field.get("key")
+        id2label = field_options_id_to_label_map(fb_field)
+        fb_label = id2label.get(str(fachbereich), str(fachbereich))
 
-        persons = await fetch_persons_by_filter(FILTER_NEUKONTAKTE)
-        sel: List[dict] = []
-        if fb_key:
-            for p in persons:
-                val = p.get(fb_key)
-                if isinstance(val, np.ndarray):
-                    val = val.tolist()
-                match = False
-                if isinstance(val, list):
-                    match = fachbereich in [str(x) for x in val if x]
-                else:
-                    match = str(val) == str(fachbereich)
-                if match:
-                    sel.append(p)
-        else:
-            sel = persons
+        # Match-Funktion für den gewünschten Fachbereich (option-id)
+        def _match(p: dict) -> bool:
+            val = p.get(fb_key)
+            if isinstance(val, np.ndarray):
+                val = val.tolist()
+            if isinstance(val, list):
+                return str(fachbereich) in [str(x) for x in val if x is not None]
+            return str(val) == str(fachbereich)
 
-        if take_count and take_count > 0:
-            sel = sel[: min(take_count, len(sel))]
+        max_collect = int(take_count) if (take_count and take_count > 0) else None
+        sel = await fetch_persons_until_match(FILTER_NEUKONTAKTE, _match, max_collect=max_collect)
 
         rows = []
         for p in sel:
@@ -474,12 +541,13 @@ async def neukontakte_preview(
             name = p.get("name") or ""
             emails_raw = p.get("email")
             email_str = ", ".join(_as_list_email(emails_raw))
+
             org_name = "-"
             org = p.get("org_id")
             if isinstance(org, dict):
                 org_name = org.get("name") or "-"
 
-            row = {
+            rows.append({
                 "Batch ID": batch_id or "",
                 "Channel": DEFAULT_CHANNEL,
                 COLD_MAILING_IMPORT_LABEL: DEFAULT_CHANNEL,
@@ -487,16 +555,15 @@ async def neukontakte_preview(
                 "name": name,
                 "E-Mail": email_str,
                 "Organisation": org_name,
-            }
-            if orgart_key:
-                row["Organisationsart"] = p.get(orgart_key)
-
-            rows.append(row)
+                "Fachbereich": fb_label,
+            })
 
         df = pd.DataFrame(rows)
         await save_df_text(df, "nk_master_final")
 
-        preview_table = (df.head(50).to_html(classes="grid", index=False, border=0) if not df.empty else "<i>Keine Daten</i>")
+        preview_table = (df.head(50).to_html(classes="grid", index=False, border=0)
+                         if not df.empty else "<i>Keine Daten</i>")
+
         html = f"""
 <!doctype html><html lang="de"><head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
@@ -511,7 +578,7 @@ async def neukontakte_preview(
 </style></head>
 <body>
   <div style="padding:16px 20px;">
-    <h3>Vorschau – Fachbereich: <b>{fachbereich}</b> | Batch: <b>{batch_id or "-"}</b> | Datensätze: <b>{len(df)}</b></h3>
+    <h3>Vorschau – Fachbereich: <b>{fb_label}</b> | Batch: <b>{batch_id or "-"}</b> | Datensätze: <b>{len(df)}</b></h3>
     {preview_table}
     <p><a class="btn" href="/neukontakte">Zurück</a></p>
     <p><button class="btn" id="btnReconcile">Abgleich durchführen</button></p>
