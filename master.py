@@ -54,9 +54,7 @@ async def save_df(df: pd.DataFrame, table: str):
         await conn.execute(f'CREATE TABLE "{table}" ({cols})')
         cols_list = list(df.columns)
         placeholders = ", ".join(f"${i+1}" for i in range(len(cols_list)))
-        # fix: Spaltenliste sauber ohne verschachtelte f-Strings bauen
-        cols_sql = ", ".join(f'"{c}"' for c in cols_list)
-        stmt = f'INSERT INTO "{table}" ({cols_sql}) VALUES ({placeholders})'
+        stmt = f'INSERT INTO "{table}" ({", ".join([f"""\"{c}\"""" for c in cols_list])}) VALUES ({placeholders})'
         records = [tuple("" if pd.isna(row[c]) else str(row[c]) for c in cols_list) for _, row in df.iterrows()]
         if records:
             await conn.executemany(stmt, records)
@@ -74,85 +72,59 @@ def extract_email(value):
     if isinstance(value, (list, tuple)):
         if len(value) == 0:
             return None
-        # Pipedrive liefert oft [{"label":"work","value":"...","primary":true}]
         first = value[0]
         if isinstance(first, dict):
             return first.get("value") or None
-        return str(first)
-    return str(value)
+        return str(first) if first is not None else None
+    return str(value) if value is not None else None
 
-async def get_persons_by_filter(filter_id: int, limit: int = 500):
-    start = 0
-    all_items = []
-    async with httpx.AsyncClient(timeout=45.0) as client:
+def to_int(v, default=0) -> int:
+    try:
+        if v is None: 
+            return default
+        s = str(v).strip()
+        return int(s) if s != "" else default
+    except:
+        return default
+
+# ========= Pipedrive =========
+async def get_person_fields():
+    url = f"{PIPEDRIVE_API}/personFields?api_token={PD_API_TOKEN}"
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        r = await client.get(url)
+        r.raise_for_status()
+        data = r.json().get("data") or []
+    mapping = {}
+    for f in data:
+        name = f.get("name")
+        key = f.get("key")
+        options = f.get("options") or []
+        mapping[name] = {"key": key, "options": options, "name": name}
+        mapping[_norm(name)] = {"key": key, "options": options, "name": name}
+    return mapping
+
+async def fetch_persons_by_filter(filter_id: int):
+    persons, start, limit = [], 0, 500
+    async with httpx.AsyncClient(timeout=60.0) as client:
         while True:
             url = f"{PIPEDRIVE_API}/persons?filter_id={filter_id}&start={start}&limit={limit}&api_token={PD_API_TOKEN}"
             r = await client.get(url)
             if r.status_code != 200:
-                raise RuntimeError(f"Pipedrive Fehler: {r.text}")
-            data = r.json().get("data") or []
-            if not data:
+                raise Exception(f"Pipedrive API Fehler: {r.text}")
+            chunk = r.json().get("data") or []
+            if not chunk:
                 break
-            all_items.extend(data)
-            if len(data) < limit:
+            persons.extend(chunk)
+            if len(chunk) < limit:
                 break
             start += limit
-    return all_items
+    return persons
 
-async def get_person_fields():
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        url = f"{PIPEDRIVE_API}/personFields?api_token={PD_API_TOKEN}"
-        r = await client.get(url)
-        r.raise_for_status()
-        return r.json().get("data") or []
-
-def detect_keys(fields, *labels):
-    """Findet Pipedrive-Feldschlüssel anhand von Labels (Fallback: Name)."""
-    res = {}
-    for label in labels:
-        norm = _norm(label)
-        for f in fields:
-            # bevorzugt exakte Label-Übereinstimmung
-            if _norm(f.get("name") or "") == norm:
-                res[label] = f.get("key")
-                break
-        else:
-            # notfalls 'name' enthält ...
-            for f in fields:
-                if norm in _norm(f.get("name") or ""):
-                    res[label] = f.get("key")
-                    break
-    return res
-
-def build_fachbereich_options(persons, key_fachbereich: str):
-    raw = []
+def extract_unique_options_from_persons(persons, field_key):
+    uniq, seen = [], set()
     for p in persons:
-        v = p.get(key_fachbereich)
-        if v is None:
-            continue
-        if isinstance(v, list):
-            for x in v:
-                if x:
-                    raw.append(x)
-        else:
-            raw.append(v)
-    # aufbereiten & zählen
-    counts = {}
-    for x in raw:
-        s = str(x).strip()
-        if not s:
-            continue
-        counts[s] = counts.get(s, 0) + 1
-    # Option-Liste
-    opts = [{"value": k, "label": k, "count": v} for k, v in sorted(counts.items(), key=lambda x: x[1], reverse=True)]
-    return opts
-
-def to_select(data: list[str]):
-    """Hilfsformat für <select> (Template)."""
-    seen = set()
-    uniq = []
-    for s in data:
-        s = str(s).strip()
+        val = p.get(field_key)
+        s = str(val).strip() if val is not None else ""
         if s and s not in seen:
             seen.add(s)
             uniq.append({"id": s, "label": s})
@@ -183,65 +155,74 @@ async def root_redirect():
     return HTMLResponse('<meta http-equiv="refresh" content="0;url=/neukontakte">')
 
 @app.get("/overview", response_class=HTMLResponse)
-async def overview_redirect():
+async def old_redirect():
     return HTMLResponse('<meta http-equiv="refresh" content="0;url=/neukontakte">')
 
-# ========= UI: Form =========
+# ========= Form (Design) =========
 @app.get("/neukontakte", response_class=HTMLResponse)
-async def neukontakte(request: Request):
-    persons = await get_persons_by_filter(FILTER_NEUKONTAKTE)
+async def neukontakte_form(request: Request):
     fields = await get_person_fields()
-    keys = detect_keys(fields, FIELD_NAME_FACHBEREICH, FIELD_NAME_BATCH, FIELD_NAME_CHANNEL, FIELD_NAME_ORGART)
-    key_fb   = keys.get(FIELD_NAME_FACHBEREICH)
-    opts = build_fachbereich_options(persons, key_fb) if key_fb else []
+
+    wanted_norm = _norm(FIELD_NAME_FACHBEREICH)
+    fach = fields.get(wanted_norm) or fields.get(FIELD_NAME_FACHBEREICH) or fields.get("Fachbereich – Kampagne")
+    if not fach:
+        return HTMLResponse(
+            "<div class='error'>❌ Feld „Fachbereich_Kampagne“ nicht gefunden. Bitte prüfen.</div>",
+            status_code=500
+        )
+
+    persons = await fetch_persons_by_filter(FILTER_NEUKONTAKTE)
+    options = fach.get("options") or extract_unique_options_from_persons(persons, fach["key"])
+
+    counts = {}
+    for p in persons:
+        val = p.get(fach["key"])
+        s = str(val).strip() if val is not None else ""
+        if s:
+            counts[s] = counts.get(s, 0) + 1
+
+    enriched = []
+    for opt in options:
+        oid, label = str(opt["id"]), opt["label"]
+        c = counts.get(oid, counts.get(label, 0))
+        enriched.append({"id": opt["id"], "label": label, "count": c or 0})
+
+    total_count = sum(counts.values())
 
     return templates.TemplateResponse(
-        "neukontakte.html",
-        {
-            "request": request,
-            "total": len(persons),
-            "options": opts,
-            "filter_id": FILTER_NEUKONTAKTE,
-        },
+        "neukontakte_form.html",
+        {"request": request, "options": enriched, "total": total_count}
     )
 
-# ========= Preview =========
+# ========= Vorschau =========
 @app.post("/neukontakte/preview", response_class=HTMLResponse)
 async def neukontakte_preview(
     request: Request,
     fachbereich_value: str = Form(...),
     batch_id: str = Form(...),
-    take_count: Optional[str] = Form(None)   # <-- robust gegen leer/fehlen
+    take_count: Optional[str] = Form(None)   # <-- robust gegen leer/fehlend
 ):
     try:
-        persons = await get_persons_by_filter(FILTER_NEUKONTAKTE)
+        take_n = to_int(take_count, 0)
+
         fields = await get_person_fields()
-        keys = detect_keys(fields, FIELD_NAME_FACHBEREICH, FIELD_NAME_BATCH, FIELD_NAME_CHANNEL, FIELD_NAME_ORGART)
-        key_fb   = keys.get(FIELD_NAME_FACHBEREICH)
-        key_batch= keys.get(FIELD_NAME_BATCH)
-        key_chan = keys.get(FIELD_NAME_CHANNEL)
+        wanted_norm = _norm(FIELD_NAME_FACHBEREICH)
+        fach = fields.get(wanted_norm) or fields.get(FIELD_NAME_FACHBEREICH) or fields.get("Fachbereich – Kampagne")
+        if not fach:
+            return HTMLResponse("<div class='error'>❌ Feld „Fachbereich_Kampagne“ nicht gefunden.</div>", status_code=500)
 
-        # filtern auf Fachbereich
-        def in_fb(p):
-            v = p.get(key_fb)
-            if isinstance(v, list):
-                return any(str(x) == fachbereich_value for x in v if x is not None)
-            return str(v) == fachbereich_value
+        key_fach   = fach["key"]
+        key_chan   = (fields.get(_norm(FIELD_NAME_CHANNEL)) or fields.get(FIELD_NAME_CHANNEL) or {}).get("key")
 
-        data = [p for p in persons if in_fb(p)] if key_fb else persons
-        # begrenzen
-        take_n = None
-        if take_count:
-            try:
-                take_n = max(1, int(take_count))
-            except Exception:
-                take_n = None
-        if take_n:
-            data = data[:take_n]
+        persons = await fetch_persons_by_filter(FILTER_NEUKONTAKTE)
+        filtered = [p for p in persons if key_fach in p and (str(p[key_fach]) == str(fachbereich_value))]
+        if take_n and int(take_n) > 0:
+            filtered = filtered[: int(take_n)]
 
-        # DataFrame vorbereiten
-        df = pd.json_normalize(data)
-        # Feldmapping (Batch/Channel fürs UI nur als Vorschau)
+        df = pd.DataFrame(filtered)
+        if df.empty:
+            return HTMLResponse("<div class='card'><h3>Keine Datensätze für diese Auswahl.</h3></div>")
+
         if "email" in df.columns:
             df["E-Mail"] = df["email"].apply(extract_email)
         if "org_name" in df.columns:
@@ -276,71 +257,53 @@ async def neukontakte_run(
     request: Request,
     fachbereich_value: str = Form(...),
     batch_id: str = Form(...),
-    take_count: Optional[str] = Form(None)  # <-- robust gegen leer/fehlen
+    take_count: Optional[str] = Form(None)  # <-- robust gegen leer/fehlend
 ):
     try:
-        # neu ziehen (keine DB-Abhängigkeit)
-        persons = await get_persons_by_filter(FILTER_NEUKONTAKTE)
+        take_n = to_int(take_count, 0)
+
         fields = await get_person_fields()
-        keys = detect_keys(fields, FIELD_NAME_FACHBEREICH, FIELD_NAME_BATCH, FIELD_NAME_CHANNEL, FIELD_NAME_ORGART)
-        key_fb   = keys.get(FIELD_NAME_FACHBEREICH)
-        key_batch= keys.get(FIELD_NAME_BATCH)
-        key_chan = keys.get(FIELD_NAME_CHANNEL)
-        key_org  = keys.get(FIELD_NAME_ORGART)
+        wanted_norm = _norm(FIELD_NAME_FACHBEREICH)
+        fach = fields.get(wanted_norm) or fields.get(FIELD_NAME_FACHBEREICH) or fields.get("Fachbereich – Kampagne")
+        if not fach:
+            return HTMLResponse("<div class='error'>❌ Feld „Fachbereich_Kampagne“ nicht gefunden.</div>", status_code=500)
 
-        # filtern & begrenzen (wie Preview)
-        def in_fb(p):
-            v = p.get(key_fb)
-            if isinstance(v, list):
-                return any(str(x) == fachbereich_value for x in v if x is not None)
-            return str(v) == fachbereich_value
-        data = [p for p in persons if in_fb(p)] if key_fb else persons
+        key_fach   = fach["key"]
+        key_batch  = (fields.get(_norm(FIELD_NAME_BATCH))   or fields.get(FIELD_NAME_BATCH)   or {}).get("key")
+        key_chan   = (fields.get(_norm(FIELD_NAME_CHANNEL)) or fields.get(FIELD_NAME_CHANNEL) or {}).get("key")
+        key_orgart = (fields.get(_norm(FIELD_NAME_ORGART))  or fields.get(FIELD_NAME_ORGART)  or {}).get("key")
 
-        # limit
-        take_n = None
-        if take_count:
-            try:
-                take_n = max(1, int(take_count))
-            except Exception:
-                take_n = None
-        if take_n:
-            data = data[:take_n]
+        persons = await fetch_persons_by_filter(FILTER_NEUKONTAKTE)
+        data = [p for p in persons if key_fach in p and (str(p[key_fach]) == str(fachbereich_value))]
+        if take_n and int(take_n) > 0:
+            data = data[: int(take_n)]
 
-        # Batch & Channel ins Live-System schreiben
-        updated = 0
-        if key_batch or key_chan:
-            # Parallelisierung in moderater Breite
-            sem = asyncio.Semaphore(8)
-            async def do_update(p):
-                nonlocal updated
-                pid = p.get("id")
-                if not pid:
-                    return
-                payload = {}
-                if key_batch:
-                    payload[key_batch] = batch_id
-                if key_chan:
-                    payload[key_chan] = CHANNEL_VALUE
-                async with sem:
-                    status = await update_person(pid, payload)
-                if status in (200, 201, 204):
-                    updated += 1
+        if not data:
+            return HTMLResponse("<div class='card'><h3>Keine Datensätze für diese Auswahl.</h3></div>")
 
-            await asyncio.gather(*(do_update(p) for p in data))
+        async def _upd(p):
+            payload = {}
+            if key_batch: payload[key_batch] = batch_id
+            if key_chan:  payload[key_chan]  = CHANNEL_VALUE
+            return await update_person(p["id"], payload)
 
-        # df bauen und Cleanup anwenden (Orga-Art leer, max.2/Orga)
-        df = pd.json_normalize(data)
+        sem = asyncio.Semaphore(8)
+        async def guarded(p):
+            async with sem:
+                return await _upd(p)
+
+        results = await asyncio.gather(*[guarded(p) for p in data])
+        updated = sum(1 for s in results if s == 200)
+
+        df = pd.DataFrame(data)
         if "email" in df.columns:
             df["E-Mail"] = df["email"].apply(extract_email)
         if "org_name" in df.columns:
             df.rename(columns={"org_name": "Organisation"}, inplace=True)
-        df["Batch ID"] = batch_id
-        df["Channel"]  = CHANNEL_VALUE
-        if key_org:
-            df[key_org] = df.get(key_org)
-        df = apply_basic_cleanup(df, key_org or FIELD_NAME_ORGART)
+        if key_orgart and key_orgart in df.columns:
+            df.rename(columns={key_orgart: "Organisationsart"}, inplace=True)
 
-        # final speichern (für Export/Weiterverarbeitung)
+        df = apply_basic_cleanup(df, "Organisationsart")
         await save_df(df, "nk_master_final")
 
         html = f"""
@@ -362,8 +325,3 @@ async def neukontakte_run(
 
     except Exception as e:
         return HTMLResponse(f"<div class='error'><h3>❌ Fehler beim Abgleich:</h3><pre>{e}</pre></div>", status_code=500)
-
-# ========= Catch-all Fallback =========
-@app.get("/{full_path:path}", include_in_schema=False)
-async def catch_all(full_path: str):
-    return HTMLResponse('<meta http-equiv="refresh" content="0;url=/neukontakte">')
