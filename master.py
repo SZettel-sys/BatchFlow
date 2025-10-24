@@ -56,8 +56,9 @@ DEFAULT_CHANNEL = "Cold-Mail"
 COLD_MAILING_IMPORT_LABEL = "Cold-Mailing Import"
 
 # Performance
-PAGE_LIMIT = int(os.getenv("PAGE_LIMIT", "200"))
-RECONCILE_MAX_ROWS = int(os.getenv("RECONCILE_MAX_ROWS", "800"))
+PAGE_LIMIT = int(os.getenv("PAGE_LIMIT", "500"))          # weniger Roundtrips
+RECONCILE_MAX_ROWS = int(os.getenv("RECONCILE_MAX_ROWS", "1000"))
+OPTIONS_TTL_SEC = int(os.getenv("OPTIONS_TTL_SEC", "900"))  # Cache für /options
 
 # OAuth Tokens (einfach)
 user_tokens: Dict[str, str] = {}
@@ -302,10 +303,9 @@ async def load_df_text(table: str) -> pd.DataFrame:
     return pd.DataFrame(data, columns=cols).replace({"": np.nan})
 
 # =============================================================================
-# Optionen-Cache (10 Minuten)
+# Optionen-Cache
 # =============================================================================
 _OPTIONS_CACHE: dict = {"ts": 0.0, "total": 0, "options": []}
-OPTIONS_TTL_SEC = 600
 
 # =============================================================================
 # Routing
@@ -342,7 +342,7 @@ async def oauth_callback(code: str):
 # -----------------------------------------------------------------------------
 @app.get("/neukontakte", response_class=HTMLResponse)
 async def neukontakte(request: Request):
-    total = await count_persons_in_filter(FILTER_NEUKONTAKTE)
+    # ⚡️ Kein serverseitiges Zählen mehr – das blockierte den First Paint.
     authed = bool(user_tokens.get("default") or PD_API_TOKEN)
 
     html = f"""<!doctype html><html lang="de">
@@ -367,7 +367,7 @@ async def neukontakte(request: Request):
 </head>
 <body>
 <header>
-  <div><b>Neukontakte (Filter {FILTER_NEUKONTAKTE})</b> · Gesamt: <b>{total}</b></div>
+  <div><b>Neukontakte (Filter {FILTER_NEUKONTAKTE})</b> · Gesamt: <b id="total-count">lädt…</b></div>
   <div>{"<span class='muted'>angemeldet</span>" if authed else "<a href='/login'>Anmelden</a>"}</div>
 </header>
 
@@ -416,6 +416,7 @@ async function loadOptions(){{
     }});
     document.getElementById('fbinfo').textContent =
       "Gesamt im Filter: " + data.total + " | Fachbereiche: " + data.options.length;
+    document.getElementById('total-count').textContent = String(data.total);
   }} catch(e) {{
     alert('Fehler beim Laden der Fachbereiche: ' + e);
   }} finally {{
@@ -450,22 +451,6 @@ loadOptions();
 </script>
 </body></html>"""
     return HTMLResponse(html)
-
-async def count_persons_in_filter(filter_id: int) -> int:
-    start, total = 0, 0
-    while True:
-        url = append_token(f"{PIPEDRIVE_API}/persons?filter_id={filter_id}&start={start}&limit={PAGE_LIMIT}")
-        r = await http_client().get(url, headers=get_headers())
-        if r.status_code != 200:
-            return total
-        items = r.json().get("data") or []
-        if not items:
-            break
-        total += len(items)
-        if len(items) < PAGE_LIMIT:
-            break
-        start += PAGE_LIMIT
-    return total
 
 # -----------------------------------------------------------------------------
 @app.get("/neukontakte/options")
@@ -627,7 +612,6 @@ async def _reconcile_impl() -> HTMLResponse:
                     continue
                 b = n[0]
                 ext_buckets.setdefault(b, []).append(n)
-        # dedupe je Bucket
         for b in list(ext_buckets.keys()):
             ext_buckets[b] = list(dict.fromkeys(ext_buckets[b]))
 
@@ -640,7 +624,6 @@ async def _reconcile_impl() -> HTMLResponse:
             bucket = ext_buckets.get(cand_norm[0])
             if not bucket:
                 continue
-            # Vorfilter nach Länge (±4 Zeichen) reduziert Kandidatenmenge
             near = [n for n in bucket if abs(len(n) - len(cand_norm)) <= 4]
             if not near:
                 continue
