@@ -2,6 +2,7 @@
 import os
 import re
 import time
+import sys
 from typing import Optional, Dict, List, Tuple, AsyncGenerator
 
 import numpy as np
@@ -10,10 +11,7 @@ import httpx
 import asyncpg
 
 from fastapi import FastAPI, Request, Body
-from fastapi.responses import (
-    HTMLResponse, RedirectResponse, JSONResponse,
-    PlainTextResponse, StreamingResponse
-)
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.gzip import GZipMiddleware
 from rapidfuzz import fuzz, process
@@ -46,28 +44,26 @@ DATABASE_URL = os.getenv("DATABASE_URL", "")
 if not DATABASE_URL:
     raise ValueError("DATABASE_URL fehlt")
 
-SCHEMA = os.getenv("PGSCHEMA", "public")  # falls ihr mal ein anderes Schema nutzen wollt
+SCHEMA = os.getenv("PGSCHEMA", "public")
 
-# Felder / Filter
+# Filter/Felder
 FILTER_NEUKONTAKTE = 2998
 FIELD_FACHBEREICH_HINT = "fachbereich"
 FIELD_ORGART_HINT = "organisationsart"
 
-# Visual / Vorgaben
+# UI/Defaults
 DEFAULT_CHANNEL = "Cold-Mail"
 COLD_MAILING_IMPORT_LABEL = "Cold-Mailing Import"
 
-# Paginierungs-Limit (klein halten → weniger RAM-Spitzen)
+# Performance
 PAGE_LIMIT = int(os.getenv("PAGE_LIMIT", "200"))
-
-# Abgleich-Obergrenze für Free-Instanz (kann per Env erhöht werden)
 RECONCILE_MAX_ROWS = int(os.getenv("RECONCILE_MAX_ROWS", "800"))
 
 # OAuth Tokens (einfach)
 user_tokens: Dict[str, str] = {}
 
 # =============================================================================
-# App-Startup: HTTP-Client + DB-Pool
+# Startup: HTTP-Client + DB-Pool
 # =============================================================================
 def http_client() -> httpx.AsyncClient:
     return app.state.http  # type: ignore[attr-defined]
@@ -89,7 +85,7 @@ async def _shutdown():
         await app.state.pool.close()
 
 # =============================================================================
-# Health-Check
+# Health
 # =============================================================================
 @app.get("/healthz")
 async def healthz():
@@ -101,7 +97,7 @@ async def healthz():
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
 # =============================================================================
-# Hilfsfunktionen (Parsing, Normalisierung, Ähnlichkeit)
+# Helpers
 # =============================================================================
 def _as_list_email(value) -> List[str]:
     if value is None or (isinstance(value, float) and pd.isna(value)):
@@ -127,14 +123,11 @@ def normalize_name(s: str) -> str:
     if not s:
         return ""
     s = s.lower()
-    s = re.sub(r"\b(gmbh|ug|ag|kg|ohg|inc|ltd|co|kgAA)\b", "", s)
+    s = re.sub(r"\b(gmbh|ug|ag|kg|ohg|inc|ltd|co)\b", "", s)
     s = re.sub(r"[^a-z0-9 ]", "", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
-# =============================================================================
-# Pipedrive Helper
-# =============================================================================
 def get_headers() -> Dict[str, str]:
     token = user_tokens.get("default", "")
     if token:
@@ -157,23 +150,11 @@ async def get_person_fields() -> List[dict]:
     r.raise_for_status()
     return r.json().get("data") or []
 
-async def get_field_key_by_hint(label_hint: str) -> Optional[str]:
-    fields = await get_person_fields()
-    hint = label_hint.lower()
-    for f in fields:
-        if hint in (f.get("name") or "").lower():
-            return f.get("key")
-    return None
-
 async def get_person_field_by_hint(label_hint: str) -> Optional[dict]:
-    url = append_token(f"{PIPEDRIVE_API}/personFields")
-    r = await http_client().get(url, headers=get_headers())
-    r.raise_for_status()
-    fields = r.json().get("data") or []
+    fields = await get_person_fields()
     hint = (label_hint or "").lower()
     for f in fields:
-        name = (f.get("name") or "").lower()
-        if hint in name:
+        if hint in (f.get("name") or "").lower():
             return f
     return None
 
@@ -186,7 +167,6 @@ def field_options_id_to_label_map(field: dict) -> Dict[str, str]:
         mp[oid] = lab
     return mp
 
-# Streamendes Zählen: vermeidet große Listen im RAM
 async def stream_count_person_field_values(
     filter_id: int,
     field_key: str,
@@ -221,7 +201,6 @@ async def stream_count_person_field_values(
         start += page_limit
     return total, counts
 
-# paginierter Fetch mit Frühabbruch
 async def fetch_persons_until_match(
     filter_id: int,
     match_fn,
@@ -248,7 +227,6 @@ async def fetch_persons_until_match(
         start += page_limit
     return collected
 
-# Orga-Fetch (paginierend)
 async def fetch_organizations_by_filter(filter_id: int, page_limit: int = PAGE_LIMIT) -> AsyncGenerator[dict, None]:
     start = 0
     while True:
@@ -265,7 +243,6 @@ async def fetch_organizations_by_filter(filter_id: int, page_limit: int = PAGE_L
             break
         start += page_limit
 
-# Personen-IDs streamen (kein Full-Download)
 async def stream_person_ids_by_filter(filter_id: int, page_limit: int = PAGE_LIMIT) -> AsyncGenerator[str, None]:
     start = 0
     while True:
@@ -327,7 +304,7 @@ _OPTIONS_CACHE: dict = {"ts": 0.0, "total": 0, "options": []}
 OPTIONS_TTL_SEC = 600
 
 # =============================================================================
-# OAuth & Routing Basics
+# Routing
 # =============================================================================
 @app.get("/")
 def root():
@@ -358,9 +335,7 @@ async def oauth_callback(code: str):
     user_tokens["default"] = tok["access_token"]
     return RedirectResponse("/neukontakte")
 
-# =============================================================================
-# Startseite
-# =============================================================================
+# -----------------------------------------------------------------------------
 @app.get("/neukontakte", response_class=HTMLResponse)
 async def neukontakte(request: Request):
     total = await count_persons_in_filter(FILTER_NEUKONTAKTE)
@@ -436,7 +411,8 @@ async function loadOptions(){{
       opt.textContent = o.label + ' (' + o.count + ')';
       sel.appendChild(opt);
     }});
-    document.getElementById('fbinfo').textContent = "Gesamt im Filter: " + data.total + " | Fachbereiche: " + data.options.length;
+    document.getElementById('fbinfo').textContent =
+      "Gesamt im Filter: " + data.total + " | Fachbereiche: " + data.options.length;
   }} catch(e) {{
     alert('Fehler beim Laden der Fachbereiche: ' + e);
   }} finally {{
@@ -489,9 +465,7 @@ async def count_persons_in_filter(filter_id: int) -> int:
         start += PAGE_LIMIT
     return total
 
-# =============================================================================
-# Optionen (Labels + Cache, streamend gezählt)
-# =============================================================================
+# -----------------------------------------------------------------------------
 @app.get("/neukontakte/options")
 async def neukontakte_options():
     now = time.time()
@@ -499,79 +473,4 @@ async def neukontakte_options():
         return JSONResponse({"total": _OPTIONS_CACHE["total"], "options": _OPTIONS_CACHE["options"]})
 
     fb_field = await get_person_field_by_hint(FIELD_FACHBEREICH_HINT)
-    if not fb_field:
-        return JSONResponse({"total": 0, "options": []})
-    fb_key = fb_field.get("key")
-    id2label = field_options_id_to_label_map(fb_field)
-
-    total, counts = await stream_count_person_field_values(FILTER_NEUKONTAKTE, fb_key)
-
-    options = []
-    for opt_id, cnt in counts.items():
-        label = id2label.get(str(opt_id), str(opt_id))
-        options.append({"value": opt_id, "label": label, "count": cnt})
-    options.sort(key=lambda x: x["count"], reverse=True)
-
-    _OPTIONS_CACHE.update({"ts": now, "total": total, "options": options})
-    return JSONResponse({"total": total, "options": options})
-
-# =============================================================================
-# Vorschau – Auswahl speichern
-# =============================================================================
-@app.post("/neukontakte/preview", response_class=HTMLResponse)
-async def neukontakte_preview(
-    fachbereich: str = Body(...),
-    take_count: Optional[int] = Body(None),
-    batch_id: Optional[str] = Body(None),
-):
-    try:
-        fb_field = await get_person_field_by_hint(FIELD_FACHBEREICH_HINT)
-        if not fb_field:
-            return HTMLResponse("<div style='padding:24px;color:#b00'>❌ 'Fachbereich'-Feld nicht gefunden.</div>", 500)
-        fb_key = fb_field.get("key")
-        id2label = field_options_id_to_label_map(fb_field)
-        fb_label = id2label.get(str(fachbereich), str(fachbereich))
-
-        def _match(p: dict) -> bool:
-            val = p.get(fb_key)
-            if isinstance(val, np.ndarray):
-                val = val.tolist()
-            if isinstance(val, list):
-                return str(fachbereich) in [str(x) for x in val if x is not None]
-            return str(val) == str(fachbereich)
-
-        max_collect = int(take_count) if (take_count and take_count > 0) else None
-        sel = await fetch_persons_until_match(FILTER_NEUKONTAKTE, _match, max_collect=max_collect)
-
-        rows = []
-        for p in sel:
-            pid = p.get("id")
-            name = p.get("name") or ""
-            email_str = ", ".join(_as_list_email(p.get("email")))
-            org_name = "-"
-            org = p.get("org_id")
-            if isinstance(org, dict):
-                org_name = org.get("name") or "-"
-            rows.append({
-                "Batch ID": batch_id or "",
-                "Channel": DEFAULT_CHANNEL,
-                COLD_MAILING_IMPORT_LABEL: DEFAULT_CHANNEL,
-                "id": pid,
-                "name": name,
-                "E-Mail": email_str,
-                "Organisation": org_name,
-                "Fachbereich": fb_label,
-            })
-
-        df = pd.DataFrame(rows)
-        await save_df_text(df, "nk_master_final")
-
-        preview_table = (df.head(50).to_html(classes="grid", index=False, border=0)
-                         if not df.empty else "<i>Keine Daten</i>")
-
-        html = f"""
-<!doctype html><html lang="de"><head>
-<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>Vorschau – Neukontakte</title>
-<style>
-  body{{font-family: Inter, -apple-system, Segoe UI, Roboto, Arial, sans-serif;background:#f5f7fa;color
+    if not fbassistant_RGCTXanalysis
