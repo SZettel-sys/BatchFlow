@@ -1,6 +1,7 @@
 # master.py
 import os
 import re
+import io
 import sys
 import time
 from typing import Optional, Dict, List, Tuple, AsyncGenerator
@@ -11,7 +12,7 @@ import httpx
 import asyncpg
 
 from fastapi import FastAPI, Request, Body, Query
-from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.gzip import GZipMiddleware
 from rapidfuzz import fuzz, process
@@ -46,19 +47,19 @@ if not DATABASE_URL:
 
 SCHEMA = os.getenv("PGSCHEMA", "public")
 
-# Filter/Felder (hier ggf. je Kampagnentyp unterscheiden)
+# Filter/Felder (anpassen, falls nötig)
 FILTER_NEUKONTAKTE = 2998
 FIELD_FACHBEREICH_HINT = "fachbereich"
-FIELD_ORGART_HINT = "organisationsart"
+FIELD_ORGART_HINT = "organisationsart"  # wird NICHT mehr im Abgleich genutzt
 
 # UI/Defaults
-DEFAULT_CHANNEL = "Cold E-Mail"             # fix gesetzt
+DEFAULT_CHANNEL = "Cold E-Mail"              # fix laut Wunsch
 COLD_MAILING_IMPORT_LABEL = "Cold-Mailing Import"
 
 # Performance
-PAGE_LIMIT = int(os.getenv("PAGE_LIMIT", "500"))
-RECONCILE_MAX_ROWS = int(os.getenv("RECONCILE_MAX_ROWS", "1000"))
-OPTIONS_TTL_SEC = int(os.getenv("OPTIONS_TTL_SEC", "900"))
+PAGE_LIMIT = int(os.getenv("PAGE_LIMIT", "500"))              # größere Seiten -> weniger Roundtrips
+RECONCILE_MAX_ROWS = int(os.getenv("RECONCILE_MAX_ROWS", "10000"))
+OPTIONS_TTL_SEC = int(os.getenv("OPTIONS_TTL_SEC", "900"))    # Cache für /options
 PER_ORG_DEFAULT_LIMIT = int(os.getenv("PER_ORG_DEFAULT_LIMIT", "2"))  # 1 oder 2
 
 # OAuth Tokens (einfach)
@@ -75,7 +76,7 @@ def get_pool() -> asyncpg.Pool:
 
 @app.on_event("startup")
 async def _startup():
-    limits = httpx.Limits(max_keepalive_connections=10, max_connections=20)
+    limits = httpx.Limits(max_keepalive_connections=16, max_connections=24)
     app.state.http = httpx.AsyncClient(timeout=60.0, limits=limits)
     app.state.pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=4)
 
@@ -121,14 +122,6 @@ def _as_list_email(value) -> List[str]:
         return out
     return [str(value)]
 
-def split_name(full: str) -> Tuple[str, str]:
-    if not full:
-        return "", ""
-    parts = str(full).strip().split()
-    if len(parts) == 1:
-        return parts[0], ""
-    return parts[0], " ".join(parts[1:])
-
 def normalize_name(s: str) -> str:
     if not s:
         return ""
@@ -137,6 +130,20 @@ def normalize_name(s: str) -> str:
     s = re.sub(r"[^a-z0-9 ]", "", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
+
+def split_name(first_name: Optional[str], last_name: Optional[str], full_name: Optional[str]) -> Tuple[str, str]:
+    fn = first_name or ""
+    ln = last_name or ""
+    if fn or ln:
+        return fn, ln
+    # Fallback grob splitten
+    n = (full_name or "").strip()
+    if not n:
+        return "", ""
+    parts = n.split()
+    if len(parts) == 1:
+        return parts[0], ""
+    return " ".join(parts[:-1]), parts[-1]
 
 def get_headers() -> Dict[str, str]:
     token = user_tokens.get("default", "")
@@ -177,100 +184,43 @@ def field_options_id_to_label_map(field: dict) -> Dict[str, str]:
         mp[oid] = lab
     return mp
 
-# ---- Pipedrive Streaming-Helper ---------------------------------------------
+# =============================================================================
+# Pipedrive fetcher (streamend) + Performance: early stop
+# =============================================================================
+async def stream_persons_by_filter(
+    filter_id: int,
+    page_limit: int = PAGE_LIMIT,
+) -> AsyncGenerator[List[dict], None]:
+    start = 0
+    while True:
+        url = append_token(f"{PIPEDRIVE_API}/persons?filter_id={filter_id}&start={start}&limit={page_limit}&sort=name")
+        r = await http_client().get(url, headers=get_headers())
+        if r.status_code != 200:
+            raise Exception(f"Pipedrive API Fehler: {r.text}")
+        data = r.json().get("data") or []
+        if not data:
+            break
+        yield data
+        if len(data) < page_limit:
+            break
+        start += page_limit
+
 async def fetch_persons_until_match(
     filter_id: int,
-    predicate,
-    max_collect: Optional[int] = None,
-    page_limit: int = PAGE_LIMIT,
-) -> List[dict]:
-    start = 0
-    out: List[dict] = []
-    while True:
-        url = append_token(f"{PIPEDRIVE_API}/persons?filter_id={filter_id}&start={start}&limit={page_limit}")
-        r = await http_client().get(url, headers=get_headers())
-        if r.status_code != 200:
-            raise Exception(f"Pipedrive API Fehler: {r.text}")
-        items = r.json().get("data") or []
-        if not items:
-            break
-        for p in items:
-            if predicate(p):
-                out.append(p)
-                if max_collect and len(out) >= max_collect:
-                    return out
-        if len(items) < page_limit:
-            break
-        start += page_limit
-    return out
-
-async def fetch_organizations_by_filter(
-    filter_id: int,
-    page_limit: int = PAGE_LIMIT,
-) -> AsyncGenerator[dict, None]:
-    start = 0
-    while True:
-        url = append_token(f"{PIPEDRIVE_API}/organizations?filter_id={filter_id}&start={start}&limit={page_limit}")
-        r = await http_client().get(url, headers=get_headers())
-        if r.status_code != 200:
-            raise Exception(f"Pipedrive API Fehler (Orgs {filter_id}): {r.text}")
-        chunk = r.json().get("data") or []
-        if not chunk:
-            break
-        for o in chunk:
-            yield o
-        if len(chunk) < page_limit:
-            break
-        start += page_limit
-
-async def stream_person_ids_by_filter(
-    filter_id: int,
-    page_limit: int = PAGE_LIMIT,
-) -> AsyncGenerator[str, None]:
-    start = 0
-    while True:
-        url = append_token(f"{PIPEDRIVE_API}/persons?filter_id={filter_id}&start={start}&limit={page_limit}")
-        r = await http_client().get(url, headers=get_headers())
-        if r.status_code != 200:
-            raise Exception(f"Pipedrive API Fehler: {r.text}")
-        items = r.json().get("data") or []
-        if not items:
-            break
-        for p in items:
-            pid = p.get("id")
-            if pid is not None:
-                yield str(pid)
-        if len(items) < page_limit:
-            break
-        start += page_limit
-
-# ---- Zählen nach „max N Kontakte pro Organisation“ --------------------------
-async def stream_counts_with_org_cap(
-    filter_id: int,
-    fachbereich_key: str,
+    predicate,                      # (person) -> bool
     per_org_limit: int,
-    page_limit: int = PAGE_LIMIT,
-) -> Tuple[int, Dict[str, int]]:
+    max_collect: Optional[int] = None,
+) -> List[dict]:
     """
-    Zählt total & Fachbereich-Counts mit Orga-Limit **pro Fachbereich**.
-    Annahme: jede Person hat genau EINEN Fachbereich.
+    Streamt Personen und sammelt so lange, bis predicate True und Orga-Limit eingehalten
+    wurde. Bricht früh ab, wenn max_collect erreicht.
     """
-    total = 0
-    counts: Dict[str, int] = {}
-    # pro Fachbereich eigene Orga-Nutzung
-    used_by_fb: Dict[str, Dict[str, int]] = {}
-
-    start = 0
-    while True:
-        url = append_token(f"{PIPEDRIVE_API}/persons?filter_id={filter_id}&start={start}&limit={page_limit}")
-        r = await http_client().get(url, headers=get_headers())
-        if r.status_code != 200:
-            raise Exception(f"Pipedrive API Fehler: {r.text}")
-        items = r.json().get("data") or []
-        if not items:
-            break
-
-        for p in items:
+    org_used: Dict[str, int] = {}
+    out: List[dict] = []
+    for chunk in [c async for c in stream_persons_by_filter(filter_id)]:
+        for p in chunk:
+            if not predicate(p):
+                continue
             # Orga-Schlüssel
             org_key = None
             org = p.get("org_id")
@@ -281,31 +231,75 @@ async def stream_counts_with_org_cap(
                     org_key = f"name:{normalize_name(org.get('name'))}"
             if not org_key:
                 org_key = f"noorg:{p.get('id')}"
+            used = org_used.get(org_key, 0)
+            if used >= per_org_limit:
+                continue
+            org_used[org_key] = used + 1
+            out.append(p)
+            if max_collect and len(out) >= max_collect:
+                return out
+    return out
 
-            # EIN Fachbereich (string oder None)
+# ---- Zählen nach „Kontakte pro Organisation“ pro Fachbereich ---------------
+async def stream_counts_with_org_cap(
+    filter_id: int,
+    fachbereich_key: str,
+    per_org_limit: int,
+    page_limit: int = PAGE_LIMIT,
+) -> Tuple[int, Dict[str, int]]:
+    total = 0
+    counts: Dict[str, int] = {}
+    used_by_fb: Dict[str, Dict[str, int]] = {}
+    start = 0
+    while True:
+        url = append_token(f"{PIPEDRIVE_API}/persons?filter_id={filter_id}&start={start}&limit={page_limit}")
+        r = await http_client().get(url, headers=get_headers())
+        if r.status_code != 200:
+            raise Exception(f"Pipedrive API Fehler: {r.text}")
+        chunk = r.json().get("data") or []
+        if not chunk:
+            break
+        for p in chunk:
+            # FB (genau einer laut Anforderung)
             fb_val = p.get(fachbereich_key)
-            fb = str(fb_val).strip() if fb_val is not None else ""
-            if not fb:
+            if isinstance(fb_val, np.ndarray):
+                fb_val = fb_val.tolist()
+            if isinstance(fb_val, list):
+                fb_vals = [str(fb_val[0])] if fb_val else []
+            elif fb_val is not None and str(fb_val).strip() != "":
+                fb_vals = [str(fb_val)]
+            else:
+                fb_vals = []
+            if not fb_vals:
                 continue
 
-            # Orga-Limit **pro Fachbereich**
+            org_key = None
+            org = p.get("org_id")
+            if isinstance(org, dict):
+                if org.get("id") is not None:
+                    org_key = f"id:{org.get('id')}"
+                elif org.get("name"):
+                    org_key = f"name:{normalize_name(org.get('name'))}"
+            if not org_key:
+                org_key = f"noorg:{p.get('id')}"
+
+            fb = fb_vals[0]
             used_map = used_by_fb.setdefault(fb, {})
             used = used_map.get(org_key, 0)
             if used >= per_org_limit:
                 continue
-
             used_map[org_key] = used + 1
             counts[fb] = counts.get(fb, 0) + 1
             total += 1
 
-        if len(items) < page_limit:
+        if len(chunk) < page_limit:
             break
         start += page_limit
 
     return total, counts
 
 # =============================================================================
-# DB helpers
+# DB helpers (Schema-fest)
 # =============================================================================
 async def ensure_table_text(conn: asyncpg.Connection, table: str, cols: List[str]):
     col_defs = ", ".join([f'"{c}" TEXT' for c in cols])
@@ -346,7 +340,7 @@ async def load_df_text(table: str) -> pd.DataFrame:
 _OPTIONS_CACHE: Dict[int, dict] = {}
 
 # =============================================================================
-# Routing – Landing mit 3 Kampagnen
+# UI – Kampagnenwahl
 # =============================================================================
 @app.get("/")
 def root():
@@ -359,49 +353,36 @@ async def campaign_home():
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>BatchFlow – Kampagne wählen</title>
 <style>
-  :root{--bg:#f7f8fb;--card:#fff;--txt:#111827;--muted:#6b7280;--border:#e5e7eb;--primary:#0ea5e9;--primary-h:#0284c7}
-  *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--txt);font:15px/1.45 Inter,-apple-system,Segoe UI,Roboto,Arial,sans-serif}
-  header{position:sticky;top:0;z-index:10;background:#fff;border-bottom:1px solid var(--border)}
-  .hwrap{max-width:1080px;margin:0 auto;padding:16px 20px;display:flex;align-items:center;gap:14px}
+  :root{--bg:#f6f8fb;--card:#fff;--txt:#0f172a;--muted:#64748b;--border:#e2e8f0;--primary:#0ea5e9;--primary-h:#0284c7}
+  *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--txt);font:16px/1.6 Inter,-apple-system,Segoe UI,Roboto,Arial,sans-serif}
+  header{background:#fff;border-bottom:1px solid var(--border)}
+  .hwrap{max-width:1120px;margin:0 auto;padding:16px 20px;display:flex;align-items:center;gap:12px}
   .brand{font-weight:700;font-size:18px}
   .sub{color:var(--muted)}
-  .wrap{max-width:1080px;margin:34px auto;padding:0 20px}
-  .grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:18px}
-  @media (max-width:900px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
-  @media (max-width:640px){.grid{grid-template-columns:1fr}}
-  .card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:22px 20px;box-shadow:0 2px 6px rgba(0,0,0,.04)}
-  .title{font-weight:700;margin:2px 0 8px 0}
-  .desc{color:var(--muted);min-height:44px}
-  .cta{margin-top:14px}
+  main{max-width:1120px;margin:32px auto;padding:0 20px}
+  .grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:20px}
+  @media (max-width:1120px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+  @media (max-width:800px){.grid{grid-template-columns:1fr}}
+  .card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:22px;box-shadow:0 2px 8px rgba(2,8,23,.04)}
+  .title{font-weight:700;font-size:18px;margin:2px 0 6px}
+  .desc{color:var(--muted);min-height:48px}
   .btn{display:inline-flex;align-items:center;gap:8px;padding:10px 14px;border-radius:10px;background:var(--primary);color:#fff;text-decoration:none}
   .btn:hover{background:var(--primary-h)}
 </style></head>
 <body>
-<header><div class="hwrap"><div class="brand">BatchFlow</div><div class="sub">Kampagne wählen</div></div></header>
-<main class="wrap">
+<header><div class="hwrap"><div class="brand">BatchFlow</div><div class="sub">Kampagne auswählen</div></div></header>
+<main>
   <div class="grid">
-    <div class="card">
-      <div class="title">Neukontakte</div>
-      <div class="desc">Neue Personen aus dem Filter mit Orga-Limit, Bereinigung & Export.</div>
-      <div class="cta"><a class="btn" href="/neukontakte?mode=new">Starten</a></div>
-    </div>
-    <div class="card">
-      <div class="title">Nachfass</div>
-      <div class="desc">Folgekampagne für bereits kontaktierte Leads.</div>
-      <div class="cta"><a class="btn" href="/neukontakte?mode=nachfass">Starten</a></div>
-    </div>
-    <div class="card">
-      <div class="title">Refresh</div>
-      <div class="desc">Kontaktdaten aktualisieren/ergänzen.</div>
-      <div class="cta"><a class="btn" href="/neukontakte?mode=refresh">Starten</a></div>
-    </div>
+    <div class="card"><div class="title">Neukontakte</div><div class="desc">Neue Personen aus Filter, Abgleich & Export.</div><a class="btn" href="/neukontakte?mode=new">Starten</a></div>
+    <div class="card"><div class="title">Nachfass</div><div class="desc">Folgekampagne für bereits kontaktierte Leads.</div><a class="btn" href="/neukontakte?mode=nachfass">Starten</a></div>
+    <div class="card"><div class="title">Refresh</div><div class="desc">Kontaktdaten aktualisieren / ergänzen.</div><a class="btn" href="/neukontakte?mode=refresh">Starten</a></div>
   </div>
 </main>
 </body></html>"""
     return HTMLResponse(html)
 
 # =============================================================================
-# Hauptformular – Harmonisiert; „Pro Organisation“ über Fachbereich
+# UI – Auswahl
 # =============================================================================
 @app.get("/neukontakte", response_class=HTMLResponse)
 async def neukontakte(request: Request, mode: str = Query("new")):
@@ -414,40 +395,41 @@ async def neukontakte(request: Request, mode: str = Query("new")):
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>{page_title} – BatchFlow</title>
 <style>
-  :root{{--bg:#f7f8fb;--card:#fff;--txt:#111827;--muted:#6b7280;--border:#e5e7eb;--primary:#0ea5e9;--primary-h:#0284c7}}
-  *{{box-sizing:border-box}} body{{margin:0;background:var(--bg);color:var(--txt);font:15px/1.45 Inter,-apple-system,Segoe UI,Roboto,Arial,sans-serif}}
-  header{{position:sticky;top:0;z-index:10;background:#fff;border-bottom:1px solid var(--border)}}
-  .hwrap{{max-width:1080px;margin:0 auto;padding:14px 20px;display:flex;align-items:center;justify-content:space-between;gap:12px}}
-  .crumbs a{{color:#0a66c2;text-decoration:none}} .crumbs a:hover{{text-decoration:underline}}
-  .wrap{{max-width:1080px;margin:28px auto;padding:0 20px}}
-  .card{{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:18px 18px 16px;box-shadow:0 2px 6px rgba(0,0,0,.04)}}
-  .rowTop{{display:grid;grid-template-columns:260px 1fr;gap:16px;margin-bottom:10px}}
-  .row{{display:grid;grid-template-columns:repeat(4,1fr) 140px;gap:16px;align-items:end}}
-  @media (max-width:980px){{.row{{grid-template-columns:1fr 1fr;}} .row>div:last-child{{grid-column:1/-1;justify-self:end}}}}
-  label{{display:block;font-weight:600;margin:6px 0 6px}}
-  select,input{{width:100%;padding:10px 12px;border:1px solid #cdd5df;border-radius:10px;background:#fff}}
+  :root{{--bg:#f6f8fb;--card:#fff;--txt:#0f172a;--muted:#64748b;--border:#e2e8f0;--primary:#0ea5e9;--primary-h:#0284c7}}
+  *{{box-sizing:border-box}} body{{margin:0;background:var(--bg);color:var(--txt);font:16px/1.6 Inter,-apple-system,Segoe UI,Roboto,Arial,sans-serif}}
+  header{{background:#fff;border-bottom:1px solid var(--border)}}
+  .hwrap{{max-width:1120px;margin:0 auto;padding:14px 20px;display:flex;align-items:center;justify-content:space-between;gap:12px}}
+  main{{max-width:1120px;margin:28px auto;padding:0 20px}}
+  .card{{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:20px;box-shadow:0 2px 8px rgba(2,8,23,.04)}}
+  label{{display:block;font-weight:600;margin:8px 0 6px}}
+  select,input{{width:100%;padding:10px 12px;border:1px solid #cbd5e1;border-radius:10px;background:#fff}}
   .hint{{color:var(--muted);font-size:13px;margin-top:6px}}
-  .btn{{background:var(--primary);border:none;color:#fff;border-radius:10px;padding:11px 16px;cursor:pointer}}
-  .btn:hover{{background:var(--primary-h)}}
+  .rowTop{{display:grid;grid-template-columns:260px 1fr;gap:16px;margin-bottom:12px}}
+  .row{{display:grid;grid-template-columns:repeat(4,1fr) 200px 200px;gap:16px;align-items:end}}
+  @media (max-width:1120px){{.row{{grid-template-columns:repeat(2,1fr)}} .row>div:nth-last-child(-n+2){{grid-column:1/-1;display:flex;gap:10px;justify-content:flex-end}}}}
+  .btn{{background:var(--primary);border:none;color:#fff;border-radius:10px;padding:12px 16px;cursor:pointer}}
+  .btn.secondary{{background:#334155}} .btn.secondary:hover{{opacity:.95}}
+  .btn:disabled{{opacity:.5;cursor:not-allowed}}
+  .btn:hover:not(:disabled){{background:var(--primary-h)}}
   #overlay{{display:none;position:fixed;inset:0;background:rgba(255,255,255,.6);backdrop-filter:blur(2px);z-index:9999;align-items:center;justify-content:center}}
-  .spinner{{width:46px;height:46px;border:4px solid #93c5fd;border-top-color:#1d4ed8;border-radius:50%;animation:spin 1s linear infinite}}
+  .spinner{{width:44px;height:44px;border:4px solid #93c5fd;border-top-color:#1d4ed8;border-radius:50%;animation:spin 1s linear infinite}}
   @keyframes spin{{to{{transform:rotate(360deg)}}}}
 </style>
 </head>
 <body>
 <header>
   <div class="hwrap">
-    <div class="crumbs"><a href="/campaign">← Kampagne wählen</a></div>
+    <div><a href="/campaign" style="color:#0a66c2;text-decoration:none">← Kampagne wählen</a></div>
     <div><b>{page_title}</b> · Gesamt: <b id="total-count">lädt…</b></div>
-    <div>{"<span style='color:#6b7280'>angemeldet</span>" if authed else "<a href='/login'>Anmelden</a>"}</div>
+    <div>{"<span style='color:#64748b'>angemeldet</span>" if authed else "<a href='/login'>Anmelden</a>"}</div>
   </div>
 </header>
 
-<main class="wrap">
+<main>
   <section class="card">
     <div class="rowTop">
       <div>
-        <label>Pro Organisation</label>
+        <label>Kontakte pro Organisation</label>
         <select id="per_org_limit">
           <option value="1">1</option>
           <option value="2" selected>2</option>
@@ -456,7 +438,7 @@ async def neukontakte(request: Request, mode: str = Query("new")):
       <div>
         <label>Fachbereich</label>
         <select id="fachbereich"><option value="">– bitte auswählen –</option></select>
-        <div class="hint" id="fbinfo">Die Zahl in Klammern berücksichtigt bereits „Pro Organisation“.</div>
+        <div class="hint" id="fbinfo">Die Zahl in Klammern berücksichtigt bereits „Kontakte pro Organisation“.</div>
       </div>
     </div>
 
@@ -477,7 +459,10 @@ async def neukontakte(request: Request, mode: str = Query("new")):
       </div>
       <div></div>
       <div style="justify-self:end">
-        <button class="btn" id="btnPreview">Vorschau laden</button>
+        <button class="btn" id="btnPreview" disabled>Vorschau laden</button>
+      </div>
+      <div style="justify-self:end">
+        <button class="btn secondary" id="btnExport" disabled>Abgleich & Download</button>
       </div>
     </div>
   </section>
@@ -487,75 +472,94 @@ async def neukontakte(request: Request, mode: str = Query("new")):
 
 <script>
 const MODE = new URLSearchParams(location.search).get('mode') || 'new';
-function showOverlay(){{document.getElementById("overlay").style.display="flex";}}
-function hideOverlay(){{document.getElementById("overlay").style.display="none";}}
+const fbSel = document.getElementById('fachbereich');
+const btnPrev = document.getElementById('btnPreview');
+const btnExp  = document.getElementById('btnExport');
 
-async function loadOptions(){{
+function toggleCTAs(){ const ok = !!fbSel.value; btnPrev.disabled = !ok; btnExp.disabled = !ok; }
+fbSel.addEventListener('change', toggleCTAs);
+
+function showOverlay(){ document.getElementById("overlay").style.display="flex"; }
+function hideOverlay(){ document.getElementById("overlay").style.display="none"; }
+
+async function loadOptions(){
   showOverlay();
-  try {{
+  try{
     const pol = document.getElementById('per_org_limit').value || '{PER_ORG_DEFAULT_LIMIT}';
-    const r = await fetch('/neukontakte/options?per_org_limit=' + encodeURIComponent(pol) + '&mode=' + encodeURIComponent(MODE), {{cache:'no-store'}});
+    const r = await fetch('/neukontakte/options?per_org_limit=' + encodeURIComponent(pol) + '&mode=' + encodeURIComponent(MODE), {cache:'no-store'});
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const data = await r.json();
     const sel = document.getElementById('fachbereich');
     sel.innerHTML = '<option value="">– bitte auswählen –</option>';
-    data.options.forEach(o => {{
+    data.options.forEach(o => {
       const opt = document.createElement('option');
       opt.value = o.value;
       opt.textContent = o.label + ' (' + o.count + ')';
       sel.appendChild(opt);
-    }});
-    document.getElementById('fbinfo').textContent = "Gesamt (nach Orga-Limit): " + data.total + " | Fachbereiche: " + data.options.length;
+    });
+    document.getElementById('fbinfo').textContent = "Gesamt (nach Orga-Limit): " + data.total + " · Fachbereiche: " + data.options.length;
     document.getElementById('total-count').textContent = String(data.total);
-  }} catch(e) {{
-    alert('Fehler beim Laden der Fachbereiche: ' + e);
-  }} finally {{
-    hideOverlay();
-  }}
-}}
+    toggleCTAs();
+  }catch(e){ alert('Fehler beim Laden der Fachbereiche: ' + e); }
+  finally{ hideOverlay(); }
+}
 
 document.getElementById('per_org_limit').addEventListener('change', loadOptions);
 
-document.getElementById('btnPreview').addEventListener('click', async () => {{
-  const fb = document.getElementById('fachbereich').value;
-  const tc = document.getElementById('take_count').value || null;
+btnPrev.addEventListener('click', async () => {
+  const fb  = document.getElementById('fachbereich').value;
+  const tc  = document.getElementById('take_count').value || null;
   const bid = document.getElementById('batch_id').value || null;
-  const camp = document.getElementById('campaign').value || null;
+  const camp= document.getElementById('campaign').value || null;
   const pol = document.getElementById('per_org_limit').value || '{PER_ORG_DEFAULT_LIMIT}';
-  if(!fb) {{ alert('Bitte zuerst einen Fachbereich wählen.'); return; }}
+  if(!fb){ alert('Bitte zuerst einen Fachbereich wählen.'); return; }
   showOverlay();
-  try {{
-    const r = await fetch('/neukontakte/preview?mode=' + encodeURIComponent(MODE), {{
-      method:'POST', headers:{{'Content-Type':'application/json'}}, cache:'no-store',
-      body: JSON.stringify({{ fachbereich: fb, take_count: tc ? parseInt(tc) : null, batch_id: bid, campaign: camp, per_org_limit: parseInt(pol) }})
-    }});
+  try{
+    const r = await fetch('/neukontakte/preview?mode=' + encodeURIComponent(MODE), {
+      method:'POST', headers:{'Content-Type':'application/json'}, cache:'no-store',
+      body: JSON.stringify({ fachbereich: fb, take_count: tc ? parseInt(tc) : null, batch_id: bid, campaign: camp, per_org_limit: parseInt(pol) })
+    });
     if (!r.ok) throw new Error('HTTP ' + r.status);
-    const html = await r.text();
-    document.open(); document.write(html); document.close();
-  }} catch(e) {{ alert('Fehler: ' + e); }} finally {{ hideOverlay(); }}
-}});
+    const html = await r.text(); document.open(); document.write(html); document.close();
+  }catch(e){ alert('Fehler: ' + e); } finally{ hideOverlay(); }
+});
+
+btnExp.addEventListener('click', async () => {
+  const fb  = document.getElementById('fachbereich').value;
+  const tc  = document.getElementById('take_count').value || null;
+  const bid = document.getElementById('batch_id').value || null;
+  const camp= document.getElementById('campaign').value || null;
+  const pol = document.getElementById('per_org_limit').value || '{PER_ORG_DEFAULT_LIMIT}';
+  if(!fb){ alert('Bitte zuerst einen Fachbereich wählen.'); return; }
+  showOverlay();
+  try{
+    const r = await fetch('/neukontakte/export?mode=' + encodeURIComponent(MODE), {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ fachbereich: fb, take_count: tc ? parseInt(tc) : null, batch_id: bid, campaign: camp, per_org_limit: parseInt(pol) })
+    });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = 'BatchFlow_Export.xlsx'; a.click();
+    URL.revokeObjectURL(url);
+  }catch(e){ alert('Fehler: ' + e); } finally{ hideOverlay(); }
+});
+
 loadOptions();
 </script>
 </body></html>"""
     return HTMLResponse(html)
 
-
 # =============================================================================
-# Optionen – je nach Modus später unterschiedliche Filter/Regeln möglich
+# Optionen (Fachbereichswerte) – per AJAX
 # =============================================================================
 @app.get("/neukontakte/options")
-async def neukontakte_options(
-    per_org_limit: int = Query(PER_ORG_DEFAULT_LIMIT, ge=1, le=2),
-    mode: str = Query("new"),
-):
+async def neukontakte_options(per_org_limit: int = Query(PER_ORG_DEFAULT_LIMIT, ge=1, le=2), mode: str = Query("new")):
     now = time.time()
-    cache_key = (per_org_limit, mode)
-    cache = _OPTIONS_CACHE.get(hash(cache_key)) or {}
+    cache = _OPTIONS_CACHE.get(per_org_limit) or {}
     if cache.get("options") and (now - cache.get("ts", 0.0) < OPTIONS_TTL_SEC):
         return JSONResponse({"total": cache["total"], "options": cache["options"]})
-
-    # Modus-spezifische Auswahl (hier noch gleich – später anpassen)
-    filter_id = FILTER_NEUKONTAKTE  # if mode == 'nachfass': ...; if mode == 'refresh': ...
 
     fb_field = await get_person_field_by_hint(FIELD_FACHBEREICH_HINT)
     if not fb_field:
@@ -563,7 +567,7 @@ async def neukontakte_options(
     fb_key = fb_field.get("key")
     id2label = field_options_id_to_label_map(fb_field)
 
-    total, counts = await stream_counts_with_org_cap(filter_id, fb_key, per_org_limit)
+    total, counts = await stream_counts_with_org_cap(FILTER_NEUKONTAKTE, fb_key, per_org_limit)
 
     options = []
     for opt_id, cnt in counts.items():
@@ -571,11 +575,11 @@ async def neukontakte_options(
         options.append({"value": opt_id, "label": label, "count": cnt})
     options.sort(key=lambda x: x["count"], reverse=True)
 
-    _OPTIONS_CACHE[hash(cache_key)] = {"ts": now, "total": total, "options": options}
+    _OPTIONS_CACHE[per_org_limit] = {"ts": now, "total": total, "options": options}
     return JSONResponse({"total": total, "options": options})
 
 # =============================================================================
-# Vorschau – Name split + Kampagne + Channel, Modus vorbereitbar
+# Vorschau – erzeugt nk_master_final
 # =============================================================================
 @app.post("/neukontakte/preview", response_class=HTMLResponse)
 async def neukontakte_preview(
@@ -587,9 +591,6 @@ async def neukontakte_preview(
     mode: str = Query("new"),
 ):
     try:
-        # Modus-spezifische Quellen (aktuell gleich)
-        filter_id = FILTER_NEUKONTAKTE
-
         fb_field = await get_person_field_by_hint(FIELD_FACHBEREICH_HINT)
         if not fb_field:
             return HTMLResponse("<div style='padding:24px;color:#b00'>❌ 'Fachbereich'-Feld nicht gefunden.</div>", 500)
@@ -605,35 +606,19 @@ async def neukontakte_preview(
                 return str(fachbereich) in [str(x) for x in val if x is not None]
             return str(val) == str(fachbereich)
 
-        raw = await fetch_persons_until_match(filter_id, _match, max_collect=None)
-
-        org_used: Dict[str, int] = {}
-        sel: List[dict] = []
-        for p in raw:
-            org_key = None
-            org = p.get("org_id")
-            if isinstance(org, dict):
-                if org.get("id") is not None:
-                    org_key = f"id:{org.get('id')}"
-                elif org.get("name"):
-                    org_key = f"name:{normalize_name(org.get('name'))}"
-            if not org_key:
-                org_key = f"noorg:{p.get('id')}"
-
-            used = org_used.get(org_key, 0)
-            if used >= int(per_org_limit):
-                continue
-            org_used[org_key] = used + 1
-            sel.append(p)
-
-        if take_count and take_count > 0:
-            sel = sel[: min(take_count, len(sel))]
+        # Personen einsammeln – früh abbrechen falls take_count gesetzt
+        raw = await fetch_persons_until_match(
+            FILTER_NEUKONTAKTE, _match, per_org_limit,
+            max_collect=take_count if take_count and take_count > 0 else None
+        )
 
         rows = []
-        for p in sel:
+        for p in raw[: (take_count or len(raw))]:
             pid = p.get("id")
-            full_name = p.get("name") or ""
-            first, last = split_name(full_name)
+            first = p.get("first_name")
+            last = p.get("last_name")
+            full = p.get("name")
+            vor, nach = split_name(first, last, full)
             email_str = ", ".join(_as_list_email(p.get("email")))
             org_name = "-"
             org = p.get("org_id")
@@ -644,12 +629,11 @@ async def neukontakte_preview(
                 "Channel": DEFAULT_CHANNEL,
                 COLD_MAILING_IMPORT_LABEL: campaign or "",
                 "id": pid,
-                "Person - Vorname": first,
-                "Person - Nachname": last,
+                "Person - Vorname": vor,
+                "Person - Nachname": nach,
                 "E-Mail": email_str,
                 "Organisation": org_name,
                 "Fachbereich": fb_label,
-                "Kampagnen-Typ": mode,
             })
 
         df = pd.DataFrame(rows)
@@ -658,28 +642,51 @@ async def neukontakte_preview(
         preview_table = (df.head(50).to_html(classes="grid", index=False, border=0)
                          if not df.empty else "<i>Keine Daten</i>")
 
+        # schlanke, ruhige Vorschau
         html = f"""<!doctype html><html lang="de"><head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>Vorschau – {mode.capitalize()}</title>
+<title>Vorschau – {fb_label}</title>
 <style>
-  body{{font-family: Inter, -apple-system, Segoe UI, Roboto, Arial, sans-serif;background:#f5f7fa;color:#1f2937;margin:0}}
-  .grid{{width:100%;border-collapse:collapse}}
-  .grid th,.grid td{{border:1px solid #e5e7eb;padding:8px 10px;text-align:left}}
-  .grid th{{background:#f3f4f6}}
-  .btn{{background:#0ea5e9;border:none;color:#fff;border-radius:8px;padding:10px 16px;cursor:pointer;text-decoration:none}}
-  .btn:hover{{background:#0284c7}}
+  :root{{--bg:#f6f8fb;--card:#fff;--txt:#0f172a;--muted:#64748b;--border:#e2e8f0;--primary:#0ea5e9;--primary-h:#0284c7}}
+  *{{box-sizing:border-box}} body{{margin:0;background:var(--bg);color:var(--txt);font:16px/1.6 Inter,-apple-system,Segoe UI,Roboto,Arial,sans-serif}}
+  header{{background:#fff;border-bottom:1px solid var(--border)}}
+  .hwrap{{max-width:1120px;margin:0 auto;padding:14px 20px;display:flex;align-items:center;justify-content:space-between;gap:12px}}
+  main{{max-width:1120px;margin:24px auto;padding:0 20px}}
+  .card{{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:18px;box-shadow:0 2px 8px rgba(2,8,23,.04)}}
+  .btn{{background:var(--primary);border:none;color:#fff;border-radius:10px;padding:10px 14px;cursor:pointer;text-decoration:none;display:inline-flex;gap:8px;align-items:center}}
+  .btn:hover{{background:var(--primary-h)}}
+  .btn.secondary{{background:#334155}} .btn.secondary:hover{{opacity:.95}}
+  table{{width:100%;border-collapse:separate;border-spacing:0;border:1px solid var(--border);border-radius:12px;overflow:hidden}}
+  th,td{{padding:10px 12px;border-bottom:1px solid var(--border);text-align:left;vertical-align:top}}
+  th{{background:#f8fafc;font-weight:700}}
+  tr:last-child td{{border-bottom:0}}
+  .toolbar{{display:flex;gap:10px;justify-content:flex-end;margin-top:14px}}
 </style></head>
 <body>
-  <div style="padding:16px 20px;">
-    <h3>Vorschau – Typ: <b>{mode.capitalize()}</b> | Fachbereich: <b>{fb_label}</b> | Batch: <b>{batch_id or "-"}</b> | Datensätze: <b>{len(df)}</b></h3>
-    {preview_table}
-    <p><a class="btn" href="/neukontakte?mode={mode}">Zurück</a></p>
-    <p><button class="btn" id="btnReconcile">Abgleich durchführen</button></p>
+<header>
+  <div class="hwrap">
+    <div><a href="/neukontakte" style="color:#0a66c2;text-decoration:none">← zurück zur Auswahl</a></div>
+    <div><b>Vorschau</b> – Fachbereich: <b>{fb_label}</b> · Batch: <b>{batch_id or "-"}</b> · Zeilen: <b>{len(df)}</b></div>
+    <div style="color:#64748b">Datensätze nach Orga-Limit</div>
   </div>
+</header>
+
+<main>
+  <section class="card">
+    {preview_table}
+    <div class="toolbar">
+      <a class="btn secondary" href="/neukontakte">Zurück</a>
+      <button class="btn" id="btnReconcile">Abgleich durchführen</button>
+    </div>
+  </section>
+</main>
+
 <script>
-document.getElementById('btnReconcile').addEventListener('click', () => {{
-  window.location.href = '/neukontakte/reconcile';
-}});
+  document.getElementById('btnReconcile').addEventListener('click', async () => {{
+    const r = await fetch('/neukontakte/reconcile', {{method:'POST'}});
+    const html = await r.text();
+    document.open(); document.write(html); document.close();
+  }});
 </script>
 </body></html>"""
         return HTMLResponse(html)
@@ -687,48 +694,37 @@ document.getElementById('btnReconcile').addEventListener('click', () => {{
         return HTMLResponse(f"<pre style='padding:24px;color:#b00'>❌ Fehler beim Abruf/Speichern:\n{e}</pre>", status_code=500)
 
 # =============================================================================
-# Abgleich – nk_master_ready & nk_delete_log (unverändert)
+# Abgleich – schreibt nk_master_ready & nk_delete_log
+#  - Regel "Organisationsart gesetzt" entfällt (wird gefiltert)
 # =============================================================================
 async def _reconcile_impl() -> HTMLResponse:
-    print("==> reconcile START", file=sys.stderr, flush=True)
-
     master = await load_df_text("nk_master_final")
-    print(f"==> reconcile loaded rows={len(master)}", file=sys.stderr, flush=True)
     if master.empty:
         return HTMLResponse("<div style='padding:24px'>Keine Daten in nk_master_final.</div>")
 
     if len(master) > RECONCILE_MAX_ROWS:
         return HTMLResponse(
             f"<div style='padding:24px;color:#b00'>❌ Zu viele Datensätze ({len(master)}). "
-            f"Bitte auf ≤ {RECONCILE_MAX_ROWS} begrenzen.</div>",
-            status_code=400
+            f"Bitte auf ≤ {RECONCILE_MAX_ROWS} begrenzen.</div>", status_code=400
         )
 
     col_person_id = "id" if "id" in master.columns else None
     col_org_name = "Organisation" if "Organisation" in master.columns else None
-    col_orgart = "Organisationsart" if "Organisationsart" in master.columns else None
 
-    delete_log = []
+    delete_log: List[Dict[str, str]] = []
 
-    if col_orgart and col_orgart in master.columns:
-        mask_orgtype = master[col_orgart].notna() & (master[col_orgart].astype(str).str.strip() != "")
-        removed = master[mask_orgtype].copy()
-        for _, r in removed.iterrows():
-            pname = (str(r.get("Person - Vorname") or "") + " " + str(r.get("Person - Nachname") or "")).strip() or str(r.get("name") or "")
-            delete_log.append({"reason":"organisationsart_set","id":r.get(col_person_id),"name":pname,
-                               "org_name":r.get(col_org_name),"extra":str(r.get(col_orgart))})
-        master = master[~mask_orgtype].copy()
-
+    # Regel 3 – Orga-Abgleich (Filter 1245, 851, 1521) >=95% mit Buckets
     suspect_org_filters = [1245, 851, 1521]
     if col_org_name and col_org_name in master.columns:
         ext_buckets: Dict[str, List[str]] = {}
         for fid in suspect_org_filters:
-            async for o in fetch_organizations_by_filter(fid, page_limit=PAGE_LIMIT):
-                n = normalize_name(o.get("name") or "")
-                if not n:
-                    continue
-                b = n[0]
-                ext_buckets.setdefault(b, []).append(n)
+            async for chunk in stream_organizations_by_filter(fid, PAGE_LIMIT):
+                for o in chunk:
+                    n = normalize_name(o.get("name") or "")
+                    if not n:
+                        continue
+                    b = n[0]
+                    ext_buckets.setdefault(b, []).append(n)
         for b in list(ext_buckets.keys()):
             ext_buckets[b] = list(dict.fromkeys(ext_buckets[b]))
 
@@ -746,35 +742,34 @@ async def _reconcile_impl() -> HTMLResponse:
                 continue
             best = process.extractOne(cand_norm, near, scorer=fuzz.token_sort_ratio)
             if best and best[1] >= 95:
-                pname = (str(row.get("Person - Vorname") or "") + " " + str(row.get("Person - Nachname") or "")).strip() or str(row.get("name") or "")
                 drop_idx.append(idx)
-                delete_log.append({"reason":"org_match_95","id":row.get(col_person_id),"name":pname,
+                delete_log.append({"reason":"org_match_95","id":str(row.get(col_person_id) or ""), "name":str(row.get("name") or ""),
                                    "org_name":cand,"extra":f"Best Match: {best[0]} ({best[1]}%)"})
         if drop_idx:
             master = master.drop(index=drop_idx)
 
+    # Regel 4 – Personen-ID-Abgleich (Filter 1216, 1708)
     suspect_person_filters = [1216, 1708]
     if col_person_id:
         suspect_ids = set()
         for fid in suspect_person_filters:
-            async for pid in stream_person_ids_by_filter(fid, page_limit=PAGE_LIMIT):
-                suspect_ids.add(pid)
+            async for ids in stream_person_ids_by_filter(fid, PAGE_LIMIT):
+                suspect_ids.update(ids)
         if suspect_ids:
             mask_pid = master[col_person_id].astype(str).isin(suspect_ids)
             removed = master[mask_pid].copy()
             for _, r in removed.iterrows():
-                pname = (str(r.get("Person - Vorname") or "") + " " + str(r.get("Person - Nachname") or "")).strip() or str(r.get("name") or "")
-                delete_log.append({"reason":"person_id_match","id":r.get(col_person_id),"name":pname,
-                                   "org_name":r.get(col_org_name),"extra":"ID in Filter 1216/1708"})
+                delete_log.append({"reason":"person_id_match","id":str(r.get(col_person_id) or ""),"name":str(r.get("name") or ""),
+                                   "org_name":str(r.get(col_org_name) or ""),"extra":"ID in Filter 1216/1708"})
             master = master[~mask_pid].copy()
 
+    # Speichern
     await save_df_text(master, "nk_master_ready")
     log_df = pd.DataFrame(delete_log, columns=["reason","id","name","org_name","extra"])
     await save_df_text(log_df, "nk_delete_log")
 
     stats = {
         "after": len(master),
-        "del_orgtype": log_df[log_df["reason"]=="organisationsart_set"].shape[0],
         "del_orgmatch": log_df[log_df["reason"]=="org_match_95"].shape[0],
         "del_pid": log_df[log_df["reason"]=="person_id_match"].shape[0],
         "deleted_total": log_df.shape[0],
@@ -785,42 +780,46 @@ async def _reconcile_impl() -> HTMLResponse:
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>Abgleich – Ergebnis</title>
 <style>
-  body{{font-family: Inter, -apple-system, Segoe UI, Roboto, Arial, sans-serif;background:#f5f7fa;color:#1f2937;margin:0}}
-  .wrap{{max-width:1180px;margin:28px auto;padding:0 16px}}
-  .card{{background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:22px;margin-top:16px;box-shadow:0 1px 3px rgba(0,0,0,.05)}}
-  .grid{{width:100%;border-collapse:collapse}}
-  .grid th,.grid td{{border:1px solid #e5e7eb;padding:8px 10px;text-align:left}}
-  .grid th{{background:#f3f4f6}}
-  .btn{{background:#0ea5e9;border:none;color:#fff;border-radius:8px;padding:10px 16px;cursor:pointer;text-decoration:none}}
-  .btn:hover{{background:#0284c7}}
-  .muted{{color:#6b7280}}
-  .row{{display:flex;gap:10px;flex-wrap:wrap;align-items:center}}
+  :root{{--bg:#f6f8fb;--card:#fff;--txt:#0f172a;--muted:#64748b;--border:#e2e8f0;--primary:#0ea5e9;--primary-h:#0284c7}}
+  *{{box-sizing:border-box}} body{{margin:0;background:var(--bg);color:var(--txt);font:16px/1.6 Inter,-apple-system,Segoe UI,Roboto,Arial,sans-serif}}
+  header{{background:#fff;border-bottom:1px solid var(--border)}}
+  .hwrap{{max-width:1120px;margin:0 auto;padding:14px 20px;display:flex;align-items:center;justify-content:space-between;gap:12px}}
+  main{{max-width:1120px;margin:24px auto;padding:0 20px}}
+  .card{{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:18px;box-shadow:0 2px 8px rgba(2,8,23,.04);margin-bottom:16px}}
+  .gridStats{{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}}
+  .kpi{{border:1px solid var(--border);border-radius:12px;padding:14px;background:#fafbff}}
+  .kpi b{{font-size:20px}}
+  .btn{{background:var(--primary);border:none;color:#fff;border-radius:10px;padding:10px 14px;cursor:pointer;text-decoration:none;display:inline-flex;gap:8px;align-items:center}}
+  .btn.secondary{{background:#334155}} .btn.secondary:hover{{opacity:.95}}
+  table{{width:100%;border-collapse:separate;border-spacing:0;overflow:hidden;border-radius:12px;border:1px solid var(--border)}}
+  th,td{{padding:10px 12px;border-bottom:1px solid var(--border);text-align:left;vertical-align:top}}
+  th{{background:#f8fafc;font-weight:700}}
+  tr:last-child td{{border-bottom:0}}
 </style></head>
 <body>
-<div class="wrap">
-  <div class="card">
-    <div class="row">
-      <span>Ergebnis: <b>{stats["after"]}</b> Zeilen in <b>nk_master_ready</b></span>
-    </div>
-    <p class="muted">
-      Entfernt (Organisationsart gesetzt): <b>{stats["del_orgtype"]}</b><br/>
-      Entfernt (Orga-Match ≥95% – Filter 1245/851/1521): <b>{stats["del_orgmatch"]}</b><br/>
-      Entfernt (Person-ID in Filtern 1216/1708): <b>{stats["del_pid"]}</b><br/>
-      <b>Summe entfernt:</b> {stats["deleted_total"]}
-    </p>
-    <div class="row">
-      <a class="btn" href="/campaign">Zur Kampagnenwahl</a>
-      <a class="btn" href="/neukontakte?mode=new">Neukontakte</a>
-    </div>
+<header>
+  <div class="hwrap">
+    <div><b>Abgleich abgeschlossen</b></div>
+    <div class="muted">Ergebnis in <b>nk_master_ready</b> · Log in <b>nk_delete_log</b></div>
   </div>
-  <div class="card">
-    <h3>Entfernte Datensätze (Top 50)</h3>
+</header>
+
+<main>
+  <section class="card">
+    <div class="gridStats">
+      <div class="kpi"><div class="muted">Übrig</div><b>{stats["after"]}</b></div>
+      <div class="kpi"><div class="muted">Orga-Match ≥95%</div><b>{stats["del_orgmatch"]}</b></div>
+      <div class="kpi"><div class="muted">Person-ID in 1216/1708</div><b>{stats["del_pid"]}</b></div>
+    </div>
+    <div style="margin-top:12px"><a class="btn secondary" href="/neukontakte">Neue Auswahl</a></div>
+  </section>
+
+  <section class="card">
+    <h3 style="margin:0 0 10px">Entfernte Datensätze (Top 50)</h3>
     {table_html}
-    <p class="muted">Vollständiges Log in Neon: <b>nk_delete_log</b></p>
-  </div>
-</div>
+  </section>
+</main>
 </body></html>"""
-    print("==> reconcile DONE", file=sys.stderr, flush=True)
     return HTMLResponse(html)
 
 @app.post("/neukontakte/reconcile", response_class=HTMLResponse)
@@ -835,6 +834,112 @@ async def neukontakte_reconcile_post():
 @app.get("/neukontakte/reconcile", response_class=HTMLResponse)
 async def neukontakte_reconcile_get():
     return await neukontakte_reconcile_post()
+
+# =============================================================================
+# Organisationen & Personen-IDs (für Abgleich)
+# =============================================================================
+async def stream_organizations_by_filter(filter_id: int, page_limit: int = PAGE_LIMIT):
+    start = 0
+    while True:
+        url = append_token(f"{PIPEDRIVE_API}/organizations?filter_id={filter_id}&start={start}&limit={page_limit}")
+        r = await http_client().get(url, headers=get_headers())
+        if r.status_code != 200:
+            raise Exception(f"Pipedrive API Fehler (Orgs {filter_id}): {r.text}")
+        chunk = r.json().get("data") or []
+        if not chunk:
+            break
+        yield chunk
+        if len(chunk) < page_limit:
+            break
+        start += page_limit
+
+async def stream_person_ids_by_filter(filter_id: int, page_limit: int = PAGE_LIMIT):
+    start = 0
+    while True:
+        url = append_token(f"{PIPEDRIVE_API}/persons?filter_id={filter_id}&start={start}&limit={page_limit}&sort=id")
+        r = await http_client().get(url, headers=get_headers())
+        if r.status_code != 200:
+            raise Exception(f"Pipedrive API Fehler (Persons {filter_id}): {r.text}")
+        data = r.json().get("data") or []
+        if not data:
+            break
+        yield [str(p.get("id")) for p in data if p.get("id") is not None]
+        if len(data) < page_limit:
+            break
+        start += page_limit
+
+# =============================================================================
+# Abgleich & Excel-Export (Direkt-Button)
+# =============================================================================
+def _export_dataframe(master_ready: pd.DataFrame) -> pd.DataFrame:
+    # Mapping auf Exportspalten (die wir zuverlässig befüllen können)
+    cols = {
+        "Batch ID": master_ready.get("Batch ID"),
+        "Channel": master_ready.get("Channel"),
+        COLD_MAILING_IMPORT_LABEL: master_ready.get(COLD_MAILING_IMPORT_LABEL),
+        "Person - Prospect ID": master_ready.get("id"),
+        "Person - Vorname": master_ready.get("Person - Vorname"),
+        "Person - Nachname": master_ready.get("Person - Nachname"),
+        "E-Mail": master_ready.get("E-Mail"),
+        "Organisation": master_ready.get("Organisation"),
+        "Fachbereich": master_ready.get("Fachbereich"),
+    }
+    return pd.DataFrame(cols)
+
+@app.post("/neukontakte/export")
+async def neukontakte_export(
+    fachbereich: str = Body(...),
+    take_count: Optional[int] = Body(None),
+    batch_id: Optional[str] = Body(None),
+    campaign: Optional[str] = Body(None),
+    per_org_limit: int = Body(PER_ORG_DEFAULT_LIMIT),
+    mode: str = Query("new"),
+):
+    """
+    Erzeugt Auswahl -> speichert nk_master_final -> Abgleich -> Excel Download.
+    """
+    # Reuse der Preview-Logik zum Erstellen von nk_master_final
+    _ = await neukontakte_preview(fachbereich, take_count, batch_id, campaign, per_org_limit, mode)
+    # Abgleich
+    _ = await _reconcile_impl()
+    # Laden & Export
+    ready = await load_df_text("nk_master_ready")
+    export_df = _export_dataframe(ready)
+    buf = io.BytesIO()
+    export_df.to_excel(buf, index=False, sheet_name="Export")
+    buf.seek(0)
+    headers = {
+        "Content-Disposition": "attachment; filename=BatchFlow_Export.xlsx"
+    }
+    return StreamingResponse(buf, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers=headers)
+
+# =============================================================================
+# OAuth
+# =============================================================================
+@app.get("/login")
+def login():
+    if not PD_CLIENT_ID:
+        return HTMLResponse("<h3>CLIENT_ID fehlt. Bitte OAuth-Daten setzen oder PD_API_TOKEN nutzen.</h3>", 400)
+    redirect_uri = f"{BASE_URL}/oauth/callback"
+    url = f"{OAUTH_AUTHORIZE_URL}?client_id={PD_CLIENT_ID}&redirect_uri={redirect_uri}"
+    return RedirectResponse(url)
+
+@app.get("/oauth/callback")
+async def oauth_callback(code: str):
+    redirect_uri = f"{BASE_URL}/oauth/callback"
+    payload = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": redirect_uri,
+        "client_id": PD_CLIENT_ID,
+        "client_secret": PD_CLIENT_SECRET
+    }
+    r = await http_client().post(OAUTH_TOKEN_URL, data=payload)
+    tok = r.json()
+    if "access_token" not in tok:
+        return HTMLResponse(f"<h3>❌ OAuth Fehler: {tok}</h3>", 400)
+    user_tokens["default"] = tok["access_token"]
+    return RedirectResponse("/campaign")
 
 # =============================================================================
 # Redirects / Fallback
