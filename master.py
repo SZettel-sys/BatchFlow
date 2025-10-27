@@ -359,39 +359,44 @@ async def campaign_home():
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>BatchFlow – Kampagne wählen</title>
 <style>
-  :root{--bg:#f5f7fa;--card:#fff;--muted:#6b7280;--border:#e5e7eb;--primary:#0ea5e9;--primary-h:#0284c7;}
-  body{font-family:Inter,-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:var(--bg);color:#1f2937;margin:0}
-  .wrap{max-width:980px;margin:48px auto;padding:0 16px}
-  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:18px}
-  .card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:24px;box-shadow:0 2px 6px rgba(0,0,0,.05);text-align:center}
-  .title{font-size:22px;font-weight:700;margin-bottom:10px}
-  .desc{color:var(--muted);margin-bottom:18px;min-height:42px}
-  .btn{display:inline-block;background:var(--primary);color:#fff;text-decoration:none;border-radius:10px;padding:10px 14px}
+  :root{--bg:#f7f8fb;--card:#fff;--txt:#111827;--muted:#6b7280;--border:#e5e7eb;--primary:#0ea5e9;--primary-h:#0284c7}
+  *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--txt);font:15px/1.45 Inter,-apple-system,Segoe UI,Roboto,Arial,sans-serif}
+  header{position:sticky;top:0;z-index:10;background:#fff;border-bottom:1px solid var(--border)}
+  .hwrap{max-width:1080px;margin:0 auto;padding:16px 20px;display:flex;align-items:center;gap:14px}
+  .brand{font-weight:700;font-size:18px}
+  .sub{color:var(--muted)}
+  .wrap{max-width:1080px;margin:34px auto;padding:0 20px}
+  .grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:18px}
+  @media (max-width:900px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+  @media (max-width:640px){.grid{grid-template-columns:1fr}}
+  .card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:22px 20px;box-shadow:0 2px 6px rgba(0,0,0,.04)}
+  .title{font-weight:700;margin:2px 0 8px 0}
+  .desc{color:var(--muted);min-height:44px}
+  .cta{margin-top:14px}
+  .btn{display:inline-flex;align-items:center;gap:8px;padding:10px 14px;border-radius:10px;background:var(--primary);color:#fff;text-decoration:none}
   .btn:hover{background:var(--primary-h)}
-  header{padding:18px 22px;background:#fff;border-bottom:1px solid var(--border)}
-  header b{font-size:18px}
 </style></head>
 <body>
-<header><b>BatchFlow</b> <span style="color:#9ca3af">– Kampagne auswählen</span></header>
-<div class="wrap">
+<header><div class="hwrap"><div class="brand">BatchFlow</div><div class="sub">Kampagne wählen</div></div></header>
+<main class="wrap">
   <div class="grid">
     <div class="card">
       <div class="title">Neukontakte</div>
-      <div class="desc">Neue Personen aus dem Pipedrive-Filter mit Orga-Limit, Bereinigung & Export.</div>
-      <a class="btn" href="/neukontakte?mode=new">Starten</a>
+      <div class="desc">Neue Personen aus dem Filter mit Orga-Limit, Bereinigung & Export.</div>
+      <div class="cta"><a class="btn" href="/neukontakte?mode=new">Starten</a></div>
     </div>
     <div class="card">
       <div class="title">Nachfass</div>
-      <div class="desc">Folgekampagne für bereits kontaktierte Leads (Logik vorbereitet).</div>
-      <a class="btn" href="/neukontakte?mode=nachfass">Starten</a>
+      <div class="desc">Folgekampagne für bereits kontaktierte Leads.</div>
+      <div class="cta"><a class="btn" href="/neukontakte?mode=nachfass">Starten</a></div>
     </div>
     <div class="card">
       <div class="title">Refresh</div>
-      <div class="desc">Kontakte auffrischen/ergänzen (Logik vorbereitet).</div>
-      <a class="btn" href="/neukontakte?mode=refresh">Starten</a>
+      <div class="desc">Kontaktdaten aktualisieren/ergänzen.</div>
+      <div class="cta"><a class="btn" href="/neukontakte?mode=refresh">Starten</a></div>
     </div>
   </div>
-</div>
+</main>
 </body></html>"""
     return HTMLResponse(html)
 
@@ -401,11 +406,7 @@ async def campaign_home():
 @app.get("/neukontakte", response_class=HTMLResponse)
 async def neukontakte(request: Request, mode: str = Query("new")):
     authed = bool(user_tokens.get("default") or PD_API_TOKEN)
-    title_map = {
-        "new": "Neukontakte",
-        "nachfass": "Nachfass",
-        "refresh": "Refresh",
-    }
+    title_map = {"new":"Neukontakte","nachfass":"Nachfass","refresh":"Refresh"}
     page_title = title_map.get(mode, "Neukontakte")
 
     html = f"""<!doctype html><html lang="de">
@@ -413,36 +414,37 @@ async def neukontakte(request: Request, mode: str = Query("new")):
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>{page_title} – BatchFlow</title>
 <style>
-  :root{{--bg:#f5f7fa;--card:#fff;--muted:#6b7280;--border:#e5e7eb;--primary:#0ea5e9;--primary-h:#0284c7}}
-  body{{font-family: Inter, -apple-system, Segoe UI, Roboto, Arial, sans-serif;background:var(--bg);color:#1f2937;margin:0}}
-  header{{display:flex;justify-content:space-between;align-items:center;padding:18px 22px;background:#fff;border-bottom:1px solid var(--border)}}
-  .wrap{{max-width:1180px;margin:28px auto;padding:0 16px}}
-  .card{{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:22px;box-shadow:0 2px 6px rgba(0,0,0,.05)}}
-  label{{display:block;margin:10px 0 6px;font-weight:600}}
-  select,input{{width:100%;padding:10px 12px;border:1px solid #cfd6df;border-radius:8px}}
-  .row{{display:grid;grid-template-columns:1fr 1fr 1fr 1fr auto;gap:16px;align-items:end}}
-  .rowTop{{display:grid;grid-template-columns:240px 1fr;gap:16px}}
-  .muted{{color:var(--muted)}}
-  .btn{{background:var(--primary);border:none;color:#fff;border-radius:8px;padding:10px 16px;cursor:pointer}}
+  :root{{--bg:#f7f8fb;--card:#fff;--txt:#111827;--muted:#6b7280;--border:#e5e7eb;--primary:#0ea5e9;--primary-h:#0284c7}}
+  *{{box-sizing:border-box}} body{{margin:0;background:var(--bg);color:var(--txt);font:15px/1.45 Inter,-apple-system,Segoe UI,Roboto,Arial,sans-serif}}
+  header{{position:sticky;top:0;z-index:10;background:#fff;border-bottom:1px solid var(--border)}}
+  .hwrap{{max-width:1080px;margin:0 auto;padding:14px 20px;display:flex;align-items:center;justify-content:space-between;gap:12px}}
+  .crumbs a{{color:#0a66c2;text-decoration:none}} .crumbs a:hover{{text-decoration:underline}}
+  .wrap{{max-width:1080px;margin:28px auto;padding:0 20px}}
+  .card{{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:18px 18px 16px;box-shadow:0 2px 6px rgba(0,0,0,.04)}}
+  .rowTop{{display:grid;grid-template-columns:260px 1fr;gap:16px;margin-bottom:10px}}
+  .row{{display:grid;grid-template-columns:repeat(4,1fr) 140px;gap:16px;align-items:end}}
+  @media (max-width:980px){{.row{{grid-template-columns:1fr 1fr;}} .row>div:last-child{{grid-column:1/-1;justify-self:end}}}}
+  label{{display:block;font-weight:600;margin:6px 0 6px}}
+  select,input{{width:100%;padding:10px 12px;border:1px solid #cdd5df;border-radius:10px;background:#fff}}
+  .hint{{color:var(--muted);font-size:13px;margin-top:6px}}
+  .btn{{background:var(--primary);border:none;color:#fff;border-radius:10px;padding:11px 16px;cursor:pointer}}
   .btn:hover{{background:var(--primary-h)}}
-  #overlay{{display:none;position:fixed;inset:0;background:rgba(255,255,255,.7);z-index:9999;align-items:center;justify-content:center}}
-  .spinner{{width:48px;height:48px;border:4px solid #93c5fd;border-top-color:#1d4ed8;border-radius:50%;animation:spin 1s linear infinite}}
+  #overlay{{display:none;position:fixed;inset:0;background:rgba(255,255,255,.6);backdrop-filter:blur(2px);z-index:9999;align-items:center;justify-content:center}}
+  .spinner{{width:46px;height:46px;border:4px solid #93c5fd;border-top-color:#1d4ed8;border-radius:50%;animation:spin 1s linear infinite}}
   @keyframes spin{{to{{transform:rotate(360deg)}}}}
-  .breadcrumbs a{{color:#0a66c2;text-decoration:none}}
-  .breadcrumbs a:hover{{text-decoration:underline}}
 </style>
 </head>
 <body>
 <header>
-  <div class="breadcrumbs">
-    <a href="/campaign">← Kampagne wählen</a>
+  <div class="hwrap">
+    <div class="crumbs"><a href="/campaign">← Kampagne wählen</a></div>
+    <div><b>{page_title}</b> · Gesamt: <b id="total-count">lädt…</b></div>
+    <div>{"<span style='color:#6b7280'>angemeldet</span>" if authed else "<a href='/login'>Anmelden</a>"}</div>
   </div>
-  <div><b>{page_title}</b> · Gesamt: <b id="total-count">lädt…</b></div>
-  <div>{"<span class='muted'>angemeldet</span>" if authed else "<a href='/login'>Anmelden</a>"}</div>
 </header>
 
-<div class="wrap">
-  <div class="card">
+<main class="wrap">
+  <section class="card">
     <div class="rowTop">
       <div>
         <label>Pro Organisation</label>
@@ -454,15 +456,15 @@ async def neukontakte(request: Request, mode: str = Query("new")):
       <div>
         <label>Fachbereich</label>
         <select id="fachbereich"><option value="">– bitte auswählen –</option></select>
-        <div class="muted" id="fbinfo" style="margin-top:6px;">Die Zahl in Klammern berücksichtigt bereits „Pro Organisation“.</div>
+        <div class="hint" id="fbinfo">Die Zahl in Klammern berücksichtigt bereits „Pro Organisation“.</div>
       </div>
     </div>
 
-    <div class="row" style="margin-top:14px;">
+    <div class="row">
       <div>
         <label>Batch ID</label>
         <input id="batch_id" placeholder="Bxxx"/>
-        <div class="muted">Beispiel: B111</div>
+        <div class="hint">Beispiel: B111</div>
       </div>
       <div>
         <label>Kampagnenname</label>
@@ -471,20 +473,20 @@ async def neukontakte(request: Request, mode: str = Query("new")):
       <div>
         <label>Wie viele Datensätze nehmen?</label>
         <input type="number" id="take_count" placeholder="z. B. 900" min="1"/>
-        <div class="muted">Leer lassen = alle Datensätze des gewählten Fachbereichs.</div>
+        <div class="hint">Leer lassen = alle Datensätze des gewählten Fachbereichs.</div>
       </div>
-      <div style="align-self:end;">
+      <div></div>
+      <div style="justify-self:end">
         <button class="btn" id="btnPreview">Vorschau laden</button>
       </div>
     </div>
-  </div>
-</div>
+  </section>
+</main>
 
 <div id="overlay"><div class="spinner"></div></div>
 
 <script>
 const MODE = new URLSearchParams(location.search).get('mode') || 'new';
-
 function showOverlay(){{document.getElementById("overlay").style.display="flex";}}
 function hideOverlay(){{document.getElementById("overlay").style.display="none";}}
 
@@ -503,8 +505,7 @@ async function loadOptions(){{
       opt.textContent = o.label + ' (' + o.count + ')';
       sel.appendChild(opt);
     }});
-    document.getElementById('fbinfo').textContent =
-      "Gesamt (nach Orga-Limit): " + data.total + " | Fachbereiche: " + data.options.length;
+    document.getElementById('fbinfo').textContent = "Gesamt (nach Orga-Limit): " + data.total + " | Fachbereiche: " + data.options.length;
     document.getElementById('total-count').textContent = String(data.total);
   }} catch(e) {{
     alert('Fehler beim Laden der Fachbereiche: ' + e);
@@ -521,30 +522,23 @@ document.getElementById('btnPreview').addEventListener('click', async () => {{
   const bid = document.getElementById('batch_id').value || null;
   const camp = document.getElementById('campaign').value || null;
   const pol = document.getElementById('per_org_limit').value || '{PER_ORG_DEFAULT_LIMIT}';
-
   if(!fb) {{ alert('Bitte zuerst einen Fachbereich wählen.'); return; }}
   showOverlay();
   try {{
     const r = await fetch('/neukontakte/preview?mode=' + encodeURIComponent(MODE), {{
-      method:'POST',
-      headers:{{'Content-Type':'application/json'}},
-      cache:'no-store',
+      method:'POST', headers:{{'Content-Type':'application/json'}}, cache:'no-store',
       body: JSON.stringify({{ fachbereich: fb, take_count: tc ? parseInt(tc) : null, batch_id: bid, campaign: camp, per_org_limit: parseInt(pol) }})
     }});
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const html = await r.text();
     document.open(); document.write(html); document.close();
-  }} catch(e) {{
-    alert('Fehler: ' + e);
-  }} finally {{
-    hideOverlay();
-  }}
+  }} catch(e) {{ alert('Fehler: ' + e); }} finally {{ hideOverlay(); }}
 }});
-
 loadOptions();
 </script>
 </body></html>"""
     return HTMLResponse(html)
+
 
 # =============================================================================
 # Optionen – je nach Modus später unterschiedliche Filter/Regeln möglich
