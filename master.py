@@ -28,32 +28,25 @@ BASE_URL = os.getenv("BASE_URL", "").rstrip("/")
 if not BASE_URL:
     raise ValueError("❌ BASE_URL fehlt (z. B. https://deine-app.onrender.com)")
 
-# OAuth (optional)
 PD_CLIENT_ID = os.getenv("PD_CLIENT_ID", "")
 PD_CLIENT_SECRET = os.getenv("PD_CLIENT_SECRET", "")
 OAUTH_AUTHORIZE_URL = "https://oauth.pipedrive.com/oauth/authorize"
 OAUTH_TOKEN_URL = "https://oauth.pipedrive.com/oauth/token"
 
-# Fallback API Token (optional)
 PD_API_TOKEN = os.getenv("PD_API_TOKEN", "")
-
-# Pipedrive API Root
 PIPEDRIVE_API = "https://api.pipedrive.com/v1"
 
-# Neon / Postgres
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 if not DATABASE_URL:
     raise ValueError("DATABASE_URL fehlt")
-
 SCHEMA = os.getenv("PGSCHEMA", "public")
 
 # Filter/Felder
 FILTER_NEUKONTAKTE = 2998
-FIELD_FACHBEREICH_HINT = "fachbereich"     # Feld in Pipedrive (Person)
-# FIELD_ORGART_HINT bleibt ungenutzt (Regel entfernt)
+FIELD_FACHBEREICH_HINT = "fachbereich"
 
 # UI/Defaults
-DEFAULT_CHANNEL = "Cold E-Mail"              # fix laut Wunsch
+DEFAULT_CHANNEL = "Cold E-Mail"
 COLD_MAILING_IMPORT_LABEL = "Cold-Mailing Import"
 
 # Performance
@@ -62,55 +55,48 @@ RECONCILE_MAX_ROWS = int(os.getenv("RECONCILE_MAX_ROWS", "10000"))
 OPTIONS_TTL_SEC = int(os.getenv("OPTIONS_TTL_SEC", "900"))
 PER_ORG_DEFAULT_LIMIT = int(os.getenv("PER_ORG_DEFAULT_LIMIT", "2"))
 
-# OAuth Tokens (einfach)
 user_tokens: Dict[str, str] = {}
 
 # =============================================================================
-# Template-Spalten (Excel-Export)
+# Excel-Template (exakte Reihenfolge)
 # =============================================================================
-# >>> Passe diese Liste auf deine ZIEL-Datei an (Reihenfolge & Namen) <<<
 TEMPLATE_COLUMNS = [
-    # Kern-Header aus deiner Beschreibung + gängige Felder
     "Batch ID",
     "Channel",
-    COLD_MAILING_IMPORT_LABEL,
-    "Person - Prospect ID",
-    "Person - Organisation",
-    "Organisation - ID",
-    "Person - Geschlecht",
-    "Person - Titel",
-    "Person - Vorname",
-    "Person - Nachname",
-    "Person - Position",
-    "Person - ID",
-    "Person - XING-Profil",
-    "Person - LinkedIn Profil-URL",
-    "Person - E-Mail-Adresse - Büro",
-    # zusätzliche, oft gewünschte:
-    "E-Mail",           # wir liefern hierhin die primäre E-Mail, wenn -Büro nicht vorhanden
-    "Fachbereich",
+    "Cold-Mailing Import",
+    "Prospect ID",
+    "Organisation ID",
+    "Organisation Name",
+    "Person ID",
+    "Person Vorname",
+    "Person Nachname",
+    "Person Titel",
+    "Person Geschlecht",
+    "Person Position",
+    "Person E-Mail",
+    "XING Profil",
+    "LinkedIn URL",
 ]
 
-# Mapping „Feld-Hinweis in Pipedrive“ → Zielspalte
-# (wir suchen nach Person-Feldern, deren Name den Hint enthält; case-insensitive)
+# Mapping: Feld-Hinweis (im Namen des Pipedrive-Personenfeldes) -> Zielspalte
 PERSON_FIELD_HINTS_TO_EXPORT = {
-    "prospect": "Person - Prospect ID",
-    "organisation": "Person - Organisation",        # selten als Personen-Custom-Feld gepflegt
-    "org id": "Organisation - ID",                  # falls es ein Custom-Feld auf Person gibt
-    "gender": "Person - Geschlecht",
-    "geschlecht": "Person - Geschlecht",
-    "titel": "Person - Titel",
-    "position": "Person - Position",
-    "xing": "Person - XING-Profil",
-    "linkedin": "Person - LinkedIn Profil-URL",
-    "email büro": "Person - E-Mail-Adresse - Büro",
-    "email buero": "Person - E-Mail-Adresse - Büro",
-    "e-mail büro": "Person - E-Mail-Adresse - Büro",
-    "e-mail buero": "Person - E-Mail-Adresse - Büro",
+    "prospect": "Prospect ID",
+    "gender": "Person Geschlecht",
+    "geschlecht": "Person Geschlecht",
+    "titel": "Person Titel",
+    "position": "Person Position",
+    "xing": "XING Profil",
+    "linkedin": "LinkedIn URL",
+    # Büro/Office-E-Mail – falls vorhanden nehmen wir diese bevorzugt:
+    "email büro": "Person E-Mail",
+    "email buero": "Person E-Mail",
+    "e-mail büro": "Person E-Mail",
+    "e-mail buero": "Person E-Mail",
+    "office email": "Person E-Mail",
 }
 
 # =============================================================================
-# Startup: HTTP-Client + DB-Pool
+# Startup / Shutdown
 # =============================================================================
 def http_client() -> httpx.AsyncClient:
     return app.state.http  # type: ignore[attr-defined]
@@ -132,7 +118,7 @@ async def _shutdown():
         await app.state.pool.close()
 
 # =============================================================================
-# Health
+# Helpers
 # =============================================================================
 @app.get("/healthz")
 async def healthz():
@@ -143,9 +129,6 @@ async def healthz():
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
-# =============================================================================
-# Helpers
-# =============================================================================
 def _as_list_email(value) -> List[str]:
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return []
@@ -228,12 +211,9 @@ def field_options_id_to_label_map(field: dict) -> Dict[str, str]:
     return mp
 
 # =============================================================================
-# Pipedrive fetcher (streamend) + Performance: early stop
+# Pipedrive Fetcher
 # =============================================================================
-async def stream_persons_by_filter(
-    filter_id: int,
-    page_limit: int = PAGE_LIMIT,
-) -> AsyncGenerator[List[dict], None]:
+async def stream_persons_by_filter(filter_id: int, page_limit: int = PAGE_LIMIT) -> AsyncGenerator[List[dict], None]:
     start = 0
     while True:
         url = append_token(f"{PIPEDRIVE_API}/persons?filter_id={filter_id}&start={start}&limit={page_limit}&sort=name")
@@ -250,7 +230,7 @@ async def stream_persons_by_filter(
 
 async def fetch_persons_until_match(
     filter_id: int,
-    predicate,                      # (person) -> bool
+    predicate,
     per_org_limit: int,
     max_collect: Optional[int] = None,
 ) -> List[dict]:
@@ -258,8 +238,9 @@ async def fetch_persons_until_match(
     out: List[dict] = []
     async for chunk in stream_persons_by_filter(filter_id):
         for p in chunk:
-            if not predicate(p):
+            if not predicate(p):  # falscher Fachbereich
                 continue
+            # org key
             org_key = None
             org = p.get("org_id")
             if isinstance(org, dict):
@@ -335,7 +316,7 @@ async def stream_counts_with_org_cap(
     return total, counts
 
 # =============================================================================
-# DB helpers (Schema-fest)
+# DB
 # =============================================================================
 async def ensure_table_text(conn: asyncpg.Connection, table: str, cols: List[str]):
     col_defs = ", ".join([f'"{c}" TEXT' for c in cols])
@@ -371,12 +352,12 @@ async def load_df_text(table: str) -> pd.DataFrame:
     return pd.DataFrame(data, columns=cols).replace({"": np.nan})
 
 # =============================================================================
-# Optionen-Cache
+# Caches
 # =============================================================================
 _OPTIONS_CACHE: Dict[int, dict] = {}
 
 # =============================================================================
-# UI – Kampagnenwahl
+# Routing – Kampagnenwahl
 # =============================================================================
 @app.get("/")
 def root():
@@ -418,7 +399,7 @@ async def campaign_home():
     return HTMLResponse(html)
 
 # =============================================================================
-# UI – Auswahl
+# UI – Auswahlseite
 # =============================================================================
 @app.get("/neukontakte", response_class=HTMLResponse)
 async def neukontakte(request: Request, mode: str = Query("new")):
@@ -588,7 +569,7 @@ loadOptions();
     return HTMLResponse(html)
 
 # =============================================================================
-# Optionen (Fachbereichswerte)
+# Optionen
 # =============================================================================
 @app.get("/neukontakte/options")
 async def neukontakte_options(per_org_limit: int = Query(PER_ORG_DEFAULT_LIMIT, ge=1, le=2), mode: str = Query("new")):
@@ -615,7 +596,7 @@ async def neukontakte_options(per_org_limit: int = Query(PER_ORG_DEFAULT_LIMIT, 
     return JSONResponse({"total": total, "options": options})
 
 # =============================================================================
-# Vorschau – nk_master_final
+# Vorschau – nk_master_final (gleich im Ziel-Spaltenlayout)
 # =============================================================================
 @app.post("/neukontakte/preview", response_class=HTMLResponse)
 async def neukontakte_preview(
@@ -634,12 +615,11 @@ async def neukontakte_preview(
         id2label = field_options_id_to_label_map(fb_field)
         fb_label = id2label.get(str(fachbereich), str(fachbereich))
 
-        # Personen-Feld-Mapping (HINTS → Pipedrive-Key)
         person_fields = await get_person_fields()
         hint_to_key: Dict[str, str] = {}
         for f in person_fields:
             nm = (f.get("name") or "").lower()
-            for hint, col in PERSON_FIELD_HINTS_TO_EXPORT.items():
+            for hint in PERSON_FIELD_HINTS_TO_EXPORT.keys():
                 if hint in nm and hint not in hint_to_key:
                     hint_to_key[hint] = f.get("key")
 
@@ -664,7 +644,6 @@ async def neukontakte_preview(
             if isinstance(v, dict) and "label" in v:
                 return str(v.get("label") or "")
             if isinstance(v, list):
-                # Mehrfachfeld: erste sinnvolle Repräsentation
                 if v and isinstance(v[0], dict) and "value" in v[0]:
                     return str(v[0].get("value") or "")
                 return ", ".join([str(x) for x in v if x])
@@ -677,8 +656,12 @@ async def neukontakte_preview(
             last = p.get("last_name")
             full = p.get("name")
             vor, nach = split_name(first, last, full)
+
             emails = _as_list_email(p.get("email"))
             email_primary = emails[0] if emails else ""
+            email_office = get_field(p, "email büro") or get_field(p, "email buero") or get_field(p, "office email")
+            person_email = email_office or email_primary
+
             org_name, org_id = "-", ""
             org = p.get("org_id")
             if isinstance(org, dict):
@@ -689,26 +672,23 @@ async def neukontakte_preview(
             row = {
                 "Batch ID": batch_id or "",
                 "Channel": DEFAULT_CHANNEL,
-                COLD_MAILING_IMPORT_LABEL: campaign or "",
-                "Person - Prospect ID": get_field(p, "prospect"),
-                "Person - Organisation": org_name,
-                "Organisation - ID": org_id,
-                "Person - Geschlecht": get_field(p, "gender") or get_field(p, "geschlecht"),
-                "Person - Titel": get_field(p, "titel"),
-                "Person - Vorname": vor,
-                "Person - Nachname": nach,
-                "Person - Position": get_field(p, "position"),
-                "Person - ID": str(pid or ""),
-                "Person - XING-Profil": get_field(p, "xing"),
-                "Person - LinkedIn Profil-URL": get_field(p, "linkedin"),
-                "Person - E-Mail-Adresse - Büro": get_field(p, "email büro") or get_field(p, "email buero"),
-                "E-Mail": email_primary,
-                "Fachbereich": fb_label,
+                "Cold-Mailing Import": campaign or "",
+                "Prospect ID": get_field(p, "prospect"),
+                "Organisation ID": org_id,
+                "Organisation Name": org_name,
+                "Person ID": str(pid or ""),
+                "Person Vorname": vor,
+                "Person Nachname": nach,
+                "Person Titel": get_field(p, "titel"),
+                "Person Geschlecht": get_field(p, "gender") or get_field(p, "geschlecht"),
+                "Person Position": get_field(p, "position"),
+                "Person E-Mail": person_email,
+                "XING Profil": get_field(p, "xing"),
+                "LinkedIn URL": get_field(p, "linkedin"),
             }
-
             rows.append(row)
 
-        df = pd.DataFrame(rows)
+        df = pd.DataFrame(rows, columns=TEMPLATE_COLUMNS)
         await save_df_text(df, "nk_master_final")
 
         preview_table = (df.head(50).to_html(classes="grid", index=False, border=0)
@@ -765,7 +745,7 @@ async def neukontakte_preview(
         return HTMLResponse(f"<pre style='padding:24px;color:#b00'>❌ Fehler beim Abruf/Speichern:\n{e}</pre>", status_code=500)
 
 # =============================================================================
-# Organisationen & Personen-IDs (für Abgleich)
+# Abgleich (ohne „Organisationsart“-Regel)
 # =============================================================================
 async def stream_organizations_by_filter(filter_id: int, page_limit: int = PAGE_LIMIT):
     start = 0
@@ -797,9 +777,6 @@ async def stream_person_ids_by_filter(filter_id: int, page_limit: int = PAGE_LIM
             break
         start += page_limit
 
-# =============================================================================
-# Abgleich – schreibt nk_master_ready & nk_delete_log (ohne Organisationsart-Regel)
-# =============================================================================
 async def _reconcile_impl() -> HTMLResponse:
     master = await load_df_text("nk_master_final")
     if master.empty:
@@ -811,12 +788,12 @@ async def _reconcile_impl() -> HTMLResponse:
             f"Bitte auf ≤ {RECONCILE_MAX_ROWS} begrenzen.</div>", status_code=400
         )
 
-    col_person_id = "Person - ID" if "Person - ID" in master.columns else ("id" if "id" in master.columns else None)
-    col_org_name = "Person - Organisation" if "Person - Organisation" in master.columns else ("Organisation" if "Organisation" in master.columns else None)
+    col_person_id = "Person ID" if "Person ID" in master.columns else None
+    col_org_name = "Organisation Name" if "Organisation Name" in master.columns else None
 
     delete_log: List[Dict[str, str]] = []
 
-    # Regel – Orga-Abgleich (Filter 1245, 851, 1521) >=95%
+    # Regel – Orga-Dubletten (Filter 1245, 851, 1521) via 95% Ähnlichkeit
     suspect_org_filters = [1245, 851, 1521]
     if col_org_name and col_org_name in master.columns:
         ext_buckets: Dict[str, List[str]] = {}
@@ -824,10 +801,8 @@ async def _reconcile_impl() -> HTMLResponse:
             async for chunk in stream_organizations_by_filter(fid, PAGE_LIMIT):
                 for o in chunk:
                     n = normalize_name(o.get("name") or "")
-                    if not n:
-                        continue
-                    b = n[0]
-                    ext_buckets.setdefault(b, []).append(n)
+                    if not n:  continue
+                    ext_buckets.setdefault(n[0], []).append(n)
         for b in list(ext_buckets.keys()):
             ext_buckets[b] = list(dict.fromkeys(ext_buckets[b]))
 
@@ -835,25 +810,23 @@ async def _reconcile_impl() -> HTMLResponse:
         for idx, row in master.iterrows():
             cand = str(row.get(col_org_name) or "").strip()
             cand_norm = normalize_name(cand)
-            if not cand_norm:
-                continue
+            if not cand_norm:  continue
             bucket = ext_buckets.get(cand_norm[0])
-            if not bucket:
-                continue
+            if not bucket:     continue
             near = [n for n in bucket if abs(len(n) - len(cand_norm)) <= 4]
-            if not near:
-                continue
+            if not near:       continue
             best = process.extractOne(cand_norm, near, scorer=fuzz.token_sort_ratio)
             if best and best[1] >= 95:
                 drop_idx.append(idx)
                 delete_log.append({"reason":"org_match_95",
                                    "id":str(row.get(col_person_id) or ""),
-                                   "name":f"{row.get('Person - Vorname') or ''} {row.get('Person - Nachname') or ''}".strip(),
-                                   "org_name":cand,"extra":f"Best Match: {best[0]} ({best[1]}%)"})
+                                   "name":f"{row.get('Person Vorname') or ''} {row.get('Person Nachname') or ''}".strip(),
+                                   "org_name":cand,
+                                   "extra":f"Best Match: {best[0]} ({best[1]}%)"})
         if drop_idx:
             master = master.drop(index=drop_idx)
 
-    # Regel – Personen-ID-Abgleich (Filter 1216, 1708)
+    # Regel – Personen-ID in Filtern 1216, 1708
     suspect_person_filters = [1216, 1708]
     if col_person_id:
         suspect_ids = set()
@@ -866,7 +839,7 @@ async def _reconcile_impl() -> HTMLResponse:
             for _, r in removed.iterrows():
                 delete_log.append({"reason":"person_id_match",
                                    "id":str(r.get(col_person_id) or ""),
-                                   "name":f"{r.get('Person - Vorname') or ''} {r.get('Person - Nachname') or ''}".strip(),
+                                   "name":f"{r.get('Person Vorname') or ''} {r.get('Person Nachname') or ''}".strip(),
                                    "org_name":str(r.get(col_org_name) or ""),
                                    "extra":"ID in Filter 1216/1708"})
             master = master[~mask_pid].copy()
@@ -943,20 +916,13 @@ async def neukontakte_reconcile_get():
     return await neukontakte_reconcile_post()
 
 # =============================================================================
-# Abgleich & Excel-Export (Direkt-Button) – Template-orientiert
+# Abgleich & Excel-Export (Direktbutton)
 # =============================================================================
 def build_export_from_ready(master_ready: pd.DataFrame) -> pd.DataFrame:
-    # Master-DF → in Template-Spalten bringen (fehlende Spalten leer)
     out = pd.DataFrame(columns=TEMPLATE_COLUMNS)
     for col in TEMPLATE_COLUMNS:
-        if col in master_ready.columns:
-            out[col] = master_ready[col]
-        else:
-            out[col] = ""  # fehlendes Feld leer
-    # Falls „E-Mail“ leer und „Person - E-Mail-Adresse - Büro“ gefüllt → übernehmen
-    mask = (out.get("E-Mail", pd.Series(dtype=str)) == "") & (out.get("Person - E-Mail-Adresse - Büro", pd.Series(dtype=str)) != "")
-    if mask.any():
-        out.loc[mask, "E-Mail"] = out.loc[mask, "Person - E-Mail-Adresse - Büro"]
+        out[col] = master_ready[col] if col in master_ready.columns else ""
+    # Fallback: falls Person E-Mail leer, versuchen wir nichts weiter (wurde in preview schon bevorzugt befüllt)
     return out
 
 @app.post("/neukontakte/export")
@@ -968,11 +934,8 @@ async def neukontakte_export(
     per_org_limit: int = Body(PER_ORG_DEFAULT_LIMIT),
     mode: str = Query("new"),
 ):
-    # Auswahl + nk_master_final
     _ = await neukontakte_preview(fachbereich, take_count, batch_id, campaign, per_org_limit, mode)
-    # Abgleich
     _ = await _reconcile_impl()
-    # Export
     ready = await load_df_text("nk_master_ready")
     export_df = build_export_from_ready(ready)
     buf = io.BytesIO()
@@ -982,7 +945,7 @@ async def neukontakte_export(
     return StreamingResponse(buf, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers=headers)
 
 # =============================================================================
-# OAuth
+# OAuth & Fallback
 # =============================================================================
 @app.get("/login")
 def login():
@@ -1009,9 +972,6 @@ async def oauth_callback(code: str):
     user_tokens["default"] = tok["access_token"]
     return RedirectResponse("/campaign")
 
-# =============================================================================
-# Redirects / Fallback
-# =============================================================================
 @app.get("/overview", include_in_schema=False)
 async def overview_redirect(request: Request):
     return RedirectResponse("/campaign", status_code=307)
