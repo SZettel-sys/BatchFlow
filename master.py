@@ -10,7 +10,7 @@ import pandas as pd
 import httpx
 import asyncpg
 
-from fastapi import FastAPI, Request, Body
+from fastapi import FastAPI, Request, Body, Query
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.gzip import GZipMiddleware
@@ -52,13 +52,14 @@ FIELD_FACHBEREICH_HINT = "fachbereich"
 FIELD_ORGART_HINT = "organisationsart"
 
 # UI/Defaults
-DEFAULT_CHANNEL = "Cold-Mail"
+DEFAULT_CHANNEL = "Cold E-Mail"             # <-- fix gesetzt
 COLD_MAILING_IMPORT_LABEL = "Cold-Mailing Import"
 
 # Performance
-PAGE_LIMIT = int(os.getenv("PAGE_LIMIT", "500"))          # weniger Roundtrips
+PAGE_LIMIT = int(os.getenv("PAGE_LIMIT", "500"))              # weniger Roundtrips
 RECONCILE_MAX_ROWS = int(os.getenv("RECONCILE_MAX_ROWS", "1000"))
-OPTIONS_TTL_SEC = int(os.getenv("OPTIONS_TTL_SEC", "900"))  # Cache für /options
+OPTIONS_TTL_SEC = int(os.getenv("OPTIONS_TTL_SEC", "900"))    # Cache für /options
+PER_ORG_DEFAULT_LIMIT = int(os.getenv("PER_ORG_DEFAULT_LIMIT", "2"))  # 1 oder 2
 
 # OAuth Tokens (einfach)
 user_tokens: Dict[str, str] = {}
@@ -120,6 +121,15 @@ def _as_list_email(value) -> List[str]:
         return out
     return [str(value)]
 
+def split_name(full: str) -> Tuple[str, str]:
+    """Einfache Heuristik für Vor- / Nachname."""
+    if not full:
+        return "", ""
+    parts = str(full).strip().split()
+    if len(parts) == 1:
+        return parts[0], ""
+    return parts[0], " ".join(parts[1:])
+
 def normalize_name(s: str) -> str:
     if not s:
         return ""
@@ -168,69 +178,39 @@ def field_options_id_to_label_map(field: dict) -> Dict[str, str]:
         mp[oid] = lab
     return mp
 
-async def stream_count_person_field_values(
-    filter_id: int,
-    field_key: str,
-    page_limit: int = PAGE_LIMIT,
-) -> Tuple[int, Dict[str, int]]:
-    total = 0
-    counts: Dict[str, int] = {}
-    start = 0
-    while True:
-        url = append_token(f"{PIPEDRIVE_API}/persons?filter_id={filter_id}&start={start}&limit={page_limit}")
-        r = await http_client().get(url, headers=get_headers())
-        if r.status_code != 200:
-            raise Exception(f"Pipedrive API Fehler: {r.text}")
-        chunk = r.json().get("data") or []
-        if not chunk:
-            break
-        for p in chunk:
-            total += 1
-            val = p.get(field_key)
-            if isinstance(val, np.ndarray):
-                val = val.tolist()
-            if isinstance(val, list):
-                for v in val:
-                    if v is not None and str(v).strip() != "":
-                        key = str(v)
-                        counts[key] = counts.get(key, 0) + 1
-            elif val is not None and str(val).strip() != "":
-                key = str(val)
-                counts[key] = counts.get(key, 0) + 1
-        if len(chunk) < page_limit:
-            break
-        start += page_limit
-    return total, counts
-
+# ---- Pipedrive Streaming-Helper ---------------------------------------------
 async def fetch_persons_until_match(
     filter_id: int,
-    match_fn,
+    predicate,
     max_collect: Optional[int] = None,
     page_limit: int = PAGE_LIMIT,
 ) -> List[dict]:
-    collected: List[dict] = []
+    """Streamt Personen aus einem Filter und sammelt jene, die predicate(person) erfüllen."""
     start = 0
+    out: List[dict] = []
     while True:
         url = append_token(f"{PIPEDRIVE_API}/persons?filter_id={filter_id}&start={start}&limit={page_limit}")
         r = await http_client().get(url, headers=get_headers())
         if r.status_code != 200:
             raise Exception(f"Pipedrive API Fehler: {r.text}")
-        chunk = r.json().get("data") or []
-        if not chunk:
+        items = r.json().get("data") or []
+        if not items:
             break
-        for p in chunk:
-            if match_fn(p):
-                collected.append(p)
-                if max_collect and len(collected) >= max_collect:
-                    return collected
-        if len(chunk) < page_limit:
+        for p in items:
+            if predicate(p):
+                out.append(p)
+                if max_collect and len(out) >= max_collect:
+                    return out
+        if len(items) < page_limit:
             break
         start += page_limit
-    return collected
+    return out
 
 async def fetch_organizations_by_filter(
-    filter_id: int, page_limit: int = PAGE_LIMIT
+    filter_id: int,
+    page_limit: int = PAGE_LIMIT,
 ) -> AsyncGenerator[dict, None]:
+    """Yieldet Organisationen aus einem Pipedrive-Filter."""
     start = 0
     while True:
         url = append_token(f"{PIPEDRIVE_API}/organizations?filter_id={filter_id}&start={start}&limit={page_limit}")
@@ -247,24 +227,90 @@ async def fetch_organizations_by_filter(
         start += page_limit
 
 async def stream_person_ids_by_filter(
-    filter_id: int, page_limit: int = PAGE_LIMIT
+    filter_id: int,
+    page_limit: int = PAGE_LIMIT,
 ) -> AsyncGenerator[str, None]:
+    """Yieldet Personen-IDs als Strings für einen Filter (speicherschonend)."""
     start = 0
     while True:
         url = append_token(f"{PIPEDRIVE_API}/persons?filter_id={filter_id}&start={start}&limit={page_limit}")
         r = await http_client().get(url, headers=get_headers())
         if r.status_code != 200:
-            raise Exception(f"Pipedrive API Fehler (Persons {filter_id}): {r.text}")
-        data = r.json().get("data") or []
-        if not data:
+            raise Exception(f"Pipedrive API Fehler: {r.text}")
+        items = r.json().get("data") or []
+        if not items:
             break
-        for p in data:
+        for p in items:
             pid = p.get("id")
             if pid is not None:
                 yield str(pid)
-        if len(data) < page_limit:
+        if len(items) < page_limit:
             break
         start += page_limit
+
+# ---- Kern: Zählen nach „max N Kontakte pro Organisation“ --------------------
+async def stream_counts_with_org_cap(
+    filter_id: int,
+    fachbereich_key: str,
+    per_org_limit: int,
+    page_limit: int = PAGE_LIMIT,
+) -> Tuple[int, Dict[str, int]]:
+    """
+    Zählt total & Fachbereich-Counts, nachdem max. N Kontakte pro Organisation
+    berücksichtigt wurden. Streamend & speicherschonend.
+    """
+    total = 0
+    counts: Dict[str, int] = {}
+    org_used: Dict[str, int] = {}  # org_key -> wie viele schon gezählt
+
+    start = 0
+    while True:
+        url = append_token(f"{PIPEDRIVE_API}/persons?filter_id={filter_id}&start={start}&limit={page_limit}")
+        r = await http_client().get(url, headers=get_headers())
+        if r.status_code != 200:
+            raise Exception(f"Pipedrive API Fehler: {r.text}")
+        chunk = r.json().get("data") or []
+        if not chunk:
+            break
+
+        for p in chunk:
+            # Org-Key bestimmen (id wenn vorhanden, sonst normalisierter Name, sonst Person-ID)
+            org_key = None
+            org = p.get("org_id")
+            if isinstance(org, dict):
+                if org.get("id") is not None:
+                    org_key = f"id:{org.get('id')}"
+                elif org.get("name"):
+                    org_key = f"name:{normalize_name(org.get('name'))}"
+            if not org_key:
+                pid = p.get("id")
+                org_key = f"noorg:{pid}"
+
+            used = org_used.get(org_key, 0)
+            if used >= per_org_limit:
+                continue  # Orga-Kontingent erschöpft
+
+            # Person zählt
+            org_used[org_key] = used + 1
+            total += 1
+
+            val = p.get(fachbereich_key)
+            if isinstance(val, np.ndarray):
+                val = val.tolist()
+            if isinstance(val, list):
+                for v in val:
+                    if v is not None and str(v).strip() != "":
+                        key = str(v)
+                        counts[key] = counts.get(key, 0) + 1
+            elif val is not None and str(val).strip() != "":
+                key = str(val)
+                counts[key] = counts.get(key, 0) + 1
+
+        if len(chunk) < page_limit:
+            break
+        start += page_limit
+
+    return total, counts
 
 # =============================================================================
 # DB helpers (Schema-fest)
@@ -303,9 +349,9 @@ async def load_df_text(table: str) -> pd.DataFrame:
     return pd.DataFrame(data, columns=cols).replace({"": np.nan})
 
 # =============================================================================
-# Optionen-Cache
+# Optionen-Cache (abhängig von per_org_limit)
 # =============================================================================
-_OPTIONS_CACHE: dict = {"ts": 0.0, "total": 0, "options": []}
+_OPTIONS_CACHE: Dict[int, dict] = {}
 
 # =============================================================================
 # Routing
@@ -342,7 +388,6 @@ async def oauth_callback(code: str):
 # -----------------------------------------------------------------------------
 @app.get("/neukontakte", response_class=HTMLResponse)
 async def neukontakte(request: Request):
-    # ⚡️ Kein serverseitiges Zählen mehr – das blockierte den First Paint.
     authed = bool(user_tokens.get("default") or PD_API_TOKEN)
 
     html = f"""<!doctype html><html lang="de">
@@ -356,7 +401,7 @@ async def neukontakte(request: Request):
   .card{{background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:22px;box-shadow:0 1px 3px rgba(0,0,0,.05)}}
   label{{display:block;margin:12px 0 6px;font-weight:600}}
   select,input{{width:100%;padding:10px 12px;border:1px solid #cfd6df;border-radius:8px}}
-  .row{{display:grid;grid-template-columns:1fr 220px 220px auto;gap:16px;align-items:end}}
+  .row{{display:grid;grid-template-columns:1fr 160px 220px 220px 220px auto;gap:16px;align-items:end}}  /* Kampagne ergänzt */
   .muted{{color:#6b7280}}
   .btn{{background:#0ea5e9;border:none;color:#fff;border-radius:8px;padding:10px 16px;cursor:pointer}}
   .btn:hover{{background:#0284c7}}
@@ -373,19 +418,32 @@ async def neukontakte(request: Request):
 
 <div class="wrap">
   <div class="card">
-    <label>Fachbereich</label>
-    <select id="fachbereich"><option value="">– bitte auswählen –</option></select>
-    <div class="muted" id="fbinfo" style="margin-top:6px;">Die Zahl in Klammern zeigt die vorhandenen Datensätze im Filter.</div>
-    <div class="row" style="margin-top:14px;">
+    <div class="row">
+      <div style="grid-column:1/-1">
+        <label>Fachbereich</label>
+        <select id="fachbereich"><option value="">– bitte auswählen –</option></select>
+        <div class="muted" id="fbinfo" style="margin-top:6px;">Die Zahl in Klammern berücksichtigt bereits „Pro Organisation“.</div>
+      </div>
       <div>
-        <label>Wie viele Datensätze nehmen?</label>
-        <input type="number" id="take_count" placeholder="z. B. 900" min="1"/>
-        <div class="muted">Leer lassen = alle Datensätze des gewählten Fachbereichs.</div>
+        <label>Pro Organisation</label>
+        <select id="per_org_limit">
+          <option value="1">1</option>
+          <option value="2" selected>2</option>
+        </select>
       </div>
       <div>
         <label>Batch ID</label>
         <input id="batch_id" placeholder="Bxxx"/>
         <div class="muted">Beispiel: B111</div>
+      </div>
+      <div>
+        <label>Kampagnenname</label>
+        <input id="campaign" placeholder="z. B. Herbstkampagne"/>
+      </div>
+      <div>
+        <label>Wie viele Datensätze nehmen?</label>
+        <input type="number" id="take_count" placeholder="z. B. 900" min="1"/>
+        <div class="muted">Leer lassen = alle Datensätze des gewählten Fachbereichs.</div>
       </div>
       <div style="align-self:end;">
         <button class="btn" id="btnPreview">Vorschau laden</button>
@@ -403,7 +461,8 @@ function hideOverlay(){{document.getElementById("overlay").style.display="none";
 async function loadOptions(){{
   showOverlay();
   try {{
-    const r = await fetch('/neukontakte/options', {{cache:'no-store'}});
+    const pol = document.getElementById('per_org_limit').value || '{PER_ORG_DEFAULT_LIMIT}';
+    const r = await fetch('/neukontakte/options?per_org_limit=' + encodeURIComponent(pol), {{cache:'no-store'}});
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const data = await r.json();
     const sel = document.getElementById('fachbereich');
@@ -415,7 +474,7 @@ async function loadOptions(){{
       sel.appendChild(opt);
     }});
     document.getElementById('fbinfo').textContent =
-      "Gesamt im Filter: " + data.total + " | Fachbereiche: " + data.options.length;
+      "Gesamt (nach Orga-Limit): " + data.total + " | Fachbereiche: " + data.options.length;
     document.getElementById('total-count').textContent = String(data.total);
   }} catch(e) {{
     alert('Fehler beim Laden der Fachbereiche: ' + e);
@@ -424,10 +483,15 @@ async function loadOptions(){{
   }}
 }}
 
+document.getElementById('per_org_limit').addEventListener('change', loadOptions);
+
 document.getElementById('btnPreview').addEventListener('click', async () => {{
   const fb = document.getElementById('fachbereich').value;
   const tc = document.getElementById('take_count').value || null;
   const bid = document.getElementById('batch_id').value || null;
+  const camp = document.getElementById('campaign').value || null;
+  const pol = document.getElementById('per_org_limit').value || '{PER_ORG_DEFAULT_LIMIT}';
+
   if(!fb) {{ alert('Bitte zuerst einen Fachbereich wählen.'); return; }}
   showOverlay();
   try {{
@@ -435,7 +499,7 @@ document.getElementById('btnPreview').addEventListener('click', async () => {{
       method:'POST',
       headers:{{'Content-Type':'application/json'}},
       cache:'no-store',
-      body: JSON.stringify({{ fachbereich: fb, take_count: tc ? parseInt(tc) : null, batch_id: bid }})
+      body: JSON.stringify({{ fachbereich: fb, take_count: tc ? parseInt(tc) : null, batch_id: bid, campaign: camp, per_org_limit: parseInt(pol) }})
     }});
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const html = await r.text();
@@ -454,10 +518,11 @@ loadOptions();
 
 # -----------------------------------------------------------------------------
 @app.get("/neukontakte/options")
-async def neukontakte_options():
+async def neukontakte_options(per_org_limit: int = Query(PER_ORG_DEFAULT_LIMIT, ge=1, le=2)):
     now = time.time()
-    if _OPTIONS_CACHE["options"] and (now - _OPTIONS_CACHE["ts"] < OPTIONS_TTL_SEC):
-        return JSONResponse({"total": _OPTIONS_CACHE["total"], "options": _OPTIONS_CACHE["options"]})
+    cache = _OPTIONS_CACHE.get(per_org_limit) or {}
+    if cache.get("options") and (now - cache.get("ts", 0.0) < OPTIONS_TTL_SEC):
+        return JSONResponse({"total": cache["total"], "options": cache["options"]})
 
     fb_field = await get_person_field_by_hint(FIELD_FACHBEREICH_HINT)
     if not fb_field:
@@ -465,7 +530,7 @@ async def neukontakte_options():
     fb_key = fb_field.get("key")
     id2label = field_options_id_to_label_map(fb_field)
 
-    total, counts = await stream_count_person_field_values(FILTER_NEUKONTAKTE, fb_key)
+    total, counts = await stream_counts_with_org_cap(FILTER_NEUKONTAKTE, fb_key, per_org_limit)
 
     options = []
     for opt_id, cnt in counts.items():
@@ -473,17 +538,19 @@ async def neukontakte_options():
         options.append({"value": opt_id, "label": label, "count": cnt})
     options.sort(key=lambda x: x["count"], reverse=True)
 
-    _OPTIONS_CACHE.update({"ts": now, "total": total, "options": options})
+    _OPTIONS_CACHE[per_org_limit] = {"ts": now, "total": total, "options": options}
     return JSONResponse({"total": total, "options": options})
 
 # =============================================================================
-# Vorschau – Auswahl speichern
+# Vorschau – Auswahl speichern (mit Orga-Limit) + Name split + Kampagne + Channel
 # =============================================================================
 @app.post("/neukontakte/preview", response_class=HTMLResponse)
 async def neukontakte_preview(
     fachbereich: str = Body(...),
     take_count: Optional[int] = Body(None),
     batch_id: Optional[str] = Body(None),
+    campaign: Optional[str] = Body(None),
+    per_org_limit: int = Body(PER_ORG_DEFAULT_LIMIT),
 ):
     try:
         fb_field = await get_person_field_by_hint(FIELD_FACHBEREICH_HINT)
@@ -501,13 +568,36 @@ async def neukontakte_preview(
                 return str(fachbereich) in [str(x) for x in val if x is not None]
             return str(val) == str(fachbereich)
 
-        max_collect = int(take_count) if (take_count and take_count > 0) else None
-        sel = await fetch_persons_until_match(FILTER_NEUKONTAKTE, _match, max_collect=max_collect)
+        # Personen einsammeln (ohne Orga-Limit), dann Orga-Limit anwenden
+        raw = await fetch_persons_until_match(FILTER_NEUKONTAKTE, _match, max_collect=None)
+
+        org_used: Dict[str, int] = {}
+        sel: List[dict] = []
+        for p in raw:
+            org_key = None
+            org = p.get("org_id")
+            if isinstance(org, dict):
+                if org.get("id") is not None:
+                    org_key = f"id:{org.get('id')}"
+                elif org.get("name"):
+                    org_key = f"name:{normalize_name(org.get('name'))}"
+            if not org_key:
+                org_key = f"noorg:{p.get('id')}"
+
+            used = org_used.get(org_key, 0)
+            if used >= int(per_org_limit):
+                continue
+            org_used[org_key] = used + 1
+            sel.append(p)
+
+        if take_count and take_count > 0:
+            sel = sel[: min(take_count, len(sel))]
 
         rows = []
         for p in sel:
             pid = p.get("id")
-            name = p.get("name") or ""
+            full_name = p.get("name") or ""
+            first, last = split_name(full_name)
             email_str = ", ".join(_as_list_email(p.get("email")))
             org_name = "-"
             org = p.get("org_id")
@@ -515,10 +605,11 @@ async def neukontakte_preview(
                 org_name = org.get("name") or "-"
             rows.append({
                 "Batch ID": batch_id or "",
-                "Channel": DEFAULT_CHANNEL,
-                COLD_MAILING_IMPORT_LABEL: DEFAULT_CHANNEL,
+                "Channel": DEFAULT_CHANNEL,                         # fix "Cold E-Mail"
+                COLD_MAILING_IMPORT_LABEL: campaign or "",         # Kampagnenname hier speichern
                 "id": pid,
-                "name": name,
+                "Person - Vorname": first,
+                "Person - Nachname": last,
                 "E-Mail": email_str,
                 "Organisation": org_name,
                 "Fachbereich": fb_label,
@@ -543,14 +634,13 @@ async def neukontakte_preview(
 </style></head>
 <body>
   <div style="padding:16px 20px;">
-    <h3>Vorschau – Fachbereich: <b>{fb_label}</b> | Batch: <b>{batch_id or "-"}</b> | Datensätze: <b>{len(df)}</b></h3>
+    <h3>Vorschau – Fachbereich: <b>{fb_label}</b> | Batch: <b>{batch_id or "-"}</b> | Datensätze (mit Orga-Limit): <b>{len(df)}</b></h3>
     {preview_table}
     <p><a class="btn" href="/neukontakte">Zurück</a></p>
     <p><button class="btn" id="btnReconcile">Abgleich durchführen</button></p>
   </div>
 <script>
 document.getElementById('btnReconcile').addEventListener('click', () => {{
-  // Navigation (GET) – robuster als POST ohne Body bei Edge/Proxy
   window.location.href = '/neukontakte/reconcile';
 }});
 </script>
@@ -561,6 +651,7 @@ document.getElementById('btnReconcile').addEventListener('click', () => {{
 
 # =============================================================================
 # Abgleich – nk_master_ready & nk_delete_log
+# (Regel „max 2 pro Orga“ ENTFERNT, da bereits vorher angewandt)
 # =============================================================================
 async def _reconcile_impl() -> HTMLResponse:
     print("==> reconcile START", file=sys.stderr, flush=True)
@@ -588,18 +679,11 @@ async def _reconcile_impl() -> HTMLResponse:
         mask_orgtype = master[col_orgart].notna() & (master[col_orgart].astype(str).str.strip() != "")
         removed = master[mask_orgtype].copy()
         for _, r in removed.iterrows():
-            delete_log.append({"reason":"organisationsart_set","id":r.get(col_person_id),"name":r.get("name"),
+            # Name-Fallback: Vorname Nachname, sonst evtl. 'name'
+            pname = (str(r.get("Person - Vorname") or "") + " " + str(r.get("Person - Nachname") or "")).strip() or str(r.get("name") or "")
+            delete_log.append({"reason":"organisationsart_set","id":r.get(col_person_id),"name":pname,
                                "org_name":r.get(col_org_name),"extra":str(r.get(col_orgart))})
         master = master[~mask_orgtype].copy()
-
-    # Regel 1 – max. 2 Personen pro Organisation
-    if col_org_name and col_org_name in master.columns:
-        master["_rank"] = master.groupby(col_org_name).cumcount() + 1
-        over = master[master["_rank"] > 2].copy()
-        for _, r in over.iterrows():
-            delete_log.append({"reason":"limit_per_org","id":r.get(col_person_id),"name":r.get("name"),
-                               "org_name":r.get(col_org_name),"extra":"über 2 pro Organisation"})
-        master = master[master["_rank"] <= 2].drop(columns=["_rank"], errors="ignore")
 
     # Regel 3 – Orga-Abgleich (Filter 1245, 851, 1521) >=95% mit Buckets
     suspect_org_filters = [1245, 851, 1521]
@@ -629,8 +713,9 @@ async def _reconcile_impl() -> HTMLResponse:
                 continue
             best = process.extractOne(cand_norm, near, scorer=fuzz.token_sort_ratio)
             if best and best[1] >= 95:
+                pname = (str(row.get("Person - Vorname") or "") + " " + str(row.get("Person - Nachname") or "")).strip() or str(row.get("name") or "")
                 drop_idx.append(idx)
-                delete_log.append({"reason":"org_match_95","id":row.get(col_person_id),"name":row.get("name"),
+                delete_log.append({"reason":"org_match_95","id":row.get(col_person_id),"name":pname,
                                    "org_name":cand,"extra":f"Best Match: {best[0]} ({best[1]}%)"})
         if drop_idx:
             master = master.drop(index=drop_idx)
@@ -646,7 +731,8 @@ async def _reconcile_impl() -> HTMLResponse:
             mask_pid = master[col_person_id].astype(str).isin(suspect_ids)
             removed = master[mask_pid].copy()
             for _, r in removed.iterrows():
-                delete_log.append({"reason":"person_id_match","id":r.get(col_person_id),"name":r.get("name"),
+                pname = (str(r.get("Person - Vorname") or "") + " " + str(r.get("Person - Nachname") or "")).strip() or str(r.get("name") or "")
+                delete_log.append({"reason":"person_id_match","id":r.get(col_person_id),"name":pname,
                                    "org_name":r.get(col_org_name),"extra":"ID in Filter 1216/1708"})
             master = master[~mask_pid].copy()
 
@@ -658,7 +744,6 @@ async def _reconcile_impl() -> HTMLResponse:
     stats = {
         "after": len(master),
         "del_orgtype": log_df[log_df["reason"]=="organisationsart_set"].shape[0],
-        "del_limit": log_df[log_df["reason"]=="limit_per_org"].shape[0],
         "del_orgmatch": log_df[log_df["reason"]=="org_match_95"].shape[0],
         "del_pid": log_df[log_df["reason"]=="person_id_match"].shape[0],
         "deleted_total": log_df.shape[0],
@@ -688,7 +773,6 @@ async def _reconcile_impl() -> HTMLResponse:
     </div>
     <p class="muted">
       Entfernt (Organisationsart gesetzt): <b>{stats["del_orgtype"]}</b><br/>
-      Entfernt (mehr als 2 pro Organisation): <b>{stats["del_limit"]}</b><br/>
       Entfernt (Orga-Match ≥95% – Filter 1245/851/1521): <b>{stats["del_orgmatch"]}</b><br/>
       Entfernt (Person-ID in Filtern 1216/1708): <b>{stats["del_pid"]}</b><br/>
       <b>Summe entfernt:</b> {stats["deleted_total"]}
@@ -717,7 +801,6 @@ async def neukontakte_reconcile_post():
         print("==> reconcile ERROR\n", traceback.format_exc(), file=sys.stderr, flush=True)
         return HTMLResponse(f"<pre style='padding:24px;color:#b00'>❌ Fehler beim Abgleich: {e}</pre>", status_code=500)
 
-# GET-Fallback (robuster gegen 502 bei POST ohne Body)
 @app.get("/neukontakte/reconcile", response_class=HTMLResponse)
 async def neukontakte_reconcile_get():
     return await neukontakte_reconcile_post()
