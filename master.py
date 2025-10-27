@@ -251,9 +251,14 @@ async def stream_counts_with_org_cap(
     per_org_limit: int,
     page_limit: int = PAGE_LIMIT,
 ) -> Tuple[int, Dict[str, int]]:
+    """
+    Zählt total & Fachbereich-Counts mit Orga-Limit **pro Fachbereich**.
+    Annahme: jede Person hat genau EINEN Fachbereich.
+    """
     total = 0
     counts: Dict[str, int] = {}
-    org_used: Dict[str, int] = {}
+    # pro Fachbereich eigene Orga-Nutzung
+    used_by_fb: Dict[str, Dict[str, int]] = {}
 
     start = 0
     while True:
@@ -261,11 +266,12 @@ async def stream_counts_with_org_cap(
         r = await http_client().get(url, headers=get_headers())
         if r.status_code != 200:
             raise Exception(f"Pipedrive API Fehler: {r.text}")
-        chunk = r.json().get("data") or []
-        if not chunk:
+        items = r.json().get("data") or []
+        if not items:
             break
 
-        for p in chunk:
+        for p in items:
+            # Orga-Schlüssel
             org_key = None
             org = p.get("org_id")
             if isinstance(org, dict):
@@ -274,29 +280,25 @@ async def stream_counts_with_org_cap(
                 elif org.get("name"):
                     org_key = f"name:{normalize_name(org.get('name'))}"
             if not org_key:
-                pid = p.get("id")
-                org_key = f"noorg:{pid}"
+                org_key = f"noorg:{p.get('id')}"
 
-            used = org_used.get(org_key, 0)
+            # EIN Fachbereich (string oder None)
+            fb_val = p.get(fachbereich_key)
+            fb = str(fb_val).strip() if fb_val is not None else ""
+            if not fb:
+                continue
+
+            # Orga-Limit **pro Fachbereich**
+            used_map = used_by_fb.setdefault(fb, {})
+            used = used_map.get(org_key, 0)
             if used >= per_org_limit:
                 continue
 
-            org_used[org_key] = used + 1
+            used_map[org_key] = used + 1
+            counts[fb] = counts.get(fb, 0) + 1
             total += 1
 
-            val = p.get(fachbereich_key)
-            if isinstance(val, np.ndarray):
-                val = val.tolist()
-            if isinstance(val, list):
-                for v in val:
-                    if v is not None and str(v).strip() != "":
-                        key = str(v)
-                        counts[key] = counts.get(key, 0) + 1
-            elif val is not None and str(val).strip() != "":
-                key = str(val)
-                counts[key] = counts.get(key, 0) + 1
-
-        if len(chunk) < page_limit:
+        if len(items) < page_limit:
             break
         start += page_limit
 
