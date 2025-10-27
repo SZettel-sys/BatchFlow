@@ -47,23 +47,67 @@ if not DATABASE_URL:
 
 SCHEMA = os.getenv("PGSCHEMA", "public")
 
-# Filter/Felder (anpassen, falls nötig)
+# Filter/Felder
 FILTER_NEUKONTAKTE = 2998
-FIELD_FACHBEREICH_HINT = "fachbereich"
-FIELD_ORGART_HINT = "organisationsart"  # wird NICHT mehr im Abgleich genutzt
+FIELD_FACHBEREICH_HINT = "fachbereich"     # Feld in Pipedrive (Person)
+# FIELD_ORGART_HINT bleibt ungenutzt (Regel entfernt)
 
 # UI/Defaults
 DEFAULT_CHANNEL = "Cold E-Mail"              # fix laut Wunsch
 COLD_MAILING_IMPORT_LABEL = "Cold-Mailing Import"
 
 # Performance
-PAGE_LIMIT = int(os.getenv("PAGE_LIMIT", "500"))              # größere Seiten -> weniger Roundtrips
+PAGE_LIMIT = int(os.getenv("PAGE_LIMIT", "500"))
 RECONCILE_MAX_ROWS = int(os.getenv("RECONCILE_MAX_ROWS", "10000"))
-OPTIONS_TTL_SEC = int(os.getenv("OPTIONS_TTL_SEC", "900"))    # Cache für /options
-PER_ORG_DEFAULT_LIMIT = int(os.getenv("PER_ORG_DEFAULT_LIMIT", "2"))  # 1 oder 2
+OPTIONS_TTL_SEC = int(os.getenv("OPTIONS_TTL_SEC", "900"))
+PER_ORG_DEFAULT_LIMIT = int(os.getenv("PER_ORG_DEFAULT_LIMIT", "2"))
 
 # OAuth Tokens (einfach)
 user_tokens: Dict[str, str] = {}
+
+# =============================================================================
+# Template-Spalten (Excel-Export)
+# =============================================================================
+# >>> Passe diese Liste auf deine ZIEL-Datei an (Reihenfolge & Namen) <<<
+TEMPLATE_COLUMNS = [
+    # Kern-Header aus deiner Beschreibung + gängige Felder
+    "Batch ID",
+    "Channel",
+    COLD_MAILING_IMPORT_LABEL,
+    "Person - Prospect ID",
+    "Person - Organisation",
+    "Organisation - ID",
+    "Person - Geschlecht",
+    "Person - Titel",
+    "Person - Vorname",
+    "Person - Nachname",
+    "Person - Position",
+    "Person - ID",
+    "Person - XING-Profil",
+    "Person - LinkedIn Profil-URL",
+    "Person - E-Mail-Adresse - Büro",
+    # zusätzliche, oft gewünschte:
+    "E-Mail",           # wir liefern hierhin die primäre E-Mail, wenn -Büro nicht vorhanden
+    "Fachbereich",
+]
+
+# Mapping „Feld-Hinweis in Pipedrive“ → Zielspalte
+# (wir suchen nach Person-Feldern, deren Name den Hint enthält; case-insensitive)
+PERSON_FIELD_HINTS_TO_EXPORT = {
+    "prospect": "Person - Prospect ID",
+    "organisation": "Person - Organisation",        # selten als Personen-Custom-Feld gepflegt
+    "org id": "Organisation - ID",                  # falls es ein Custom-Feld auf Person gibt
+    "gender": "Person - Geschlecht",
+    "geschlecht": "Person - Geschlecht",
+    "titel": "Person - Titel",
+    "position": "Person - Position",
+    "xing": "Person - XING-Profil",
+    "linkedin": "Person - LinkedIn Profil-URL",
+    "email büro": "Person - E-Mail-Adresse - Büro",
+    "email buero": "Person - E-Mail-Adresse - Büro",
+    "e-mail büro": "Person - E-Mail-Adresse - Büro",
+    "e-mail buero": "Person - E-Mail-Adresse - Büro",
+}
 
 # =============================================================================
 # Startup: HTTP-Client + DB-Pool
@@ -136,7 +180,6 @@ def split_name(first_name: Optional[str], last_name: Optional[str], full_name: O
     ln = last_name or ""
     if fn or ln:
         return fn, ln
-    # Fallback grob splitten
     n = (full_name or "").strip()
     if not n:
         return "", ""
@@ -211,17 +254,12 @@ async def fetch_persons_until_match(
     per_org_limit: int,
     max_collect: Optional[int] = None,
 ) -> List[dict]:
-    """
-    Streamt Personen und sammelt so lange, bis predicate True und Orga-Limit eingehalten
-    wurde. Bricht früh ab, wenn max_collect erreicht.
-    """
     org_used: Dict[str, int] = {}
     out: List[dict] = []
-    for chunk in [c async for c in stream_persons_by_filter(filter_id)]:
+    async for chunk in stream_persons_by_filter(filter_id):
         for p in chunk:
             if not predicate(p):
                 continue
-            # Orga-Schlüssel
             org_key = None
             org = p.get("org_id")
             if isinstance(org, dict):
@@ -240,7 +278,6 @@ async def fetch_persons_until_match(
                 return out
     return out
 
-# ---- Zählen nach „Kontakte pro Organisation“ pro Fachbereich ---------------
 async def stream_counts_with_org_cap(
     filter_id: int,
     fachbereich_key: str,
@@ -260,7 +297,6 @@ async def stream_counts_with_org_cap(
         if not chunk:
             break
         for p in chunk:
-            # FB (genau einer laut Anforderung)
             fb_val = p.get(fachbereich_key)
             if isinstance(fb_val, np.ndarray):
                 fb_val = fb_val.tolist()
@@ -552,7 +588,7 @@ loadOptions();
     return HTMLResponse(html)
 
 # =============================================================================
-# Optionen (Fachbereichswerte) – per AJAX
+# Optionen (Fachbereichswerte)
 # =============================================================================
 @app.get("/neukontakte/options")
 async def neukontakte_options(per_org_limit: int = Query(PER_ORG_DEFAULT_LIMIT, ge=1, le=2), mode: str = Query("new")):
@@ -579,7 +615,7 @@ async def neukontakte_options(per_org_limit: int = Query(PER_ORG_DEFAULT_LIMIT, 
     return JSONResponse({"total": total, "options": options})
 
 # =============================================================================
-# Vorschau – erzeugt nk_master_final
+# Vorschau – nk_master_final
 # =============================================================================
 @app.post("/neukontakte/preview", response_class=HTMLResponse)
 async def neukontakte_preview(
@@ -598,6 +634,15 @@ async def neukontakte_preview(
         id2label = field_options_id_to_label_map(fb_field)
         fb_label = id2label.get(str(fachbereich), str(fachbereich))
 
+        # Personen-Feld-Mapping (HINTS → Pipedrive-Key)
+        person_fields = await get_person_fields()
+        hint_to_key: Dict[str, str] = {}
+        for f in person_fields:
+            nm = (f.get("name") or "").lower()
+            for hint, col in PERSON_FIELD_HINTS_TO_EXPORT.items():
+                if hint in nm and hint not in hint_to_key:
+                    hint_to_key[hint] = f.get("key")
+
         def _match(p: dict) -> bool:
             val = p.get(fb_key)
             if isinstance(val, np.ndarray):
@@ -606,11 +651,24 @@ async def neukontakte_preview(
                 return str(fachbereich) in [str(x) for x in val if x is not None]
             return str(val) == str(fachbereich)
 
-        # Personen einsammeln – früh abbrechen falls take_count gesetzt
         raw = await fetch_persons_until_match(
             FILTER_NEUKONTAKTE, _match, per_org_limit,
             max_collect=take_count if take_count and take_count > 0 else None
         )
+
+        def get_field(p: dict, hint: str) -> str:
+            key = hint_to_key.get(hint)
+            if not key:
+                return ""
+            v = p.get(key)
+            if isinstance(v, dict) and "label" in v:
+                return str(v.get("label") or "")
+            if isinstance(v, list):
+                # Mehrfachfeld: erste sinnvolle Repräsentation
+                if v and isinstance(v[0], dict) and "value" in v[0]:
+                    return str(v[0].get("value") or "")
+                return ", ".join([str(x) for x in v if x])
+            return "" if v is None or (isinstance(v, float) and pd.isna(v)) else str(v)
 
         rows = []
         for p in raw[: (take_count or len(raw))]:
@@ -619,22 +677,36 @@ async def neukontakte_preview(
             last = p.get("last_name")
             full = p.get("name")
             vor, nach = split_name(first, last, full)
-            email_str = ", ".join(_as_list_email(p.get("email")))
-            org_name = "-"
+            emails = _as_list_email(p.get("email"))
+            email_primary = emails[0] if emails else ""
+            org_name, org_id = "-", ""
             org = p.get("org_id")
             if isinstance(org, dict):
                 org_name = org.get("name") or "-"
-            rows.append({
+                if org.get("id") is not None:
+                    org_id = str(org.get("id"))
+
+            row = {
                 "Batch ID": batch_id or "",
                 "Channel": DEFAULT_CHANNEL,
                 COLD_MAILING_IMPORT_LABEL: campaign or "",
-                "id": pid,
+                "Person - Prospect ID": get_field(p, "prospect"),
+                "Person - Organisation": org_name,
+                "Organisation - ID": org_id,
+                "Person - Geschlecht": get_field(p, "gender") or get_field(p, "geschlecht"),
+                "Person - Titel": get_field(p, "titel"),
                 "Person - Vorname": vor,
                 "Person - Nachname": nach,
-                "E-Mail": email_str,
-                "Organisation": org_name,
+                "Person - Position": get_field(p, "position"),
+                "Person - ID": str(pid or ""),
+                "Person - XING-Profil": get_field(p, "xing"),
+                "Person - LinkedIn Profil-URL": get_field(p, "linkedin"),
+                "Person - E-Mail-Adresse - Büro": get_field(p, "email büro") or get_field(p, "email buero"),
+                "E-Mail": email_primary,
                 "Fachbereich": fb_label,
-            })
+            }
+
+            rows.append(row)
 
         df = pd.DataFrame(rows)
         await save_df_text(df, "nk_master_final")
@@ -642,7 +714,6 @@ async def neukontakte_preview(
         preview_table = (df.head(50).to_html(classes="grid", index=False, border=0)
                          if not df.empty else "<i>Keine Daten</i>")
 
-        # schlanke, ruhige Vorschau
         html = f"""<!doctype html><html lang="de"><head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>Vorschau – {fb_label}</title>
@@ -694,8 +765,40 @@ async def neukontakte_preview(
         return HTMLResponse(f"<pre style='padding:24px;color:#b00'>❌ Fehler beim Abruf/Speichern:\n{e}</pre>", status_code=500)
 
 # =============================================================================
-# Abgleich – schreibt nk_master_ready & nk_delete_log
-#  - Regel "Organisationsart gesetzt" entfällt (wird gefiltert)
+# Organisationen & Personen-IDs (für Abgleich)
+# =============================================================================
+async def stream_organizations_by_filter(filter_id: int, page_limit: int = PAGE_LIMIT):
+    start = 0
+    while True:
+        url = append_token(f"{PIPEDRIVE_API}/organizations?filter_id={filter_id}&start={start}&limit={page_limit}")
+        r = await http_client().get(url, headers=get_headers())
+        if r.status_code != 200:
+            raise Exception(f"Pipedrive API Fehler (Orgs {filter_id}): {r.text}")
+        chunk = r.json().get("data") or []
+        if not chunk:
+            break
+        yield chunk
+        if len(chunk) < page_limit:
+            break
+        start += page_limit
+
+async def stream_person_ids_by_filter(filter_id: int, page_limit: int = PAGE_LIMIT):
+    start = 0
+    while True:
+        url = append_token(f"{PIPEDRIVE_API}/persons?filter_id={filter_id}&start={start}&limit={page_limit}&sort=id")
+        r = await http_client().get(url, headers=get_headers())
+        if r.status_code != 200:
+            raise Exception(f"Pipedrive API Fehler (Persons {filter_id}): {r.text}")
+        data = r.json().get("data") or []
+        if not data:
+            break
+        yield [str(p.get("id")) for p in data if p.get("id") is not None]
+        if len(data) < page_limit:
+            break
+        start += page_limit
+
+# =============================================================================
+# Abgleich – schreibt nk_master_ready & nk_delete_log (ohne Organisationsart-Regel)
 # =============================================================================
 async def _reconcile_impl() -> HTMLResponse:
     master = await load_df_text("nk_master_final")
@@ -708,12 +811,12 @@ async def _reconcile_impl() -> HTMLResponse:
             f"Bitte auf ≤ {RECONCILE_MAX_ROWS} begrenzen.</div>", status_code=400
         )
 
-    col_person_id = "id" if "id" in master.columns else None
-    col_org_name = "Organisation" if "Organisation" in master.columns else None
+    col_person_id = "Person - ID" if "Person - ID" in master.columns else ("id" if "id" in master.columns else None)
+    col_org_name = "Person - Organisation" if "Person - Organisation" in master.columns else ("Organisation" if "Organisation" in master.columns else None)
 
     delete_log: List[Dict[str, str]] = []
 
-    # Regel 3 – Orga-Abgleich (Filter 1245, 851, 1521) >=95% mit Buckets
+    # Regel – Orga-Abgleich (Filter 1245, 851, 1521) >=95%
     suspect_org_filters = [1245, 851, 1521]
     if col_org_name and col_org_name in master.columns:
         ext_buckets: Dict[str, List[str]] = {}
@@ -743,12 +846,14 @@ async def _reconcile_impl() -> HTMLResponse:
             best = process.extractOne(cand_norm, near, scorer=fuzz.token_sort_ratio)
             if best and best[1] >= 95:
                 drop_idx.append(idx)
-                delete_log.append({"reason":"org_match_95","id":str(row.get(col_person_id) or ""), "name":str(row.get("name") or ""),
+                delete_log.append({"reason":"org_match_95",
+                                   "id":str(row.get(col_person_id) or ""),
+                                   "name":f"{row.get('Person - Vorname') or ''} {row.get('Person - Nachname') or ''}".strip(),
                                    "org_name":cand,"extra":f"Best Match: {best[0]} ({best[1]}%)"})
         if drop_idx:
             master = master.drop(index=drop_idx)
 
-    # Regel 4 – Personen-ID-Abgleich (Filter 1216, 1708)
+    # Regel – Personen-ID-Abgleich (Filter 1216, 1708)
     suspect_person_filters = [1216, 1708]
     if col_person_id:
         suspect_ids = set()
@@ -759,11 +864,13 @@ async def _reconcile_impl() -> HTMLResponse:
             mask_pid = master[col_person_id].astype(str).isin(suspect_ids)
             removed = master[mask_pid].copy()
             for _, r in removed.iterrows():
-                delete_log.append({"reason":"person_id_match","id":str(r.get(col_person_id) or ""),"name":str(r.get("name") or ""),
-                                   "org_name":str(r.get(col_org_name) or ""),"extra":"ID in Filter 1216/1708"})
+                delete_log.append({"reason":"person_id_match",
+                                   "id":str(r.get(col_person_id) or ""),
+                                   "name":f"{r.get('Person - Vorname') or ''} {r.get('Person - Nachname') or ''}".strip(),
+                                   "org_name":str(r.get(col_org_name) or ""),
+                                   "extra":"ID in Filter 1216/1708"})
             master = master[~mask_pid].copy()
 
-    # Speichern
     await save_df_text(master, "nk_master_ready")
     log_df = pd.DataFrame(delete_log, columns=["reason","id","name","org_name","extra"])
     await save_df_text(log_df, "nk_delete_log")
@@ -836,55 +943,21 @@ async def neukontakte_reconcile_get():
     return await neukontakte_reconcile_post()
 
 # =============================================================================
-# Organisationen & Personen-IDs (für Abgleich)
+# Abgleich & Excel-Export (Direkt-Button) – Template-orientiert
 # =============================================================================
-async def stream_organizations_by_filter(filter_id: int, page_limit: int = PAGE_LIMIT):
-    start = 0
-    while True:
-        url = append_token(f"{PIPEDRIVE_API}/organizations?filter_id={filter_id}&start={start}&limit={page_limit}")
-        r = await http_client().get(url, headers=get_headers())
-        if r.status_code != 200:
-            raise Exception(f"Pipedrive API Fehler (Orgs {filter_id}): {r.text}")
-        chunk = r.json().get("data") or []
-        if not chunk:
-            break
-        yield chunk
-        if len(chunk) < page_limit:
-            break
-        start += page_limit
-
-async def stream_person_ids_by_filter(filter_id: int, page_limit: int = PAGE_LIMIT):
-    start = 0
-    while True:
-        url = append_token(f"{PIPEDRIVE_API}/persons?filter_id={filter_id}&start={start}&limit={page_limit}&sort=id")
-        r = await http_client().get(url, headers=get_headers())
-        if r.status_code != 200:
-            raise Exception(f"Pipedrive API Fehler (Persons {filter_id}): {r.text}")
-        data = r.json().get("data") or []
-        if not data:
-            break
-        yield [str(p.get("id")) for p in data if p.get("id") is not None]
-        if len(data) < page_limit:
-            break
-        start += page_limit
-
-# =============================================================================
-# Abgleich & Excel-Export (Direkt-Button)
-# =============================================================================
-def _export_dataframe(master_ready: pd.DataFrame) -> pd.DataFrame:
-    # Mapping auf Exportspalten (die wir zuverlässig befüllen können)
-    cols = {
-        "Batch ID": master_ready.get("Batch ID"),
-        "Channel": master_ready.get("Channel"),
-        COLD_MAILING_IMPORT_LABEL: master_ready.get(COLD_MAILING_IMPORT_LABEL),
-        "Person - Prospect ID": master_ready.get("id"),
-        "Person - Vorname": master_ready.get("Person - Vorname"),
-        "Person - Nachname": master_ready.get("Person - Nachname"),
-        "E-Mail": master_ready.get("E-Mail"),
-        "Organisation": master_ready.get("Organisation"),
-        "Fachbereich": master_ready.get("Fachbereich"),
-    }
-    return pd.DataFrame(cols)
+def build_export_from_ready(master_ready: pd.DataFrame) -> pd.DataFrame:
+    # Master-DF → in Template-Spalten bringen (fehlende Spalten leer)
+    out = pd.DataFrame(columns=TEMPLATE_COLUMNS)
+    for col in TEMPLATE_COLUMNS:
+        if col in master_ready.columns:
+            out[col] = master_ready[col]
+        else:
+            out[col] = ""  # fehlendes Feld leer
+    # Falls „E-Mail“ leer und „Person - E-Mail-Adresse - Büro“ gefüllt → übernehmen
+    mask = (out.get("E-Mail", pd.Series(dtype=str)) == "") & (out.get("Person - E-Mail-Adresse - Büro", pd.Series(dtype=str)) != "")
+    if mask.any():
+        out.loc[mask, "E-Mail"] = out.loc[mask, "Person - E-Mail-Adresse - Büro"]
+    return out
 
 @app.post("/neukontakte/export")
 async def neukontakte_export(
@@ -895,22 +968,17 @@ async def neukontakte_export(
     per_org_limit: int = Body(PER_ORG_DEFAULT_LIMIT),
     mode: str = Query("new"),
 ):
-    """
-    Erzeugt Auswahl -> speichert nk_master_final -> Abgleich -> Excel Download.
-    """
-    # Reuse der Preview-Logik zum Erstellen von nk_master_final
+    # Auswahl + nk_master_final
     _ = await neukontakte_preview(fachbereich, take_count, batch_id, campaign, per_org_limit, mode)
     # Abgleich
     _ = await _reconcile_impl()
-    # Laden & Export
+    # Export
     ready = await load_df_text("nk_master_ready")
-    export_df = _export_dataframe(ready)
+    export_df = build_export_from_ready(ready)
     buf = io.BytesIO()
     export_df.to_excel(buf, index=False, sheet_name="Export")
     buf.seek(0)
-    headers = {
-        "Content-Disposition": "attachment; filename=BatchFlow_Export.xlsx"
-    }
+    headers = {"Content-Disposition": "attachment; filename=BatchFlow_Export.xlsx"}
     return StreamingResponse(buf, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers=headers)
 
 # =============================================================================
