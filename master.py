@@ -486,85 +486,89 @@ async def neukontakte(request: Request, mode: str = Query("new")):
 </main>
 
 <div id="overlay"><div class="spinner"></div></div>
-
 <script>
 const MODE = new URLSearchParams(location.search).get('mode') || 'new';
 const fbSel = document.getElementById('fachbereich');
 const btnPrev = document.getElementById('btnPreview');
 const btnExp  = document.getElementById('btnExport');
 
-function toggleCTAs(){ const ok = !!fbSel.value; btnPrev.disabled = !ok; btnExp.disabled = !ok; }
+function toggleCTAs(){{ const ok = !!fbSel.value; btnPrev.disabled = !ok; btnExp.disabled = !ok; }}
 fbSel.addEventListener('change', toggleCTAs);
 
-function showOverlay(){ document.getElementById("overlay").style.display="flex"; }
-function hideOverlay(){ document.getElementById("overlay").style.display="none"; }
+function showOverlay(){{ document.getElementById("overlay").style.display="flex"; }}
+function hideOverlay(){{ document.getElementById("overlay").style.display="none"; }}
 
-async function loadOptions(){
+async function loadOptions(){{ 
   showOverlay();
-  try{
+  try {{
     const pol = document.getElementById('per_org_limit').value || '{PER_ORG_DEFAULT_LIMIT}';
-    const r = await fetch('/neukontakte/options?per_org_limit=' + encodeURIComponent(pol) + '&mode=' + encodeURIComponent(MODE), {cache:'no-store'});
+    const r = await fetch('/neukontakte/options?per_org_limit=' + encodeURIComponent(pol) + '&mode=' + encodeURIComponent(MODE), {{cache:'no-store'}});
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const data = await r.json();
     const sel = document.getElementById('fachbereich');
     sel.innerHTML = '<option value="">– bitte auswählen –</option>';
-    data.options.forEach(o => {
+    data.options.forEach(o => {{
       const opt = document.createElement('option');
       opt.value = o.value;
       opt.textContent = o.label + ' (' + o.count + ')';
       sel.appendChild(opt);
-    });
+    }});
     document.getElementById('fbinfo').textContent = "Gesamt (nach Orga-Limit): " + data.total + " · Fachbereiche: " + data.options.length;
     document.getElementById('total-count').textContent = String(data.total);
     toggleCTAs();
-  }catch(e){ alert('Fehler beim Laden der Fachbereiche: ' + e); }
-  finally{ hideOverlay(); }
-}
+  }} catch(e) {{
+    alert('Fehler beim Laden der Fachbereiche: ' + e);
+  }} finally {{
+    hideOverlay();
+  }}
+}}
 
 document.getElementById('per_org_limit').addEventListener('change', loadOptions);
 
-btnPrev.addEventListener('click', async () => {
+btnPrev.addEventListener('click', async () => {{
   const fb  = document.getElementById('fachbereich').value;
   const tc  = document.getElementById('take_count').value || null;
   const bid = document.getElementById('batch_id').value || null;
   const camp= document.getElementById('campaign').value || null;
   const pol = document.getElementById('per_org_limit').value || '{PER_ORG_DEFAULT_LIMIT}';
-  if(!fb){ alert('Bitte zuerst einen Fachbereich wählen.'); return; }
+  if(!fb) {{ alert('Bitte zuerst einen Fachbereich wählen.'); return; }}
   showOverlay();
-  try{
-    const r = await fetch('/neukontakte/preview?mode=' + encodeURIComponent(MODE), {
-      method:'POST', headers:{'Content-Type':'application/json'}, cache:'no-store',
-      body: JSON.stringify({ fachbereich: fb, take_count: tc ? parseInt(tc) : null, batch_id: bid, campaign: camp, per_org_limit: parseInt(pol) })
-    });
+  try {{
+    const r = await fetch('/neukontakte/preview?mode=' + encodeURIComponent(MODE), {{
+      method:'POST', headers:{{'Content-Type':'application/json'}}, cache:'no-store',
+      body: JSON.stringify({{ fachbereich: fb, take_count: tc ? parseInt(tc) : null, batch_id: bid, campaign: camp, per_org_limit: parseInt(pol) }})
+    }});
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const html = await r.text(); document.open(); document.write(html); document.close();
-  }catch(e){ alert('Fehler: ' + e); } finally{ hideOverlay(); }
-});
+  }} catch(e) {{ alert('Fehler: ' + e); }} finally {{ hideOverlay(); }}
+}});
 
-btnExp.addEventListener('click', async () => {
+btnExp.addEventListener('click', async () => {{
   const fb  = document.getElementById('fachbereich').value;
   const tc  = document.getElementById('take_count').value || null;
   const bid = document.getElementById('batch_id').value || null;
   const camp= document.getElementById('campaign').value || null;
   const pol = document.getElementById('per_org_limit').value || '{PER_ORG_DEFAULT_LIMIT}';
-  if(!fb){ alert('Bitte zuerst einen Fachbereich wählen.'); return; }
+  if(!fb) {{ alert('Bitte zuerst einen Fachbereich wählen.'); return; }}
   showOverlay();
-  try{
-    const r = await fetch('/neukontakte/export?mode=' + encodeURIComponent(MODE), {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ fachbereich: fb, take_count: tc ? parseInt(tc) : null, batch_id: bid, campaign: camp, per_org_limit: parseInt(pol) })
-    });
+  try {{
+    const r = await fetch('/neukontakte/export?mode=' + encodeURIComponent(MODE), {{
+      method:'POST', headers:{{'Content-Type':'application/json'}},
+      body: JSON.stringify({{ fachbereich: fb, take_count: tc ? parseInt(tc) : null, batch_id: bid, campaign: camp, per_org_limit: parseInt(pol) }})
+    }});
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const blob = await r.blob();
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url; a.download = 'BatchFlow_Export.xlsx'; a.click();
     URL.revokeObjectURL(url);
-  }catch(e){ alert('Fehler: ' + e); } finally{ hideOverlay(); }
-});
+  }} catch(e) {{ alert('Fehler: ' + e); }} finally {{ hideOverlay(); }}
+}});
 
 loadOptions();
 </script>
+
+
 </body></html>"""
     return HTMLResponse(html)
 
