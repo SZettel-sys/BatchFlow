@@ -1,10 +1,4 @@
 # master.py — BatchFlow (FastAPI + Pipedrive + Neon)
-# Neu:
-# - Export-Dateiname = Kampagnenname (sanitisiert)
-# - Vorfilter: "Datum nächste Aktivität" (innerhalb [heute-3M, heute]) -> ausschließen
-#   (in Optionen-Zählung UND beim Export)
-# - UI-Hinweistext zu bereits berücksichtigten Abgleichen
-# - Vorherige Fixes bleiben (Orga-ID robust, OOM-Schutz, f-string-sicheres JS)
 
 import os
 import re
@@ -53,7 +47,6 @@ FIELD_FACHBEREICH_HINT = os.getenv("FIELD_FACHBEREICH_HINT", "fachbereich")
 
 # UI/Defaults
 DEFAULT_CHANNEL = "Cold E-Mail"  # nur im Export
-COLD_MAILING_IMPORT_LABEL = "Cold-Mailing Import"
 
 # Performance & Limits
 PAGE_LIMIT = int(os.getenv("PAGE_LIMIT", "500"))
@@ -62,7 +55,7 @@ OPTIONS_TTL_SEC = int(os.getenv("OPTIONS_TTL_SEC", "900"))
 PER_ORG_DEFAULT_LIMIT = int(os.getenv("PER_ORG_DEFAULT_LIMIT", "2"))
 PD_CONCURRENCY = int(os.getenv("PD_CONCURRENCY", "4"))
 
-# OOM-Schutz beim Orga-Abgleich
+# OOM-Schutz
 MAX_ORG_NAMES = int(os.getenv("MAX_ORG_NAMES", "120000"))
 MAX_ORG_BUCKET = int(os.getenv("MAX_ORG_BUCKET", "15000"))
 
@@ -235,21 +228,20 @@ def parse_pd_date(d: Optional[str]) -> Optional[datetime]:
     if not d:
         return None
     try:
-        # Pipedrive liefert "YYYY-MM-DD"
         return datetime.strptime(d, "%Y-%m-%d").replace(tzinfo=timezone.utc)
     except Exception:
         return None
 
-def is_next_activity_in_last_3_months(next_activity_date: Optional[str]) -> bool:
+def is_forbidden_activity_date(val: Optional[str]) -> bool:
     """
-    True => in [heute-3M, heute]  -> ausschließen
+    True => ausschließen, wenn Datum in Zukunft ODER in [heute-3M, heute]
     """
-    dt = parse_pd_date(next_activity_date)
+    dt = parse_pd_date(val)
     if not dt:
         return False
     today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     three_months = today - timedelta(days=90)
-    return three_months <= dt <= today
+    return dt > today or (three_months <= dt <= today)
 
 # Caches
 _OPTIONS_CACHE: Dict[int, dict] = {}
@@ -283,6 +275,58 @@ async def get_person_field_by_hint(label_hint: str) -> Optional[dict]:
             return f
     return None
 
+# --- Aktivitäts-Felder robust bestimmen --------------------------------------
+_NEXT_ACTIVITY_KEY: Optional[str] = None
+_LAST_ACTIVITY_KEY: Optional[str] = None
+
+async def get_next_activity_key() -> Optional[str]:
+    global _NEXT_ACTIVITY_KEY
+    if _NEXT_ACTIVITY_KEY is not None:
+        return _NEXT_ACTIVITY_KEY
+    _NEXT_ACTIVITY_KEY = "next_activity_date"
+    try:
+        fields = await get_person_fields()
+        want = ["next activity", "next_activity_date", "nächste aktivität", "naechste aktivitaet", "datum nächste aktivität"]
+        wl = [(w, w.replace("ä","ae").replace("ö","oe").replace("ü","ue")) for w in want]
+        for f in fields:
+            nm = (f.get("name") or "").lower()
+            if any((w in nm) or (wa in nm) for w, wa in wl):
+                _NEXT_ACTIVITY_KEY = f.get("key") or _NEXT_ACTIVITY_KEY
+                break
+    except Exception:
+        pass
+    return _NEXT_ACTIVITY_KEY
+
+async def get_last_activity_key() -> Optional[str]:
+    global _LAST_ACTIVITY_KEY
+    if _LAST_ACTIVITY_KEY is not None:
+        return _LAST_ACTIVITY_KEY
+    _LAST_ACTIVITY_KEY = "last_activity_date"
+    try:
+        fields = await get_person_fields()
+        want = ["last activity", "last_activity_date", "letzte aktivität", "letzte aktivitaet", "datum letzte aktivität"]
+        wl = [(w, w.replace("ä","ae").replace("ö","oe").replace("ü","ue")) for w in want]
+        for f in fields:
+            nm = (f.get("name") or "").lower()
+            if any((w in nm) or (wa in nm) for w, wa in wl):
+                _LAST_ACTIVITY_KEY = f.get("key") or _LAST_ACTIVITY_KEY
+                break
+    except Exception:
+        pass
+    return _LAST_ACTIVITY_KEY
+
+def extract_field_date(p: dict, key: Optional[str]) -> Optional[str]:
+    if not key:
+        return None
+    v = p.get(key)
+    if isinstance(v, dict):
+        v = v.get("value")
+    elif isinstance(v, list):
+        v = v[0] if v else None
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return None
+    return str(v)
+
 # =============================================================================
 # Pipedrive Fetcher
 # =============================================================================
@@ -308,6 +352,8 @@ async def stream_counts_with_org_cap(
     counts: Dict[str, int] = {}
     used_by_fb: Dict[str, Dict[str, int]] = {}
     start = 0
+    last_key = await get_last_activity_key()
+    next_key = await get_next_activity_key()
     while True:
         url = append_token(f"{PIPEDRIVE_API}/persons?filter_id={filter_id}&start={start}&limit={page_limit}")
         r = await http_client().get(url, headers=get_headers())
@@ -317,8 +363,9 @@ async def stream_counts_with_org_cap(
         if not chunk:
             break
         for p in chunk:
-            # Vorfilter: Datum nächste Aktivität -> ausschließen, wenn in den letzten 3 Monaten (inkl. heute)
-            if is_next_activity_in_last_3_months(p.get("next_activity_date")):
+            # Vorfilter: erst last_activity_date, sonst next_activity_date
+            val = extract_field_date(p, last_key) or extract_field_date(p, next_key)
+            if is_forbidden_activity_date(val):
                 continue
 
             fb_val = p.get(fachbereich_key)
@@ -355,11 +402,10 @@ async def stream_counts_with_org_cap(
         if len(chunk) < page_limit:
             break
         start += page_limit
-
     return total, counts
 
 # =============================================================================
-# Parallele Filter-Fetches + Streams
+# Parallele Streams (Abgleich)
 # =============================================================================
 import asyncio
 
@@ -515,8 +561,7 @@ async def campaign_home():
 @app.get("/neukontakte", response_class=HTMLResponse)
 async def neukontakte(request: Request, mode: str = Query("new")):
     authed = bool(user_tokens.get("default") or PD_API_TOKEN)
-    title_map = {"new": "Neukontakte", "nachfass": "Nachfass", "refresh": "Refresh"}
-    page_title = title_map.get(mode, "Neukontakte")
+    page_title = {"new": "Neukontakte", "nachfass": "Nachfass", "refresh": "Refresh"}.get(mode, "Neukontakte")
     html = f"""<!doctype html><html lang="de">
 <head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
@@ -574,7 +619,7 @@ async def neukontakte(request: Request, mode: str = Query("new")):
         <ul class="info">
           <li>Die Anzahl bezieht sich bereits auf Anzahl der Kontakte pro Organisation.</li>
           <li>Es sind keine Datensätze dabei, die eine gesetzte Organisationsart haben.</li>
-          <li>Das Datum der letzten Aktivität ist berücksichtigt (keine Einträge der letzten 3 Monate bis heute).</li>
+          <li>Aktivitätsdaten sind berücksichtigt (keine Einträge von heute bis 3&nbsp;Monate zurück und keine zukünftigen Daten).</li>
         </ul>
       </div>
       <div class="col-4">
@@ -719,7 +764,7 @@ async def neukontakte_options(per_org_limit: int = Query(PER_ORG_DEFAULT_LIMIT, 
     return JSONResponse({"total": total, "options": options})
 
 # =============================================================================
-# Datenaufbau (mit Orga-ID-Fix + Next-Activity-Vorfilter)
+# Datenaufbau (inkl. Aktivitäts-Vorfilter & Orga-ID-Fix)
 # =============================================================================
 async def _build_master_final_from_pd(
     fachbereich: str,
@@ -746,6 +791,10 @@ async def _build_master_final_from_pd(
         if any(x in nm for x in ("gender", "geschlecht")):
             gender_options_map = field_options_id_to_label_map(f)
 
+    # Aktivitäts-Feldkeys nur 1x holen
+    last_key = await get_last_activity_key()
+    next_key = await get_next_activity_key()
+
     def get_field(p: dict, hint: str) -> str:
         key = hint_to_key.get(hint)
         if not key:
@@ -765,8 +814,9 @@ async def _build_master_final_from_pd(
         return sv
 
     def _match_person(p: dict) -> bool:
-        # Vorfilter: next_activity_date in den letzten 3 Monaten bis heute -> ausschließen
-        if is_next_activity_in_last_3_months(p.get("next_activity_date")):
+        # Vorfilter: zuerst letztes Aktivitätsdatum, sonst nächstes
+        av = extract_field_date(p, last_key) or extract_field_date(p, next_key)
+        if is_forbidden_activity_date(av):
             return False
         val = p.get(fb_key)
         if isinstance(val, np.ndarray):
@@ -775,14 +825,12 @@ async def _build_master_final_from_pd(
             return str(fachbereich) in [str(x) for x in val if x is not None]
         return str(val) == str(fachbereich)
 
-    # Personen streamen & vorfiltern
     selected: List[dict] = []
     org_used: Dict[str, int] = {}
     async for chunk in stream_persons_by_filter(FILTER_NEUKONTAKTE):
         for p in chunk:
             if not _match_person(p):
                 continue
-            # Orga-Limit anwenden
             org_key = None
             org = p.get("org_id")
             if isinstance(org, dict):
@@ -796,7 +844,6 @@ async def _build_master_final_from_pd(
             if used >= per_org_limit:
                 continue
             org_used[org_key] = used + 1
-
             selected.append(p)
             if take_count and take_count > 0 and len(selected) >= take_count:
                 break
@@ -811,7 +858,7 @@ async def _build_master_final_from_pd(
         full = p.get("name")
         vor, nach = split_name(first, last, full)
 
-        # --- Organisation robust (Dict / Int/Str / Fallback) ---
+        # --- Organisation robust ---
         org_name, org_id = "-", ""
         org = p.get("org_id")
         if isinstance(org, dict):
@@ -854,8 +901,20 @@ async def _build_master_final_from_pd(
     return df
 
 # =============================================================================
-# Abgleich — (wie zuvor, OOM-schonend)
+# Abgleich — speicherschonend, Delete-Log für UI
 # =============================================================================
+def _pretty_reason(reason: str, extra: str = "") -> str:
+    r = (reason or "").lower()
+    if r == "org_match_95":
+        base = "Organisations-Duplikat (≥95 %)"
+    elif r == "person_id_match":
+        base = "Person bereits kontaktiert (ID in 1216/1708)"
+    elif r == "limit_per_org":
+        base = "Mehr als zulässige Kontakte pro Organisation"
+    else:
+        base = r or "Entfernt"
+    return f"{base}{(' – ' + extra) if extra else ''}"
+
 async def _reconcile_impl() -> HTMLResponse:
     master = await load_df_text("nk_master_final")
     if master.empty:
@@ -869,6 +928,7 @@ async def _reconcile_impl() -> HTMLResponse:
 
     col_person_id = "Person ID"
     col_org_name = "Organisation Name"
+    col_org_id = "Organisation ID"
     delete_rows: List[Dict[str, str]] = []
 
     # ---- Orga-Dubletten (Filter 1245/851/1521) via ≥95 % (mit Kappung)
@@ -914,6 +974,7 @@ async def _reconcile_impl() -> HTMLResponse:
                 "reason": "org_match_95",
                 "id": str(row.get(col_person_id) or ""),
                 "name": f"{row.get('Person Vorname') or ''} {row.get('Person Nachname') or ''}".strip(),
+                "org_id": str(row.get(col_org_id) or ""),
                 "org_name": cand,
                 "extra": f"Best Match: {best[0]} ({best[1]}%)"
             })
@@ -931,22 +992,24 @@ async def _reconcile_impl() -> HTMLResponse:
                 "reason": "person_id_match",
                 "id": str(r.get(col_person_id) or ""),
                 "name": f"{r.get('Person Vorname') or ''} {r.get('Person Nachname') or ''}".strip(),
+                "org_id": str(r.get(col_org_id) or ""),
                 "org_name": str(r.get(col_org_name) or ""),
                 "extra": "ID in Filter 1216/1708"
             })
         master = master[~mask_pid].copy()
 
     await save_df_text(master, "nk_master_ready")
-    log_df = pd.DataFrame(delete_rows, columns=["reason", "id", "name", "org_name", "extra"])
+    log_df = pd.DataFrame(delete_rows, columns=["reason", "id", "name", "org_id", "org_name", "extra"])
     await save_df_text(log_df, "nk_delete_log")
 
+    # Für die HTML-Antwort (kurzer Inline-Report)
     stats = {
         "after": len(master),
         "del_orgmatch": log_df[log_df["reason"] == "org_match_95"].shape[0] if not log_df.empty else 0,
         "del_pid": log_df[log_df["reason"] == "person_id_match"].shape[0] if not log_df.empty else 0,
         "deleted_total": log_df.shape[0] if not log_df.empty else 0,
     }
-    table_html = log_df.head(50).to_html(classes="grid", index=False, border=0) if not log_df.empty else "<i>keine</i>"
+    table_html = log_df.head(50).to_html(index=False, border=0) if not log_df.empty else "<i>keine</i>"
     return HTMLResponse(
         f"<div style='padding:16px;font-family:Inter,system-ui'>Übrig: <b>{stats['after']}</b> · "
         f"Orga≥95%: <b>{stats['del_orgmatch']}</b> · PersonID: <b>{stats['del_pid']}</b>"
@@ -954,19 +1017,34 @@ async def _reconcile_impl() -> HTMLResponse:
     )
 
 # =============================================================================
-# Export als Job (Excel) — Dateiname = Kampagnenname
+# Export als Job (Excel) — Dateiname = Kampagnenname, Textformat für IDs
 # =============================================================================
 def build_export_from_ready(master_ready: pd.DataFrame) -> pd.DataFrame:
     out = pd.DataFrame(columns=TEMPLATE_COLUMNS)
     for col in TEMPLATE_COLUMNS:
         out[col] = master_ready[col] if col in master_ready.columns else ""
+    # IDs als Strings
+    for c in ("Organisation ID", "Person ID"):
+        if c in out.columns:
+            out[c] = out[c].astype(str).fillna("").replace("nan", "")
     return out
 
 def _df_to_excel_bytes(df: pd.DataFrame) -> bytes:
-    buf = io.BytesIO()
-    df.to_excel(buf, index=False, sheet_name="Export")
-    buf.seek(0)
-    return buf.read()
+    # openpyxl nutzen, um Numberformat auf Text zu setzen
+    from openpyxl.utils import get_column_letter
+    with pd.ExcelWriter(io.BytesIO(), engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Export")
+        ws = writer.sheets["Export"]
+        # Spaltenindizes
+        col_idx = {col: i+1 for i, col in enumerate(df.columns)}
+        for name in ("Organisation ID", "Person ID"):
+            if name in col_idx:
+                j = col_idx[name]
+                for i in range(2, len(df) + 2):
+                    ws.cell(i, j).number_format = "@"
+        writer.book.properties.creator = "BatchFlow"
+        data: io.BytesIO = writer.book.save(filename=None)  # type: ignore
+    return data.getvalue()
 
 class Job:
     def __init__(self) -> None:
@@ -1049,7 +1127,7 @@ async def export_download(job_id: str):
     )
 
 # =============================================================================
-# Übersicht/Summary
+# Übersicht/Summary (ohne „Top 50“, eigene Spalten & „Grund“)
 # =============================================================================
 def _count_reason(df: pd.DataFrame, keys: List[str]) -> int:
     if df.empty or "reason" not in df.columns:
@@ -1070,8 +1148,19 @@ async def neukontakte_summary(job_id: str = Query(...)):
     cnt_pid       = _count_reason(log, ["person_id_match"])
     removed_sum   = cnt_orgtype + cnt_limit_org + cnt_org95 + cnt_pid
 
-    top = log.tail(50).copy() if not log.empty else pd.DataFrame()
-    table_html = (top.to_html(classes="grid", index=False, border=0) if not top.empty else "<i>keine</i>")
+    # Anzeige-Tabelle bauen (Id, Name, Organisation ID, Organisation Name, Grund)
+    if not log.empty:
+        view = log.tail(50).copy()
+        view["Grund"] = view.apply(lambda r: _pretty_reason(str(r.get("reason") or ""), str(r.get("extra") or "")), axis=1)
+        view = view.rename(columns={
+            "id": "Id",
+            "name": "Name",
+            "org_id": "Organisation ID",
+            "org_name": "Organisation Name",
+        })[["Id", "Name", "Organisation ID", "Organisation Name", "Grund"]]
+        table_html = view.to_html(classes="grid", index=False, border=0)
+    else:
+        table_html = "<i>keine</i>"
 
     html = f"""
 <!doctype html><html lang="de"><head>
@@ -1108,7 +1197,7 @@ async def neukontakte_summary(job_id: str = Query(...)):
   </section>
 
   <section class="card">
-    <h2>Entfernte Datensätze (Top 50)</h2>
+    <h2>Entfernte Datensätze</h2>
     {table_html}
     <div class="muted" style="margin-top:8px">Vollständiges Log in Neon: <code>nk_delete_log</code></div>
   </section>
