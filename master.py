@@ -571,87 +571,92 @@ async def neukontakte(request: Request, mode: str = Query("new")):
   <div id="phase" style="color:#0f172a"></div>
   <div class="barwrap"><div class="bar" id="bar"></div></div>
 </div>
+  <script>
+    const MODE = new URLSearchParams(location.search).get('mode') || 'new';
+    const el = id => document.getElementById(id);
+    const fbSel = el('fachbereich');
+    const btnExp = el('btnExport');
 
-<script>
-const MODE = new URLSearchParams(location.search).get('mode') || 'new';
-const el = id => document.getElementById(id);
-const fbSel = el('fachbereich');
-const btnExp = el('btnExport');
+    function toggleCTAs() {{ btnExp.disabled = !fbSel.value; }}
+    fbSel.addEventListener('change', toggleCTAs);
+    el('per_org_limit').addEventListener('change', loadOptions);
 
-function toggleCTAs() { btnExp.disabled = !fbSel.value; }
-fbSel.addEventListener('change', toggleCTAs);
-el('per_org_limit').addEventListener('change', loadOptions);
+    function showOverlay(msg) {{
+      el("phase").textContent = msg || "";
+      el("overlay").style.display = "flex";
+    }}
+    function hideOverlay() {{ el("overlay").style.display = "none"; }}
+    function setProgress(p) {{ el("bar").style.width = (Math.max(0, Math.min(100, p)) + "%"); }}
 
-function showOverlay(msg){ el("phase").textContent = msg || ""; el("overlay").style.display="flex"; }
-function hideOverlay(){ el("overlay").style.display="none"; }
-function setProgress(p){ el("bar").style.width = (Math.max(0, Math.min(100, p)) + "%"); }
+    async function loadOptions() {{
+      showOverlay("Lade Optionen …"); setProgress(15);
+      try {{
+        const pol = el('per_org_limit').value || '{PER_ORG_DEFAULT_LIMIT}';
+        const r = await fetch('/neukontakte/options?per_org_limit=' + encodeURIComponent(pol) + '&mode=' + encodeURIComponent(MODE), {{cache:'no-store'}});
+        const data = await r.json();
+        const sel = fbSel;
+        sel.innerHTML = '<option value="">– bitte auswählen –</option>';
+        for (const o of data.options) {{
+          const opt = document.createElement('option');
+          opt.value = o.value; opt.textContent = o.label + ' (' + o.count + ')';
+          sel.appendChild(opt);
+        }}
+        el('fbinfo').textContent = "Gesamt (nach Orga-Limit): " + data.total + " · Fachbereiche: " + data.options.length;
+        el('total-count').textContent = String(data.total);
+        toggleCTAs();
+      }} catch(e) {{
+        alert('Fehler beim Laden der Fachbereiche: ' + e);
+      }} finally {{
+        setProgress(100); setTimeout(hideOverlay, 200);
+      }}
+    }}
 
-async function loadOptions(){
-  showOverlay("Lade Optionen …"); setProgress(15);
-  try{
-    const pol = el('per_org_limit').value || '{PER_ORG_DEFAULT_LIMIT}';
-    const r = await fetch('/neukontakte/options?per_org_limit=' + encodeURIComponent(pol) + '&mode=' + encodeURIComponent(MODE), {cache:'no-store'});
-    const data = await r.json();
-    const sel = fbSel; sel.innerHTML = '<option value="">– bitte auswählen –</option>';
-    for (const o of data.options){
-      const opt = document.createElement('option');
-      opt.value = o.value; opt.textContent = o.label + ' (' + o.count + ')';
-      sel.appendChild(opt);
-    }
-    el('fbinfo').textContent = "Gesamt (nach Orga-Limit): " + data.total + " · Fachbereiche: " + data.options.length;
-    el('total-count').textContent = String(data.total);
-    toggleCTAs();
-  }catch(e){
-    alert('Fehler beim Laden der Fachbereiche: ' + e);
-  }finally{
-    setProgress(100); setTimeout(hideOverlay, 200);
-  }
-}
+    async function startExport() {{
+      const fb  = fbSel.value;
+      const tc  = el('take_count').value || null;
+      const bid = el('batch_id').value || null;
+      const camp= el('campaign').value || null;
+      const pol = el('per_org_limit').value || '{PER_ORG_DEFAULT_LIMIT}';
+      if (!fb) {{ alert('Bitte zuerst einen Fachbereich wählen.'); return; }}
 
-async function startExport(){
-  const fb  = fbSel.value;
-  const tc  = el('take_count').value || null;
-  const bid = el('batch_id').value || null;
-  const camp= el('campaign').value || null;
-  const pol = el('per_org_limit').value || '{PER_ORG_DEFAULT_LIMIT}';
-  if (!fb){ alert('Bitte zuerst einen Fachbereich wählen.'); return; }
+      showOverlay("Starte Abgleich …"); setProgress(5);
+      const r = await fetch('/neukontakte/export_start?mode=' + encodeURIComponent(MODE), {{
+        method:'POST', headers:{{'Content-Type':'application/json'}},
+        body: JSON.stringify({{ fachbereich: fb, take_count: tc ? parseInt(tc) : null, batch_id: bid, campaign: camp, per_org_limit: parseInt(pol) }})
+      }});
+      if (!r.ok) {{ hideOverlay(); alert('Start fehlgeschlagen.'); return; }}
+      const {{ job_id }} = await r.json();
+      await poll(job_id);
+    }}
 
-  showOverlay("Starte Abgleich …"); setProgress(5);
-  const r = await fetch('/neukontakte/export_start?mode=' + encodeURIComponent(MODE), {
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({ fachbereich: fb, take_count: tc ? parseInt(tc) : null, batch_id: bid, campaign: camp, per_org_limit: parseInt(pol) })
-  });
-  if (!r.ok){ hideOverlay(); alert('Start fehlgeschlagen.'); return; }
-  const { job_id } = await r.json();
-  await poll(job_id);
-}
+    async function poll(job_id) {{
+      let done = false, tries = 0;
+      while (!done && tries < 3600) {{
+        await new Promise(res => setTimeout(res, 300));
+        const r = await fetch('/neukontakte/export_progress?job_id=' + encodeURIComponent(job_id), {{cache:'no-store'}});
+        if (!r.ok) {{ el('phase').textContent = 'Fehler beim Fortschritt'; return; }}
+        const s = await r.json();
+        if (s.error) {{ el('phase').textContent = s.error; setProgress(100); return; }}
+        el('phase').textContent = s.phase || 'Arbeite …';
+        setProgress(s.percent ?? 0);
+        done = !!s.done; tries++;
+      }}
+      if (done) {{
+        el('phase').textContent = 'Export bereit – Download startet …'; setProgress(100);
+        window.location.href = '/neukontakte/export_download?job_id=' + encodeURIComponent(job_id);
+        setTimeout(() => {{
+          window.location.href = '/neukontakte/summary?job_id=' + encodeURIComponent(job_id);
+        }}, 800);
+      }} else {{
+        el('phase').textContent = 'Zeitüberschreitung beim Export';
+      }}
+    }}
 
-async function poll(job_id){
-  let done = false, tries = 0;
-  while(!done && tries < 3600){
-    await new Promise(res => setTimeout(res, 300));
-    const r = await fetch('/neukontakte/export_progress?job_id=' + encodeURIComponent(job_id), {cache:'no-store'});
-    if (!r.ok){ el('phase').textContent = 'Fehler beim Fortschritt'; return; }
-    const s = await r.json();
-    if (s.error){ el('phase').textContent = s.error; setProgress(100); return; }
-    el('phase').textContent = s.phase || 'Arbeite …';
-    setProgress(s.percent ?? 0);
-    done = !!s.done; tries++;
-  }
-  if (done){
-    el('phase').textContent = 'Export bereit – Download startet …'; setProgress(100);
-    window.location.href = '/neukontakte/export_download?job_id=' + encodeURIComponent(job_id);
-    setTimeout(() => {
-      window.location.href = '/neukontakte/summary?job_id=' + encodeURIComponent(job_id);
-    }, 800);
-  } else {
-    el('phase').textContent = 'Zeitüberschreitung beim Export';
-  }
-}
+    btnExp.addEventListener('click', startExport);
+    loadOptions();
+  </script>
 
-btnExp.addEventListener('click', startExport);
-loadOptions();
-</script>
+
 </body></html>"""
     return HTMLResponse(html)
 
