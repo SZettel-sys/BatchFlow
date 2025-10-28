@@ -1030,21 +1030,36 @@ def build_export_from_ready(master_ready: pd.DataFrame) -> pd.DataFrame:
     return out
 
 def _df_to_excel_bytes(df: pd.DataFrame) -> bytes:
-    # openpyxl nutzen, um Numberformat auf Text zu setzen
+    # IDs als Text: sicherheitshalber nochmal erzwingen
+    for name in ("Organisation ID", "Person ID"):
+        if name in df.columns:
+            df[name] = df[name].astype(str).fillna("").replace("nan", "")
+
+    import io
     from openpyxl.utils import get_column_letter
-    with pd.ExcelWriter(io.BytesIO(), engine="openpyxl") as writer:
+    import pandas as pd
+
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="Export")
         ws = writer.sheets["Export"]
-        # Spaltenindizes
-        col_idx = {col: i+1 for i, col in enumerate(df.columns)}
-        for name in ("Organisation ID", "Person ID"):
-            if name in col_idx:
-                j = col_idx[name]
+
+        # Zellenformat der ID-Spalten auf Text setzen (NumberFormat "@")
+        col_index = {col: i + 1 for i, col in enumerate(df.columns)}
+        for col_name in ("Organisation ID", "Person ID"):
+            if col_name in col_index:
+                j = col_index[col_name]
+                # ab Zeile 2 (Zeile 1 = Header)
                 for i in range(2, len(df) + 2):
                     ws.cell(i, j).number_format = "@"
+
+        # Metadaten optional
         writer.book.properties.creator = "BatchFlow"
-        data: io.BytesIO = writer.book.save(filename=None)  # type: ignore
-    return data.getvalue()
+
+    # Inhalt des Puffers zurückgeben
+    buf.seek(0)
+    return buf.getvalue()
+
 
 class Job:
     def __init__(self) -> None:
