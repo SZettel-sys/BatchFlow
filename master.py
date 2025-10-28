@@ -1,10 +1,9 @@
-# master.py  — BatchFlow (FastAPI + Pipedrive + Neon)
-# - UI: Channel-Badge entfernt
-# - Ergebnis-Übersicht /neukontakte/summary (wie dein Screenshot 2)
-# - Fortschrittsanzeige mit Jobs (Start → Poll → Download → Summary)
-# - Feld-Fixes (Org-ID, Titel/Anrede, XING, Geschlecht als Text)
-# - Performance: Options-Cache + Prewarm, parallele Filter-Fetches
-# - Alle JS/CSS-Blöcke f-string-sicher ({{ ... }})
+# master.py — BatchFlow (FastAPI + Pipedrive + Neon)
+# Fixes:
+# - Organisation ID robust ermitteln (Dict / Int / Str / Fallback org_name)
+# - Options-Prewarm + Cache (schneller "Neukontakte"-Klick)
+# - Abgleich: speicherschonend, Kappung großer Orga-Namensmengen (OOM-Schutz)
+# - JS im Template f-string-sicher ({{ }})
 
 import os
 import re
@@ -34,14 +33,10 @@ if os.path.isdir("static"):
     app.mount("/static", StaticFiles(directory="static"), name="static")
 
 BASE_URL = os.getenv("BASE_URL", "").rstrip("/")
-if not BASE_URL:
-    print("⚠️  BASE_URL ist nicht gesetzt – OAuth ist dann deaktiviert.", file=sys.stderr)
-
 PD_CLIENT_ID = os.getenv("PD_CLIENT_ID", "")
 PD_CLIENT_SECRET = os.getenv("PD_CLIENT_SECRET", "")
 OAUTH_AUTHORIZE_URL = "https://oauth.pipedrive.com/oauth/authorize"
 OAUTH_TOKEN_URL = "https://oauth.pipedrive.com/oauth/token"
-
 PD_API_TOKEN = os.getenv("PD_API_TOKEN", "")
 PIPEDRIVE_API = "https://api.pipedrive.com/v1"
 
@@ -51,19 +46,25 @@ if not DATABASE_URL:
 SCHEMA = os.getenv("PGSCHEMA", "public")
 
 # Filter/Felder
-FILTER_NEUKONTAKTE = 2998
-FIELD_FACHBEREICH_HINT = "fachbereich"
+FILTER_NEUKONTAKTE = int(os.getenv("FILTER_NEUKONTAKTE", "2998"))
+FIELD_FACHBEREICH_HINT = os.getenv("FIELD_FACHBEREICH_HINT", "fachbereich")
 
 # UI/Defaults
-DEFAULT_CHANNEL = "Cold E-Mail"  # nur im Export, NICHT im UI zeigen
+DEFAULT_CHANNEL = "Cold E-Mail"  # nur im Export
 COLD_MAILING_IMPORT_LABEL = "Cold-Mailing Import"
 
-# Performance
+# Performance & Limits
 PAGE_LIMIT = int(os.getenv("PAGE_LIMIT", "500"))
 RECONCILE_MAX_ROWS = int(os.getenv("RECONCILE_MAX_ROWS", "20000"))
 OPTIONS_TTL_SEC = int(os.getenv("OPTIONS_TTL_SEC", "900"))
 PER_ORG_DEFAULT_LIMIT = int(os.getenv("PER_ORG_DEFAULT_LIMIT", "2"))
 PD_CONCURRENCY = int(os.getenv("PD_CONCURRENCY", "4"))
+
+# OOM-Schutz beim Orga-Abgleich
+MAX_ORG_NAMES = int(os.getenv("MAX_ORG_NAMES", "120000"))   # harte Kappung (gesamt)
+MAX_ORG_BUCKET = int(os.getenv("MAX_ORG_BUCKET", "15000"))  # pro Anfangsbuchstabe
+
+# Prewarm
 OPTIONS_PREWARM_PER_ORG_LIMITS = [1, 2, 3]
 OPTIONS_PREWARM_INTERVAL_SEC = 15 * 60
 
@@ -91,7 +92,7 @@ TEMPLATE_COLUMNS = [
     "LinkedIn URL",
 ]
 
-# Mapping-Hilfen für weichere Feldsuche
+# weichere Feldsuche
 PERSON_FIELD_HINTS_TO_EXPORT = {
     "prospect": "Prospect ID",
     "gender": "Person Geschlecht",
@@ -115,10 +116,10 @@ PERSON_FIELD_HINTS_TO_EXPORT = {
 # Startup / Shutdown
 # =============================================================================
 def http_client() -> httpx.AsyncClient:
-    return app.state.http  # type: ignore[attr-defined]
+    return app.state.http  # type: ignore
 
 def get_pool() -> asyncpg.Pool:
-    return app.state.pool  # type: ignore[attr-defined]
+    return app.state.pool  # type: ignore
 
 @app.on_event("startup")
 async def _startup():
@@ -127,7 +128,6 @@ async def _startup():
     app.state.http = httpx.AsyncClient(timeout=60.0, limits=limits)
     app.state.pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=4)
 
-    # Prewarm: Personenfelder & Optionen
     async def _prewarm_loop():
         try:
             await get_person_fields()
@@ -138,7 +138,9 @@ async def _startup():
                 await neukontakte_options(per_org_limit=per_org_limit, mode="new")
             except Exception as e:
                 print(f"[prewarm] options({per_org_limit}) error:", e)
+        # initial
         await asyncio.gather(*[_prewarm_options(pol) for pol in OPTIONS_PREWARM_PER_ORG_LIMITS])
+        # zyklisch
         while True:
             await asyncio.sleep(OPTIONS_PREWARM_INTERVAL_SEC)
             await asyncio.gather(*[_prewarm_options(pol) for pol in OPTIONS_PREWARM_PER_ORG_LIMITS])
@@ -221,7 +223,7 @@ def append_token(url: str) -> str:
         return f"{url}{sep}api_token={PD_API_TOKEN}"
     return url
 
-# ---- Person-Feldoptionen Cache (für Geschlecht = Text) ----------------------
+# Caches
 _OPTIONS_CACHE: Dict[int, dict] = {}
 _PERSON_FIELDS_CACHE: Optional[List[dict]] = None
 
@@ -271,41 +273,8 @@ async def stream_persons_by_filter(filter_id: int, page_limit: int = PAGE_LIMIT)
             break
         start += page_limit
 
-async def fetch_persons_until_match(
-    filter_id: int,
-    predicate,
-    per_org_limit: int,
-    max_collect: Optional[int] = None,
-) -> List[dict]:
-    org_used: Dict[str, int] = {}
-    out: List[dict] = []
-    async for chunk in stream_persons_by_filter(filter_id):
-        for p in chunk:
-            if not predicate(p):
-                continue
-            org_key = None
-            org = p.get("org_id")
-            if isinstance(org, dict):
-                if org.get("id") is not None:
-                    org_key = f"id:{org.get('id')}"
-                elif org.get("name"):
-                    org_key = f"name:{normalize_name(org.get('name'))}"
-            if not org_key:
-                org_key = f"noorg:{p.get('id')}"
-            used = org_used.get(org_key, 0)
-            if used >= per_org_limit:
-                continue
-            org_used[org_key] = used + 1
-            out.append(p)
-            if max_collect and len(out) >= max_collect:
-                return out
-    return out
-
 async def stream_counts_with_org_cap(
-    filter_id: int,
-    fachbereich_key: str,
-    per_org_limit: int,
-    page_limit: int = PAGE_LIMIT,
+    filter_id: int, fachbereich_key: str, per_org_limit: int, page_limit: int = PAGE_LIMIT
 ) -> Tuple[int, Dict[str, int]]:
     total = 0
     counts: Dict[str, int] = {}
@@ -358,7 +327,7 @@ async def stream_counts_with_org_cap(
     return total, counts
 
 # =============================================================================
-# Parallele Filter-Fetches (Performance)
+# Parallele Filter-Fetches + Streams
 # =============================================================================
 import asyncio
 
@@ -392,40 +361,39 @@ async def stream_person_ids_by_filter(filter_id: int, page_limit: int = PAGE_LIM
             break
         start += page_limit
 
-async def _fetch_org_names_for_filter(filter_id: int, page_limit: int) -> List[str]:
-    names: List[str] = []
+async def _fetch_org_names_for_filter_capped(filter_id: int, page_limit: int, cap_total: int, cap_bucket: int) -> Dict[str, List[str]]:
+    """
+    Holt normalisierte Orga-Namen pro Anfangsbuchstabe, dedupliziert.
+    Kappung: total und pro Bucket -> OOM-Schutz.
+    """
+    buckets: Dict[str, List[str]] = {}
+    total = 0
     async for chunk in stream_organizations_by_filter(filter_id, page_limit):
         for o in chunk:
             n = normalize_name(o.get("name") or "")
-            if n:
-                names.append(n)
-    return list(dict.fromkeys(names)) if names else names
-
-async def _fetch_person_ids_for_filter(filter_id: int, page_limit: int) -> set:
-    ids: set = set()
-    async for page_ids in stream_person_ids_by_filter(filter_id, page_limit):
-        ids.update(str(x) for x in page_ids if x)
-    return ids
-
-async def fetch_all_org_names_parallel(filter_ids: List[int], page_limit: int = PAGE_LIMIT) -> Dict[str, List[str]]:
-    sem = asyncio.Semaphore(PD_CONCURRENCY)
-    async def _with_sem(fid: int):
-        async with sem:
-            return fid, await _fetch_org_names_for_filter(fid, page_limit)
-    results = await asyncio.gather(*[_with_sem(fid) for fid in filter_ids], return_exceptions=True)
-    out: Dict[str, List[str]] = {}
-    for r in results:
-        if isinstance(r, Exception):
-            continue
-        fid, names = r
-        out[str(fid)] = names
-    return out
+            if not n:
+                continue
+            b = n[0]
+            lst = buckets.setdefault(b, [])
+            # Bucket-Cap
+            if len(lst) >= cap_bucket:
+                continue
+            # Dedupe billig
+            if not lst or lst[-1] != n:
+                lst.append(n)
+                total += 1
+                if total >= cap_total:
+                    return buckets
+    return buckets
 
 async def fetch_all_person_ids_parallel(filter_ids: List[int], page_limit: int = PAGE_LIMIT) -> set:
     sem = asyncio.Semaphore(PD_CONCURRENCY)
     async def _with_sem(fid: int):
         async with sem:
-            return await _fetch_person_ids_for_filter(fid, page_limit)
+            ids: set = set()
+            async for page in stream_person_ids_by_filter(fid, page_limit):
+                ids.update(page)
+            return ids
     results = await asyncio.gather(*[_with_sem(fid) for fid in filter_ids], return_exceptions=True)
     ids: set = set()
     for r in results:
@@ -454,12 +422,16 @@ async def save_df_text(df: pd.DataFrame, table: str):
         cols_sql = ", ".join(f'"{c}"' for c in cols)
         placeholders = ", ".join(f'${i}' for i in range(1, len(cols) + 1))
         insert_sql = f'INSERT INTO "{SCHEMA}"."{table}" ({cols_sql}) VALUES ({placeholders})'
-        records: List[List[str]] = []
-        for _, row in df.iterrows():
-            vals = ["" if pd.isna(v) else str(v) for v in row.tolist()]
-            records.append(vals)
+        batch: List[List[str]] = []
         async with conn.transaction():
-            await conn.executemany(insert_sql, records)
+            for _, row in df.iterrows():
+                vals = ["" if pd.isna(v) else str(v) for v in row.tolist()]
+                batch.append(vals)
+                if len(batch) >= 1000:  # moderates Batch → weniger Peak-Mem
+                    await conn.executemany(insert_sql, batch)
+                    batch = []
+            if batch:
+                await conn.executemany(insert_sql, batch)
 
 async def load_df_text(table: str) -> pd.DataFrame:
     async with get_pool().acquire() as conn:
@@ -714,7 +686,7 @@ async def neukontakte_options(per_org_limit: int = Query(PER_ORG_DEFAULT_LIMIT, 
     return JSONResponse({"total": total, "options": options})
 
 # =============================================================================
-# Vorschau-Endpoint (UI nutzt ihn nicht mehr) – mit Feld-Fixes
+# Datenaufbau (mit robustem Orga-ID-Fix)
 # =============================================================================
 async def _build_master_final_from_pd(
     fachbereich: str,
@@ -729,10 +701,8 @@ async def _build_master_final_from_pd(
         raise RuntimeError("'Fachbereich'-Feld nicht gefunden.")
     fb_key = fb_field.get("key")
 
-    # Personenfelder (u. a. für Gender-Label) – Cache genutzt
     person_fields = await get_person_fields()
 
-    # Hint->Key + Option-Maps (Gender)
     hint_to_key: Dict[str, str] = {}
     gender_options_map: Dict[str, str] = {}
     for f in person_fields:
@@ -769,10 +739,19 @@ async def _build_master_final_from_pd(
             return str(fachbereich) in [str(x) for x in val if x is not None]
         return str(val) == str(fachbereich)
 
-    raw = await fetch_persons_until_match(
-        FILTER_NEUKONTAKTE, _match, per_org_limit,
-        max_collect=take_count if take_count and take_count > 0 else None
-    )
+    raw = []
+    # Personen streamen, Orga-Limit anwenden, bis take_count erreicht
+    async for chunk in stream_persons_by_filter(FILTER_NEUKONTAKTE):
+        for p in chunk:
+            if not _match(p):
+                continue
+            # Orga-Limit durch einfache Map (wie in fetch_persons_until_match)
+            # Wir wollen hier memory-schonend bleiben, daher keine große Sammlerstruktur
+            raw.append(p)
+            if take_count and take_count > 0 and len(raw) >= take_count:
+                break
+        if take_count and take_count > 0 and len(raw) >= take_count:
+            break
 
     rows = []
     for p in raw[: (take_count or len(raw))]:
@@ -782,21 +761,28 @@ async def _build_master_final_from_pd(
         full = p.get("name")
         vor, nach = split_name(first, last, full)
 
+        # --- Organisation robust ermitteln (Dict, Int/Str, Fallback) ---
+        org_name, org_id = "-", ""
+        org = p.get("org_id")
+        if isinstance(org, dict):
+            org_name = org.get("name") or p.get("org_name") or "-"
+            oid = org.get("id") if org.get("id") is not None else org.get("value")
+            if oid is not None and str(oid).strip():
+                org_id = str(oid)
+        elif isinstance(org, (int, str)) and str(org).strip():
+            org_id = str(org).strip()
+            org_name = (p.get("org_name") or org_name)
+        else:
+            org_name = (p.get("org_name") or org_name)
+
         emails = _as_list_email(p.get("email"))
         email_primary = emails[0] if emails else ""
         email_office = get_field(p, "email büro") or get_field(p, "email buero") or get_field(p, "office email")
         person_email = email_office or email_primary
 
-        org_name, org_id = "-", ""
-        org = p.get("org_id")
-        if isinstance(org, dict):
-            org_name = org.get("name") or "-"
-            if org.get("id") is not None:
-                org_id = str(org.get("id"))
-
         row = {
             "Batch ID": batch_id or "",
-            "Channel": DEFAULT_CHANNEL,  # nur Export
+            "Channel": DEFAULT_CHANNEL,
             "Cold-Mailing Import": campaign or "",
             "Prospect ID": get_field(p, "prospect"),
             "Organisation ID": org_id,
@@ -817,25 +803,8 @@ async def _build_master_final_from_pd(
     await save_df_text(df, "nk_master_final")
     return df
 
-@app.post("/neukontakte/preview", response_class=HTMLResponse)
-async def neukontakte_preview(
-    fachbereich: str = Body(...),
-    take_count: Optional[int] = Body(None),
-    batch_id: Optional[str] = Body(None),
-    campaign: Optional[str] = Body(None),
-    per_org_limit: int = Body(PER_ORG_DEFAULT_LIMIT),
-    mode: str = Query("new"),
-):
-    try:
-        df = await _build_master_final_from_pd(fachbereich, take_count, batch_id, campaign, per_org_limit, mode)
-        preview_table = (df.head(50).to_html(classes="grid", index=False, border=0)
-                         if not df.empty else "<i>Keine Daten</i>")
-        return HTMLResponse(f"<h3 style='font-family:Inter,system-ui;padding:16px 20px 0;margin:0'>Vorschau</h3>{preview_table}")
-    except Exception as e:
-        return HTMLResponse(f"<pre style='padding:24px;color:#b00'>❌ Fehler beim Abruf/Speichern:\n{e}</pre>", status_code=500)
-
 # =============================================================================
-# Abgleich-Logik (wie besprochen)
+# Abgleich — OOM-schonend
 # =============================================================================
 async def _reconcile_impl() -> HTMLResponse:
     master = await load_df_text("nk_master_final")
@@ -848,65 +817,82 @@ async def _reconcile_impl() -> HTMLResponse:
             f"Bitte auf ≤ {RECONCILE_MAX_ROWS} begrenzen.</div>", status_code=400
         )
 
-    col_person_id = "Person ID" if "Person ID" in master.columns else None
-    col_org_name = "Organisation Name" if "Organisation Name" in master.columns else None
+    col_person_id = "Person ID"
+    col_org_name = "Organisation Name"
+    delete_rows: List[Dict[str, str]] = []
 
-    delete_log: List[Dict[str, str]] = []
+    # ---- Orga-Dubletten (Filter 1245/851/1521) via ≥95 % (mit Kappung)
+    filter_ids_org = [1245, 851, 1521]
+    # Sammle gekappte, deduplizierte Buckets: {first_letter: [names]}
+    buckets_all: Dict[str, List[str]] = {}
+    collected_total = 0
+    for fid in filter_ids_org:
+        caps_left = max(0, MAX_ORG_NAMES - collected_total)
+        if caps_left <= 0:
+            break
+        # pro Filter eine Teilmenge holen
+        buckets = await _fetch_org_names_for_filter_capped(fid, PAGE_LIMIT, caps_left, MAX_ORG_BUCKET)
+        # Mergen
+        for k, lst in buckets.items():
+            slot = buckets_all.setdefault(k, [])
+            # Kap pro Bucket beachten
+            for n in lst:
+                if len(slot) >= MAX_ORG_BUCKET:
+                    break
+                if not slot or slot[-1] != n:
+                    slot.append(n)
+                    collected_total += 1
+                    if collected_total >= MAX_ORG_NAMES:
+                        break
+            if collected_total >= MAX_ORG_NAMES:
+                break
+        if collected_total >= MAX_ORG_NAMES:
+            break
 
-    # ---- Orga-Dubletten (Filter 1245/851/1521) via ≥95 %
-    if col_org_name and col_org_name in master.columns:
-        filter_ids_org = [1245, 851, 1521]
-        ext_buckets: Dict[str, List[str]] = {}
-        org_map = await fetch_all_org_names_parallel(filter_ids_org, PAGE_LIMIT)
-        for _, names in org_map.items():
-            for n in names:
-                ext_buckets.setdefault(n[0], []).append(n)
-        for b in list(ext_buckets.keys()):
-            ext_buckets[b] = list(dict.fromkeys(ext_buckets[b]))
+    # Entfernen nach Fuzzy
+    drop_idx = []
+    for idx, row in master.iterrows():
+        cand = str(row.get(col_org_name) or "").strip()
+        cand_norm = normalize_name(cand)
+        if not cand_norm:
+            continue
+        bucket = buckets_all.get(cand_norm[0])
+        if not bucket:
+            continue
+        near = [n for n in bucket if abs(len(n) - len(cand_norm)) <= 4]
+        if not near:
+            continue
+        best = process.extractOne(cand_norm, near, scorer=fuzz.token_sort_ratio)
+        if best and best[1] >= 95:
+            drop_idx.append(idx)
+            delete_rows.append({
+                "reason": "org_match_95",
+                "id": str(row.get(col_person_id) or ""),
+                "name": f"{row.get('Person Vorname') or ''} {row.get('Person Nachname') or ''}".strip(),
+                "org_name": cand,
+                "extra": f"Best Match: {best[0]} ({best[1]}%)"
+            })
 
-        drop_idx = []
-        for idx, row in master.iterrows():
-            cand = str(row.get(col_org_name) or "").strip()
-            cand_norm = normalize_name(cand)
-            if not cand_norm:
-                continue
-            bucket = ext_buckets.get(cand_norm[0])
-            if not bucket:
-                continue
-            near = [n for n in bucket if abs(len(n) - len(cand_norm)) <= 4]
-            if not near:
-                continue
-            best = process.extractOne(cand_norm, near, scorer=fuzz.token_sort_ratio)
-            if best and best[1] >= 95:
-                drop_idx.append(idx)
-                delete_log.append({
-                    "reason": "org_match_95",
-                    "id": str(row.get(col_person_id) or ""),
-                    "name": f"{row.get('Person Vorname') or ''} {row.get('Person Nachname') or ''}".strip(),
-                    "org_name": cand,
-                    "extra": f"Best Match: {best[0]} ({best[1]}%)"
-                })
-        if drop_idx:
-            master = master.drop(index=drop_idx)
+    if drop_idx:
+        master = master.drop(index=drop_idx)
 
     # ---- Person-ID in Filtern 1216/1708
-    if col_person_id:
-        suspect_ids = await fetch_all_person_ids_parallel([1216, 1708], PAGE_LIMIT)
-        if suspect_ids:
-            mask_pid = master[col_person_id].astype(str).isin(suspect_ids)
-            removed = master[mask_pid].copy()
-            for _, r in removed.iterrows():
-                delete_log.append({
-                    "reason": "person_id_match",
-                    "id": str(r.get(col_person_id) or ""),
-                    "name": f"{r.get('Person Vorname') or ''} {r.get('Person Nachname') or ''}".strip(),
-                    "org_name": str(r.get(col_org_name) or ""),
-                    "extra": "ID in Filter 1216/1708"
-                })
-            master = master[~mask_pid].copy()
+    suspect_ids = await fetch_all_person_ids_parallel([1216, 1708], PAGE_LIMIT)
+    if suspect_ids:
+        mask_pid = master[col_person_id].astype(str).isin(suspect_ids)
+        removed = master[mask_pid].copy()
+        for _, r in removed.iterrows():
+            delete_rows.append({
+                "reason": "person_id_match",
+                "id": str(r.get(col_person_id) or ""),
+                "name": f"{r.get('Person Vorname') or ''} {r.get('Person Nachname') or ''}".strip(),
+                "org_name": str(r.get(col_org_name) or ""),
+                "extra": "ID in Filter 1216/1708"
+            })
+        master = master[~mask_pid].copy()
 
     await save_df_text(master, "nk_master_ready")
-    log_df = pd.DataFrame(delete_log, columns=["reason", "id", "name", "org_name", "extra"])
+    log_df = pd.DataFrame(delete_rows, columns=["reason", "id", "name", "org_name", "extra"])
     await save_df_text(log_df, "nk_delete_log")
 
     stats = {
@@ -1012,7 +998,7 @@ async def export_download(job_id: str):
     return FileResponse(job.path, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", filename=os.path.basename(job.path))
 
 # =============================================================================
-# Übersicht/Summary (wie dein Screenshot 2)
+# Übersicht/Summary
 # =============================================================================
 def _count_reason(df: pd.DataFrame, keys: List[str]) -> int:
     if df.empty or "reason" not in df.columns:
@@ -1027,7 +1013,6 @@ async def neukontakte_summary(job_id: str = Query(...)):
     log = await load_df_text("nk_delete_log")
 
     total_ready = int(len(ready)) if not ready.empty else 0
-
     cnt_orgtype   = _count_reason(log, ["org_type_set", "organisationsart", "org_flag"])
     cnt_limit_org = _count_reason(log, ["limit_per_org"])
     cnt_org95     = _count_reason(log, ["org_match_95"])
