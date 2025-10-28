@@ -1,4 +1,11 @@
 # master.py  — BatchFlow (FastAPI + Pipedrive + Neon)
+# - UI: Channel-Badge entfernt
+# - Ergebnis-Übersicht /neukontakte/summary (wie dein Screenshot 2)
+# - Fortschrittsanzeige mit Jobs (Start → Poll → Download → Summary)
+# - Feld-Fixes (Org-ID, Titel/Anrede, XING, Geschlecht als Text)
+# - Performance: Options-Cache + Prewarm, parallele Filter-Fetches
+# - Alle JS/CSS-Blöcke f-string-sicher ({{ ... }})
+
 import os
 import re
 import io
@@ -14,12 +21,7 @@ import asyncpg
 from rapidfuzz import fuzz, process
 
 from fastapi import FastAPI, Request, Body, Query, HTTPException
-from fastapi.responses import (
-    HTMLResponse,
-    RedirectResponse,
-    JSONResponse,
-    FileResponse,
-)
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.gzip import GZipMiddleware
 
@@ -33,15 +35,13 @@ if os.path.isdir("static"):
 
 BASE_URL = os.getenv("BASE_URL", "").rstrip("/")
 if not BASE_URL:
-    # Für lokale Entwicklung genügt eine Warnung
-    print("⚠️  BASE_URL ist nicht gesetzt – OAuth-Login ist dann deaktiviert.", file=sys.stderr)
+    print("⚠️  BASE_URL ist nicht gesetzt – OAuth ist dann deaktiviert.", file=sys.stderr)
 
 PD_CLIENT_ID = os.getenv("PD_CLIENT_ID", "")
 PD_CLIENT_SECRET = os.getenv("PD_CLIENT_SECRET", "")
 OAUTH_AUTHORIZE_URL = "https://oauth.pipedrive.com/oauth/authorize"
 OAUTH_TOKEN_URL = "https://oauth.pipedrive.com/oauth/token"
 
-# Wenn OAuth nicht aktiv ist, kann ein klassischer API Token verwendet werden
 PD_API_TOKEN = os.getenv("PD_API_TOKEN", "")
 PIPEDRIVE_API = "https://api.pipedrive.com/v1"
 
@@ -55,7 +55,7 @@ FILTER_NEUKONTAKTE = 2998
 FIELD_FACHBEREICH_HINT = "fachbereich"
 
 # UI/Defaults
-DEFAULT_CHANNEL = "Cold E-Mail"  # nur für Export – NICHT im UI anzeigen
+DEFAULT_CHANNEL = "Cold E-Mail"  # nur im Export, NICHT im UI zeigen
 COLD_MAILING_IMPORT_LABEL = "Cold-Mailing Import"
 
 # Performance
@@ -138,9 +138,7 @@ async def _startup():
                 await neukontakte_options(per_org_limit=per_org_limit, mode="new")
             except Exception as e:
                 print(f"[prewarm] options({per_org_limit}) error:", e)
-        # initial
         await asyncio.gather(*[_prewarm_options(pol) for pol in OPTIONS_PREWARM_PER_ORG_LIMITS])
-        # zyklisch
         while True:
             await asyncio.sleep(OPTIONS_PREWARM_INTERVAL_SEC)
             await asyncio.gather(*[_prewarm_options(pol) for pol in OPTIONS_PREWARM_PER_ORG_LIMITS])
@@ -364,6 +362,36 @@ async def stream_counts_with_org_cap(
 # =============================================================================
 import asyncio
 
+async def stream_organizations_by_filter(filter_id: int, page_limit: int = PAGE_LIMIT):
+    start = 0
+    while True:
+        url = append_token(f"{PIPEDRIVE_API}/organizations?filter_id={filter_id}&start={start}&limit={page_limit}")
+        r = await http_client().get(url, headers=get_headers())
+        if r.status_code != 200:
+            raise Exception(f"Pipedrive API Fehler (Orgs {filter_id}): {r.text}")
+        chunk = r.json().get("data") or []
+        if not chunk:
+            break
+        yield chunk
+        if len(chunk) < page_limit:
+            break
+        start += page_limit
+
+async def stream_person_ids_by_filter(filter_id: int, page_limit: int = PAGE_LIMIT):
+    start = 0
+    while True:
+        url = append_token(f"{PIPEDRIVE_API}/persons?filter_id={filter_id}&start={start}&limit={page_limit}&sort=id")
+        r = await http_client().get(url, headers=get_headers())
+        if r.status_code != 200:
+            raise Exception(f"Pipedrive API Fehler (Persons {filter_id}): {r.text}")
+        data = r.json().get("data") or []
+        if not data:
+            break
+        yield [str(p.get("id")) for p in data if p.get("id") is not None]
+        if len(data) < page_limit:
+            break
+        start += page_limit
+
 async def _fetch_org_names_for_filter(filter_id: int, page_limit: int) -> List[str]:
     names: List[str] = []
     async for chunk in stream_organizations_by_filter(filter_id, page_limit):
@@ -484,7 +512,7 @@ async def campaign_home():
 </body></html>""")
 
 # =============================================================================
-# UI – Neukontakte (Form neu, ohne Channel-Pill, mit Progress)
+# UI – Neukontakte (ohne Channel-Badge, mit Progress)
 # =============================================================================
 @app.get("/neukontakte", response_class=HTMLResponse)
 async def neukontakte(request: Request, mode: str = Query("new")):
@@ -571,103 +599,99 @@ async def neukontakte(request: Request, mode: str = Query("new")):
   <div id="phase" style="color:#0f172a"></div>
   <div class="barwrap"><div class="bar" id="bar"></div></div>
 </div>
-  <script>
-    const MODE = new URLSearchParams(location.search).get('mode') || 'new';
-    const el = id => document.getElementById(id);
-    const fbSel = el('fachbereich');
-    const btnExp = el('btnExport');
 
-    function toggleCTAs() {{ btnExp.disabled = !fbSel.value; }}
-    fbSel.addEventListener('change', toggleCTAs);
-    el('per_org_limit').addEventListener('change', loadOptions);
+<script>
+const MODE = new URLSearchParams(location.search).get('mode') || 'new';
+const el = id => document.getElementById(id);
+const fbSel = el('fachbereich');
+const btnExp = el('btnExport');
 
-    function showOverlay(msg) {{
-      el("phase").textContent = msg || "";
-      el("overlay").style.display = "flex";
+function toggleCTAs() {{ btnExp.disabled = !fbSel.value; }}
+fbSel.addEventListener('change', toggleCTAs);
+el('per_org_limit').addEventListener('change', loadOptions);
+
+function showOverlay(msg) {{
+  el("phase").textContent = msg || "";
+  el("overlay").style.display = "flex";
+}}
+function hideOverlay() {{ el("overlay").style.display = "none"; }}
+function setProgress(p) {{ el("bar").style.width = (Math.max(0, Math.min(100, p)) + "%"); }}
+
+async function loadOptions() {{
+  showOverlay("Lade Optionen …"); setProgress(15);
+  try {{
+    const pol = el('per_org_limit').value || '{PER_ORG_DEFAULT_LIMIT}';
+    const r = await fetch('/neukontakte/options?per_org_limit=' + encodeURIComponent(pol) + '&mode=' + encodeURIComponent(MODE), {{cache:'no-store'}});
+    const data = await r.json();
+    const sel = fbSel;
+    sel.innerHTML = '<option value="">– bitte auswählen –</option>';
+    for (const o of data.options) {{
+      const opt = document.createElement('option');
+      opt.value = o.value; opt.textContent = o.label + ' (' + o.count + ')';
+      sel.appendChild(opt);
     }}
-    function hideOverlay() {{ el("overlay").style.display = "none"; }}
-    function setProgress(p) {{ el("bar").style.width = (Math.max(0, Math.min(100, p)) + "%"); }}
+    el('fbinfo').textContent = "Gesamt (nach Orga-Limit): " + data.total + " · Fachbereiche: " + data.options.length;
+    el('total-count').textContent = String(data.total);
+    toggleCTAs();
+  }} catch(e) {{
+    alert('Fehler beim Laden der Fachbereiche: ' + e);
+  }} finally {{
+    setProgress(100); setTimeout(hideOverlay, 200);
+  }}
+}}
 
-    async function loadOptions() {{
-      showOverlay("Lade Optionen …"); setProgress(15);
-      try {{
-        const pol = el('per_org_limit').value || '{PER_ORG_DEFAULT_LIMIT}';
-        const r = await fetch('/neukontakte/options?per_org_limit=' + encodeURIComponent(pol) + '&mode=' + encodeURIComponent(MODE), {{cache:'no-store'}});
-        const data = await r.json();
-        const sel = fbSel;
-        sel.innerHTML = '<option value="">– bitte auswählen –</option>';
-        for (const o of data.options) {{
-          const opt = document.createElement('option');
-          opt.value = o.value; opt.textContent = o.label + ' (' + o.count + ')';
-          sel.appendChild(opt);
-        }}
-        el('fbinfo').textContent = "Gesamt (nach Orga-Limit): " + data.total + " · Fachbereiche: " + data.options.length;
-        el('total-count').textContent = String(data.total);
-        toggleCTAs();
-      }} catch(e) {{
-        alert('Fehler beim Laden der Fachbereiche: ' + e);
-      }} finally {{
-        setProgress(100); setTimeout(hideOverlay, 200);
-      }}
-    }}
+async function startExport() {{
+  const fb  = fbSel.value;
+  const tc  = el('take_count').value || null;
+  const bid = el('batch_id').value || null;
+  const camp= el('campaign').value || null;
+  const pol = el('per_org_limit').value || '{PER_ORG_DEFAULT_LIMIT}';
+  if (!fb) {{ alert('Bitte zuerst einen Fachbereich wählen.'); return; }}
 
-    async function startExport() {{
-      const fb  = fbSel.value;
-      const tc  = el('take_count').value || null;
-      const bid = el('batch_id').value || null;
-      const camp= el('campaign').value || null;
-      const pol = el('per_org_limit').value || '{PER_ORG_DEFAULT_LIMIT}';
-      if (!fb) {{ alert('Bitte zuerst einen Fachbereich wählen.'); return; }}
+  showOverlay("Starte Abgleich …"); setProgress(5);
+  const r = await fetch('/neukontakte/export_start?mode=' + encodeURIComponent(MODE), {{
+    method:'POST', headers:{{'Content-Type':'application/json'}},
+    body: JSON.stringify({{ fachbereich: fb, take_count: tc ? parseInt(tc) : null, batch_id: bid, campaign: camp, per_org_limit: parseInt(pol) }})
+  }});
+  if (!r.ok) {{ hideOverlay(); alert('Start fehlgeschlagen.'); return; }}
+  const {{ job_id }} = await r.json();
+  await poll(job_id);
+}}
 
-      showOverlay("Starte Abgleich …"); setProgress(5);
-      const r = await fetch('/neukontakte/export_start?mode=' + encodeURIComponent(MODE), {{
-        method:'POST', headers:{{'Content-Type':'application/json'}},
-        body: JSON.stringify({{ fachbereich: fb, take_count: tc ? parseInt(tc) : null, batch_id: bid, campaign: camp, per_org_limit: parseInt(pol) }})
-      }});
-      if (!r.ok) {{ hideOverlay(); alert('Start fehlgeschlagen.'); return; }}
-      const {{ job_id }} = await r.json();
-      await poll(job_id);
-    }}
+async function poll(job_id) {{
+  let done = false, tries = 0;
+  while (!done && tries < 3600) {{
+    await new Promise(res => setTimeout(res, 300));
+    const r = await fetch('/neukontakte/export_progress?job_id=' + encodeURIComponent(job_id), {{cache:'no-store'}});
+    if (!r.ok) {{ el('phase').textContent = 'Fehler beim Fortschritt'; return; }}
+    const s = await r.json();
+    if (s.error) {{ el('phase').textContent = s.error; setProgress(100); return; }}
+    el('phase').textContent = s.phase || 'Arbeite …';
+    setProgress(s.percent ?? 0);
+    done = !!s.done; tries++;
+  }}
+  if (done) {{
+    el('phase').textContent = 'Export bereit – Download startet …'; setProgress(100);
+    window.location.href = '/neukontakte/export_download?job_id=' + encodeURIComponent(job_id);
+    setTimeout(() => {{
+      window.location.href = '/neukontakte/summary?job_id=' + encodeURIComponent(job_id);
+    }}, 800);
+  }} else {{
+    el('phase').textContent = 'Zeitüberschreitung beim Export';
+  }}
+}}
 
-    async function poll(job_id) {{
-      let done = false, tries = 0;
-      while (!done && tries < 3600) {{
-        await new Promise(res => setTimeout(res, 300));
-        const r = await fetch('/neukontakte/export_progress?job_id=' + encodeURIComponent(job_id), {{cache:'no-store'}});
-        if (!r.ok) {{ el('phase').textContent = 'Fehler beim Fortschritt'; return; }}
-        const s = await r.json();
-        if (s.error) {{ el('phase').textContent = s.error; setProgress(100); return; }}
-        el('phase').textContent = s.phase || 'Arbeite …';
-        setProgress(s.percent ?? 0);
-        done = !!s.done; tries++;
-      }}
-      if (done) {{
-        el('phase').textContent = 'Export bereit – Download startet …'; setProgress(100);
-        window.location.href = '/neukontakte/export_download?job_id=' + encodeURIComponent(job_id);
-        setTimeout(() => {{
-          window.location.href = '/neukontakte/summary?job_id=' + encodeURIComponent(job_id);
-        }}, 800);
-      }} else {{
-        el('phase').textContent = 'Zeitüberschreitung beim Export';
-      }}
-    }}
-
-    btnExp.addEventListener('click', startExport);
-    loadOptions();
-  </script>
-
-
+btnExp.addEventListener('click', startExport);
+loadOptions();
+</script>
 </body></html>"""
     return HTMLResponse(html)
 
 # =============================================================================
-# Optionen (mit Cache)
+# Optionen (Cache)
 # =============================================================================
 @app.get("/neukontakte/options")
-async def neukontakte_options(
-    per_org_limit: int = Query(PER_ORG_DEFAULT_LIMIT, ge=1, le=3),
-    mode: str = Query("new")
-):
+async def neukontakte_options(per_org_limit: int = Query(PER_ORG_DEFAULT_LIMIT, ge=1, le=3), mode: str = Query("new")):
     now = time.time()
     cache = _OPTIONS_CACHE.get(per_org_limit) or {}
     if cache.get("options") and (now - cache.get("ts", 0.0) < OPTIONS_TTL_SEC):
@@ -704,7 +728,6 @@ async def _build_master_final_from_pd(
     if not fb_field:
         raise RuntimeError("'Fachbereich'-Feld nicht gefunden.")
     fb_key = fb_field.get("key")
-    id2label_fb = field_options_id_to_label_map(fb_field)
 
     # Personenfelder (u. a. für Gender-Label) – Cache genutzt
     person_fields = await get_person_fields()
@@ -719,19 +742,6 @@ async def _build_master_final_from_pd(
                 hint_to_key[hint] = f.get("key")
         if any(x in nm for x in ("gender", "geschlecht")):
             gender_options_map = field_options_id_to_label_map(f)
-
-    def _match(p: dict) -> bool:
-        val = p.get(fb_key)
-        if isinstance(val, np.ndarray):
-            val = val.tolist()
-        if isinstance(val, list):
-            return str(fachbereich) in [str(x) for x in val if x is not None]
-        return str(val) == str(fachbereich)
-
-    raw = await fetch_persons_until_match(
-        FILTER_NEUKONTAKTE, _match, per_org_limit,
-        max_collect=take_count if take_count and take_count > 0 else None
-    )
 
     def get_field(p: dict, hint: str) -> str:
         key = hint_to_key.get(hint)
@@ -750,6 +760,19 @@ async def _build_master_final_from_pd(
         if hint in ("gender", "geschlecht") and gender_options_map:
             return gender_options_map.get(sv, sv)
         return sv
+
+    def _match(p: dict) -> bool:
+        val = p.get(fb_key)
+        if isinstance(val, np.ndarray):
+            val = val.tolist()
+        if isinstance(val, list):
+            return str(fachbereich) in [str(x) for x in val if x is not None]
+        return str(val) == str(fachbereich)
+
+    raw = await fetch_persons_until_match(
+        FILTER_NEUKONTAKTE, _match, per_org_limit,
+        max_collect=take_count if take_count and take_count > 0 else None
+    )
 
     rows = []
     for p in raw[: (take_count or len(raw))]:
@@ -776,7 +799,7 @@ async def _build_master_final_from_pd(
             "Channel": DEFAULT_CHANNEL,  # nur Export
             "Cold-Mailing Import": campaign or "",
             "Prospect ID": get_field(p, "prospect"),
-            "Organisation ID": org_id,  # fix
+            "Organisation ID": org_id,
             "Organisation Name": org_name,
             "Person ID": str(pid or ""),
             "Person Vorname": vor,
@@ -813,40 +836,7 @@ async def neukontakte_preview(
 
 # =============================================================================
 # Abgleich-Logik (wie besprochen)
-#  - Orga ≥95 % via rapidfuzz (Filter 1245/851/1521)
-#  - Person-ID in Filtern 1216/1708
-#  - Schreibt nk_master_ready und nk_delete_log
 # =============================================================================
-async def stream_organizations_by_filter(filter_id: int, page_limit: int = PAGE_LIMIT):
-    start = 0
-    while True:
-        url = append_token(f"{PIPEDRIVE_API}/organizations?filter_id={filter_id}&start={start}&limit={page_limit}")
-        r = await http_client().get(url, headers=get_headers())
-        if r.status_code != 200:
-            raise Exception(f"Pipedrive API Fehler (Orgs {filter_id}): {r.text}")
-        chunk = r.json().get("data") or []
-        if not chunk:
-            break
-        yield chunk
-        if len(chunk) < page_limit:
-            break
-        start += page_limit
-
-async def stream_person_ids_by_filter(filter_id: int, page_limit: int = PAGE_LIMIT):
-    start = 0
-    while True:
-        url = append_token(f"{PIPEDRIVE_API}/persons?filter_id={filter_id}&start={start}&limit={page_limit}&sort=id")
-        r = await http_client().get(url, headers=get_headers())
-        if r.status_code != 200:
-            raise Exception(f"Pipedrive API Fehler (Persons {filter_id}): {r.text}")
-        data = r.json().get("data") or []
-        if not data:
-            break
-        yield [str(p.get("id")) for p in data if p.get("id") is not None]
-        if len(data) < page_limit:
-            break
-        start += page_limit
-
 async def _reconcile_impl() -> HTMLResponse:
     master = await load_df_text("nk_master_final")
     if master.empty:
@@ -975,7 +965,7 @@ async def export_start(
     async def _run():
         try:
             job.phase = "Lade Daten …"; job.percent = 10
-            df = await _build_master_final_from_pd(fachbereich, take_count, batch_id, campaign, per_org_limit, mode)
+            await _build_master_final_from_pd(fachbereich, take_count, batch_id, campaign, per_org_limit, mode)
 
             job.phase = "Gleiche ab …"; job.percent = 45
             _ = await _reconcile_impl()  # schreibt ready + log
@@ -1022,7 +1012,7 @@ async def export_download(job_id: str):
     return FileResponse(job.path, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", filename=os.path.basename(job.path))
 
 # =============================================================================
-# Übersicht/Summary (wie Screenshot 2)
+# Übersicht/Summary (wie dein Screenshot 2)
 # =============================================================================
 def _count_reason(df: pd.DataFrame, keys: List[str]) -> int:
     if df.empty or "reason" not in df.columns:
@@ -1038,18 +1028,14 @@ async def neukontakte_summary(job_id: str = Query(...)):
 
     total_ready = int(len(ready)) if not ready.empty else 0
 
-    # Summen wie in deinem Screenshot 2
-    cnt_orgtype   = _count_reason(log, ["org_type_set", "organisationsart", "org_flag"])  # falls vorhanden
+    cnt_orgtype   = _count_reason(log, ["org_type_set", "organisationsart", "org_flag"])
     cnt_limit_org = _count_reason(log, ["limit_per_org"])
     cnt_org95     = _count_reason(log, ["org_match_95"])
     cnt_pid       = _count_reason(log, ["person_id_match"])
     removed_sum   = cnt_orgtype + cnt_limit_org + cnt_org95 + cnt_pid
 
     top = log.tail(50).copy() if not log.empty else pd.DataFrame()
-    table_html = (
-        top.to_html(classes="grid", index=False, border=0)
-        if not top.empty else "<i>keine</i>"
-    )
+    table_html = (top.to_html(classes="grid", index=False, border=0) if not top.empty else "<i>keine</i>")
 
     html = f"""
 <!doctype html><html lang="de"><head>
