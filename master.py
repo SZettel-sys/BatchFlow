@@ -1,9 +1,10 @@
 # master.py — BatchFlow (FastAPI + Pipedrive + Neon)
-# Fixes:
-# - Organisation ID robust ermitteln (Dict / Int / Str / Fallback org_name)
-# - Options-Prewarm + Cache (schneller "Neukontakte"-Klick)
-# - Abgleich: speicherschonend, Kappung großer Orga-Namensmengen (OOM-Schutz)
-# - JS im Template f-string-sicher ({{ }})
+# Neu:
+# - Export-Dateiname = Kampagnenname (sanitisiert)
+# - Vorfilter: "Datum nächste Aktivität" (innerhalb [heute-3M, heute]) -> ausschließen
+#   (in Optionen-Zählung UND beim Export)
+# - UI-Hinweistext zu bereits berücksichtigten Abgleichen
+# - Vorherige Fixes bleiben (Orga-ID robust, OOM-Schutz, f-string-sicheres JS)
 
 import os
 import re
@@ -18,6 +19,7 @@ import pandas as pd
 import httpx
 import asyncpg
 from rapidfuzz import fuzz, process
+from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI, Request, Body, Query, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, FileResponse
@@ -61,8 +63,8 @@ PER_ORG_DEFAULT_LIMIT = int(os.getenv("PER_ORG_DEFAULT_LIMIT", "2"))
 PD_CONCURRENCY = int(os.getenv("PD_CONCURRENCY", "4"))
 
 # OOM-Schutz beim Orga-Abgleich
-MAX_ORG_NAMES = int(os.getenv("MAX_ORG_NAMES", "120000"))   # harte Kappung (gesamt)
-MAX_ORG_BUCKET = int(os.getenv("MAX_ORG_BUCKET", "15000"))  # pro Anfangsbuchstabe
+MAX_ORG_NAMES = int(os.getenv("MAX_ORG_NAMES", "120000"))
+MAX_ORG_BUCKET = int(os.getenv("MAX_ORG_BUCKET", "15000"))
 
 # Prewarm
 OPTIONS_PREWARM_PER_ORG_LIMITS = [1, 2, 3]
@@ -72,7 +74,7 @@ OPTIONS_PREWARM_INTERVAL_SEC = 15 * 60
 user_tokens: Dict[str, str] = {}
 
 # =============================================================================
-# Excel-Template (exakte Reihenfolge)
+# Excel-Template
 # =============================================================================
 TEMPLATE_COLUMNS = [
     "Batch ID",
@@ -138,9 +140,7 @@ async def _startup():
                 await neukontakte_options(per_org_limit=per_org_limit, mode="new")
             except Exception as e:
                 print(f"[prewarm] options({per_org_limit}) error:", e)
-        # initial
         await asyncio.gather(*[_prewarm_options(pol) for pol in OPTIONS_PREWARM_PER_ORG_LIMITS])
-        # zyklisch
         while True:
             await asyncio.sleep(OPTIONS_PREWARM_INTERVAL_SEC)
             await asyncio.gather(*[_prewarm_options(pol) for pol in OPTIONS_PREWARM_PER_ORG_LIMITS])
@@ -223,6 +223,34 @@ def append_token(url: str) -> str:
         return f"{url}{sep}api_token={PD_API_TOKEN}"
     return url
 
+def slugify_filename(name: str, fallback: str = "BatchFlow_Export") -> str:
+    s = (name or "").strip()
+    if not s:
+        return fallback
+    s = re.sub(r"[^\w\-. ]+", "", s).strip()
+    s = re.sub(r"\s+", "_", s)
+    return s or fallback
+
+def parse_pd_date(d: Optional[str]) -> Optional[datetime]:
+    if not d:
+        return None
+    try:
+        # Pipedrive liefert "YYYY-MM-DD"
+        return datetime.strptime(d, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+def is_next_activity_in_last_3_months(next_activity_date: Optional[str]) -> bool:
+    """
+    True => in [heute-3M, heute]  -> ausschließen
+    """
+    dt = parse_pd_date(next_activity_date)
+    if not dt:
+        return False
+    today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    three_months = today - timedelta(days=90)
+    return three_months <= dt <= today
+
 # Caches
 _OPTIONS_CACHE: Dict[int, dict] = {}
 _PERSON_FIELDS_CACHE: Optional[List[dict]] = None
@@ -289,6 +317,10 @@ async def stream_counts_with_org_cap(
         if not chunk:
             break
         for p in chunk:
+            # Vorfilter: Datum nächste Aktivität -> ausschließen, wenn in den letzten 3 Monaten (inkl. heute)
+            if is_next_activity_in_last_3_months(p.get("next_activity_date")):
+                continue
+
             fb_val = p.get(fachbereich_key)
             if isinstance(fb_val, np.ndarray):
                 fb_val = fb_val.tolist()
@@ -362,10 +394,6 @@ async def stream_person_ids_by_filter(filter_id: int, page_limit: int = PAGE_LIM
         start += page_limit
 
 async def _fetch_org_names_for_filter_capped(filter_id: int, page_limit: int, cap_total: int, cap_bucket: int) -> Dict[str, List[str]]:
-    """
-    Holt normalisierte Orga-Namen pro Anfangsbuchstabe, dedupliziert.
-    Kappung: total und pro Bucket -> OOM-Schutz.
-    """
     buckets: Dict[str, List[str]] = {}
     total = 0
     async for chunk in stream_organizations_by_filter(filter_id, page_limit):
@@ -375,10 +403,8 @@ async def _fetch_org_names_for_filter_capped(filter_id: int, page_limit: int, ca
                 continue
             b = n[0]
             lst = buckets.setdefault(b, [])
-            # Bucket-Cap
             if len(lst) >= cap_bucket:
                 continue
-            # Dedupe billig
             if not lst or lst[-1] != n:
                 lst.append(n)
                 total += 1
@@ -427,7 +453,7 @@ async def save_df_text(df: pd.DataFrame, table: str):
             for _, row in df.iterrows():
                 vals = ["" if pd.isna(v) else str(v) for v in row.tolist()]
                 batch.append(vals)
-                if len(batch) >= 1000:  # moderates Batch → weniger Peak-Mem
+                if len(batch) >= 1000:
                     await conn.executemany(insert_sql, batch)
                     batch = []
             if batch:
@@ -484,7 +510,7 @@ async def campaign_home():
 </body></html>""")
 
 # =============================================================================
-# UI – Neukontakte (ohne Channel-Badge, mit Progress)
+# UI – Neukontakte
 # =============================================================================
 @app.get("/neukontakte", response_class=HTMLResponse)
 async def neukontakte(request: Request, mode: str = Query("new")):
@@ -511,11 +537,13 @@ async def neukontakte(request: Request, mode: str = Query("new")):
   label{{display:block;font-weight:600;margin:8px 0 6px}}
   select,input{{width:100%;padding:10px 12px;border:1px solid #cbd5e1;border-radius:10px;background:#fff}}
   .hint{{color:var(--muted);font-size:13px;margin-top:6px}}
+  .muted{{color:#64748b}}
   .btn{{background:var(--primary);border:none;color:#fff;border-radius:10px;padding:12px 16px;cursor:pointer}}
   .btn:disabled{{opacity:.5;cursor:not-allowed}}
   #overlay{{display:none;position:fixed;inset:0;background:rgba(255,255,255,.7);backdrop-filter:blur(2px);z-index:9999;align-items:center;justify-content:center;flex-direction:column;gap:10px}}
   .barwrap{{width:min(520px,90vw);height:10px;border-radius:999px;background:#e2e8f0;overflow:hidden}}
   .bar{{height:100%;width:0%;background:var(--primary);transition:width .2s linear}}
+  ul.info{{margin:.5rem 0 0 1rem;padding:0;font-size:13px;color:#64748b}}
 </style>
 </head>
 <body>
@@ -523,7 +551,7 @@ async def neukontakte(request: Request, mode: str = Query("new")):
   <div class="hwrap">
     <div><a href="/campaign" style="color:#0a66c2;text-decoration:none">← Kampagne wählen</a></div>
     <div><b>{page_title}</b> · Gesamt: <b id="total-count">lädt…</b></div>
-    <div>{"<span style='color:#64748b'>angemeldet</span>" if authed else "<a href='/login'>Anmelden</a>"}</div>
+    <div>{"<span class='muted'>angemeldet</span>" if authed else "<a href='/login'>Anmelden</a>"}</div>
   </div>
 </header>
 
@@ -543,6 +571,11 @@ async def neukontakte(request: Request, mode: str = Query("new")):
         <label>Fachbereich</label>
         <select id="fachbereich"><option value="">– bitte auswählen –</option></select>
         <div class="hint" id="fbinfo">Die Zahl in Klammern berücksichtigt bereits „Kontakte pro Organisation“.</div>
+        <ul class="info">
+          <li>Die Anzahl bezieht sich bereits auf Anzahl der Kontakte pro Organisation.</li>
+          <li>Es sind keine Datensätze dabei, die eine gesetzte Organisationsart haben.</li>
+          <li>Das Datum der letzten Aktivität ist berücksichtigt (keine Einträge der letzten 3 Monate bis heute).</li>
+        </ul>
       </div>
       <div class="col-4">
         <label>Wie viele Datensätze nehmen?</label>
@@ -558,7 +591,7 @@ async def neukontakte(request: Request, mode: str = Query("new")):
       <div class="col-6">
         <label>Kampagnenname</label>
         <input id="campaign" placeholder="z. B. Herbstkampagne"/>
-        <div class="hint">Wird als „Cold-Mailing Import“ gesetzt.</div>
+        <div class="hint">Wird als „Cold-Mailing Import“ gesetzt und als Dateiname verwendet.</div>
       </div>
       <div class="col-3" style="display:flex;align-items:flex-end;justify-content:flex-end">
         <button class="btn" id="btnExport" disabled>Abgleich &amp; Download</button>
@@ -686,7 +719,7 @@ async def neukontakte_options(per_org_limit: int = Query(PER_ORG_DEFAULT_LIMIT, 
     return JSONResponse({"total": total, "options": options})
 
 # =============================================================================
-# Datenaufbau (mit robustem Orga-ID-Fix)
+# Datenaufbau (mit Orga-ID-Fix + Next-Activity-Vorfilter)
 # =============================================================================
 async def _build_master_final_from_pd(
     fachbereich: str,
@@ -731,7 +764,10 @@ async def _build_master_final_from_pd(
             return gender_options_map.get(sv, sv)
         return sv
 
-    def _match(p: dict) -> bool:
+    def _match_person(p: dict) -> bool:
+        # Vorfilter: next_activity_date in den letzten 3 Monaten bis heute -> ausschließen
+        if is_next_activity_in_last_3_months(p.get("next_activity_date")):
+            return False
         val = p.get(fb_key)
         if isinstance(val, np.ndarray):
             val = val.tolist()
@@ -739,29 +775,43 @@ async def _build_master_final_from_pd(
             return str(fachbereich) in [str(x) for x in val if x is not None]
         return str(val) == str(fachbereich)
 
-    raw = []
-    # Personen streamen, Orga-Limit anwenden, bis take_count erreicht
+    # Personen streamen & vorfiltern
+    selected: List[dict] = []
+    org_used: Dict[str, int] = {}
     async for chunk in stream_persons_by_filter(FILTER_NEUKONTAKTE):
         for p in chunk:
-            if not _match(p):
+            if not _match_person(p):
                 continue
-            # Orga-Limit durch einfache Map (wie in fetch_persons_until_match)
-            # Wir wollen hier memory-schonend bleiben, daher keine große Sammlerstruktur
-            raw.append(p)
-            if take_count and take_count > 0 and len(raw) >= take_count:
+            # Orga-Limit anwenden
+            org_key = None
+            org = p.get("org_id")
+            if isinstance(org, dict):
+                if org.get("id") is not None:
+                    org_key = f"id:{org.get('id')}"
+                elif org.get("name"):
+                    org_key = f"name:{normalize_name(org.get('name'))}"
+            if not org_key:
+                org_key = f"noorg:{p.get('id')}"
+            used = org_used.get(org_key, 0)
+            if used >= per_org_limit:
+                continue
+            org_used[org_key] = used + 1
+
+            selected.append(p)
+            if take_count and take_count > 0 and len(selected) >= take_count:
                 break
-        if take_count and take_count > 0 and len(raw) >= take_count:
+        if take_count and take_count > 0 and len(selected) >= take_count:
             break
 
     rows = []
-    for p in raw[: (take_count or len(raw))]:
+    for p in selected[: (take_count or len(selected))]:
         pid = p.get("id")
         first = p.get("first_name")
         last = p.get("last_name")
         full = p.get("name")
         vor, nach = split_name(first, last, full)
 
-        # --- Organisation robust ermitteln (Dict, Int/Str, Fallback) ---
+        # --- Organisation robust (Dict / Int/Str / Fallback) ---
         org_name, org_id = "-", ""
         org = p.get("org_id")
         if isinstance(org, dict):
@@ -804,7 +854,7 @@ async def _build_master_final_from_pd(
     return df
 
 # =============================================================================
-# Abgleich — OOM-schonend
+# Abgleich — (wie zuvor, OOM-schonend)
 # =============================================================================
 async def _reconcile_impl() -> HTMLResponse:
     master = await load_df_text("nk_master_final")
@@ -823,19 +873,15 @@ async def _reconcile_impl() -> HTMLResponse:
 
     # ---- Orga-Dubletten (Filter 1245/851/1521) via ≥95 % (mit Kappung)
     filter_ids_org = [1245, 851, 1521]
-    # Sammle gekappte, deduplizierte Buckets: {first_letter: [names]}
     buckets_all: Dict[str, List[str]] = {}
     collected_total = 0
     for fid in filter_ids_org:
         caps_left = max(0, MAX_ORG_NAMES - collected_total)
         if caps_left <= 0:
             break
-        # pro Filter eine Teilmenge holen
         buckets = await _fetch_org_names_for_filter_capped(fid, PAGE_LIMIT, caps_left, MAX_ORG_BUCKET)
-        # Mergen
         for k, lst in buckets.items():
             slot = buckets_all.setdefault(k, [])
-            # Kap pro Bucket beachten
             for n in lst:
                 if len(slot) >= MAX_ORG_BUCKET:
                     break
@@ -849,7 +895,6 @@ async def _reconcile_impl() -> HTMLResponse:
         if collected_total >= MAX_ORG_NAMES:
             break
 
-    # Entfernen nach Fuzzy
     drop_idx = []
     for idx, row in master.iterrows():
         cand = str(row.get(col_org_name) or "").strip()
@@ -909,7 +954,7 @@ async def _reconcile_impl() -> HTMLResponse:
     )
 
 # =============================================================================
-# Export als Job (Excel)
+# Export als Job (Excel) — Dateiname = Kampagnenname
 # =============================================================================
 def build_export_from_ready(master_ready: pd.DataFrame) -> pd.DataFrame:
     out = pd.DataFrame(columns=TEMPLATE_COLUMNS)
@@ -931,6 +976,7 @@ class Job:
         self.error: Optional[str] = None
         self.path: Optional[str] = None
         self.total_rows: int = 0
+        self.filename_base: str = "BatchFlow_Export"
 
 JOBS: Dict[str, Job] = {}
 
@@ -947,6 +993,7 @@ async def export_start(
     job = Job()
     JOBS[job_id] = job
     job.phase = "Initialisiere …"; job.percent = 1
+    job.filename_base = slugify_filename(campaign or "BatchFlow_Export")
 
     async def _run():
         try:
@@ -961,7 +1008,7 @@ async def export_start(
             export_df = build_export_from_ready(ready)
             data = _df_to_excel_bytes(export_df)
 
-            path = f"/tmp/{uuid.uuid4()}_BatchFlow_Export.xlsx"
+            path = f"/tmp/{job.filename_base}.xlsx"
             with open(path, "wb") as f:
                 f.write(data)
 
@@ -995,7 +1042,11 @@ async def export_download(job_id: str):
         raise HTTPException(404, "Unbekannte Job-ID")
     if not job.done or not job.path:
         raise HTTPException(409, "Der Export ist noch nicht bereit.")
-    return FileResponse(job.path, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", filename=os.path.basename(job.path))
+    return FileResponse(
+        job.path,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename=os.path.basename(job.path),
+    )
 
 # =============================================================================
 # Übersicht/Summary
