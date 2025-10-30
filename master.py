@@ -1,8 +1,6 @@
-# master.py — BatchFlow (FastAPI + Pipedrive + Neon)
-# Features:
-# - Neukontakte (Filter 2998) inkl. Vorfilter (Aktivität), Orga-Limit, Abgleich, Excel
-# - Nachfass (Filter 3024): Auswahl 1–2 Kampagnen (contains), gleicher Prozess wie Neukontakte
-# - OOM-Schutz beim Abgleich, robustes Feld-Mapping, IDs als Text im Excel, Dateiname = Kampagnenname
+# master.py — BatchFlow (Nachfass: vereinfachtes Formular, Selektion über Batch-ID)
+# FastAPI + Neon (Postgres) + Pipedrive
+# © bizforward
 
 import os
 import re
@@ -44,34 +42,24 @@ if not DATABASE_URL:
     raise ValueError("DATABASE_URL fehlt (Neon DSN).")
 SCHEMA = os.getenv("PGSCHEMA", "public")
 
-# Filter/Felder
-FILTER_NEUKONTAKTE = int(os.getenv("FILTER_NEUKONTAKTE", "2998"))
-FILTER_NACHFASS = int(os.getenv("FILTER_NACHFASS", "3024"))  # <— neu
-FIELD_FACHBEREICH_HINT = os.getenv("FIELD_FACHBEREICH_HINT", "fachbereich")
+# Filter
+FILTER_NACHFASS = int(os.getenv("FILTER_NACHFASS", "3024"))
 
-# UI/Defaults
-DEFAULT_CHANNEL = "Cold E-Mail"  # nur im Export
+# Defaults
+DEFAULT_CHANNEL = "Cold E-Mail"
 
-# Performance & Limits
+# Performance
 PAGE_LIMIT = int(os.getenv("PAGE_LIMIT", "500"))
-RECONCILE_MAX_ROWS = int(os.getenv("RECONCILE_MAX_ROWS", "20000"))
-OPTIONS_TTL_SEC = int(os.getenv("OPTIONS_TTL_SEC", "900"))
-PER_ORG_DEFAULT_LIMIT = int(os.getenv("PER_ORG_DEFAULT_LIMIT", "2"))
 PD_CONCURRENCY = int(os.getenv("PD_CONCURRENCY", "4"))
-
-# OOM-Schutz
+RECONCILE_MAX_ROWS = int(os.getenv("RECONCILE_MAX_ROWS", "20000"))
 MAX_ORG_NAMES = int(os.getenv("MAX_ORG_NAMES", "120000"))
 MAX_ORG_BUCKET = int(os.getenv("MAX_ORG_BUCKET", "15000"))
-
-# Prewarm
-OPTIONS_PREWARM_PER_ORG_LIMITS = [1, 2, 3]
-OPTIONS_PREWARM_INTERVAL_SEC = 15 * 60
 
 # OAuth Speicher (einfach)
 user_tokens: Dict[str, str] = {}
 
 # =============================================================================
-# Excel-Template
+# Excel-Template (exakte Reihenfolge)
 # =============================================================================
 TEMPLATE_COLUMNS = [
     "Batch ID",
@@ -91,26 +79,6 @@ TEMPLATE_COLUMNS = [
     "LinkedIn URL",
 ]
 
-# weichere Feldsuche
-PERSON_FIELD_HINTS_TO_EXPORT = {
-    "prospect": "Prospect ID",
-    "gender": "Person Geschlecht",
-    "geschlecht": "Person Geschlecht",
-    "titel": "Person Titel",
-    "title": "Person Titel",
-    "anrede": "Person Titel",
-    "position": "Person Position",
-    "xing": "XING Profil",
-    "xing url": "XING Profil",
-    "xing profil": "XING Profil",
-    "linkedin": "LinkedIn URL",
-    "email büro": "Person E-Mail",
-    "email buero": "Person E-Mail",
-    "e-mail büro": "Person E-Mail",
-    "e-mail buero": "Person E-Mail",
-    "office email": "Person E-Mail",
-}
-
 # =============================================================================
 # Startup / Shutdown
 # =============================================================================
@@ -122,26 +90,9 @@ def get_pool() -> asyncpg.Pool:
 
 @app.on_event("startup")
 async def _startup():
-    import asyncio
     limits = httpx.Limits(max_keepalive_connections=16, max_connections=24)
     app.state.http = httpx.AsyncClient(timeout=60.0, limits=limits)
     app.state.pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=4)
-
-    async def _prewarm_loop():
-        try:
-            await get_person_fields()
-        except Exception as e:
-            print("[prewarm] person_fields error:", e)
-        async def _prewarm_options(per_org_limit: int):
-            try:
-                await neukontakte_options(per_org_limit=per_org_limit, mode="new")
-            except Exception as e:
-                print(f"[prewarm] options({per_org_limit}) error:", e)
-        await asyncio.gather(*[_prewarm_options(pol) for pol in OPTIONS_PREWARM_PER_ORG_LIMITS])
-        while True:
-            await asyncio.sleep(OPTIONS_PREWARM_INTERVAL_SEC)
-            await asyncio.gather(*[_prewarm_options(pol) for pol in OPTIONS_PREWARM_PER_ORG_LIMITS])
-    asyncio.create_task(_prewarm_loop())
 
 @app.on_event("shutdown")
 async def _shutdown():
@@ -151,7 +102,7 @@ async def _shutdown():
         await app.state.pool.close()
 
 # =============================================================================
-# Helpers
+# Hilfsfunktionen
 # =============================================================================
 @app.get("/healthz")
 async def healthz():
@@ -162,25 +113,21 @@ async def healthz():
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
-def _as_list_email(value) -> List[str]:
-    if value is None or (isinstance(value, float) and pd.isna(value)):
-        return []
-    if isinstance(value, np.ndarray):
-        value = value.tolist()
-    if isinstance(value, dict):
-        v = value.get("value")
-        return [v] if v else []
-    if isinstance(value, (list, tuple)):
-        out: List[str] = []
-        for x in value:
-            if isinstance(x, dict):
-                v = x.get("value")
-                if v:
-                    out.append(str(v))
-            elif x is not None and not (isinstance(x, float) and pd.isna(x)):
-                out.append(str(x))
-        return out
-    return [str(value)]
+def get_headers() -> Dict[str, str]:
+    token = user_tokens.get("default", "")
+    if token:
+        return {"Authorization": f"Bearer {token}"}
+    return {}
+
+def append_token(url: str) -> str:
+    if "api_token=" in url:
+        return url
+    if user_tokens.get("default"):
+        return url
+    if PD_API_TOKEN:
+        sep = "&" if "?" in url else "?"
+        return f"{url}{sep}api_token={PD_API_TOKEN}"
+    return url
 
 def normalize_name(s: str) -> str:
     if not s:
@@ -203,22 +150,6 @@ def split_name(first_name: Optional[str], last_name: Optional[str], full_name: O
     if len(parts) == 1:
         return parts[0], ""
     return " ".join(parts[:-1]), parts[-1]
-
-def get_headers() -> Dict[str, str]:
-    token = user_tokens.get("default", "")
-    if token:
-        return {"Authorization": f"Bearer {token}"}
-    return {}
-
-def append_token(url: str) -> str:
-    if "api_token=" in url:
-        return url
-    if user_tokens.get("default"):
-        return url
-    if PD_API_TOKEN:
-        sep = "&" if "?" in url else "?"
-        return f"{url}{sep}api_token={PD_API_TOKEN}"
-    return url
 
 def slugify_filename(name: str, fallback: str = "BatchFlow_Export") -> str:
     s = (name or "").strip()
@@ -247,18 +178,10 @@ def is_forbidden_activity_date(val: Optional[str]) -> bool:
     three_months = today - timedelta(days=90)
     return dt > today or (three_months <= dt <= today)
 
-# Caches
-_OPTIONS_CACHE: Dict[str, dict] = {}  # key umfasst per_org_limit + mode + kampagnen
+# =============================================================================
+# Pipedrive Feld-Ermittlung
+# =============================================================================
 _PERSON_FIELDS_CACHE: Optional[List[dict]] = None
-
-def field_options_id_to_label_map(field: dict) -> Dict[str, str]:
-    opts = field.get("options") or []
-    mp: Dict[str, str] = {}
-    for o in opts:
-        oid = str(o.get("id"))
-        lab = str(o.get("label") or o.get("name") or oid)
-        mp[oid] = lab
-    return mp
 
 async def get_person_fields() -> List[dict]:
     global _PERSON_FIELDS_CACHE
@@ -270,16 +193,36 @@ async def get_person_fields() -> List[dict]:
     _PERSON_FIELDS_CACHE = r.json().get("data") or []
     return _PERSON_FIELDS_CACHE
 
-async def get_person_field_by_hint(label_hint: str) -> Optional[dict]:
-    fields = await get_person_fields()
-    hint = (label_hint or "").lower()
-    for f in fields:
-        nm = (f.get("name") or "").lower()
-        if hint in nm:
-            return f
-    return None
+def field_options_id_to_label_map(field: dict) -> Dict[str, str]:
+    opts = field.get("options") or []
+    mp: Dict[str, str] = {}
+    for o in opts:
+        oid = str(o.get("id"))
+        lab = str(o.get("label") or o.get("name") or oid)
+        mp[oid] = lab
+    return mp
 
-# --- Aktivitäts-Felder robust bestimmen --------------------------------------
+# Geschlecht, Titel, Position, usw. – heuristische Feldsuche
+PERSON_FIELD_HINTS_TO_EXPORT = {
+    "prospect": "Prospect ID",
+    "gender": "Person Geschlecht",
+    "geschlecht": "Person Geschlecht",
+    "titel": "Person Titel",
+    "title": "Person Titel",
+    "anrede": "Person Titel",
+    "position": "Person Position",
+    "xing": "XING Profil",
+    "xing url": "XING Profil",
+    "xing profil": "XING Profil",
+    "linkedin": "LinkedIn URL",
+    "email büro": "Person E-Mail",
+    "email buero": "Person E-Mail",
+    "e-mail büro": "Person E-Mail",
+    "e-mail buero": "Person E-Mail",
+    "office email": "Person E-Mail",
+}
+
+# Aktivitätsfelder
 _NEXT_ACTIVITY_KEY: Optional[str] = None
 _LAST_ACTIVITY_KEY: Optional[str] = None
 
@@ -331,29 +274,33 @@ def extract_field_date(p: dict, key: Optional[str]) -> Optional[str]:
         return None
     return str(v)
 
-# --- Kampagnen-Feld (für Nachfass) -------------------------------------------
-_CAMPAIGN_FIELD_KEY: Optional[str] = None
+# Batch-ID Feld (für Selektion)
+_BATCH_FIELD_KEY: Optional[str] = None
 
-async def get_campaigns_field_key() -> Optional[str]:
-    """Sucht das Personenfeld 'E-Mail-Kampagnen' robust (enthält Kampagnennamen-Strings)."""
-    global _CAMPAIGN_FIELD_KEY
-    if _CAMPAIGN_FIELD_KEY is not None:
-        return _CAMPAIGN_FIELD_KEY
-    candidates = ["e-mail-kampagnen", "email kampagnen", "e mail kampagnen", "e-mail kampagnen", "mail kampagnen"]
+async def get_batch_field_key() -> Optional[str]:
+    """
+    Sucht ein Personenfeld, dessen Name Batch/Batch ID enthält.
+    """
+    global _BATCH_FIELD_KEY
+    if _BATCH_FIELD_KEY is not None:
+        return _BATCH_FIELD_KEY
     fields = await get_person_fields()
+    candidates = [
+        "batch id", "batch-id", "batch_id",
+        "batch",   # Fallback – bitte nur, wenn eindeutig
+    ]
     for f in fields:
         nm = (f.get("name") or "").lower()
         if any(c in nm for c in candidates):
-            _CAMPAIGN_FIELD_KEY = f.get("key")
+            _BATCH_FIELD_KEY = f.get("key")
             break
-    return _CAMPAIGN_FIELD_KEY
+    return _BATCH_FIELD_KEY
 
-def _contains_any_campaign(val, wanted: List[str]) -> bool:
+def _contains_any_text(val, wanted: List[str]) -> bool:
     if not wanted:
         return True
     if val is None or (isinstance(val, float) and pd.isna(val)):
         return False
-    # Feld kann Text, Liste oder Dict sein – wir normieren alles auf eine durchsuchbare Zeichenkette
     if isinstance(val, dict):
         val = val.get("value")
     if isinstance(val, (list, tuple, np.ndarray)):
@@ -385,79 +332,308 @@ async def stream_persons_by_filter(filter_id: int, page_limit: int = PAGE_LIMIT)
             break
         start += page_limit
 
-async def stream_counts_with_org_cap(
-    filter_id: int, fachbereich_key: str, per_org_limit: int, page_limit: int = PAGE_LIMIT,
-    campaigns: Optional[List[str]] = None
-) -> Tuple[int, Dict[str, int]]:
-    total = 0
-    counts: Dict[str, int] = {}
-    used_by_fb: Dict[str, Dict[str, int]] = {}
+# =============================================================================
+# DB (Textspalten)
+# =============================================================================
+async def ensure_table_text(conn: asyncpg.Connection, table: str, cols: List[str]):
+    col_defs = ", ".join([f'"{c}" TEXT' for c in cols])
+    await conn.execute(f'CREATE TABLE IF NOT EXISTS "{SCHEMA}"."{table}" ({col_defs})')
+
+async def clear_table(conn: asyncpg.Connection, table: str):
+    await conn.execute(f'DROP TABLE IF EXISTS "{SCHEMA}"."{table}"')
+
+async def save_df_text(df: pd.DataFrame, table: str):
+    async with get_pool().acquire() as conn:
+        await clear_table(conn, table)
+        await ensure_table_text(conn, table, list(df.columns))
+        if df.empty:
+            return
+        cols = list(df.columns)
+        cols_sql = ", ".join(f'"{c}"' for c in cols)
+        placeholders = ", ".join(f'${i}' for i in range(1, len(cols) + 1))
+        insert_sql = f'INSERT INTO "{SCHEMA}"."{table}" ({cols_sql}) VALUES ({placeholders})'
+        batch: List[List[str]] = []
+        async with conn.transaction():
+            for _, row in df.iterrows():
+                vals = ["" if pd.isna(v) else str(v) for v in row.tolist()]
+                batch.append(vals)
+                if len(batch) >= 1000:
+                    await conn.executemany(insert_sql, batch)
+                    batch = []
+            if batch:
+                await conn.executemany(insert_sql, batch)
+
+async def load_df_text(table: str) -> pd.DataFrame:
+    async with get_pool().acquire() as conn:
+        rows = await conn.fetch(f'SELECT * FROM "{SCHEMA}"."{table}"')
+    if not rows:
+        return pd.DataFrame()
+    cols = list(rows[0].keys())
+    data = [tuple(r[c] for c in cols) for r in rows]
+    return pd.DataFrame(data, columns=cols).replace({"": np.nan})
+
+# =============================================================================
+# UI – Nachfass (vereinfachtes Formular)
+# =============================================================================
+@app.get("/")
+def root():
+    return RedirectResponse("/nachfass")
+
+@app.get("/nachfass", response_class=HTMLResponse)
+async def nachfass_home():
+    authed = bool(user_tokens.get("default") or PD_API_TOKEN)
+    html = f"""<!doctype html><html lang="de">
+<head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Nachfass – BatchFlow</title>
+<style>
+  :root{{--bg:#f6f8fb;--card:#fff;--txt:#0f172a;--muted:#64748b;--border:#e2e8f0;--primary:#0ea5e9;--primary-h:#0284c7}}
+  *{{box-sizing:border-box}} body{{margin:0;background:var(--bg);color:var(--txt);font:16px/1.6 Inter,-apple-system,Segoe UI,Roboto,Arial,sans-serif}}
+  header{{background:#fff;border-bottom:1px solid var(--border)}}
+  .hwrap{{max-width:1120px;margin:0 auto;padding:14px 20px;display:flex;align-items:center;justify-content:space-between}}
+  main{{max-width:1120px;margin:28px auto;padding:0 20px}}
+  .card{{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:20px;box-shadow:0 2px 8px rgba(2,8,23,.04)}}
+  .grid{{display:grid;grid-template-columns:repeat(12,1fr);gap:16px}}
+  .col-6{{grid-column:span 6;min-width:260px}}
+  .col-3{{grid-column:span 3;min-width:200px}}
+  label{{display:block;font-weight:600;margin:8px 0 6px}}
+  input{{width:100%;padding:10px 12px;border:1px solid #cbd5e1;border-radius:10px;background:#fff}}
+  .hint{{color:#64748b;font-size:13px;margin-top:6px}}
+  .btn{{background:var(--primary);border:none;color:#fff;border-radius:10px;padding:12px 16px;cursor:pointer}}
+  .btn:disabled{{opacity:.5;cursor:not-allowed}}
+  #overlay{{display:none;position:fixed;inset:0;background:rgba(255,255,255,.7);backdrop-filter:blur(2px);z-index:9999;align-items:center;justify-content:center;flex-direction:column;gap:10px}}
+  .barwrap{{width:min(520px,90vw);height:10px;border-radius:999px;background:#e2e8f0;overflow:hidden}}
+  .bar{{height:100%;width:0%;background:var(--primary);transition:width .2s linear}}
+  ul.info{{margin:.5rem 0 0 1rem;padding:0;font-size:13px;color:#64748b}}
+</style>
+</head>
+<body>
+<header>
+  <div class="hwrap">
+    <div><b>Nachfass</b></div>
+    <div>{"<span class='hint'>angemeldet</span>" if authed else "<a href='/login'>Anmelden</a>"}</div>
+  </div>
+</header>
+
+<main>
+  <section class="card">
+    <div class="grid">
+      <div class="col-6">
+        <label>Nachfass: Batch ID 1 (Pflicht)</label>
+        <input id="nf_b1" placeholder="z. B. B372"/>
+      </div>
+      <div class="col-6">
+        <label>Nachfass: Batch ID 2 (optional)</label>
+        <input id="nf_b2" placeholder="optional – zweite Batch ID"/>
+      </div>
+      <div class="col-3">
+        <label>Batch ID</label>
+        <input id="batch_id" placeholder="Bxxx"/>
+        <div class="hint">wird in der Exportdatei gesetzt</div>
+      </div>
+      <div class="col-6">
+        <label>Kampagnenname</label>
+        <input id="campaign" placeholder="z. B. Herbstkampagne"/>
+        <div class="hint">wird als „Cold-Mailing Import“ gesetzt und als Dateiname verwendet</div>
+      </div>
+      <div class="col-3" style="display:flex;align-items:flex-end;justify-content:flex-end">
+        <button class="btn" id="btnExport" disabled>Abgleich &amp; Download</button>
+      </div>
+    </div>
+    <ul class="info">
+      <li>Basis: Filter 3024.</li>
+      <li>Selektion erfolgt über das Personenfeld „Batch ID“ (contains, OR) – <i>nicht</i> über „E-Mail-Kampagnen“.</li>
+      <li>Aktivitätsdaten sind berücksichtigt (keine Einträge von heute bis 3&nbsp;Monate zurück und keine zukünftigen Daten).</li>
+    </ul>
+  </section>
+</main>
+
+<div id="overlay">
+  <div id="phase" style="color:#0f172a"></div>
+  <div class="barwrap"><div class="bar" id="bar"></div></div>
+</div>
+
+<script>
+const el = id => document.getElementById(id);
+const btnExp = el('btnExport');
+function checkReady() {
+  const ok = (el('nf_b1').value || '').trim().length > 0
+          && (el('batch_id').value || '').trim().length > 0
+          && (el('campaign').value || '').trim().length > 0;
+  btnExp.disabled = !ok;
+}
+['nf_b1','nf_b2','batch_id','campaign'].forEach(id => el(id).addEventListener('input', checkReady));
+
+function showOverlay(msg) { el("phase").textContent = msg || ""; el("overlay").style.display = "flex"; }
+function hideOverlay() { el("overlay").style.display = "none"; }
+function setProgress(p) { el("bar").style.width = (Math.max(0, Math.min(100, p)) + "%"); }
+
+async function startExport() {
+  const payload = {
+    nf_batch_ids: [(el('nf_b1').value || '').trim(), (el('nf_b2').value || '').trim()].filter(Boolean),
+    batch_id: (el('batch_id').value || '').trim(),
+    campaign: (el('campaign').value || '').trim()
+  };
+  if (payload.nf_batch_ids.length === 0) { alert('Bitte mindestens eine Nachfass-Batch ID angeben.'); return; }
+  showOverlay("Starte Abgleich …"); setProgress(5);
+  const r = await fetch('/nachfass/export_start', {
+    method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload)
+  });
+  if (!r.ok) { hideOverlay(); alert('Start fehlgeschlagen.'); return; }
+  const { job_id } = await r.json();
+  await poll(job_id);
+}
+
+async function poll(job_id) {
+  let done = false, tries = 0;
+  while (!done && tries < 3600) {
+    await new Promise(res => setTimeout(res, 300));
+    const r = await fetch('/nachfass/export_progress?job_id=' + encodeURIComponent(job_id), {cache:'no-store'});
+    if (!r.ok) { el('phase').textContent = 'Fehler beim Fortschritt'; return; }
+    const s = await r.json();
+    if (s.error) { el('phase').textContent = s.error; setProgress(100); return; }
+    el('phase').textContent = s.phase || 'Arbeite …';
+    setProgress(s.percent ?? 0);
+    done = !!s.done; tries++;
+  }
+  if (done) {
+    el('phase').textContent = 'Export bereit – Download startet …'; setProgress(100);
+    window.location.href = '/nachfass/export_download?job_id=' + encodeURIComponent(job_id);
+    setTimeout(() => { window.location.href = '/nachfass/summary?job_id=' + encodeURIComponent(job_id); }, 800);
+  } else {
+    el('phase').textContent = 'Zeitüberschreitung beim Export';
+  }
+}
+
+btnExp.addEventListener('click', startExport);
+checkReady();
+</script>
+</body></html>"""
+    return HTMLResponse(html)
+
+# =============================================================================
+# Datenaufbau – Nachfass über Batch-ID
+# =============================================================================
+async def _build_nf_master_final(
+    nf_batch_ids: List[str],
+    batch_id: str,
+    campaign: str,
+) -> pd.DataFrame:
+    # Feld-Keys & Mappings
+    person_fields = await get_person_fields()
+    hint_to_key: Dict[str, str] = {}
+    gender_options_map: Dict[str, str] = {}
+    for f in person_fields:
+        nm = (f.get("name") or "").lower()
+        for hint in PERSON_FIELD_HINTS_TO_EXPORT.keys():
+            if hint in nm and hint not in hint_to_key:
+                hint_to_key[hint] = f.get("key")
+        if any(x in nm for x in ("gender", "geschlecht")):
+            gender_options_map = field_options_id_to_label_map(f)
+
+    def get_field(p: dict, hint: str) -> str:
+        key = hint_to_key.get(hint)
+        if not key:
+            return ""
+        v = p.get(key)
+        if isinstance(v, dict) and "label" in v:
+            return str(v.get("label") or "")
+        if isinstance(v, list):
+            if v and isinstance(v[0], dict) and "value" in v[0]:
+                return str(v[0].get("value") or "")
+            return ", ".join([str(x) for x in v if x])
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return ""
+        sv = str(v)
+        if hint in ("gender", "geschlecht") and gender_options_map:
+            return gender_options_map.get(sv, sv)
+        return sv
 
     last_key = await get_last_activity_key()
     next_key = await get_next_activity_key()
-    camp_key = await get_campaigns_field_key() if campaigns else None
+    batch_key = await get_batch_field_key()
+    if not batch_key:
+        raise RuntimeError("Personenfeld „Batch ID“ wurde nicht gefunden. Bitte benennen/prüfen.")
 
-    start = 0
-    while True:
-        url = append_token(f"{PIPEDRIVE_API}/persons?filter_id={filter_id}&start={start}&limit={page_limit}")
-        r = await http_client().get(url, headers=get_headers())
-        if r.status_code != 200:
-            raise Exception(f"Pipedrive API Fehler: {r.text}")
-        chunk = r.json().get("data") or []
-        if not chunk:
-            break
+    selected: List[dict] = []
+    async for chunk in stream_persons_by_filter(FILTER_NACHFASS):
         for p in chunk:
             # Aktivitäts-Vorfilter
-            val = extract_field_date(p, last_key) or extract_field_date(p, next_key)
-            if is_forbidden_activity_date(val):
+            av = extract_field_date(p, last_key) or extract_field_date(p, next_key)
+            if is_forbidden_activity_date(av):
                 continue
-            # Kampagnen-Vorfilter (nur Nachfass)
-            if campaigns and camp_key:
-                if not _contains_any_campaign(p.get(camp_key), campaigns):
-                    continue
-
-            fb_val = p.get(fachbereich_key)
-            if isinstance(fb_val, np.ndarray):
-                fb_val = fb_val.tolist()
-            if isinstance(fb_val, list):
-                fb_vals = [str(fb_val[0])] if fb_val else []
-            elif fb_val is not None and str(fb_val).strip() != "":
-                fb_vals = [str(fb_val)]
-            else:
-                fb_vals = []
-            if not fb_vals:
+            # Selektion über Batch-ID-Feld (contains – OR)
+            if not _contains_any_text(p.get(batch_key), nf_batch_ids):
                 continue
+            selected.append(p)
 
-            # Orga-Limit
-            org_key = None
-            org = p.get("org_id")
-            if isinstance(org, dict):
-                if org.get("id") is not None:
-                    org_key = f"id:{org.get('id')}"
-                elif org.get("name"):
-                    org_key = f"name:{normalize_name(org.get('name'))}"
-            if not org_key:
-                org_key = f"noorg:{p.get('id')}"
+    # Zeilen für Export aufbauen
+    rows = []
+    for p in selected:
+        pid = p.get("id")
+        first = p.get("first_name")
+        last = p.get("last_name")
+        full = p.get("name")
+        vor, nach = split_name(first, last, full)
 
-            fb = fb_vals[0]
-            used_map = used_by_fb.setdefault(fb, {})
-            used = used_map.get(org_key, 0)
-            if used >= per_org_limit:
-                continue
-            used_map[org_key] = used + 1
-            counts[fb] = counts.get(fb, 0) + 1
-            total += 1
+        # Organisation robust
+        org_name, org_id = "-", ""
+        org = p.get("org_id")
+        if isinstance(org, dict):
+            org_name = org.get("name") or p.get("org_name") or "-"
+            oid = org.get("id") if org.get("id") is not None else org.get("value")
+            if oid is not None and str(oid).strip():
+                org_id = str(oid)
+        elif isinstance(org, (int, str)) and str(org).strip():
+            org_id = str(org).strip()
+            org_name = (p.get("org_name") or org_name)
+        else:
+            org_name = (p.get("org_name") or org_name)
 
-        if len(chunk) < page_limit:
-            break
-        start += page_limit
-    return total, counts
+        # E-Mails
+        def _as_list_email(v):
+            if v is None or (isinstance(v, float) and pd.isna(v)):
+                return []
+            if isinstance(v, dict):
+                v = v.get("value")
+                return [v] if v else []
+            if isinstance(v, (list, tuple, np.ndarray)):
+                out = []
+                for x in v:
+                    if isinstance(x, dict):
+                        x = x.get("value")
+                    if x:
+                        out.append(str(x))
+                return out
+            return [str(v)]
+        emails = _as_list_email(p.get("email"))
+        person_email = emails[0] if emails else ""
+
+        rows.append({
+            "Batch ID": batch_id or "",
+            "Channel": DEFAULT_CHANNEL,
+            "Cold-Mailing Import": campaign or "",
+            "Prospect ID": get_field(p, "prospect"),
+            "Organisation ID": org_id,
+            "Organisation Name": org_name,
+            "Person ID": str(pid or ""),
+            "Person Vorname": vor,
+            "Person Nachname": nach,
+            "Person Titel": get_field(p, "titel") or get_field(p, "title") or get_field(p, "anrede"),
+            "Person Geschlecht": get_field(p, "gender") or get_field(p, "geschlecht"),
+            "Person Position": get_field(p, "position"),
+            "Person E-Mail": person_email,
+            "XING Profil": get_field(p, "xing") or get_field(p, "xing url") or get_field(p, "xing profil"),
+            "LinkedIn URL": get_field(p, "linkedin"),
+        })
+
+    df = pd.DataFrame(rows, columns=TEMPLATE_COLUMNS)
+    await save_df_text(df, "nk_master_final")
+    return df
 
 # =============================================================================
-# Parallele Streams (Abgleich)
+# Abgleich (wie bei Neukontakte)
 # =============================================================================
-import asyncio
-
 async def stream_organizations_by_filter(filter_id: int, page_limit: int = PAGE_LIMIT):
     start = 0
     while True:
@@ -507,510 +683,6 @@ async def _fetch_org_names_for_filter_capped(filter_id: int, page_limit: int, ca
                     return buckets
     return buckets
 
-async def fetch_all_person_ids_parallel(filter_ids: List[int], page_limit: int = PAGE_LIMIT) -> set:
-    sem = asyncio.Semaphore(PD_CONCURRENCY)
-    async def _with_sem(fid: int):
-        async with sem:
-            ids: set = set()
-            async for page in stream_person_ids_by_filter(fid, page_limit):
-                ids.update(page)
-            return ids
-    results = await asyncio.gather(*[_with_sem(fid) for fid in filter_ids], return_exceptions=True)
-    ids: set = set()
-    for r in results:
-        if isinstance(r, Exception):
-            continue
-        ids.update(r)
-    return ids
-
-# =============================================================================
-# DB
-# =============================================================================
-async def ensure_table_text(conn: asyncpg.Connection, table: str, cols: List[str]):
-    col_defs = ", ".join([f'"{c}" TEXT' for c in cols])
-    await conn.execute(f'CREATE TABLE IF NOT EXISTS "{SCHEMA}"."{table}" ({col_defs})')
-
-async def clear_table(conn: asyncpg.Connection, table: str):
-    await conn.execute(f'DROP TABLE IF EXISTS "{SCHEMA}"."{table}"')
-
-async def save_df_text(df: pd.DataFrame, table: str):
-    async with get_pool().acquire() as conn:
-        await clear_table(conn, table)
-        await ensure_table_text(conn, table, list(df.columns))
-        if df.empty:
-            return
-        cols = list(df.columns)
-        cols_sql = ", ".join(f'"{c}"' for c in cols)
-        placeholders = ", ".join(f'${i}' for i in range(1, len(cols) + 1))
-        insert_sql = f'INSERT INTO "{SCHEMA}"."{table}" ({cols_sql}) VALUES ({placeholders})'
-        batch: List[List[str]] = []
-        async with conn.transaction():
-            for _, row in df.iterrows():
-                vals = ["" if pd.isna(v) else str(v) for v in row.tolist()]
-                batch.append(vals)
-                if len(batch) >= 1000:
-                    await conn.executemany(insert_sql, batch)
-                    batch = []
-            if batch:
-                await conn.executemany(insert_sql, batch)
-
-async def load_df_text(table: str) -> pd.DataFrame:
-    async with get_pool().acquire() as conn:
-        rows = await conn.fetch(f'SELECT * FROM "{SCHEMA}"."{table}"')
-    if not rows:
-        return pd.DataFrame()
-    cols = list(rows[0].keys())
-    data = [tuple(r[c] for c in cols) for r in rows]
-    return pd.DataFrame(data, columns=cols).replace({"": np.nan})
-
-# =============================================================================
-# UI – Kampagnenwahl
-# =============================================================================
-@app.get("/")
-def root():
-    return RedirectResponse("/campaign")
-
-@app.get("/campaign", response_class=HTMLResponse)
-async def campaign_home():
-    return HTMLResponse("""<!doctype html><html lang="de">
-<head>
-<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>BatchFlow – Kampagne wählen</title>
-<style>
-  :root{--bg:#f6f8fb;--card:#fff;--txt:#0f172a;--muted:#64748b;--border:#e2e8f0;--primary:#0ea5e9;--primary-h:#0284c7}
-  *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--txt);font:16px/1.6 Inter,-apple-system,Segoe UI,Roboto,Arial,sans-serif}
-  header{background:#fff;border-bottom:1px solid var(--border)}
-  .hwrap{max-width:1120px;margin:0 auto;padding:16px 20px;display:flex;align-items:center;gap:12px}
-  .brand{font-weight:700;font-size:18px}
-  .sub{color:var(--muted)}
-  main{max-width:1120px;margin:32px auto;padding:0 20px}
-  .grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:20px}
-  @media (max-width:1120px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
-  @media (max-width:800px){.grid{grid-template-columns:1fr}}
-  .card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:22px;box-shadow:0 2px 8px rgba(2,8,23,.04)}
-  .title{font-weight:700;font-size:18px;margin:2px 0 6px}
-  .desc{color:var(--muted);min-height:48px}
-  .btn{display:inline-flex;align-items:center;gap:8px;padding:10px 14px;border-radius:10px;background:var(--primary);color:#fff;text-decoration:none}
-  .btn:hover{background:var(--primary-h)}
-</style></head>
-<body>
-<header><div class="hwrap"><div class="brand">BatchFlow</div><div class="sub">Kampagne auswählen</div></div></header>
-<main>
-  <div class="grid">
-    <div class="card"><div class="title">Neukontakte</div><div class="desc">Neue Personen aus Filter, Abgleich & Export.</div><a class="btn" href="/neukontakte?mode=new">Starten</a></div>
-    <div class="card"><div class="title">Nachfass</div><div class="desc">Folgekampagne auf Basis vorhandener E-Mail-Kampagnen.</div><a class="btn" href="/neukontakte?mode=nachfass">Starten</a></div>
-    <div class="card"><div class="title">Refresh</div><div class="desc">Kontaktdaten aktualisieren / ergänzen.</div><a class="btn" href="/neukontakte?mode=refresh">Starten</a></div>
-  </div>
-</main>
-</body></html>""")
-
-# =============================================================================
-# UI – Neukontakte/Nachfass
-# =============================================================================
-@app.get("/neukontakte", response_class=HTMLResponse)
-async def neukontakte(request: Request, mode: str = Query("new")):
-    authed = bool(user_tokens.get("default") or PD_API_TOKEN)
-    page_title = {"new": "Neukontakte", "nachfass": "Nachfass", "refresh": "Refresh"}.get(mode, "Neukontakte")
-    is_nf = (mode == "nachfass")
-
-    # Zusätzliche Felder (Nachfass): Kampagne 1/2
-    extra_nf_html = """
-      <div class="col-6">
-        <label>Kampagne 1 (Pflicht)</label>
-        <input id="nf_camp1" placeholder="z. B. B372_E-Mail_Waalaxy2025_1_EK"/>
-        <div class="hint">Wird als <i>contains</i> auf „E-Mail-Kampagnen“ angewendet.</div>
-      </div>
-      <div class="col-6">
-        <label>Kampagne 2 (optional)</label>
-        <input id="nf_camp2" placeholder="optional – zweite Kampagne"/>
-      </div>
-    """ if is_nf else ""
-
-    nf_info_li = """<li>Es werden nur Kontakte berücksichtigt, deren Feld „E-Mail-Kampagnen“ die angegebene(n) Kampagne(n) enthält (contains, OR-Verknüpfung).</li>""" if is_nf else ""
-
-    html = f"""<!doctype html><html lang="de">
-<head>
-<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>{page_title} – BatchFlow</title>
-<style>
-  :root{{--bg:#f6f8fb;--card:#fff;--txt:#0f172a;--muted:#64748b;--border:#e2e8f0;--primary:#0ea5e9;--primary-h:#0284c7}}
-  *{{box-sizing:border-box}} body{{margin:0;background:var(--bg);color:var(--txt);font:16px/1.6 Inter,-apple-system,Segoe UI,Roboto,Arial,sans-serif}}
-  header{{background:#fff;border-bottom:1px solid var(--border)}}
-  .hwrap{{max-width:1120px;margin:0 auto;padding:14px 20px;display:flex;align-items:center;justify-content:space-between;gap:12px}}
-  main{{max-width:1120px;margin:28px auto;padding:0 20px}}
-  .card{{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:20px;box-shadow:0 2px 8px rgba(2,8,23,.04)}}
-  .grid{{display:grid;grid-template-columns:repeat(12,1fr);gap:16px}}
-  .col-3{{grid-column:span 3;min-width:220px}}
-  .col-4{{grid-column:span 4;min-width:260px}}
-  .col-5{{grid-column:span 5;min-width:260px}}
-  .col-6{{grid-column:span 6;min-width:260px}}
-  label{{display:block;font-weight:600;margin:8px 0 6px}}
-  select,input{{width:100%;padding:10px 12px;border:1px solid #cbd5e1;border-radius:10px;background:#fff}}
-  .hint{{color:var(--muted);font-size:13px;margin-top:6px}}
-  .muted{{color:#64748b}}
-  .btn{{background:var(--primary);border:none;color:#fff;border-radius:10px;padding:12px 16px;cursor:pointer}}
-  .btn:disabled{{opacity:.5;cursor:not-allowed}}
-  #overlay{{display:none;position:fixed;inset:0;background:rgba(255,255,255,.7);backdrop-filter:blur(2px);z-index:9999;align-items:center;justify-content:center;flex-direction:column;gap:10px}}
-  .barwrap{{width:min(520px,90vw);height:10px;border-radius:999px;background:#e2e8f0;overflow:hidden}}
-  .bar{{height:100%;width:0%;background:var(--primary);transition:width .2s linear}}
-  ul.info{{margin:.5rem 0 0 1rem;padding:0;font-size:13px;color:#64748b}}
-</style>
-</head>
-<body>
-<header>
-  <div class="hwrap">
-    <div><a href="/campaign" style="color:#0a66c2;text-decoration:none">← Kampagne wählen</a></div>
-    <div><b>{page_title}</b> · Gesamt: <b id="total-count">lädt…</b></div>
-    <div>{"<span class='muted'>angemeldet</span>" if authed else "<a href='/login'>Anmelden</a>"}</div>
-  </div>
-</header>
-
-<main>
-  <section class="card">
-    <div class="grid">
-      <div class="col-3">
-        <label>Kontakte pro Organisation</label>
-        <select id="per_org_limit">
-          <option value="1">1</option>
-          <option value="2" selected>2</option>
-          <option value="3">3</option>
-        </select>
-        <div class="hint">Beispiel: 2</div>
-      </div>
-      <div class="col-5">
-        <label>Fachbereich</label>
-        <select id="fachbereich"><option value="">– bitte auswählen –</option></select>
-        <div class="hint" id="fbinfo">Die Zahl in Klammern berücksichtigt bereits „Kontakte pro Organisation“.</div>
-        <ul class="info">
-          <li>Die Anzahl bezieht sich bereits auf Anzahl der Kontakte pro Organisation.</li>
-          <li>Es sind keine Datensätze dabei, die eine gesetzte Organisationsart haben.</li>
-          <li>Aktivitätsdaten sind berücksichtigt (keine Einträge von heute bis 3&nbsp;Monate zurück und keine zukünftigen Daten).</li>
-          {nf_info_li}
-        </ul>
-      </div>
-      <div class="col-4">
-        <label>Wie viele Datensätze nehmen?</label>
-        <input type="number" id="take_count" placeholder="z. B. 900" min="1"/>
-        <div class="hint">Leer lassen = alle Datensätze des gewählten Fachbereichs.</div>
-      </div>
-
-      <div class="col-12">{extra_nf_html}</div>
-
-      <div class="col-3">
-        <label>Batch ID</label>
-        <input id="batch_id" placeholder="Bxxx"/>
-        <div class="hint">z. B. B111</div>
-      </div>
-      <div class="col-6">
-        <label>Kampagnenname</label>
-        <input id="campaign" placeholder="z. B. Herbstkampagne"/>
-        <div class="hint">Wird als „Cold-Mailing Import“ gesetzt und als Dateiname verwendet.</div>
-      </div>
-      <div class="col-3" style="display:flex;align-items:flex-end;justify-content:flex-end">
-        <button class="btn" id="btnExport" disabled>Abgleich &amp; Download</button>
-      </div>
-    </div>
-  </section>
-</main>
-
-<div id="overlay">
-  <div id="phase" style="color:#0f172a"></div>
-  <div class="barwrap"><div class="bar" id="bar"></div></div>
-</div>
-
-<script>
-const MODE = new URLSearchParams(location.search).get('mode') || 'new';
-const el = id => document.getElementById(id);
-const fbSel = el('fachbereich');
-const btnExp = el('btnExport');
-
-function nfOk() {{
-  if (MODE !== 'nachfass') return true;
-  const c1 = (el('nf_camp1')?.value || '').trim();
-  return !!c1 && !!fbSel.value;
-}}
-
-function toggleCTAs() {{
-  btnExp.disabled = !fbSel.value || !nfOk();
-}}
-fbSel.addEventListener('change', toggleCTAs);
-el('per_org_limit').addEventListener('change', loadOptions);
-if (MODE === 'nachfass') {{
-  el('nf_camp1').addEventListener('input', toggleCTAs);
-  el('nf_camp2').addEventListener('input', toggleCTAs);
-}}
-
-function showOverlay(msg) {{ el("phase").textContent = msg || ""; el("overlay").style.display = "flex"; }}
-function hideOverlay() {{ el("overlay").style.display = "none"; }}
-function setProgress(p) {{ el("bar").style.width = (Math.max(0, Math.min(100, p)) + "%"); }}
-
-async function loadOptions() {{
-  showOverlay("Lade Optionen …"); setProgress(15);
-  try {{
-    const pol = el('per_org_limit').value || '{PER_ORG_DEFAULT_LIMIT}';
-    const params = new URLSearchParams({{ per_org_limit: String(pol), mode: MODE }});
-    if (MODE === 'nachfass') {{
-      const c1 = (el('nf_camp1')?.value || '').trim();
-      const c2 = (el('nf_camp2')?.value || '').trim();
-      if (c1) params.append('campaign', c1);
-      if (c2) params.append('campaign', c2);
-    }}
-    const r = await fetch('/neukontakte/options?' + params.toString(), {{cache:'no-store'}});
-    const data = await r.json();
-    const sel = fbSel;
-    sel.innerHTML = '<option value="">– bitte auswählen –</option>';
-    for (const o of data.options) {{
-      const opt = document.createElement('option');
-      opt.value = o.value; opt.textContent = o.label + ' (' + o.count + ')';
-      sel.appendChild(opt);
-    }}
-    el('fbinfo').textContent = "Gesamt (nach Orga-Limit): " + data.total + " · Fachbereiche: " + data.options.length;
-    el('total-count').textContent = String(data.total);
-    toggleCTAs();
-  }} catch(e) {{
-    alert('Fehler beim Laden der Fachbereiche: ' + e);
-  }} finally {{
-    setProgress(100); setTimeout(hideOverlay, 200);
-  }}
-}}
-
-async function startExport() {{
-  const fb  = fbSel.value;
-  const tc  = el('take_count').value || null;
-  const bid = el('batch_id').value || null;
-  const camp= el('campaign').value || null;
-  const pol = el('per_org_limit').value || '{PER_ORG_DEFAULT_LIMIT}';
-  const payload = {{ fachbereich: fb, take_count: tc ? parseInt(tc) : null, batch_id: bid, campaign: camp, per_org_limit: parseInt(pol) }};
-  if (MODE === 'nachfass') {{
-    payload['nf_campaigns'] = [(el('nf_camp1')?.value || '').trim(), (el('nf_camp2')?.value || '').trim()].filter(Boolean);
-  }}
-  if (!fb) {{ alert('Bitte zuerst einen Fachbereich wählen.'); return; }}
-  if (MODE === 'nachfass' && (!payload['nf_campaigns'] || payload['nf_campaigns'].length === 0)) {{
-    alert('Bitte mindestens eine Kampagne angeben.'); return;
-  }}
-
-  showOverlay("Starte Abgleich …"); setProgress(5);
-  const r = await fetch('/neukontakte/export_start?mode=' + encodeURIComponent(MODE), {{
-    method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify(payload)
-  }});
-  if (!r.ok) {{ hideOverlay(); alert('Start fehlgeschlagen.'); return; }}
-  const {{ job_id }} = await r.json();
-  await poll(job_id);
-}}
-
-async function poll(job_id) {{
-  let done = false, tries = 0;
-  while (!done && tries < 3600) {{
-    await new Promise(res => setTimeout(res, 300));
-    const r = await fetch('/neukontakte/export_progress?job_id=' + encodeURIComponent(job_id), {{cache:'no-store'}});
-    if (!r.ok) {{ el('phase').textContent = 'Fehler beim Fortschritt'; return; }}
-    const s = await r.json();
-    if (s.error) {{ el('phase').textContent = s.error; setProgress(100); return; }}
-    el('phase').textContent = s.phase || 'Arbeite …';
-    setProgress(s.percent ?? 0);
-    done = !!s.done; tries++;
-  }}
-  if (done) {{
-    el('phase').textContent = 'Export bereit – Download startet …'; setProgress(100);
-    window.location.href = '/neukontakte/export_download?job_id=' + encodeURIComponent(job_id);
-    setTimeout(() => {{ window.location.href = '/neukontakte/summary?job_id=' + encodeURIComponent(job_id); }}, 800);
-  }} else {{
-    el('phase').textContent = 'Zeitüberschreitung beim Export';
-  }}
-}}
-
-btnExp.addEventListener('click', startExport);
-loadOptions();
-</script>
-</body></html>"""
-    return HTMLResponse(html)
-
-# =============================================================================
-# Optionen (Cache) – unterstützt Nachfass-Kampagnen
-# =============================================================================
-@app.get("/neukontakte/options")
-async def neukontakte_options(
-    per_org_limit: int = Query(PER_ORG_DEFAULT_LIMIT, ge=1, le=3),
-    mode: str = Query("new"),
-    campaign: List[str] = Query(default=[])
-):
-    # Cache-Key abhängig von Modus, Limit und Kampagnen
-    cache_key = f"{mode}|{per_org_limit}|{','.join(sorted([c.strip().lower() for c in campaign if c]))}"
-    now = time.time()
-    cache = _OPTIONS_CACHE.get(cache_key) or {}
-    if cache.get("options") and (now - cache.get("ts", 0.0) < OPTIONS_TTL_SEC):
-        return JSONResponse({"total": cache["total"], "options": cache["options"]})
-
-    fb_field = await get_person_field_by_hint(FIELD_FACHBEREICH_HINT)
-    if not fb_field:
-        return JSONResponse({"total": 0, "options": []})
-    fb_key = fb_field.get("key")
-    id2label = field_options_id_to_label_map(fb_field)
-
-    filter_id = FILTER_NACHFASS if mode == "nachfass" else FILTER_NEUKONTAKTE
-    total, counts = await stream_counts_with_org_cap(filter_id, fb_key, per_org_limit, PAGE_LIMIT, campaigns=campaign if mode=="nachfass" else None)
-    options = []
-    for opt_id, cnt in counts.items():
-        label = id2label.get(str(opt_id), str(opt_id))
-        options.append({"value": opt_id, "label": label, "count": cnt})
-    options.sort(key=lambda x: x["count"], reverse=True)
-
-    _OPTIONS_CACHE[cache_key] = {"ts": now, "total": total, "options": options}
-    return JSONResponse({"total": total, "options": options})
-
-# =============================================================================
-# Datenaufbau (inkl. Aktivitäts-/Kampagnen-Vorfilter & Orga-ID-Fix)
-# =============================================================================
-async def _build_master_final_from_pd(
-    fachbereich: str,
-    take_count: Optional[int],
-    batch_id: Optional[str],
-    campaign: Optional[str],
-    per_org_limit: int,
-    mode: str,
-    nf_campaigns: Optional[List[str]] = None,
-) -> pd.DataFrame:
-    fb_field = await get_person_field_by_hint(FIELD_FACHBEREICH_HINT)
-    if not fb_field:
-        raise RuntimeError("'Fachbereich'-Feld nicht gefunden.")
-    fb_key = fb_field.get("key")
-    person_fields = await get_person_fields()
-
-    hint_to_key: Dict[str, str] = {}
-    gender_options_map: Dict[str, str] = {}
-    for f in person_fields:
-        nm = (f.get("name") or "").lower()
-        for hint in PERSON_FIELD_HINTS_TO_EXPORT.keys():
-            if hint in nm and hint not in hint_to_key:
-                hint_to_key[hint] = f.get("key")
-        if any(x in nm for x in ("gender", "geschlecht")):
-            gender_options_map = field_options_id_to_label_map(f)
-
-    # Aktivitäts- & Kampagnen-Feldkeys
-    last_key = await get_last_activity_key()
-    next_key = await get_next_activity_key()
-    camp_key = await get_campaigns_field_key() if mode == "nachfass" else None
-    nf_campaigns = [c for c in (nf_campaigns or []) if c]
-
-    def get_field(p: dict, hint: str) -> str:
-        key = hint_to_key.get(hint)
-        if not key:
-            return ""
-        v = p.get(key)
-        if isinstance(v, dict) and "label" in v:
-            return str(v.get("label") or "")
-        if isinstance(v, list):
-            if v and isinstance(v[0], dict) and "value" in v[0]:
-                return str(v[0].get("value") or "")
-            return ", ".join([str(x) for x in v if x])
-        if v is None or (isinstance(v, float) and pd.isna(v)):
-            return ""
-        sv = str(v)
-        if hint in ("gender", "geschlecht") and gender_options_map:
-            return gender_options_map.get(sv, sv)
-        return sv
-
-    def _match_person(p: dict) -> bool:
-        # Aktivitäts-Vorfilter
-        av = extract_field_date(p, last_key) or extract_field_date(p, next_key)
-        if is_forbidden_activity_date(av):
-            return False
-        # Kampagnenfilter (Nachfass)
-        if mode == "nachfass" and camp_key and nf_campaigns:
-            if not _contains_any_campaign(p.get(camp_key), nf_campaigns):
-                return False
-        # Fachbereich
-        val = p.get(fb_key)
-        if isinstance(val, np.ndarray):
-            val = val.tolist()
-        if isinstance(val, list):
-            return str(fachbereich) in [str(x) for x in val if x is not None]
-        return str(val) == str(fachbereich)
-
-    # Personen streamen & auswählen
-    filter_id = FILTER_NACHFASS if mode == "nachfass" else FILTER_NEUKONTAKTE
-    selected: List[dict] = []
-    org_used: Dict[str, int] = {}
-    async for chunk in stream_persons_by_filter(filter_id):
-        for p in chunk:
-            if not _match_person(p):
-                continue
-            # Orga-Limit
-            org_key = None
-            org = p.get("org_id")
-            if isinstance(org, dict):
-                if org.get("id") is not None:
-                    org_key = f"id:{org.get('id')}"
-                elif org.get("name"):
-                    org_key = f"name:{normalize_name(org.get('name'))}"
-            if not org_key:
-                org_key = f"noorg:{p.get('id')}"
-            used = org_used.get(org_key, 0)
-            if used >= per_org_limit:
-                continue
-            org_used[org_key] = used + 1
-            selected.append(p)
-            if take_count and take_count > 0 and len(selected) >= take_count:
-                break
-        if take_count and take_count > 0 and len(selected) >= take_count:
-            break
-
-    # Datensätze -> Export-DF (exakte Spalten)
-    rows = []
-    for p in selected[: (take_count or len(selected))]:
-        pid = p.get("id")
-        first = p.get("first_name")
-        last = p.get("last_name")
-        full = p.get("name")
-        vor, nach = split_name(first, last, full)
-
-        # Organisation robust
-        org_name, org_id = "-", ""
-        org = p.get("org_id")
-        if isinstance(org, dict):
-            org_name = org.get("name") or p.get("org_name") or "-"
-            oid = org.get("id") if org.get("id") is not None else org.get("value")
-            if oid is not None and str(oid).strip():
-                org_id = str(oid)
-        elif isinstance(org, (int, str)) and str(org).strip():
-            org_id = str(org).strip()
-            org_name = (p.get("org_name") or org_name)
-        else:
-            org_name = (p.get("org_name") or org_name)
-
-        emails = _as_list_email(p.get("email"))
-        email_primary = emails[0] if emails else ""
-        # Büro-Mail falls vorhanden
-        email_office = ""
-        for k in ("email büro", "email buero", "office email"):
-            email_office = email_office or get_field(p, k)
-        person_email = email_office or email_primary
-
-        rows.append({
-            "Batch ID": batch_id or "",
-            "Channel": DEFAULT_CHANNEL,
-            "Cold-Mailing Import": campaign or "",
-            "Prospect ID": get_field(p, "prospect"),
-            "Organisation ID": org_id,
-            "Organisation Name": org_name,
-            "Person ID": str(pid or ""),
-            "Person Vorname": vor,
-            "Person Nachname": nach,
-            "Person Titel": get_field(p, "titel") or get_field(p, "title") or get_field(p, "anrede"),
-            "Person Geschlecht": get_field(p, "gender") or get_field(p, "geschlecht"),
-            "Person Position": get_field(p, "position"),
-            "Person E-Mail": person_email,
-            "XING Profil": get_field(p, "xing") or get_field(p, "xing url") or get_field(p, "xing profil"),
-            "LinkedIn URL": get_field(p, "linkedin"),
-        })
-
-    df = pd.DataFrame(rows, columns=TEMPLATE_COLUMNS)
-    await save_df_text(df, "nk_master_final")
-    return df
-
-# =============================================================================
-# Abgleich — speicherschonend, Delete-Log
-# =============================================================================
 def _pretty_reason(reason: str, extra: str = "") -> str:
     r = (reason or "").lower()
     if r == "org_match_95":
@@ -1039,7 +711,7 @@ async def _reconcile_impl() -> HTMLResponse:
     col_org_id = "Organisation ID"
     delete_rows: List[Dict[str, str]] = []
 
-    # Orga-Dubletten via ≥95 %
+    # Orga-Dubletten via ≥95 % (Filter 1245/851/1521)
     filter_ids_org = [1245, 851, 1521]
     buckets_all: Dict[str, List[str]] = {}
     collected_total = 0
@@ -1090,8 +762,13 @@ async def _reconcile_impl() -> HTMLResponse:
     if drop_idx:
         master = master.drop(index=drop_idx)
 
-    # Person-ID in Filtern 1216/1708
-    suspect_ids = await fetch_all_person_ids_parallel([1216, 1708], PAGE_LIMIT)
+    # Person-ID in Filtern 1216/1708 entfernen
+    suspect_ids = set()
+    async for page in stream_person_ids_by_filter(1216):
+        suspect_ids.update(page)
+    async for page in stream_person_ids_by_filter(1708):
+        suspect_ids.update(page)
+
     if suspect_ids:
         mask_pid = master[col_person_id].astype(str).isin(suspect_ids)
         removed = master[mask_pid].copy()
@@ -1125,7 +802,7 @@ async def _reconcile_impl() -> HTMLResponse:
     )
 
 # =============================================================================
-# Export als Job (Excel) — Dateiname = Kampagnenname, IDs als Text
+# Export – Job/Excel
 # =============================================================================
 def build_export_from_ready(master_ready: pd.DataFrame) -> pd.DataFrame:
     out = pd.DataFrame(columns=TEMPLATE_COLUMNS)
@@ -1137,11 +814,10 @@ def build_export_from_ready(master_ready: pd.DataFrame) -> pd.DataFrame:
     return out
 
 def _df_to_excel_bytes(df: pd.DataFrame) -> bytes:
-    # sichere Text-Formatierung für IDs
+    # IDs als Text
     for name in ("Organisation ID", "Person ID"):
         if name in df.columns:
             df[name] = df[name].astype(str).fillna("").replace("nan", "")
-    import io, pandas as pd
     from openpyxl.utils import get_column_letter
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
@@ -1169,15 +845,11 @@ class Job:
 
 JOBS: Dict[str, Job] = {}
 
-@app.post("/neukontakte/export_start")
+@app.post("/nachfass/export_start")
 async def export_start(
-    fachbereich: str = Body(...),
-    take_count: Optional[int] = Body(None),
-    batch_id: Optional[str] = Body(None),
-    campaign: Optional[str] = Body(None),
-    per_org_limit: int = Body(PER_ORG_DEFAULT_LIMIT),
-    mode: str = Query("new"),
-    nf_campaigns: Optional[List[str]] = Body(default=None),
+    nf_batch_ids: List[str] = Body(..., embed=True),
+    batch_id: str = Body(...),
+    campaign: str = Body(...),
 ):
     job_id = str(uuid.uuid4())
     job = Job()
@@ -1188,9 +860,7 @@ async def export_start(
     async def _run():
         try:
             job.phase = "Lade Daten …"; job.percent = 10
-            await _build_master_final_from_pd(
-                fachbereich, take_count, batch_id, campaign, per_org_limit, mode, nf_campaigns=nf_campaigns
-            )
+            await _build_nf_master_final(nf_batch_ids=nf_batch_ids, batch_id=batch_id, campaign=campaign)
 
             job.phase = "Gleiche ab …"; job.percent = 45
             _ = await _reconcile_impl()  # schreibt ready + log
@@ -1215,10 +885,11 @@ async def export_start(
             job.percent = 100
             job.done = True
 
+    import asyncio
     asyncio.create_task(_run())
     return JSONResponse({"job_id": job_id})
 
-@app.get("/neukontakte/export_progress")
+@app.get("/nachfass/export_progress")
 async def export_progress(job_id: str):
     job = JOBS.get(job_id)
     if not job:
@@ -1227,7 +898,7 @@ async def export_progress(job_id: str):
         return JSONResponse({"error": job.error, "done": True, "phase": job.phase, "percent": job.percent})
     return JSONResponse({"phase": job.phase, "percent": job.percent, "done": job.done, "total_rows": job.total_rows})
 
-@app.get("/neukontakte/export_download")
+@app.get("/nachfass/export_download")
 async def export_download(job_id: str):
     job = JOBS.get(job_id)
     if not job:
@@ -1241,7 +912,7 @@ async def export_download(job_id: str):
     )
 
 # =============================================================================
-# Übersicht/Summary (Id, Name, Orga-ID/Name, Grund – ohne „Top 50“ Hinweis)
+# Übersicht/Summary (Id, Name, Orga-ID/Name, Grund)
 # =============================================================================
 def _count_reason(df: pd.DataFrame, keys: List[str]) -> int:
     if df.empty or "reason" not in df.columns:
@@ -1250,17 +921,15 @@ def _count_reason(df: pd.DataFrame, keys: List[str]) -> int:
     keys_l = [k.lower() for k in keys]
     return int(r.isin(keys_l).sum())
 
-@app.get("/neukontakte/summary", response_class=HTMLResponse)
-async def neukontakte_summary(job_id: str = Query(...)):
+@app.get("/nachfass/summary", response_class=HTMLResponse)
+async def nachfass_summary(job_id: str = Query(...)):
     ready = await load_df_text("nk_master_ready")
     log = await load_df_text("nk_delete_log")
 
     total_ready = int(len(ready)) if not ready.empty else 0
-    cnt_orgtype   = _count_reason(log, ["org_type_set", "organisationsart", "org_flag"])
-    cnt_limit_org = _count_reason(log, ["limit_per_org"])
-    cnt_org95     = _count_reason(log, ["org_match_95"])
-    cnt_pid       = _count_reason(log, ["person_id_match"])
-    removed_sum   = cnt_orgtype + cnt_limit_org + cnt_org95 + cnt_pid
+    cnt_org95 = _count_reason(log, ["org_match_95"])
+    cnt_pid   = _count_reason(log, ["person_id_match"])
+    removed_sum = cnt_org95 + cnt_pid
 
     if not log.empty:
         view = log.tail(50).copy()
@@ -1278,7 +947,7 @@ async def neukontakte_summary(job_id: str = Query(...)):
     html = f"""
 <!doctype html><html lang="de"><head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>Übersicht – BatchFlow</title>
+<title>Übersicht – Nachfass</title>
 <style>
   :root{{--bg:#f6f8fb;--card:#fff;--txt:#0f172a;--muted:#64748b;--border:#e2e8f0;--primary:#0ea5e9}}
   *{{box-sizing:border-box}} body{{margin:0;background:var(--bg);color:var(--txt);font:16px/1.6 Inter,-apple-system,Segoe UI,Roboto,Arial,sans-serif}}
@@ -1286,8 +955,6 @@ async def neukontakte_summary(job_id: str = Query(...)):
   .card{{background:#fff;border:1px solid var(--border);border-radius:14px;padding:18px;box-shadow:0 2px 8px rgba(2,8,23,.04);margin-bottom:18px}}
   .btn{{display:inline-block;background:#0ea5e9;color:#fff;padding:10px 14px;border-radius:10px;text-decoration:none}}
   h2{{margin:0 0 10px 0;font-size:18px}}
-  ul{{list-style:none;padding:0;margin:8px 0 0 0}}
-  li{{margin:4px 0}}
   table{{width:100%;border-collapse:collapse;margin-top:8px}}
   th,td{{padding:8px 10px;border-bottom:1px solid #e2e8f0;text-align:left;font-size:13px}}
   th{{background:#f8fafc}}
@@ -1298,14 +965,12 @@ async def neukontakte_summary(job_id: str = Query(...)):
   <section class="card">
     <div><b>Ergebnis:</b> <b>{total_ready}</b> Zeilen in <code>nk_master_ready</code></div>
     <ul>
-      <li>Entfernt (Organisationsart gesetzt): <b>{cnt_orgtype}</b></li>
-      <li>Entfernt (mehr als 2 pro Organisation): <b>{cnt_limit_org}</b></li>
       <li>Entfernt (Orga-Match ≥95% – Filter 1245/851/1521): <b>{cnt_org95}</b></li>
       <li>Entfernt (Person-ID in Filtern 1216/1708): <b>{cnt_pid}</b></li>
       <li><b>Summe entfernt:</b> <b>{removed_sum}</b></li>
     </ul>
     <div style="margin-top:12px">
-      <a class="btn" href="/neukontakte">Zurück</a>
+      <a class="btn" href="/nachfass">Zurück</a>
     </div>
   </section>
 
@@ -1345,18 +1010,7 @@ async def oauth_callback(code: str):
     if "access_token" not in tok:
         return HTMLResponse(f"<h3>❌ OAuth Fehler: {tok}</h3>", 400)
     user_tokens["default"] = tok["access_token"]
-    return RedirectResponse("/campaign")
-
-# =============================================================================
-# Catch-all
-# =============================================================================
-@app.get("/overview", include_in_schema=False)
-async def overview_redirect(request: Request):
-    return RedirectResponse("/campaign", status_code=307)
-
-@app.get("/{full_path:path}", include_in_schema=False)
-async def catch_all(full_path: str, request: Request):
-    return RedirectResponse("/campaign", status_code=307)
+    return RedirectResponse("/nachfass")
 
 # =============================================================================
 # Lokaler Start
