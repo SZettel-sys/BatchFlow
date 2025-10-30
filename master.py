@@ -411,7 +411,7 @@ async def nachfass_home():
 <header>
   <div class="hwrap">
     <div><b>Nachfass</b></div>
-    <div>{"<span class='hint'>angemeldet</span>" if authed else "<a href='/login'>Anmelden</a>"}</div>
+    <div>{{"<span class='hint'>angemeldet</span>" if authed else "<a href='/login'>Anmelden</a>"}}</div>
   </div>
 </header>
 
@@ -442,7 +442,7 @@ async def nachfass_home():
     </div>
     <ul class="info">
       <li>Basis: Filter 3024.</li>
-      <li>Selektion erfolgt über das Personenfeld „Batch ID“ (contains, OR) – <i>nicht</i> über „E-Mail-Kampagnen“.</li>
+      <li>Selektion erfolgt über das Personenfeld „Batch ID“ (contains, OR).</li>
       <li>Aktivitätsdaten sind berücksichtigt (keine Einträge von heute bis 3&nbsp;Monate zurück und keine zukünftigen Daten).</li>
     </ul>
   </section>
@@ -456,60 +456,62 @@ async def nachfass_home():
 <script>
 const el = id => document.getElementById(id);
 const btnExp = el('btnExport');
-function checkReady() {
-  const ok = (el('nf_b1').value || '').trim().length > 0
-          && (el('batch_id').value || '').trim().length > 0
-          && (el('campaign').value || '').trim().length > 0;
+
+function checkReady() {{
+  const ok = ((el('nf_b1').value || '')).trim().length > 0
+          && ((el('batch_id').value || '')).trim().length > 0
+          && ((el('campaign').value || '')).trim().length > 0;
   btnExp.disabled = !ok;
-}
+}}
 ['nf_b1','nf_b2','batch_id','campaign'].forEach(id => el(id).addEventListener('input', checkReady));
 
-function showOverlay(msg) { el("phase").textContent = msg || ""; el("overlay").style.display = "flex"; }
-function hideOverlay() { el("overlay").style.display = "none"; }
-function setProgress(p) { el("bar").style.width = (Math.max(0, Math.min(100, p)) + "%"); }
+function showOverlay(msg) {{ el("phase").textContent = msg || ""; el("overlay").style.display = "flex"; }}
+function hideOverlay() {{ el("overlay").style.display = "none"; }}
+function setProgress(p) {{ el("bar").style.width = (Math.max(0, Math.min(100, p)) + "%"); }}
 
-async function startExport() {
-  const payload = {
+async function startExport() {{
+  const payload = {{
     nf_batch_ids: [(el('nf_b1').value || '').trim(), (el('nf_b2').value || '').trim()].filter(Boolean),
     batch_id: (el('batch_id').value || '').trim(),
     campaign: (el('campaign').value || '').trim()
-  };
-  if (payload.nf_batch_ids.length === 0) { alert('Bitte mindestens eine Nachfass-Batch ID angeben.'); return; }
+  }};
+  if (payload.nf_batch_ids.length === 0) {{ alert('Bitte mindestens eine Nachfass-Batch ID angeben.'); return; }}
   showOverlay("Starte Abgleich …"); setProgress(5);
-  const r = await fetch('/nachfass/export_start', {
-    method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload)
-  });
-  if (!r.ok) { hideOverlay(); alert('Start fehlgeschlagen.'); return; }
-  const { job_id } = await r.json();
+  const r = await fetch('/nachfass/export_start', {{
+    method: 'POST', headers: {{'Content-Type':'application/json'}}, body: JSON.stringify(payload)
+  }});
+  if (!r.ok) {{ hideOverlay(); alert('Start fehlgeschlagen.'); return; }}
+  const {{ job_id }} = await r.json();
   await poll(job_id);
-}
+}}
 
-async function poll(job_id) {
+async function poll(job_id) {{
   let done = false, tries = 0;
-  while (!done && tries < 3600) {
+  while (!done && tries < 3600) {{
     await new Promise(res => setTimeout(res, 300));
-    const r = await fetch('/nachfass/export_progress?job_id=' + encodeURIComponent(job_id), {cache:'no-store'});
-    if (!r.ok) { el('phase').textContent = 'Fehler beim Fortschritt'; return; }
+    const r = await fetch('/nachfass/export_progress?job_id=' + encodeURIComponent(job_id), {{cache:'no-store'}});
+    if (!r.ok) {{ el('phase').textContent = 'Fehler beim Fortschritt'; return; }}
     const s = await r.json();
-    if (s.error) { el('phase').textContent = s.error; setProgress(100); return; }
+    if (s.error) {{ el('phase').textContent = s.error; setProgress(100); return; }}
     el('phase').textContent = s.phase || 'Arbeite …';
     setProgress(s.percent ?? 0);
     done = !!s.done; tries++;
-  }
-  if (done) {
+  }}
+  if (done) {{
     el('phase').textContent = 'Export bereit – Download startet …'; setProgress(100);
     window.location.href = '/nachfass/export_download?job_id=' + encodeURIComponent(job_id);
-    setTimeout(() => { window.location.href = '/nachfass/summary?job_id=' + encodeURIComponent(job_id); }, 800);
-  } else {
+    setTimeout(() => {{ window.location.href = '/nachfass/summary?job_id=' + encodeURIComponent(job_id); }}, 800);
+  }} else {{
     el('phase').textContent = 'Zeitüberschreitung beim Export';
-  }
-}
+  }}
+}}
 
 btnExp.addEventListener('click', startExport);
 checkReady();
 </script>
 </body></html>"""
     return HTMLResponse(html)
+
 
 # =============================================================================
 # Datenaufbau – Nachfass über Batch-ID
