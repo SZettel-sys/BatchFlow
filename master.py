@@ -1,11 +1,9 @@
-# master.py — BatchFlow (Nachfass: vereinfachtes Formular, Selektion über Batch-ID)
+# master.py — BatchFlow (Übersicht + Nachfass (Batch-ID) + getrennte Tabellen)
 # FastAPI + Neon (Postgres) + Pipedrive
-# © bizforward
 
 import os
 import re
 import io
-import time
 import uuid
 from typing import Optional, Dict, List, Tuple, AsyncGenerator
 
@@ -16,7 +14,7 @@ import asyncpg
 from rapidfuzz import fuzz, process
 from datetime import datetime, timedelta, timezone
 
-from fastapi import FastAPI, Request, Body, Query, HTTPException
+from fastapi import FastAPI, Body, Query, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.gzip import GZipMiddleware
@@ -50,7 +48,6 @@ DEFAULT_CHANNEL = "Cold E-Mail"
 
 # Performance
 PAGE_LIMIT = int(os.getenv("PAGE_LIMIT", "500"))
-PD_CONCURRENCY = int(os.getenv("PD_CONCURRENCY", "4"))
 RECONCILE_MAX_ROWS = int(os.getenv("RECONCILE_MAX_ROWS", "20000"))
 MAX_ORG_NAMES = int(os.getenv("MAX_ORG_NAMES", "120000"))
 MAX_ORG_BUCKET = int(os.getenv("MAX_ORG_BUCKET", "15000"))
@@ -102,7 +99,7 @@ async def _shutdown():
         await app.state.pool.close()
 
 # =============================================================================
-# Hilfsfunktionen
+# Helfer
 # =============================================================================
 @app.get("/healthz")
 async def healthz():
@@ -168,9 +165,7 @@ def parse_pd_date(d: Optional[str]) -> Optional[datetime]:
         return None
 
 def is_forbidden_activity_date(val: Optional[str]) -> bool:
-    """
-    True => ausschließen, wenn Datum in Zukunft ODER in [heute-3M, heute]
-    """
+    """True => ausschließen, wenn Datum in Zukunft ODER in [heute-3M, heute]"""
     dt = parse_pd_date(val)
     if not dt:
         return False
@@ -202,7 +197,6 @@ def field_options_id_to_label_map(field: dict) -> Dict[str, str]:
         mp[oid] = lab
     return mp
 
-# Geschlecht, Titel, Position, usw. – heuristische Feldsuche
 PERSON_FIELD_HINTS_TO_EXPORT = {
     "prospect": "Prospect ID",
     "gender": "Person Geschlecht",
@@ -215,14 +209,9 @@ PERSON_FIELD_HINTS_TO_EXPORT = {
     "xing url": "XING Profil",
     "xing profil": "XING Profil",
     "linkedin": "LinkedIn URL",
-    "email büro": "Person E-Mail",
-    "email buero": "Person E-Mail",
-    "e-mail büro": "Person E-Mail",
-    "e-mail buero": "Person E-Mail",
     "office email": "Person E-Mail",
 }
 
-# Aktivitätsfelder
 _NEXT_ACTIVITY_KEY: Optional[str] = None
 _LAST_ACTIVITY_KEY: Optional[str] = None
 
@@ -274,21 +263,16 @@ def extract_field_date(p: dict, key: Optional[str]) -> Optional[str]:
         return None
     return str(v)
 
-# Batch-ID Feld (für Selektion)
+# Batch-ID Feld (für Nachfass-Selektion)
 _BATCH_FIELD_KEY: Optional[str] = None
 
 async def get_batch_field_key() -> Optional[str]:
-    """
-    Sucht ein Personenfeld, dessen Name Batch/Batch ID enthält.
-    """
+    """Sucht ein Personenfeld, dessen Name Batch/Batch ID enthält."""
     global _BATCH_FIELD_KEY
     if _BATCH_FIELD_KEY is not None:
         return _BATCH_FIELD_KEY
     fields = await get_person_fields()
-    candidates = [
-        "batch id", "batch-id", "batch_id",
-        "batch",   # Fallback – bitte nur, wenn eindeutig
-    ]
+    candidates = ["batch id", "batch-id", "batch_id", "batch"]
     for f in fields:
         nm = (f.get("name") or "").lower()
         if any(c in nm for c in candidates):
@@ -335,6 +319,13 @@ async def stream_persons_by_filter(filter_id: int, page_limit: int = PAGE_LIMIT)
 # =============================================================================
 # DB (Textspalten)
 # =============================================================================
+def tables(prefix: str):
+    return {
+        "final": f"{prefix}_master_final",
+        "ready": f"{prefix}_master_ready",
+        "log":   f"{prefix}_delete_log",
+    }
+
 async def ensure_table_text(conn: asyncpg.Connection, table: str, cols: List[str]):
     col_defs = ", ".join([f'"{c}" TEXT' for c in cols])
     await conn.execute(f'CREATE TABLE IF NOT EXISTS "{SCHEMA}"."{table}" ({col_defs})')
@@ -373,12 +364,73 @@ async def load_df_text(table: str) -> pd.DataFrame:
     return pd.DataFrame(data, columns=cols).replace({"": np.nan})
 
 # =============================================================================
-# UI – Nachfass (vereinfachtes Formular)
+# Übersicht (Root)
 # =============================================================================
-@app.get("/")
+@app.get("/", include_in_schema=False)
 def root():
-    return RedirectResponse("/nachfass")
+    return RedirectResponse("/overview", status_code=307)
 
+@app.get("/campaign", include_in_schema=False)
+async def _legacy_campaign_redirect():
+    return RedirectResponse("/overview", status_code=307)
+
+@app.get("/overview", response_class=HTMLResponse)
+async def overview():
+    authed = bool(user_tokens.get("default") or PD_API_TOKEN)
+    return HTMLResponse(f"""<!doctype html><html lang="de">
+<head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>BatchFlow – Übersicht</title>
+<style>
+  :root{{--bg:#f6f8fb;--card:#fff;--txt:#0f172a;--muted:#64748b;--border:#e2e8f0;--primary:#0ea5e9;--primary-h:#0284c7}}
+  *{{box-sizing:border-box}} body{{margin:0;background:var(--bg);color:var(--txt);font:16px/1.6 Inter,-apple-system,Segoe UI,Roboto,Arial,sans-serif}}
+  header{{background:#fff;border-bottom:1px solid var(--border)}}
+  .hwrap{{max-width:1120px;margin:0 auto;padding:16px 20px;display:flex;align-items:center;justify-content:space-between}}
+  .brand{{font-weight:700;font-size:18px}}
+  .sub{{color:var(--muted)}}
+  main{{max-width:1120px;margin:32px auto;padding:0 20px}}
+  .grid{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:20px}}
+  @media (max-width:1024px){{.grid{{grid-template-columns:repeat(2,minmax(0,1fr))}}}}
+  @media (max-width:720px){{.grid{{grid-template-columns:1fr}}}}
+  .card{{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:22px;box-shadow:0 2px 8px rgba(2,8,23,.04)}}
+  .title{{font-weight:700;font-size:18px;margin:2px 0 6px}}
+  .desc{{color:var(--muted);min-height:48px}}
+  .btn{{display:inline-flex;align-items:center;gap:8px;padding:10px 14px;border-radius:10px;background:var(--primary);color:#fff;text-decoration:none}}
+  .btn:hover{{background:var(--primary-h)}}
+</style>
+</head>
+<body>
+<header>
+  <div class="hwrap">
+    <div class="brand">BatchFlow</div>
+    <div class="sub">Übersicht</div>
+    <div>{{"<span class='sub'>angemeldet</span>" if authed else "<a href='/login'>Anmelden</a>"}}</div>
+  </div>
+</header>
+<main>
+  <div class="grid">
+    <div class="card">
+      <div class="title">Neukontakte</div>
+      <div class="desc">Neue Leads aus Filter, Abgleich &amp; Export.</div>
+      <a class="btn" href="/neukontakte">Öffnen</a>
+    </div>
+    <div class="card">
+      <div class="title">Nachfass</div>
+      <div class="desc">Nachfassen anhand einer oder zwei Batch IDs (Filter 3024).</div>
+      <a class="btn" href="/nachfass">Öffnen</a>
+    </div>
+    <div class="card">
+      <div class="title">Refresh</div>
+      <div class="desc">Kontaktdaten aktualisieren/ergänzen.</div>
+      <a class="btn" href="/refresh">Öffnen</a>
+    </div>
+  </div>
+</main>
+</body></html>""")
+
+# =============================================================================
+# Nachfass – UI (Batch-ID)
+# =============================================================================
 @app.get("/nachfass", response_class=HTMLResponse)
 async def nachfass_home():
     authed = bool(user_tokens.get("default") or PD_API_TOKEN)
@@ -466,7 +518,6 @@ function checkReady() {{
 ['nf_b1','nf_b2','batch_id','campaign'].forEach(id => el(id).addEventListener('input', checkReady));
 
 function showOverlay(msg) {{ el("phase").textContent = msg || ""; el("overlay").style.display = "flex"; }}
-function hideOverlay() {{ el("overlay").style.display = "none"; }}
 function setProgress(p) {{ el("bar").style.width = (Math.max(0, Math.min(100, p)) + "%"); }}
 
 async function startExport() {{
@@ -480,7 +531,7 @@ async function startExport() {{
   const r = await fetch('/nachfass/export_start', {{
     method: 'POST', headers: {{'Content-Type':'application/json'}}, body: JSON.stringify(payload)
   }});
-  if (!r.ok) {{ hideOverlay(); alert('Start fehlgeschlagen.'); return; }}
+  if (!r.ok) {{ alert('Start fehlgeschlagen.'); return; }}
   const {{ job_id }} = await r.json();
   await poll(job_id);
 }}
@@ -512,26 +563,20 @@ checkReady();
 </body></html>"""
     return HTMLResponse(html)
 
-
 # =============================================================================
-# Datenaufbau – Nachfass über Batch-ID
+# Nachfass – Datenaufbau + Abgleich + Export
 # =============================================================================
-async def _build_nf_master_final(
-    nf_batch_ids: List[str],
-    batch_id: str,
-    campaign: str,
-) -> pd.DataFrame:
-    # Feld-Keys & Mappings
+async def _build_nf_master_final(nf_batch_ids: List[str], batch_id: str, campaign: str) -> pd.DataFrame:
     person_fields = await get_person_fields()
     hint_to_key: Dict[str, str] = {}
-    gender_options_map: Dict[str, str] = {}
+    gender_map: Dict[str, str] = {}
     for f in person_fields:
         nm = (f.get("name") or "").lower()
         for hint in PERSON_FIELD_HINTS_TO_EXPORT.keys():
             if hint in nm and hint not in hint_to_key:
                 hint_to_key[hint] = f.get("key")
         if any(x in nm for x in ("gender", "geschlecht")):
-            gender_options_map = field_options_id_to_label_map(f)
+            gender_map = field_options_id_to_label_map(f)
 
     def get_field(p: dict, hint: str) -> str:
         key = hint_to_key.get(hint)
@@ -547,38 +592,34 @@ async def _build_nf_master_final(
         if v is None or (isinstance(v, float) and pd.isna(v)):
             return ""
         sv = str(v)
-        if hint in ("gender", "geschlecht") and gender_options_map:
-            return gender_options_map.get(sv, sv)
+        if hint in ("gender", "geschlecht") and gender_map:
+            return gender_map.get(sv, sv)
         return sv
 
     last_key = await get_last_activity_key()
     next_key = await get_next_activity_key()
     batch_key = await get_batch_field_key()
     if not batch_key:
-        raise RuntimeError("Personenfeld „Batch ID“ wurde nicht gefunden. Bitte benennen/prüfen.")
+        raise RuntimeError("Personenfeld „Batch ID“ wurde nicht gefunden.")
 
     selected: List[dict] = []
     async for chunk in stream_persons_by_filter(FILTER_NACHFASS):
         for p in chunk:
-            # Aktivitäts-Vorfilter
+            # Aktivitätsfilter (keine Zukunft, nicht innerhalb der letzten 3 Monate)
             av = extract_field_date(p, last_key) or extract_field_date(p, next_key)
             if is_forbidden_activity_date(av):
                 continue
-            # Selektion über Batch-ID-Feld (contains – OR)
+            # Selektion über Batch-ID
             if not _contains_any_text(p.get(batch_key), nf_batch_ids):
                 continue
             selected.append(p)
 
-    # Zeilen für Export aufbauen
     rows = []
     for p in selected:
         pid = p.get("id")
-        first = p.get("first_name")
-        last = p.get("last_name")
-        full = p.get("name")
-        vor, nach = split_name(first, last, full)
+        vor, nach = split_name(p.get("first_name"), p.get("last_name"), p.get("name"))
 
-        # Organisation robust
+        # Organisation
         org_name, org_id = "-", ""
         org = p.get("org_id")
         if isinstance(org, dict):
@@ -592,8 +633,8 @@ async def _build_nf_master_final(
         else:
             org_name = (p.get("org_name") or org_name)
 
-        # E-Mails
-        def _as_list_email(v):
+        # E-Mail (erste vorhandene)
+        def _list_email(v):
             if v is None or (isinstance(v, float) and pd.isna(v)):
                 return []
             if isinstance(v, dict):
@@ -608,8 +649,8 @@ async def _build_nf_master_final(
                         out.append(str(x))
                 return out
             return [str(v)]
-        emails = _as_list_email(p.get("email"))
-        person_email = emails[0] if emails else ""
+        emails = _list_email(p.get("email"))
+        email = emails[0] if emails else ""
 
         rows.append({
             "Batch ID": batch_id or "",
@@ -624,18 +665,15 @@ async def _build_nf_master_final(
             "Person Titel": get_field(p, "titel") or get_field(p, "title") or get_field(p, "anrede"),
             "Person Geschlecht": get_field(p, "gender") or get_field(p, "geschlecht"),
             "Person Position": get_field(p, "position"),
-            "Person E-Mail": person_email,
+            "Person E-Mail": email,
             "XING Profil": get_field(p, "xing") or get_field(p, "xing url") or get_field(p, "xing profil"),
             "LinkedIn URL": get_field(p, "linkedin"),
         })
 
     df = pd.DataFrame(rows, columns=TEMPLATE_COLUMNS)
-    await save_df_text(df, "nk_master_final")
+    await save_df_text(df, tables("nf")["final"])
     return df
 
-# =============================================================================
-# Abgleich (wie bei Neukontakte)
-# =============================================================================
 async def stream_organizations_by_filter(filter_id: int, page_limit: int = PAGE_LIMIT):
     start = 0
     while True:
@@ -643,11 +681,11 @@ async def stream_organizations_by_filter(filter_id: int, page_limit: int = PAGE_
         r = await http_client().get(url, headers=get_headers())
         if r.status_code != 200:
             raise Exception(f"Pipedrive API Fehler (Orgs {filter_id}): {r.text}")
-        chunk = r.json().get("data") or []
-        if not chunk:
+        data = r.json().get("data") or []
+        if not data:
             break
-        yield chunk
-        if len(chunk) < page_limit:
+        yield data
+        if len(data) < page_limit:
             break
         start += page_limit
 
@@ -697,16 +735,13 @@ def _pretty_reason(reason: str, extra: str = "") -> str:
         base = r or "Entfernt"
     return f"{base}{(' – ' + extra) if extra else ''}"
 
-async def _reconcile_impl() -> HTMLResponse:
-    master = await load_df_text("nk_master_final")
+async def _reconcile(prefix: str) -> None:
+    t = tables(prefix)
+    master = await load_df_text(t["final"])
     if master.empty:
-        return HTMLResponse("<div style='padding:24px'>Keine Daten in nk_master_final.</div>")
-
-    if len(master) > RECONCILE_MAX_ROWS:
-        return HTMLResponse(
-            f"<div style='padding:24px;color:#b00'>❌ Zu viele Datensätze ({len(master)}). "
-            f"Bitte auf ≤ {RECONCILE_MAX_ROWS} begrenzen.</div>", status_code=400
-        )
+        await save_df_text(pd.DataFrame(), t["ready"])
+        await save_df_text(pd.DataFrame(columns=["reason","id","name","org_id","org_name","extra"]), t["log"])
+        return
 
     col_person_id = "Person ID"
     col_org_name = "Organisation Name"
@@ -785,27 +820,10 @@ async def _reconcile_impl() -> HTMLResponse:
             })
         master = master[~mask_pid].copy()
 
-    await save_df_text(master, "nk_master_ready")
+    await save_df_text(master, t["ready"])
     log_df = pd.DataFrame(delete_rows, columns=["reason", "id", "name", "org_id", "org_name", "extra"])
-    await save_df_text(log_df, "nk_delete_log")
+    await save_df_text(log_df, t["log"])
 
-    # Kurzer Inline-Report
-    stats = {
-        "after": len(master),
-        "del_orgmatch": log_df[log_df["reason"] == "org_match_95"].shape[0] if not log_df.empty else 0,
-        "del_pid": log_df[log_df["reason"] == "person_id_match"].shape[0] if not log_df.empty else 0,
-        "deleted_total": log_df.shape[0] if not log_df.empty else 0,
-    }
-    table_html = log_df.head(50).to_html(index=False, border=0) if not log_df.empty else "<i>keine</i>"
-    return HTMLResponse(
-        f"<div style='padding:16px;font-family:Inter,system-ui'>Übrig: <b>{stats['after']}</b> · "
-        f"Orga≥95%: <b>{stats['del_orgmatch']}</b> · PersonID: <b>{stats['del_pid']}</b>"
-        f"<div style='margin-top:8px'>{table_html}</div></div>"
-    )
-
-# =============================================================================
-# Export – Job/Excel
-# =============================================================================
 def build_export_from_ready(master_ready: pd.DataFrame) -> pd.DataFrame:
     out = pd.DataFrame(columns=TEMPLATE_COLUMNS)
     for col in TEMPLATE_COLUMNS:
@@ -820,7 +838,6 @@ def _df_to_excel_bytes(df: pd.DataFrame) -> bytes:
     for name in ("Organisation ID", "Person ID"):
         if name in df.columns:
             df[name] = df[name].astype(str).fillna("").replace("nan", "")
-    from openpyxl.utils import get_column_letter
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="Export")
@@ -835,6 +852,7 @@ def _df_to_excel_bytes(df: pd.DataFrame) -> bytes:
     buf.seek(0)
     return buf.getvalue()
 
+# Jobspeicher
 class Job:
     def __init__(self) -> None:
         self.phase = "Warten …"
@@ -865,10 +883,10 @@ async def export_start(
             await _build_nf_master_final(nf_batch_ids=nf_batch_ids, batch_id=batch_id, campaign=campaign)
 
             job.phase = "Gleiche ab …"; job.percent = 45
-            _ = await _reconcile_impl()  # schreibt ready + log
+            await _reconcile("nf")
 
             job.phase = "Erzeuge Excel …"; job.percent = 70
-            ready = await load_df_text("nk_master_ready")
+            ready = await load_df_text(tables("nf")["ready"])
             export_df = build_export_from_ready(ready)
             data = _df_to_excel_bytes(export_df)
 
@@ -914,7 +932,7 @@ async def export_download(job_id: str):
     )
 
 # =============================================================================
-# Übersicht/Summary (Id, Name, Orga-ID/Name, Grund)
+# Summary (Nachfass)
 # =============================================================================
 def _count_reason(df: pd.DataFrame, keys: List[str]) -> int:
     if df.empty or "reason" not in df.columns:
@@ -925,8 +943,8 @@ def _count_reason(df: pd.DataFrame, keys: List[str]) -> int:
 
 @app.get("/nachfass/summary", response_class=HTMLResponse)
 async def nachfass_summary(job_id: str = Query(...)):
-    ready = await load_df_text("nk_master_ready")
-    log = await load_df_text("nk_delete_log")
+    ready = await load_df_text(tables("nf")["ready"])
+    log = await load_df_text(tables("nf")["log"])
 
     total_ready = int(len(ready)) if not ready.empty else 0
     cnt_org95 = _count_reason(log, ["org_match_95"])
@@ -935,7 +953,9 @@ async def nachfass_summary(job_id: str = Query(...)):
 
     if not log.empty:
         view = log.tail(50).copy()
-        view["Grund"] = view.apply(lambda r: _pretty_reason(str(r.get("reason") or ""), str(r.get("extra") or "")), axis=1)
+        def _pretty(r):
+            return _pretty_reason(str(r.get("reason") or ""), str(r.get("extra") or ""))
+        view["Grund"] = view.apply(_pretty, axis=1)
         view = view.rename(columns={
             "id": "Id",
             "name": "Name",
@@ -965,26 +985,45 @@ async def nachfass_summary(job_id: str = Query(...)):
 </head><body>
 <main>
   <section class="card">
-    <div><b>Ergebnis:</b> <b>{total_ready}</b> Zeilen in <code>nk_master_ready</code></div>
+    <div><b>Ergebnis:</b> <b>{total_ready}</b> Zeilen in <code>nf_master_ready</code></div>
     <ul>
       <li>Entfernt (Orga-Match ≥95% – Filter 1245/851/1521): <b>{cnt_org95}</b></li>
       <li>Entfernt (Person-ID in Filtern 1216/1708): <b>{cnt_pid}</b></li>
       <li><b>Summe entfernt:</b> <b>{removed_sum}</b></li>
     </ul>
-    <div style="margin-top:12px">
-      <a class="btn" href="/nachfass">Zurück</a>
-    </div>
+    <div style="margin-top:12px"><a class="btn" href="/overview">Zur Übersicht</a></div>
   </section>
-
   <section class="card">
     <h2>Entfernte Datensätze</h2>
     {table_html}
-    <div class="muted" style="margin-top:8px">Vollständiges Log in Neon: <code>nk_delete_log</code></div>
+    <div class="muted" style="margin-top:8px">Vollständiges Log in Neon: <code>nf_delete_log</code></div>
   </section>
 </main>
 </body></html>
 """
     return HTMLResponse(html)
+
+# =============================================================================
+# Platzhalter-Routen (Neukontakte / Refresh) — später ersetzen
+# =============================================================================
+@app.get("/neukontakte", response_class=HTMLResponse)
+async def neukontakte_placeholder():
+    return HTMLResponse("""<div style='font:16px/1.6 system-ui;padding:24px'>
+      <h2>Neukontakte</h2>
+      <p>Die vollständige Seite hänge ich dir als Nächstes hier ein. Tabellenraum ist reserviert:</p>
+      <ul>
+        <li><code>nk_master_final</code></li>
+        <li><code>nk_master_ready</code></li>
+        <li><code>nk_delete_log</code></li>
+      </ul>
+      <p><a href="/overview">← Zur Übersicht</a></p></div>""")
+
+@app.get("/refresh", response_class=HTMLResponse)
+async def refresh_placeholder():
+    return HTMLResponse("""<div style='font:16px/1.6 system-ui;padding:24px'>
+      <h2>Refresh</h2>
+      <p>Platzhalter – Umsetzung folgt.</p>
+      <p><a href="/overview">← Zur Übersicht</a></p></div>""")
 
 # =============================================================================
 # OAuth (optional)
@@ -1012,7 +1051,7 @@ async def oauth_callback(code: str):
     if "access_token" not in tok:
         return HTMLResponse(f"<h3>❌ OAuth Fehler: {tok}</h3>", 400)
     user_tokens["default"] = tok["access_token"]
-    return RedirectResponse("/nachfass")
+    return RedirectResponse("/overview")
 
 # =============================================================================
 # Lokaler Start
