@@ -564,6 +564,8 @@ async def campaign_home():
 async def neukontakte(request: Request, mode: str = Query("new")):
     authed = bool(user_tokens.get("default") or PD_API_TOKEN)
     page_title = {"new": "Neukontakte", "nachfass": "Nachfass", "refresh": "Refresh"}.get(mode, "Neukontakte")
+    # Wichtig: JS Default-Wert aus Python bereitstellen, damit keine f-string-Braces im Script auftauchen
+    default_per_org_js = PER_ORG_DEFAULT_LIMIT
     html = f"""<!doctype html><html lang=\"de\">
 <head>
 <meta charset=\"utf-8\"/><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"/>
@@ -654,6 +656,7 @@ async def neukontakte(request: Request, mode: str = Query("new")):
 
 <script>
 const MODE = new URLSearchParams(location.search).get('mode') || 'new';
+const DEFAULT_PER_ORG = {default_per_org_js};
 const el = id => document.getElementById(id);
 const fbSel = el('fachbereich');
 const btnExp = el('btnExport');
@@ -672,7 +675,7 @@ function setProgress(p) { el("bar").style.width = (Math.max(0, Math.min(100, p))
 async function loadOptions() {
   showOverlay("Lade Optionen …"); setProgress(15);
   try {
-    const pol = el('per_org_limit').value || '{PER_ORG_DEFAULT_LIMIT}';
+    const pol = Number(el('per_org_limit').value || DEFAULT_PER_ORG);
     const r = await fetch('/neukontakte/options?per_org_limit=' + encodeURIComponent(pol) + '&mode=' + encodeURIComponent(MODE), {cache:'no-store'});
     const data = await r.json();
     const sel = fbSel;
@@ -697,7 +700,7 @@ async function startExport() {
   const tc  = el('take_count').value || null;
   const bid = el('batch_id').value || null;
   const camp= el('campaign').value || null;
-  const pol = el('per_org_limit').value || '{PER_ORG_DEFAULT_LIMIT}';
+  const pol = Number(el('per_org_limit').value || DEFAULT_PER_ORG);
   if (!fb) { alert('Bitte zuerst einen Fachbereich wählen.'); return; }
 
   showOverlay("Starte Abgleich …"); setProgress(5);
@@ -1254,6 +1257,23 @@ async def oauth_callback(code: str):
         return HTMLResponse(f"<h3>❌ OAuth Fehler: {tok}</h3>", 400)
     user_tokens["default"] = tok["access_token"]
     return RedirectResponse("/campaign")
+
+# =============================================================================
+# Test-/Diagnose-Endpunkt (einfacher Selbsttest)
+# =============================================================================
+@app.get("/__selftest__")
+async def __selftest__():
+    return {
+        "ok": True,
+        "per_org_default": PER_ORG_DEFAULT_LIMIT,
+        "template_columns_ok": TEMPLATE_COLUMNS == [
+            "Batch ID","Channel","Cold-Mailing Import","Prospect ID",
+            "Organisation ID","Organisation Name","Person ID","Person Vorname",
+            "Person Nachname","Person Titel","Person Geschlecht","Person Position",
+            "Person E-Mail","XING Profil","LinkedIn URL"
+        ],
+        "endpoints": ["/campaign","/neukontakte","/neukontakte/options","/neukontakte/export_start","/neukontakte/summary"]
+    }
 
 # =============================================================================
 # Catch-all
