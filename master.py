@@ -43,6 +43,7 @@ SCHEMA = os.getenv("PGSCHEMA", "public")
 
 # Filter/Felder
 FILTER_NEUKONTAKTE = int(os.getenv("FILTER_NEUKONTAKTE", "2998"))
+FILTER_NACHFASS = int(os.getenv("FILTER_NACHFASS", "3024"))
 FIELD_FACHBEREICH_HINT = os.getenv("FIELD_FACHBEREICH_HINT", "fachbereich")
 
 # UI/Defaults
@@ -106,6 +107,43 @@ PERSON_FIELD_HINTS_TO_EXPORT = {
     "e-mail buero": "Person E-Mail",
     "office email": "Person E-Mail",
 }
+
+
+# --- Batch-ID Feldsuche (für Nachfass) ---------------------------------------
+_BATCH_FIELD_KEY: Optional[str] = None
+
+async def get_batch_field_key() -> Optional[str]:
+    """Sucht ein Personenfeld, dessen Name Batch/Batch ID enthält."""
+    global _BATCH_FIELD_KEY
+    if _BATCH_FIELD_KEY is not None:
+        return _BATCH_FIELD_KEY
+    fields = await get_person_fields()
+    candidates = ["batch id", "batch-id", "batch_id", "batch"]
+    for f in fields:
+        nm = (f.get("name") or "").lower()
+        if any(c in nm for c in candidates):
+            _BATCH_FIELD_KEY = f.get("key")
+            break
+    return _BATCH_FIELD_KEY
+
+def _contains_any_text(val, wanted: List[str]) -> bool:
+    if not wanted:
+        return True
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return False
+    if isinstance(val, dict):
+        val = val.get("value")
+    if isinstance(val, (list, tuple, np.ndarray)):
+        flat: List[str] = []
+        for x in val:
+            if isinstance(x, dict):
+                x = x.get("value")
+            if x:
+                flat.append(str(x))
+        val = " | ".join(flat)
+    s = str(val).lower()
+    return any(k.lower() in s for k in wanted if k)
+
 
 # =============================================================================
 # Startup / Shutdown
@@ -671,7 +709,7 @@ async function loadOptions() {{
   showOverlay("Lade Optionen …"); setProgress(15);
   try {{
     const pol = el('per_org_limit').value || '{PER_ORG_DEFAULT_LIMIT}';
-    const r = await fetch('/neukontakte/options?per_org_limit=' + encodeURIComponent(pol) + '&mode=' + encodeURIComponent(MODE), {{cache:'no-store'}});
+    const r = await fetch('/neukontakte/options?per_org_limit=' + encodeURIComponent(pol) + '&mode=' + encodeURIComponent(MODE), {{{cache:'no-store'}}});
     const data = await r.json();
     const sel = fbSel;
     sel.innerHTML = '<option value="">– bitte auswählen –</option>';
@@ -712,7 +750,7 @@ async function poll(job_id) {{
   let done = false, tries = 0;
   while (!done && tries < 3600) {{
     await new Promise(res => setTimeout(res, 300));
-    const r = await fetch('/neukontakte/export_progress?job_id=' + encodeURIComponent(job_id), {{cache:'no-store'}});
+    const r = await fetch('/neukontakte/export_progress?job_id=' + encodeURIComponent(job_id), {{{cache:'no-store'}}});
     if (!r.ok) {{ el('phase').textContent = 'Fehler beim Fortschritt'; return; }}
     const s = await r.json();
     if (s.error) {{ el('phase').textContent = s.error; setProgress(100); return; }}
@@ -1255,6 +1293,451 @@ async def oauth_callback(code: str):
 @app.get("/overview", include_in_schema=False)
 async def overview_redirect(request: Request):
     return RedirectResponse("/campaign", status_code=307)
+
+
+
+# =============================================================================
+# Nachfass – Datenaufbau + Abgleich + Export
+# =============================================================================
+async def _build_nf_master_final(nf_batch_ids: List[str], batch_id: str, campaign: str) -> pd.DataFrame:
+    person_fields = await get_person_fields()
+    hint_to_key: Dict[str, str] = {}
+    gender_map: Dict[str, str] = {}
+    for f in person_fields:
+        nm = (f.get("name") or "").lower()
+        for hint in PERSON_FIELD_HINTS_TO_EXPORT.keys():
+            if hint in nm and hint not in hint_to_key:
+                hint_to_key[hint] = f.get("key")
+        if any(x in nm for x in ("gender", "geschlecht")):
+            gender_map = field_options_id_to_label_map(f)
+
+    def get_field(p: dict, hint: str) -> str:
+        key = hint_to_key.get(hint)
+        if not key:
+            return ""
+        v = p.get(key)
+        if isinstance(v, dict) and "label" in v:
+            return str(v.get("label") or "")
+        if isinstance(v, list):
+            if v and isinstance(v[0], dict) and "value" in v[0]:
+                return str(v[0].get("value") or "")
+            return ", ".join([str(x) for x in v if x])
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return ""
+        sv = str(v)
+        if hint in ("gender", "geschlecht") and gender_map:
+            return gender_map.get(sv, sv)
+        return sv
+
+    last_key = await get_last_activity_key()
+    next_key = await get_next_activity_key()
+    batch_key = await get_batch_field_key()
+    if not batch_key:
+        raise RuntimeError("Personenfeld „Batch ID“ wurde nicht gefunden.")
+
+    selected: List[dict] = []
+    async for chunk in stream_persons_by_filter(FILTER_NACHFASS):
+        for p in chunk:
+            # Aktivitätsfilter (keine Zukunft, nicht innerhalb der letzten 3 Monate)
+            av = extract_field_date(p, last_key) or extract_field_date(p, next_key)
+            if is_forbidden_activity_date(av):
+                continue
+            # Selektion über Batch-ID
+            if not _contains_any_text(p.get(batch_key), nf_batch_ids):
+                continue
+            selected.append(p)
+
+    rows = []
+    for p in selected:
+        pid = p.get("id")
+        vor, nach = split_name(p.get("first_name"), p.get("last_name"), p.get("name"))
+
+        # Organisation
+        org_name, org_id = "-", ""
+        org = p.get("org_id")
+        if isinstance(org, dict):
+            org_name = org.get("name") or p.get("org_name") or "-"
+            oid = org.get("id") if org.get("id") is not None else org.get("value")
+            if oid is not None and str(oid).strip():
+                org_id = str(oid)
+        elif isinstance(org, (int, str)) and str(org).strip():
+            org_id = str(org).strip()
+            org_name = (p.get("org_name") or org_name)
+        else:
+            org_name = (p.get("org_name") or org_name)
+
+        emails = _as_list_email(p.get("email"))
+        email = emails[0] if emails else ""
+
+        rows.append({
+            "Batch ID": batch_id or "",
+            "Channel": DEFAULT_CHANNEL,
+            "Cold-Mailing Import": campaign or "",
+            "Prospect ID": get_field(p, "prospect"),
+            "Organisation ID": org_id,
+            "Organisation Name": org_name,
+            "Person ID": str(pid or ""),
+            "Person Vorname": vor,
+            "Person Nachname": nach,
+            "Person Titel": get_field(p, "titel") or get_field(p, "title") or get_field(p, "anrede"),
+            "Person Geschlecht": get_field(p, "gender") or get_field(p, "geschlecht"),
+            "Person Position": get_field(p, "position"),
+            "Person E-Mail": email,
+            "XING Profil": get_field(p, "xing") or get_field(p, "xing url") or get_field(p, "xing profil"),
+            "LinkedIn URL": get_field(p, "linkedin"),
+        })
+
+    df = pd.DataFrame(rows, columns=TEMPLATE_COLUMNS)
+    await save_df_text(df, "nf_master_final")
+    return df
+
+# =============================================================================
+# Nachfass – Abgleich (Orga≥95 %, Person-ID in 1216/1708)
+# =============================================================================
+async def _reconcile_nf() -> None:
+    master = await load_df_text("nf_master_final")
+    if master.empty:
+        await save_df_text(pd.DataFrame(), "nf_master_ready")
+        await save_df_text(pd.DataFrame(columns=["reason","id","name","org_id","org_name","extra"]), "nf_delete_log")
+        return
+
+    col_person_id = "Person ID"
+    col_org_name  = "Organisation Name"
+    col_org_id    = "Organisation ID"
+    delete_rows: List[Dict[str, str]] = []
+
+    # Orga-Dubletten via ≥95 % (Filter 1245/851/1521) – mit Kappung
+    filter_ids_org = [1245, 851, 1521]
+    buckets_all: Dict[str, List[str]] = {}
+    collected_total = 0
+    for fid in filter_ids_org:
+        caps_left = max(0, MAX_ORG_NAMES - collected_total)
+        if caps_left <= 0:
+            break
+        buckets = await _fetch_org_names_for_filter_capped(fid, PAGE_LIMIT, caps_left, MAX_ORG_BUCKET)
+        for k, lst in buckets.items():
+            slot = buckets_all.setdefault(k, [])
+            for n in lst:
+                if len(slot) >= MAX_ORG_BUCKET:
+                    break
+                if not slot or slot[-1] != n:
+                    slot.append(n)
+                    collected_total += 1
+                    if collected_total >= MAX_ORG_NAMES:
+                        break
+            if collected_total >= MAX_ORG_NAMES:
+                break
+        if collected_total >= MAX_ORG_NAMES:
+            break
+
+    drop_idx = []
+    for idx, row in master.iterrows():
+        cand = str(row.get(col_org_name) or "").strip()
+        cand_norm = normalize_name(cand)
+        if not cand_norm:
+            continue
+        bucket = buckets_all.get(cand_norm[0])
+        if not bucket:
+            continue
+        near = [n for n in bucket if abs(len(n) - len(cand_norm)) <= 4]
+        if not near:
+            continue
+        best = process.extractOne(cand_norm, near, scorer=fuzz.token_sort_ratio)
+        if best and best[1] >= 95:
+            drop_idx.append(idx)
+            delete_rows.append({
+                "reason": "org_match_95",
+                "id": str(row.get(col_person_id) or ""),
+                "name": f"{row.get('Person Vorname') or ''} {row.get('Person Nachname') or ''}".strip(),
+                "org_id": str(row.get(col_org_id) or ""),
+                "org_name": cand,
+                "extra": f"Best Match: {best[0]} ({best[1]}%)"
+            })
+
+    if drop_idx:
+        master = master.drop(index=drop_idx)
+
+    # Person-ID in Filtern 1216/1708 entfernen
+    suspect_ids = await fetch_all_person_ids_parallel([1216, 1708], PAGE_LIMIT)
+    if suspect_ids:
+        mask_pid = master[col_person_id].astype(str).isin(suspect_ids)
+        removed = master[mask_pid].copy()
+        for _, r in removed.iterrows():
+            delete_rows.append({
+                "reason": "person_id_match",
+                "id": str(r.get(col_person_id) or ""),
+                "name": f"{r.get('Person Vorname') or ''} {r.get('Person Nachname') or ''}".strip(),
+                "org_id": str(r.get(col_org_id) or ""),
+                "org_name": str(r.get(col_org_name) or ""),
+                "extra": "ID in Filter 1216/1708"
+            })
+        master = master[~mask_pid].copy()
+
+    await save_df_text(master, "nf_master_ready")
+    log_df = pd.DataFrame(delete_rows, columns=["reason", "id", "name", "org_id", "org_name", "extra"])
+    await save_df_text(log_df, "nf_delete_log")
+
+# =============================================================================
+# Nachfass – Export-Flow (Start / Progress / Download)
+# =============================================================================
+@app.post("/nachfass/export_start")
+async def export_start(
+    nf_batch_ids: List[str] = Body(..., embed=True),
+    batch_id: str = Body(...),
+    campaign: str = Body(...),
+):
+    job_id = str(uuid.uuid4())
+    job = Job()
+    JOBS[job_id] = job
+    job.phase = "Initialisiere …"; job.percent = 1
+    job.filename_base = slugify_filename(campaign or "BatchFlow_Export")
+
+    async def _run():
+        try:
+            job.phase = "Lade Daten …"; job.percent = 10
+            await _build_nf_master_final(nf_batch_ids=nf_batch_ids, batch_id=batch_id, campaign=campaign)
+
+            job.phase = "Gleiche ab …"; job.percent = 45
+            await _reconcile_nf()
+
+            job.phase = "Erzeuge Excel …"; job.percent = 70
+            ready = await load_df_text("nf_master_ready")
+            export_df = build_export_from_ready(ready)
+            data = _df_to_excel_bytes(export_df)
+
+            path = f"/tmp/{job.filename_base}.xlsx"
+            with open(path, "wb") as f:
+                f.write(data)
+
+            job.total_rows = len(export_df)
+            job.phase = f"Fertig – {job.total_rows} Zeile(n)"
+            job.percent = 100
+            job.done = True
+            job.path = path
+        except Exception as e:
+            job.error = f"Export fehlgeschlagen: {e}"
+            job.phase = "Fehler"
+            job.percent = 100
+            job.done = True
+
+    import asyncio
+    asyncio.create_task(_run())
+    return JSONResponse({"job_id": job_id})
+
+@app.get("/nachfass/export_progress")
+async def export_progress(job_id: str):
+    job = JOBS.get(job_id)
+    if not job:
+        raise HTTPException(404, "Unbekannte Job-ID")
+    if job.error:
+        return JSONResponse({"error": job.error, "done": True, "phase": job.phase, "percent": job.percent})
+    return JSONResponse({"phase": job.phase, "percent": job.percent, "done": job.done, "total_rows": job.total_rows})
+
+@app.get("/nachfass/export_download")
+async def export_download(job_id: str):
+    job = JOBS.get(job_id)
+    if not job:
+        raise HTTPException(404, "Unbekannte Job-ID")
+    if not job.done or not job.path:
+        raise HTTPException(409, "Der Export ist noch nicht bereit.")
+    return FileResponse(
+        job.path,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename=os.path.basename(job.path),
+    )
+
+# =============================================================================
+# Summary (Nachfass)
+# =============================================================================
+@app.get("/nachfass/summary", response_class=HTMLResponse)
+async def nachfass_summary(job_id: str = Query(...)):
+    ready = await load_df_text("nf_master_ready")
+    log = await load_df_text("nf_delete_log")
+
+    total_ready = int(len(ready)) if not ready.empty else 0
+    cnt_org95 = _count_reason(log, ["org_match_95"])
+    cnt_pid   = _count_reason(log, ["person_id_match"])
+    removed_sum = cnt_org95 + cnt_pid
+
+    if not log.empty:
+        view = log.tail(50).copy()
+        def _pretty(r):
+            return _pretty_reason(str(r.get("reason") or ""), str(r.get("extra") or ""))
+        view["Grund"] = view.apply(_pretty, axis=1)
+        view = view.rename(columns={
+            "id": "Id",
+            "name": "Name",
+            "org_id": "Organisation ID",
+            "org_name": "Organisation Name",
+        })[["Id", "Name", "Organisation ID", "Organisation Name", "Grund"]]
+        table_html = view.to_html(classes="grid", index=False, border=0)
+    else:
+        table_html = "<i>keine</i>"
+
+    html = f"""
+<!doctype html><html lang="de"><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Übersicht – Nachfass</title>
+<style>
+  :root{{--bg:#f6f8fb;--card:#fff;--txt:#0f172a;--muted:#64748b;--border:#e2e8f0;--primary:#0ea5e9}}
+  *{{box-sizing:border-box}} body{{margin:0;background:var(--bg);color:var(--txt);font:16px/1.6 Inter,-apple-system,Segoe UI,Roboto,Arial,sans-serif}}
+  main{{max-width:1120px;margin:28px auto;padding:0 20px}}
+  .card{{background:#fff;border:1px solid var(--border);border-radius:14px;padding:18px;box-shadow:0 2px 8px rgba(2,8,23,.04);margin-bottom:18px}}
+  .btn{{display:inline-block;background:#0ea5e9;color:#fff;padding:10px 14px;border-radius:10px;text-decoration:none}}
+  h2{{margin:0 0 10px 0;font-size:18px}}
+  table{{width:100%;border-collapse:collapse;margin-top:8px}}
+  th,td{{padding:8px 10px;border-bottom:1px solid #e2e8f0;text-align:left;font-size:13px}}
+  th{{background:#f8fafc}}
+  .muted{{color:#64748b;font-size:13px}}
+</style>
+</head><body>
+<main>
+  <section class="card">
+    <div><b>Ergebnis:</b> <b>{total_ready}</b> Zeilen in <code>nf_master_ready</code></div>
+    <ul>
+      <li>Entfernt (Orga-Match ≥95% – Filter 1245/851/1521): <b>{cnt_org95}</b></li>
+      <li>Entfernt (Person-ID in Filtern 1216/1708): <b>{cnt_pid}</b></li>
+      <li><b>Summe entfernt:</b> <b>{removed_sum}</b></li>
+    </ul>
+    <div style="margin-top:12px"><a class="btn" href="/overview">Zur Übersicht</a></div>
+  </section>
+  <section class="card">
+    <h2>Entfernte Datensätze</h2>
+    {table_html}
+    <div class="muted" style="margin-top:8px">Vollständiges Log in Neon: <code>nf_delete_log</code></div>
+  </section>
+</main>
+</body></html>
+"""
+    return HTMLResponse(html)
+
+# =============================================================================
+# Nachfass – einfache Eingabeseite
+# =============================================================================
+@app.get("/nachfass", response_class=HTMLResponse)
+
+async def nachfass_page():
+    authed = bool(user_tokens.get("default") or PD_API_TOKEN)
+    auth_html = "<span class='hint'>angemeldet</span>" if authed else "<a href='/login'>Anmelden</a>"
+    html = """<!doctype html><html lang="de">
+<head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Nachfass – BatchFlow</title>
+<style>
+  :root{--bg:#f6f8fb;--card:#fff;--txt:#0f172a;--muted:#64748b;--border:#e2e8f0;--primary:#0ea5e9;--primary-h:#0284c7}
+  *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--txt);font:16px/1.6 Inter,-apple-system,Segoe UI,Roboto,Arial,sans-serif}
+  header{background:#fff;border-bottom:1px solid var(--border)}
+  .hwrap{max-width:1120px;margin:0 auto;padding:14px 20px;display:flex;align-items:center;justify-content:space-between;gap:12px}
+  main{max-width:1120px;margin:28px auto;padding:0 20px}
+  .card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:20px;box-shadow:0 2px 8px rgba(2,8,23,.04)}
+  .grid{display:grid;grid-template-columns:repeat(12,1fr);gap:16px}
+  .col-6{grid-column:span 6;min-width:260px}
+  .col-3{grid-column:span 3;min-width:220px}
+  .col-12{grid-column:span 12}
+  label{display:block;font-weight:600;margin:8px 0 6px}
+  textarea,input{width:100%;padding:10px 12px;border:1px solid #cbd5e1;border-radius:10px;background:#fff}
+  .hint{color:#64748b;font-size:13px;margin-top:6px}
+  .btn{background:#0ea5e9;border:none;color:#fff;border-radius:10px;padding:12px 16px;cursor:pointer}
+  .btn:hover{background:#0284c7}
+  #overlay{display:none;position:fixed;inset:0;background:rgba(255,255,255,.7);backdrop-filter:blur(2px);z-index:9999;align-items:center;justify-content:center;flex-direction:column;gap:10px}
+  .barwrap{width:min(520px,90vw);height:10px;border-radius:999px;background:#e2e8f0;overflow:hidden}
+  .bar{height:100%;width:0%;background:#0ea5e9;transition:width .2s linear}
+</style>
+</head>
+<body>
+<header>
+  <div class="hwrap">
+    <div><a href="/campaign" style="color:#0a66c2;text-decoration:none">← Kampagne wählen</a></div>
+    <div><b>Nachfass</b></div>
+    <div>__AUTH__</div>
+  </div>
+</header>
+
+<main>
+  <section class="card">
+    <div class="grid">
+      <div class="col-6">
+        <label>Batch IDs (1–2 Werte)</label>
+        <textarea id="nf_batch_ids" rows="3" placeholder="z. B. B111, B096"></textarea>
+        <div class="hint">Komma- oder zeilengetrennt. Es wird auf Teilstring im Feld „Batch ID“ gematcht.</div>
+      </div>
+      <div class="col-3">
+        <label>Batch ID (Exportspalte)</label>
+        <input id="batch_id" placeholder="Bxxx"/>
+        <div class="hint">z. B. B222</div>
+      </div>
+      <div class="col-3">
+        <label>Kampagnenname</label>
+        <input id="campaign" placeholder="z. B. Folgewoche"/>
+        <div class="hint">Wird als „Cold-Mailing Import“ gesetzt und als Dateiname verwendet.</div>
+      </div>
+      <div class="col-12" style="display:flex;justify-content:flex-end">
+        <button class="btn" id="btnExport">Abgleich &amp; Download</button>
+      </div>
+    </div>
+  </section>
+</main>
+
+<div id="overlay">
+  <div id="phase" style="color:#0f172a"></div>
+  <div class="barwrap"><div class="bar" id="bar"></div></div>
+</div>
+
+<script>
+const el = id => document.getElementById(id);
+function showOverlay(msg) { el("phase").textContent = msg || ""; el("overlay").style.display = "flex"; }
+function hideOverlay() { el("overlay").style.display = "none"; }
+function setProgress(p) { el("bar").style.width = (Math.max(0, Math.min(100, p)) + "%"); }
+
+function _parseIDs(raw) {
+  if (!raw) return [];
+  return raw.split(/[\n,;]/).map(s => s.trim()).filter(Boolean).slice(0, 2);
+}
+
+async function startExport() {
+  const raw = el('nf_batch_ids').value || '';
+  const ids = _parseIDs(raw);
+  const bid = el('batch_id').value || '';
+  const camp= el('campaign').value || '';
+  if (ids.length === 0) { alert('Bitte mindestens eine Batch ID angeben.'); return; }
+
+  showOverlay("Starte Abgleich …"); setProgress(5);
+  const r = await fetch('/nachfass/export_start', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ nf_batch_ids: ids, batch_id: bid, campaign: camp })
+  });
+  if (!r.ok) { hideOverlay(); alert('Start fehlgeschlagen.'); return; }
+  const { job_id } = await r.json();
+  await poll(job_id);
+}
+
+async function poll(job_id) {
+  let done = false, tries = 0;
+  while (!done && tries < 3600) {
+    await new Promise(res => setTimeout(res, 300));
+    const r = await fetch('/nachfass/export_progress?job_id=' + encodeURIComponent(job_id), {cache:'no-store'});
+    if (!r.ok) { el('phase').textContent = 'Fehler beim Fortschritt'; return; }
+    const s = await r.json();
+    if (s.error) { el('phase').textContent = s.error; setProgress(100); return; }
+    el('phase').textContent = s.phase || 'Arbeite …';
+    setProgress(s.percent ?? 0);
+    done = !!s.done; tries++;
+  }
+  if (done) {
+    el('phase').textContent = 'Export bereit – Download startet …'; setProgress(100);
+    window.location.href = '/nachfass/export_download?job_id=' + encodeURIComponent(job_id);
+    setTimeout(() => {
+      window.location.href = '/nachfass/summary?job_id=' + encodeURIComponent(job_id);
+    }, 800);
+  } else {
+    el('phase').textContent = 'Zeitüberschreitung beim Export';
+  }
+}
+
+el('btnExport').addEventListener('click', startExport);
+</script>
+</body></html>"""
+    return HTMLResponse(html.replace("__AUTH__", auth_html))
 
 @app.get("/{full_path:path}", include_in_schema=False)
 async def catch_all(full_path: str, request: Request):
