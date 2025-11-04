@@ -1257,13 +1257,6 @@ async def oauth_callback(code: str):
 async def overview_redirect(request: Request):
     return RedirectResponse("/campaign", status_code=307)
 
-@app.get("/{full_path:path}", include_in_schema=False)
-async def catch_all(full_path: str, request: Request):
-    return RedirectResponse("/campaign", status_code=307)
-
-# =============================================================================
-# Lokaler Start
-# =============================================================================
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("master:app", host="0.0.0.0", port=int(os.getenv("PORT", 8000)), reload=False)
@@ -1392,3 +1385,9 @@ el('btnExportNf').addEventListener('click', startExportNf);
 </body></html>"""
     html = html.replace("{AUTHTAG}", authed_html)
     return HTMLResponse(html)
+
+# --- Catch-All: muss als LETZTE Route definiert sein ---
+@app.get("/{full_path:path}", include_in_schema=False)
+async def catch_all(full_path: str, request: Request):
+    return RedirectResponse("/campaign", status_code=307)
+
