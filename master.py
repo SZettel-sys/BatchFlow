@@ -1635,29 +1635,30 @@ async def nachfass_summary(job_id: str = Query(...)):
 @app.get("/nachfass", response_class=HTMLResponse)
 async def nachfass_page():
     authed = bool(user_tokens.get("default") or PD_API_TOKEN)
-    return HTMLResponse(f"""<!doctype html><html lang="de">
+    authed_html = "<span class='hint'>angemeldet</span>" if authed else "<a href='/login'>Anmelden</a>"
+    html = """<!doctype html><html lang="de">
 <head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>Nachfass – BatchFlow</title>
 <style>
-  :root{{--bg:#f6f8fb;--card:#fff;--txt:#0f172a;--muted:#64748b;--border:#e2e8f0;--primary:#0ea5e9;--primary-h:#0284c7}}
-  *{{box-sizing:border-box}} body{{margin:0;background:var(--bg);color:var(--txt);font:16px/1.6 Inter,-apple-system,Segoe UI,Roboto,Arial,sans-serif}}
-  header{{background:#fff;border-bottom:1px solid var(--border)}}
-  .hwrap{{max-width:1120px;margin:0 auto;padding:14px 20px;display:flex;align-items:center;justify-content:space-between;gap:12px}}
-  main{{max-width:1120px;margin:28px auto;padding:0 20px}}
-  .card{{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:20px;box-shadow:0 2px 8px rgba(2,8,23,.04)}}
-  .grid{{display:grid;grid-template-columns:repeat(12,1fr);gap:16px}}
-  .col-6{{grid-column:span 6;min-width:260px}}
-  .col-3{{grid-column:span 3;min-width:220px}}
-  .col-12{{grid-column:span 12}}
-  label{{display:block;font-weight:600;margin:8px 0 6px}}
-  textarea,input{{width:100%;padding:10px 12px;border:1px solid #cbd5e1;border-radius:10px;background:#fff}}
-  .hint{{color:#64748b;font-size:13px;margin-top:6px}}
-  .btn{{background:#0ea5e9;border:none;color:#fff;border-radius:10px;padding:12px 16px;cursor:pointer}}
-  .btn:hover{{background:#0284c7}}
-  #overlay{{display:none;position:fixed;inset:0;background:rgba(255,255,255,.7);backdrop-filter:blur(2px);z-index:9999;align-items:center;justify-content:center;flex-direction:column;gap:10px}}
-  .barwrap{{width:min(520px,90vw);height:10px;border-radius:999px;background:#e2e8f0;overflow:hidden}}
-  .bar{{height:100%;width:0%;background:#0ea5e9;transition:width .2s linear}}
+  :root{--bg:#f6f8fb;--card:#fff;--txt:#0f172a;--muted:#64748b;--border:#e2e8f0;--primary:#0ea5e9;--primary-h:#0284c7}
+  *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--txt);font:16px/1.6 Inter,-apple-system,Segoe UI,Roboto,Arial,sans-serif}
+  header{background:#fff;border-bottom:1px solid var(--border)}
+  .hwrap{max-width:1120px;margin:0 auto;padding:14px 20px;display:flex;align-items:center;justify-content:space-between;gap:12px}
+  main{max-width:1120px;margin:28px auto;padding:0 20px}
+  .card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:20px;box-shadow:0 2px 8px rgba(2,8,23,.04)}
+  .grid{display:grid;grid-template-columns:repeat(12,1fr);gap:16px}
+  .col-6{grid-column:span 6;min-width:260px}
+  .col-3{grid-column:span 3;min-width:220px}
+  .col-12{grid-column:span 12}
+  label{display:block;font-weight:600;margin:8px 0 6px}
+  textarea,input{width:100%;padding:10px 12px;border:1px solid #cbd5e1;border-radius:10px;background:#fff}
+  .hint{color:#64748b;font-size:13px}
+  .btn{background:#0ea5e9;border:none;color:#fff;border-radius:10px;padding:12px 16px;cursor:pointer}
+  .btn:hover{background:#0284c7}
+  #overlay{display:none;position:fixed;inset:0;background:rgba(255,255,255,.7);backdrop-filter:blur(2px);z-index:9999;align-items:center;justify-content:center;flex-direction:column;gap:10px}
+  .barwrap{width:min(520px,90vw);height:10px;border-radius:999px;background:#e2e8f0;overflow:hidden}
+  .bar{height:100%;width:0%;background:#0ea5e9;transition:width .2s linear}
 </style>
 </head>
 <body>
@@ -1665,7 +1666,7 @@ async def nachfass_page():
   <div class="hwrap">
     <div><a href="/campaign" style="color:#0a66c2;text-decoration:none">← Kampagne wählen</a></div>
     <div><b>Nachfass</b></div>
-    <div>{{"<span class='hint'>angemeldet</span>" if authed else "<a href='/login'>Anmelden</a>"}}</div>
+    <div>{AUTHTAG}</div>
   </div>
 </header>
 
@@ -1752,8 +1753,9 @@ async function poll(job_id) {
 
 el('btnExport').addEventListener('click', startExport);
 </script>
-</body></html>""")
-
+</body></html>"""
+    html = html.replace("{AUTHTAG}", authed_html)
+    return HTMLResponse(html)
 @app.get("/{full_path:path}", include_in_schema=False)
 async def catch_all(full_path: str, request: Request):
     return RedirectResponse("/campaign", status_code=307)
