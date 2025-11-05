@@ -638,13 +638,13 @@ el('btnExportNf').addEventListener('click',startExportNf);
 # =============================================================================
 # Catch-All
 # =============================================================================
-@app.get("/overview",include_in_schema=False)
-async def overview_redirect(request:Request):
-    return RedirectResponse("/campaign",status_code=307)
-
-@app.get("/{full_path:path}",include_in_schema=False)
-async def catch_all(full_path:str,request:Request):
-    return RedirectResponse("/campaign",status_code=307)
+@app.get("/{full_path:path}", include_in_schema=False)
+async def catch_all(full_path: str, request: Request):
+    # Falls die URL bereits auf einer bekannten Seite zeigt, NICHT umleiten
+    known_prefixes = ("campaign", "neukontakte", "nachfass", "login", "oauth")
+    if any(full_path.startswith(p) for p in known_prefixes):
+        raise HTTPException(status_code=404, detail="Nicht gefunden.")
+    return RedirectResponse("/campaign", status_code=307)
 
 if __name__=="__main__":
     import uvicorn
