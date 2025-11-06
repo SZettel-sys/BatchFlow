@@ -393,15 +393,16 @@ async def stream_persons_by_batch_id(batch_key: str, batch_ids: List[str],
 # =============================================================================
 # Nachfass – Aufbau Master (direkte Batch-Selektion)
 # =============================================================================
+# =============================================================================
+# Nachfass – Aufbau Master (optimiert mit Parallelisierung)
+# =============================================================================
 async def _build_nf_master_final(
     nf_batch_ids: List[str],
     batch_id: str,
     campaign: str,
     job_obj=None,
 ) -> pd.DataFrame:
-    """
-    Baut Nachfass-Daten direkt über die Batch-ID-Suche auf.
-    """
+    """Baut Nachfass-Daten parallel für mehrere Batch-IDs."""
     fields = await get_person_fields()
     batch_key = None
     for f in fields:
@@ -412,6 +413,7 @@ async def _build_nf_master_final(
     if not batch_key:
         raise RuntimeError("Personenfeld „Batch ID“ wurde nicht gefunden.")
 
+    # Feldzuordnung vorbereiten
     hint_to_key: Dict[str, str] = {}
     for f in fields:
         nm = (f.get("name") or "").lower()
@@ -434,55 +436,73 @@ async def _build_nf_master_final(
             return ""
         return str(v)
 
+    # -------------------------------------------------------------------------
+    # Sammle Personen parallel pro Batch-ID
+    # -------------------------------------------------------------------------
+    async def collect_batch(bid: str) -> List[dict]:
+        persons = []
+        async for chunk in stream_persons_by_batch_id(batch_key, [bid]):
+            persons.extend(chunk)
+        return persons
+
+    # Parallel alle Batch-IDs abfragen
+    if job_obj:
+        job_obj.phase = "Starte parallele Batch-Abfragen …"
+        job_obj.percent = 10
+
+    results = await asyncio.gather(
+        *[collect_batch(bid) for bid in nf_batch_ids],
+        return_exceptions=True,
+    )
+
     rows: List[dict] = []
     total = 0
-    batches_done = 0
-
-    for bid in nf_batch_ids:
-        batches_done += 1
+    for idx, res in enumerate(results):
+        if isinstance(res, Exception):
+            print(f"[WARN] Batch {nf_batch_ids[idx]} Fehler: {res}")
+            continue
         if job_obj:
-            job_obj.phase = f"Lade Batch {bid} …"
-            job_obj.percent = 5 + (20 * batches_done)
-        async for chunk in stream_persons_by_batch_id(batch_key, [bid]):
-            for p in chunk:
-                if total >= NF_MAX_ROWS:
-                    break
-                org = p.get("org_id") or {}
-                org_name = org.get("name") or p.get("org_name") or "-"
-                org_id = str(org.get("id") or "")
-                emails = _as_list_email(p.get("email"))
-                email = emails[0] if emails else ""
-                first = p.get("first_name") or ""
-                last = p.get("last_name") or ""
-                rows.append({
-                    "Batch ID": batch_id or "",
-                    "Channel": DEFAULT_CHANNEL,
-                    "Cold-Mailing Import": campaign or "",
-                    "Prospect ID": get_field(p, "prospect"),
-                    "Organisation ID": org_id,
-                    "Organisation Name": org_name,
-                    "Person ID": str(p.get("id") or ""),
-                    "Person Vorname": first,
-                    "Person Nachname": last,
-                    "Person Titel": get_field(p, "titel") or get_field(p, "title") or get_field(p, "anrede"),
-                    "Person Geschlecht": get_field(p, "gender") or get_field(p, "geschlecht"),
-                    "Person Position": get_field(p, "position"),
-                    "Person E-Mail": email,
-                    "XING Profil": get_field(p, "xing") or get_field(p, "xing url") or get_field(p, "xing profil"),
-                    "LinkedIn URL": get_field(p, "linkedin"),
-                })
-                total += 1
+            job_obj.phase = f"Verarbeite Batch {nf_batch_ids[idx]} ({len(res)} Treffer)"
+            job_obj.percent = 15 + int((idx + 1) / len(results) * 20)
+        for p in res:
             if total >= NF_MAX_ROWS:
                 break
+            org = p.get("org_id") or {}
+            org_name = org.get("name") or p.get("org_name") or "-"
+            org_id = str(org.get("id") or "")
+            emails = _as_list_email(p.get("email"))
+            email = emails[0] if emails else ""
+            first = p.get("first_name") or ""
+            last = p.get("last_name") or ""
+            rows.append({
+                "Batch ID": batch_id or "",
+                "Channel": DEFAULT_CHANNEL,
+                "Cold-Mailing Import": campaign or "",
+                "Prospect ID": get_field(p, "prospect"),
+                "Organisation ID": org_id,
+                "Organisation Name": org_name,
+                "Person ID": str(p.get("id") or ""),
+                "Person Vorname": first,
+                "Person Nachname": last,
+                "Person Titel": get_field(p, "titel") or get_field(p, "title") or get_field(p, "anrede"),
+                "Person Geschlecht": get_field(p, "gender") or get_field(p, "geschlecht"),
+                "Person Position": get_field(p, "position"),
+                "Person E-Mail": email,
+                "XING Profil": get_field(p, "xing") or get_field(p, "xing url") or get_field(p, "xing profil"),
+                "LinkedIn URL": get_field(p, "linkedin"),
+            })
+            total += 1
         if total >= NF_MAX_ROWS:
             break
 
     df = pd.DataFrame(rows, columns=TEMPLATE_COLUMNS)
     await save_df_text(df, "nf_master_final")
+
     if job_obj:
         job_obj.phase = f"Daten gesammelt: {len(df)} Zeilen"
         job_obj.percent = 40
     return df
+
 
 # =============================================================================
 # Neukontakte – Aufbau Master
