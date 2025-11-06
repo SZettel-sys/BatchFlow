@@ -349,6 +349,8 @@ async def stream_persons_by_batch_id(batch_key: str, batch_ids: List[str], page_
                 f"{PIPEDRIVE_API}/persons/search?term={bid}&fields={batch_key}&start={start}&limit={page_limit}"
             )
             r = await http_client().get(url, headers=get_headers())
+            if job_obj and total % 500 == 0:
+                await update_progress(job_obj, f"Verarbeite Batch {bid} ({total} Datensätze) …", min(10 + total // 200, 45))
             if r.status_code != 200:
                 raise Exception(f"Pipedrive Fehler bei Batch {bid}: {r.text}")
             data = r.json().get("data", {}).get("items", [])
@@ -1006,9 +1008,8 @@ async def export_start_nk(
 
     asyncio.create_task(_run())
     return JSONResponse({"job_id": job_id})
-
 # -----------------------------------------------------------------------------
-# Export-Start – Nachfass
+# Export-Start – Nachfass (mit dynamischem Fortschritt & klaren Phasen)
 # -----------------------------------------------------------------------------
 @app.post("/nachfass/export_start")
 async def export_start_nf(
@@ -1019,33 +1020,65 @@ async def export_start_nf(
     job_id = str(uuid.uuid4())
     job = Job()
     JOBS[job_id] = job
-    job.phase = "Initialisiere …"
+    job.phase = "Initialisiere Nachfass …"
     job.percent = 1
     job.filename_base = slugify_filename(campaign or "BatchFlow_Export")
 
     import asyncio
 
+    async def update_progress(phase: str, percent: int):
+        """Hilfsfunktion für sauberen UI-Fortschritt."""
+        job.phase = phase
+        job.percent = max(0, min(100, percent))
+        await asyncio.sleep(0.05)  # erlaubt dem UI, den Zwischenstand zu rendern
+
     async def _run():
         try:
-            job.phase = "Lade Nachfass-Daten …"
-            job.percent = 10
-            await _build_nf_master_final(nf_batch_ids, batch_id, campaign, job_obj=job)
-            job.phase = "Abgleich …"
-            job.percent = 45
-            await reconcile_with_progress(job, "nf")   
-            job.phase = "Excel …"
-            job.percent = 80
+            # ---------------------------
+            # 1. Lade Personen (Batch-ID Suche)
+            # ---------------------------
+            await update_progress("Lade Nachfass-Daten aus Pipedrive …", 5)
+            df = await _build_nf_master_final(nf_batch_ids, batch_id, campaign, job_obj=job)
+
+            if df.empty:
+                job.error = "Keine Personen für angegebene Batch-IDs gefunden."
+                job.phase = "Keine Daten"
+                job.percent = 100
+                job.done = True
+                return
+
+            total = len(df)
+            if total > 8000:
+                await update_progress(f"Reduziere Vergleichsdaten (nur 8000 von {total}) …", 30)
+                df = df.sample(8000, random_state=42)
+
+            # ---------------------------
+            # 2. Abgleich / Duplikate entfernen
+            # ---------------------------
+            await update_progress("Führe Abgleich durch (Organisationen & IDs) …", 55)
+            await reconcile_with_progress(job, "nf")
+
+            # ---------------------------
+            # 3. Excel-Datei erzeugen
+            # ---------------------------
+            await update_progress("Erzeuge Excel-Datei …", 80)
             ready = await load_df_text("nf_master_ready")
             export_df = build_export_from_ready(ready)
             data = _df_to_excel_bytes(export_df)
             path = f"/tmp/{job.filename_base}.xlsx"
+
+            # ---------------------------
+            # 4. Schreiben & Abschluss
+            # ---------------------------
+            await update_progress(f"Schreibe Datei ({len(export_df)} Zeilen) …", 90)
             with open(path, "wb") as f:
                 f.write(data)
+
+            await update_progress("Export abgeschlossen – Download startet gleich …", 100)
             job.total_rows = len(export_df)
             job.path = path
-            job.phase = f"Fertig – {job.total_rows} Zeilen"
-            job.percent = 100
             job.done = True
+
         except Exception as e:
             job.error = f"Fehler: {e}"
             job.phase = "Fehler"
@@ -1054,6 +1087,7 @@ async def export_start_nf(
 
     asyncio.create_task(_run())
     return JSONResponse({"job_id": job_id})
+
 
 # --- Ende Teil 4/5 ---
 # =============================================================================
@@ -1333,7 +1367,7 @@ async function startExportNf(){{const ids=_parseIDs(el('nf_batch_ids').value);if
   const{{job_id}}=await r.json();await poll(job_id);}}
 async function poll(job_id){{let done=false;while(!done){{await new Promise(r=>setTimeout(r,400));
   const r=await fetch('/nachfass/export_progress?job_id='+encodeURIComponent(job_id));
-  const s=await r.json();el('phase').textContent=s.phase||'…';setProgress(s.percent||0);if(s.done)done=true;}}
+  const s=await r.json();el('phase').textContent = (s.phase || '…') + ' (' + (s.percent || 0) + '%)';setProgress(s.percent||0);if(s.done)done=true;}}
   el('phase').textContent='Download startet …';setProgress(100);
   window.location.href='/nachfass/export_download?job_id='+job_id;
   setTimeout(()=>window.location.href='/nachfass/summary?job_id='+job_id,1000);
