@@ -16,6 +16,7 @@ import pandas as pd
 import httpx
 import asyncpg
 from rapidfuzz import fuzz, process
+fuzz.default_processor = lambda s: s
 from fastapi import FastAPI, Request, Body, Query, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -54,13 +55,13 @@ FIELD_FACHBEREICH_HINT = os.getenv("FIELD_FACHBEREICH_HINT", "fachbereich")
 
 DEFAULT_CHANNEL = "Cold E-Mail"
 PAGE_LIMIT = int(os.getenv("PAGE_LIMIT", "500"))
-NF_PAGE_LIMIT = int(os.getenv("NF_PAGE_LIMIT", "100"))
+NF_PAGE_LIMIT = int(os.getenv("NF_PAGE_LIMIT", "500"))
 NF_MAX_ROWS = int(os.getenv("NF_MAX_ROWS", "10000"))
 RECONCILE_MAX_ROWS = int(os.getenv("RECONCILE_MAX_ROWS", "20000"))
 PER_ORG_DEFAULT_LIMIT = int(os.getenv("PER_ORG_DEFAULT_LIMIT", "2"))
 PD_CONCURRENCY = int(os.getenv("PD_CONCURRENCY", "4"))
-MAX_ORG_NAMES = int(os.getenv("MAX_ORG_NAMES", "120000"))
-MAX_ORG_BUCKET = int(os.getenv("MAX_ORG_BUCKET", "15000"))
+MAX_ORG_NAMES = int(os.getenv("MAX_ORG_NAMES", "100000"))
+MAX_ORG_BUCKET = int(os.getenv("MAX_ORG_BUCKET", "12000"))
 
 # -----------------------------------------------------------------------------
 # Caches und Globals
@@ -611,6 +612,48 @@ async def _fetch_org_names_for_filter_capped(filter_id: int, page_limit: int, ca
                 if total >= cap_total:
                     return buckets
     return buckets
+# =============================================================================
+# PERFORMANCE-HELPERS – Cache, Fuzzy-Skip, Parallel IDs
+# =============================================================================
+from functools import lru_cache
+
+# --- Cache für Organisationsnamen (pro Filter-ID) ---
+_ORG_CACHE: Dict[int, List[str]] = {}
+
+async def get_org_cache(filter_id: int) -> List[str]:
+    """Lädt und cached Organisationen aus Pipedrive-Filter."""
+    if filter_id in _ORG_CACHE:
+        return _ORG_CACHE[filter_id]
+    names: List[str] = []
+    async for chunk in stream_organizations_by_filter(filter_id):
+        for o in chunk:
+            n = normalize_name(o.get("name") or "")
+            if n:
+                names.append(n)
+    _ORG_CACHE[filter_id] = names
+    return names
+
+# --- ID-Liste (1216/1708) parallel laden ---
+async def fetch_ids_parallel(ids: List[int]) -> set:
+    async def _fetch(fid: int) -> set:
+        out: set = set()
+        async for page in stream_person_ids_by_filter(fid):
+            out.update(page)
+        return out
+    results = await asyncio.gather(*[_fetch(fid) for fid in ids])
+    merged = set().union(*results)
+    return merged
+
+# --- schneller Vergleich (2-Buchstaben-Bucket) ---
+def bucket_key(name: str) -> str:
+    n = normalize_name(name)
+    if not n:
+        return ""
+    return n[:2] if len(n) > 1 else n
+
+# --- fuzzy ratio (schneller als token_sort_ratio) ---
+def fast_fuzzy(a: str, b: str) -> int:
+    return fuzz.partial_ratio(a, b)
 
 async def _reconcile_generic(prefix: str, job_obj=None):
     master = await load_df_text(f"{prefix}_master_final")
@@ -712,6 +755,90 @@ async def _reconcile_generic(prefix: str, job_obj=None):
     if job_obj:
         job_obj.phase = "Abgleich abgeschlossen"
         job_obj.percent = 85
+# =============================================================================
+# HIGH-PERFORMANCE RECONCILE
+# =============================================================================
+async def _reconcile(prefix: str) -> None:
+    """Optimierte Abgleich-Routine mit Caching, parallelem ID-Fetch & Fuzzy-Skip."""
+    t = tables(prefix)
+    master = await load_df_text(t["final"])
+    if master.empty:
+        await save_df_text(pd.DataFrame(), t["ready"])
+        await save_df_text(pd.DataFrame(columns=["reason","id","name","org_id","org_name","extra"]), t["log"])
+        return
+
+    col_person_id = "Person ID"
+    col_org_name = "Organisation Name"
+    col_org_id = "Organisation ID"
+    delete_rows: List[Dict[str, str]] = []
+
+    # === 1) Organisations-Dubletten vorbereiten ===
+    filter_ids_org = [1245]  # nur ein kombinierter Filter nutzen
+    buckets_all: Dict[str, List[str]] = {}
+
+    # Organisationen aus Cache laden
+    for fid in filter_ids_org:
+        names = await get_org_cache(fid)
+        for n in names:
+            b = bucket_key(n)
+            if not b:
+                continue
+            lst = buckets_all.setdefault(b, [])
+            if len(lst) < MAX_ORG_BUCKET:
+                lst.append(n)
+
+    # === 2) Orga-Fuzzy-Vergleich optimiert ===
+    drop_idx = []
+    for idx, row in master.iterrows():
+        cand = str(row.get(col_org_name) or "").strip()
+        cand_norm = normalize_name(cand)
+        if not cand_norm:
+            continue
+        if str(row.get(col_org_id) or "").strip():
+            # hat ID -> überspringen
+            continue
+        b = bucket_key(cand)
+        bucket = buckets_all.get(b)
+        if not bucket:
+            continue
+        near = [n for n in bucket if abs(len(n) - len(cand_norm)) <= 3]
+        if not near:
+            continue
+        best = process.extractOne(cand_norm, near, scorer=fast_fuzzy)
+        if best and best[1] >= 95:
+            drop_idx.append(idx)
+            delete_rows.append({
+                "reason": "org_match_95",
+                "id": str(row.get(col_person_id) or ""),
+                "name": f"{row.get('Person Vorname') or ''} {row.get('Person Nachname') or ''}".strip(),
+                "org_id": str(row.get(col_org_id) or ""),
+                "org_name": cand,
+                "extra": f"Best Match: {best[0]} ({best[1]}%)"
+            })
+
+    if drop_idx:
+        master = master.drop(index=drop_idx)
+
+    # === 3) Person-IDs parallel laden ===
+    suspect_ids = await fetch_ids_parallel([1216, 1708])
+    if suspect_ids:
+        mask_pid = master[col_person_id].astype(str).isin(suspect_ids)
+        removed = master[mask_pid].copy()
+        for _, r in removed.iterrows():
+            delete_rows.append({
+                "reason": "person_id_match",
+                "id": str(r.get(col_person_id) or ""),
+                "name": f"{r.get('Person Vorname') or ''} {r.get('Person Nachname') or ''}".strip(),
+                "org_id": str(r.get(col_org_id) or ""),
+                "org_name": str(r.get(col_org_name) or ""),
+                "extra": "ID in Filter 1216/1708"
+            })
+        master = master[~mask_pid].copy()
+
+    # === 4) Ergebnisse speichern ===
+    await save_df_text(master, t["ready"])
+    log_df = pd.DataFrame(delete_rows, columns=["reason","id","name","org_id","org_name","extra"])
+    await save_df_text(log_df, t["log"])
 
 # =============================================================================
 # Excel-Export
@@ -754,6 +881,40 @@ class Job:
         self.filename_base: str = "BatchFlow_Export"
 
 JOBS: Dict[str, Job] = {}
+# =============================================================================
+# JOB-PROGRESS HELPER
+# =============================================================================
+async def reconcile_with_progress(job: "Job", prefix: str):
+    """
+    Führt den optimierten _reconcile()-Lauf mit Fortschrittsmeldungen aus.
+    Aktualisiert job.phase und job.percent schrittweise.
+    """
+    try:
+        job.phase = "Lade Organisationsdaten …"; job.percent = 50
+        await asyncio.sleep(0.1)  # UI-Update erlauben
+        t = tables(prefix)
+        master = await load_df_text(t["final"])
+        if master.empty:
+            job.phase = "Keine Daten"; job.percent = 100
+            await save_df_text(pd.DataFrame(), t["ready"])
+            await save_df_text(pd.DataFrame(columns=["reason","id","name","org_id","org_name","extra"]), t["log"])
+            return
+
+        job.phase = "Vergleiche Organisationen …"; job.percent = 60
+        await asyncio.sleep(0.1)
+        await _reconcile(prefix)   # nutzt deinen optimierten Code
+
+        job.phase = "Prüfe Person-IDs …"; job.percent = 80
+        await asyncio.sleep(0.1)
+
+        job.phase = "Speichere Ergebnisse …"; job.percent = 90
+        await asyncio.sleep(0.1)
+
+        job.phase = "Fertig – Ergebnisse geschrieben"; job.percent = 100
+    except Exception as e:
+        job.error = f"Fehler beim Abgleich: {e}"
+        job.phase = "Fehler"
+        job.percent = 100
 
 # -----------------------------------------------------------------------------
 # Export-Start – Neukontakte
@@ -781,8 +942,8 @@ async def export_start_nk(
             job.percent = 10
             await _build_nk_master_final(fachbereich, take_count, batch_id, campaign, per_org_limit, job_obj=job)
             job.phase = "Abgleich …"
-            job.percent = 55
-            await _reconcile_generic("nk", job_obj=job)
+            job.percent = 45
+            await reconcile_with_progress(job, "nk")   
             job.phase = "Excel …"
             job.percent = 80
             ready = await load_df_text("nk_master_ready")
@@ -829,8 +990,8 @@ async def export_start_nf(
             job.percent = 10
             await _build_nf_master_final(nf_batch_ids, batch_id, campaign, job_obj=job)
             job.phase = "Abgleich …"
-            job.percent = 55
-            await _reconcile_generic("nf", job_obj=job)
+            job.percent = 45
+           await reconcile_with_progress(job, "nf")   
             job.phase = "Excel …"
             job.percent = 80
             ready = await load_df_text("nf_master_ready")
