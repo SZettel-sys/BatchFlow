@@ -991,7 +991,7 @@ async def export_start_nf(
             await _build_nf_master_final(nf_batch_ids, batch_id, campaign, job_obj=job)
             job.phase = "Abgleich …"
             job.percent = 45
-           await reconcile_with_progress(job, "nf")   
+            await reconcile_with_progress(job, "nf")   
             job.phase = "Excel …"
             job.percent = 80
             ready = await load_df_text("nf_master_ready")
