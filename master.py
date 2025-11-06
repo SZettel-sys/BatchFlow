@@ -1448,6 +1448,49 @@ async def nachfass_summary(job_id: str = Query(...)):
     <section style='margin-top:20px'>{table_html}</section>
     <a href='/campaign'>Zur Übersicht</a></main></body></html>"""
     return HTMLResponse(html)
+# ----------------------------------------------------------------------------- 
+# Fortschritt & Download – Nachfass & Neukontakte
+# -----------------------------------------------------------------------------
+@app.get("/nachfass/export_progress")
+async def nachfass_export_progress(job_id: str = Query(...)):
+    job = JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job nicht gefunden")
+    return JSONResponse({
+        "phase": job.phase,
+        "percent": job.percent,
+        "done": job.done,
+        "error": job.error,
+    })
+
+
+@app.get("/nachfass/export_download")
+async def nachfass_export_download(job_id: str = Query(...)):
+    job = JOBS.get(job_id)
+    if not job or not job.path:
+        raise HTTPException(status_code=404, detail="Datei nicht gefunden")
+    return FileResponse(job.path, filename=f"{job.filename_base}.xlsx", media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+
+@app.get("/neukontakte/export_progress")
+async def neukontakte_export_progress(job_id: str = Query(...)):
+    job = JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job nicht gefunden")
+    return JSONResponse({
+        "phase": job.phase,
+        "percent": job.percent,
+        "done": job.done,
+        "error": job.error,
+    })
+
+
+@app.get("/neukontakte/export_download")
+async def neukontakte_export_download(job_id: str = Query(...)):
+    job = JOBS.get(job_id)
+    if not job or not job.path:
+        raise HTTPException(status_code=404, detail="Datei nicht gefunden")
+    return FileResponse(job.path, filename=f"{job.filename_base}.xlsx", media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 # -----------------------------------------------------------------------------
 # Catch-All (kein Redirect-Loop)
