@@ -336,7 +336,7 @@ async def stream_person_ids_by_filter(filter_id: int, page_limit: int = PAGE_LIM
 # =============================================================================
 # Nachfass – Batch-ID-Stream (optimiert)
 # =============================================================================
-async def stream_persons_by_batch_id(batch_key: str, batch_ids: List[str], page_limit: int = NF_PAGE_LIMIT) -> AsyncGenerator[List[dict], None]:
+async def stream_persons_by_batch_id(batch_key: str, batch_ids: List[str], page_limit: int = NF_PAGE_LIMIT, job_obj=None, update_progress=None) -> AsyncGenerator[List[dict], None]:
     """
     Lädt Personen direkt über /persons/search für jede Batch-ID (mit Paging).
     Holt jeweils bis zu page_limit = 500 Datensätze pro Durchlauf.
@@ -363,9 +363,6 @@ async def stream_persons_by_batch_id(batch_key: str, batch_ids: List[str], page_
         # print(f"→ Streamed {total} Personen für Batch {bid}")
 
 
-# =============================================================================
-# Nachfass – Aufbau Master (direkte Batch-Selektion)
-# =============================================================================
 # =============================================================================
 # Nachfass – Aufbau Master (optimiert mit Parallelisierung)
 # =============================================================================
@@ -413,8 +410,11 @@ async def _build_nf_master_final(
     # Sammle Personen parallel pro Batch-ID
     # -------------------------------------------------------------------------
     async def collect_batch(bid: str) -> List[dict]:
-        persons = []
-        page = 0
+    persons = []
+    async for chunk in stream_persons_by_batch_id(batch_key, [bid], job_obj=job_obj, update_progress=update_progress):
+        persons.extend(chunk)
+    return persons
+
     async for chunk in stream_persons_by_batch_id(batch_key, [bid]):
         persons.extend(chunk)
         page += 1
@@ -948,9 +948,7 @@ async def reconcile_with_progress(job: "Job", prefix: str):
         job.phase = "Fehler"
         job.percent = 100
 
-# -----------------------------------------------------------------------------
-# Export-Start – Neukontakte
-# -----------------------------------------------------------------------------
+
 # -----------------------------------------------------------------------------
 # Export-Start – Neukontakte (mit dynamischem Fortschritt)
 # -----------------------------------------------------------------------------
@@ -971,10 +969,11 @@ async def export_start_nk(
 
     import asyncio
 
-    async def update_progress(phase: str, percent: int):
-        job.phase = phase
-        job.percent = max(0, min(100, percent))
-        await asyncio.sleep(0.05)  # UI-Refresh erlauben
+    async def update_progress(job, msg, percent):
+    if job:
+        job.phase = msg
+        job.percent = percent
+        await asyncio.sleep(0.05)
 
     async def _run():
         try:
