@@ -581,9 +581,17 @@ async def _build_nk_master_final(
     rows = []
     for p in selected:
         pid = p.get("id")
-        org = p.get("org_id") or {}
-        org_name = org.get("name") or p.get("org_name") or "-"
-        org_id = str(org.get("id") or "")
+        org_id = ""
+        org_name = "-"
+        org = p.get("org_id")
+        if isinstance(org, dict):
+            org_id = str(org.get("id") or org.get("value") or "").strip()
+            org_name = org.get("name") or p.get("org_name") or "-"
+        elif isinstance(org, (int, str)):
+            org_id = str(org).strip()
+            org_name = p.get("org_name") or "-"
+        else:
+            org_name = p.get("org_name") or "-"
         emails = _as_list_email(p.get("email"))
         email = emails[0] if emails else ""
         first = p.get("first_name") or ""
@@ -684,7 +692,11 @@ async def _reconcile_generic(prefix: str, job_obj=None):
         near = [n for n in bucket if abs(len(n) - len(norm)) <= 4]
         if not near:
             continue
-        best = process.extractOne(norm, near, scorer=fuzz.token_sort_ratio)
+        # Wenn eine Organisation ID existiert, kein Fuzzy-Abgleich nötig
+        if str(row.get(col_org_id) or "").strip():
+        continue
+        best = process.extractOne(norm, near, scorer=fuzz.token_set_ratio)
+    
         if best and best[1] >= 95:
             drop_idx.append(idx)
             delete_rows.append({
