@@ -18,7 +18,7 @@ import asyncpg
 from rapidfuzz import fuzz, process
 fuzz.default_processor = lambda s: s
 from fastapi import FastAPI, Request, Body, Query, HTTPException
-from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, FileResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.gzip import GZipMiddleware
 
@@ -1026,8 +1026,8 @@ async def export_start_nk(
 
     asyncio.create_task(_run())
     return JSONResponse({"job_id": job_id})
-# -----------------------------------------------------------------------------
-# Export-Start – Nachfass (mit dynamischem Fortschritt & klaren Phasen)
+# ----------------------------------------------------------------------------- 
+# Export-Start – Nachfass (stabil, speichert Excel im RAM, mit Fortschritt)
 # -----------------------------------------------------------------------------
 @app.post("/nachfass/export_start")
 async def export_start_nf(
@@ -1045,15 +1045,15 @@ async def export_start_nf(
     import asyncio
 
     async def update_progress(phase: str, percent: int):
-        """Hilfsfunktion für sauberen UI-Fortschritt."""
+        """Hilfsfunktion für sanfte Fortschrittsupdates im UI."""
         job.phase = phase
         job.percent = max(0, min(100, percent))
-        await asyncio.sleep(0.05)  # erlaubt dem UI, den Zwischenstand zu rendern
+        await asyncio.sleep(0.05)
 
     async def _run():
         try:
             # ---------------------------
-            # 1. Lade Personen (Batch-ID Suche)
+            # 1️⃣ Lade Personen nach Batch-ID
             # ---------------------------
             await update_progress("Lade Nachfass-Daten aus Pipedrive …", 5)
             df = await _build_nf_master_final(nf_batch_ids, batch_id, campaign, job_obj=job)
@@ -1071,31 +1071,27 @@ async def export_start_nf(
                 df = df.sample(8000, random_state=42)
 
             # ---------------------------
-            # 2. Abgleich / Duplikate entfernen
+            # 2️⃣ Abgleich / Dublettenprüfung
             # ---------------------------
-            await update_progress("Führe Abgleich durch (Organisationen & IDs) …", 55)
+            await update_progress("Führe Abgleich (Organisationen & IDs) durch …", 55)
             await reconcile_with_progress(job, "nf")
 
             # ---------------------------
-            # 3. Excel-Datei erzeugen
+            # 3️⃣ Excel im Arbeitsspeicher erzeugen
             # ---------------------------
             await update_progress("Erzeuge Excel-Datei …", 80)
             ready = await load_df_text("nf_master_ready")
             export_df = build_export_from_ready(ready)
-            data = _df_to_excel_bytes(export_df)
-            path = f"/tmp/{job.filename_base}.xlsx"
+            job.excel_bytes = _df_to_excel_bytes(export_df)  # RAM statt /tmp/
 
             # ---------------------------
-            # 4. Schreiben & Abschluss
+            # 4️⃣ Abschluss
             # ---------------------------
-            await update_progress(f"Schreibe Datei ({len(export_df)} Zeilen) …", 90)
-            with open(path, "wb") as f:
-                f.write(data)
-
-            await update_progress("Export abgeschlossen – Download startet gleich …", 100)
+            await update_progress(f"Export abgeschlossen – {len(export_df)} Zeilen", 100)
             job.total_rows = len(export_df)
-            job.path = path
             job.done = True
+
+            print(f"[Nachfass] Export abgeschlossen – {job.total_rows} Zeilen, Job-ID: {job_id}")
 
         except Exception as e:
             job.error = f"Fehler: {e}"
@@ -1105,6 +1101,7 @@ async def export_start_nf(
 
     asyncio.create_task(_run())
     return JSONResponse({"job_id": job_id})
+
 
 
 # --- Ende Teil 4/5 ---
@@ -1464,12 +1461,33 @@ async def nachfass_export_progress(job_id: str = Query(...)):
     })
 
 
+from fastapi.responses import StreamingResponse
+
 @app.get("/nachfass/export_download")
 async def nachfass_export_download(job_id: str = Query(...)):
     job = JOBS.get(job_id)
-    if not job or not job.path:
-        raise HTTPException(status_code=404, detail="Datei nicht gefunden")
-    return FileResponse(job.path, filename=f"{job.filename_base}.xlsx", media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    if not job:
+        raise HTTPException(status_code=404, detail="Job nicht gefunden")
+
+    # Excel direkt aus Arbeitsspeicher (RAM)
+    if getattr(job, "excel_bytes", None):
+        filename = f"{job.filename_base}.xlsx"
+        return StreamingResponse(
+            io.BytesIO(job.excel_bytes),
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
+
+    # Fallback, falls doch lokal geschrieben wurde
+    if job.path and os.path.exists(job.path):
+        return FileResponse(
+            job.path,
+            filename=f"{job.filename_base}.xlsx",
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+    raise HTTPException(status_code=404, detail="Datei nicht gefunden")
+
 
 
 @app.get("/neukontakte/export_progress")
