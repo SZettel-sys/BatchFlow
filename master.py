@@ -413,8 +413,8 @@ async def _build_nf_master_final(
     # Sammle Personen parallel pro Batch-ID
     # -------------------------------------------------------------------------
     async def collect_batch(bid: str) -> List[dict]:
-    persons = []
-    page = 0
+        persons = []
+        page = 0
     async for chunk in stream_persons_by_batch_id(batch_key, [bid]):
         persons.extend(chunk)
         page += 1
