@@ -978,6 +978,19 @@ async def export_start_nk(
 
     async def _run():
         try:
+            print("[Nachfass] _run() gestartet")
+            await update_progress("Lade Nachfass-Daten aus Pipedrive …", 5)
+            df = await _build_nf_master_final(nf_batch_ids, batch_id, campaign, job_obj=job)
+            print(f"[Nachfass] Fortschritt: {job.phase} ({job.percent}%)")
+
+            if df.empty:
+                job.error = "Keine Personen für angegebene Batch-IDs gefunden."
+                job.phase = "Keine Daten"
+                job.percent = 100
+                job.done = True
+                print("[Nachfass] Keine Daten gefunden, breche ab")
+            return
+            
             await update_progress("Lade Neukontakte aus Pipedrive …", 5)
             df = await _build_nk_master_final(
                 fachbereich, take_count, batch_id, campaign, per_org_limit, job_obj=job
