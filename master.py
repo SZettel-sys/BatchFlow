@@ -898,6 +898,168 @@ async def campaign_home():
       <a class="btn" href="/neukontakte?mode=refresh">Starten</a></div>
   </div>
 </main></body></html>""")
+# -----------------------------------------------------------------------------
+# UI – Neukontakte (Frontend)
+# -----------------------------------------------------------------------------
+@app.get("/neukontakte", response_class=HTMLResponse)
+async def neukontakte_page(request: Request, mode: str = Query("new")):
+    authed = bool(user_tokens.get("default") or PD_API_TOKEN)
+    authed_html = "<span class='muted'>angemeldet</span>" if authed else "<a href='/login'>Anmelden</a>"
+    return HTMLResponse(f"""<!doctype html><html lang="de">
+<head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Neukontakte – BatchFlow</title>
+<style>
+  body{{margin:0;background:#f6f8fb;color:#0f172a;font:16px/1.6 Inter,sans-serif}}
+  header{{background:#fff;border-bottom:1px solid #e2e8f0}}
+  .hwrap{{max-width:1120px;margin:0 auto;padding:14px 20px;display:flex;align-items:center;
+          justify-content:space-between;gap:12px}}
+  main{{max-width:1120px;margin:28px auto;padding:0 20px}}
+  .card{{background:#fff;border:1px solid #e2e8f0;border-radius:14px;padding:20px;box-shadow:0 2px 8px rgba(2,8,23,.04)}}
+  .grid{{display:grid;grid-template-columns:repeat(12,1fr);gap:16px}}
+  .col-3{{grid-column:span 3;min-width:220px}} .col-4{{grid-column:span 4;min-width:260px}}
+  .col-5{{grid-column:span 5;min-width:260px}} .col-6{{grid-column:span 6;min-width:260px}}
+  label{{display:block;font-weight:600;margin:8px 0 6px}} select,input{{width:100%;padding:10px 12px;
+  border:1px solid #cbd5e1;border-radius:10px;background:#fff}}
+  .btn{{background:#0ea5e9;border:none;color:#fff;border-radius:10px;padding:12px 16px;cursor:pointer}}
+  .btn:disabled{{opacity:.5;cursor:not-allowed}} .hint{{color:#64748b;font-size:13px;margin-top:6px}}
+  #overlay{{display:none;position:fixed;inset:0;background:rgba(255,255,255,.7);backdrop-filter:blur(2px);
+            z-index:9999;align-items:center;justify-content:center;flex-direction:column;gap:10px}}
+  .barwrap{{width:min(520px,90vw);height:10px;border-radius:999px;background:#e2e8f0;overflow:hidden}}
+  .bar{{height:100%;width:0%;background:#0ea5e9;transition:width .2s linear}}
+</style></head>
+<body>
+<header><div class="hwrap">
+  <div><a href="/campaign" style="color:#0a66c2;text-decoration:none">← Kampagne wählen</a></div>
+  <div><b>Neukontakte</b></div>
+  <div>{authed_html}</div>
+</div></header>
+
+<main><section class="card"><div class="grid">
+  <div class="col-3"><label>Kontakte pro Organisation</label>
+    <select id="per_org_limit"><option value="1">1</option><option value="2" selected>2</option><option value="3">3</option></select>
+    <div class="hint">Beispiel: 2</div></div>
+
+  <div class="col-5"><label>Fachbereich</label><select id="fachbereich"><option value="">– bitte auswählen –</option></select>
+    <div class="hint" id="fbinfo">Gesamt: …</div></div>
+
+  <div class="col-4"><label>Wie viele Datensätze?</label><input id="take_count" placeholder="z. B. 900" type="number"/>
+    <div class="hint">Leer = alle Datensätze.</div></div>
+
+  <div class="col-3"><label>Batch ID</label><input id="batch_id" placeholder="Bxxx"/></div>
+  <div class="col-6"><label>Kampagnenname</label><input id="campaign" placeholder="z. B. Frühling 2025"/></div>
+  <div class="col-3" style="display:flex;align-items:flex-end;justify-content:flex-end">
+    <button class="btn" id="btnExport" disabled>Abgleich & Download</button></div>
+</div></section></main>
+
+<div id="overlay"><div id="phase" style="color:#0f172a"></div>
+<div class="barwrap"><div class="bar" id="bar"></div></div></div>
+
+<script>
+const el = id => document.getElementById(id);
+const fbSel = el('fachbereich');
+const btn = el('btnExport');
+function showOverlay(msg){{el('phase').textContent=msg||'';el('overlay').style.display='flex';}}
+function hideOverlay(){{el('overlay').style.display='none';}}
+function setProgress(p){{el('bar').style.width=Math.max(0,Math.min(100,p))+'%';}}
+async function loadOptions(){{
+  showOverlay('Lade Fachbereiche …');setProgress(15);
+  const pol = el('per_org_limit').value;
+  const r = await fetch('/neukontakte/options?per_org_limit='+encodeURIComponent(pol));
+  const data = await r.json();
+  fbSel.innerHTML='<option value="">– bitte auswählen –</option>';
+  data.options.forEach(o=>{{const opt=document.createElement('option');opt.value=o.value;opt.textContent=o.label+' ('+o.count+')';fbSel.appendChild(opt);}});
+  hideOverlay();
+  fbSel.onchange=()=>btn.disabled=!fbSel.value;
+}}
+async function startExport(){{
+  const fb=fbSel.value; if(!fb)return alert('Bitte Fachbereich wählen');
+  const tc=el('take_count').value||null; const bid=el('batch_id').value||null;
+  const camp=el('campaign').value||null; const pol=parseInt(el('per_org_limit').value);
+  showOverlay('Starte Abgleich …');setProgress(5);
+  const r=await fetch('/neukontakte/export_start',{{method:'POST',headers:{{'Content-Type':'application/json'}},
+  body:JSON.stringify({{fachbereich:fb,take_count:tc?parseInt(tc):null,batch_id:bid,campaign:camp,per_org_limit:pol}})}}); 
+  if(!r.ok){{hideOverlay();return alert('Start fehlgeschlagen');}}
+  const{{job_id}}=await r.json();await poll(job_id);
+}}
+async function poll(job_id){{let done=false;while(!done){{await new Promise(r=>setTimeout(r,400));
+  const r=await fetch('/neukontakte/export_progress?job_id='+encodeURIComponent(job_id));
+  const s=await r.json();el('phase').textContent=s.phase||'…';setProgress(s.percent||0);if(s.done)done=true;}}
+  el('phase').textContent='Download startet …';setProgress(100);
+  window.location.href='/neukontakte/export_download?job_id='+job_id;
+  setTimeout(()=>window.location.href='/neukontakte/summary?job_id='+job_id,1000);
+}}
+el('btnExport').onclick=startExport;
+loadOptions();
+</script></body></html>""")
+
+# -----------------------------------------------------------------------------
+# UI – Nachfass (Frontend)
+# -----------------------------------------------------------------------------
+@app.get("/nachfass", response_class=HTMLResponse)
+async def nachfass_page(request: Request):
+    authed = bool(user_tokens.get("default") or PD_API_TOKEN)
+    authed_html = "<span class='muted'>angemeldet</span>" if authed else "<a href='/login'>Anmelden</a>"
+    return HTMLResponse(f"""<!doctype html><html lang="de">
+<head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Nachfass – BatchFlow</title>
+<style>
+  body{{margin:0;background:#f6f8fb;color:#0f172a;font:16px/1.6 Inter,sans-serif}}
+  header{{background:#fff;border-bottom:1px solid #e2e8f0}}
+  .hwrap{{max-width:1120px;margin:0 auto;padding:14px 20px;display:flex;align-items:center;
+          justify-content:space-between;gap:12px}}
+  main{{max-width:1120px;margin:28px auto;padding:0 20px}}
+  .card{{background:#fff;border:1px solid #e2e8f0;border-radius:14px;padding:20px;box-shadow:0 2px 8px rgba(2,8,23,.04)}}
+  .grid{{display:grid;grid-template-columns:repeat(12,1fr);gap:16px}}
+  .col-6{{grid-column:span 6;min-width:260px}} .col-3{{grid-column:span 3;min-width:220px}}
+  label{{display:block;font-weight:600;margin:8px 0 6px}} textarea,input{{width:100%;padding:10px 12px;
+  border:1px solid #cbd5e1;border-radius:10px;background:#fff}}
+  .btn{{background:#0ea5e9;border:none;color:#fff;border-radius:10px;padding:12px 16px;cursor:pointer}}
+  .btn:hover{{background:#0284c7}} .hint{{color:#64748b;font-size:13px;margin-top:6px}}
+  #overlay{{display:none;position:fixed;inset:0;background:rgba(255,255,255,.7);backdrop-filter:blur(2px);
+            z-index:9999;align-items:center;justify-content:center;flex-direction:column;gap:10px}}
+  .barwrap{{width:min(520px,90vw);height:10px;border-radius:999px;background:#e2e8f0;overflow:hidden}}
+  .bar{{height:100%;width:0%;background:#0ea5e9;transition:width .2s linear}}
+</style></head>
+<body>
+<header><div class="hwrap">
+  <div><a href="/campaign" style="color:#0a66c2;text-decoration:none">← Kampagne wählen</a></div>
+  <div><b>Nachfass</b></div>
+  <div>{authed_html}</div>
+</div></header>
+
+<main><section class="card"><div class="grid">
+  <div class="col-6"><label>Batch IDs (1–2 Werte)</label>
+    <textarea id="nf_batch_ids" rows="3" placeholder="z. B. B111, B222"></textarea>
+    <div class="hint">Komma oder Zeilenumbruch. Es wird auf Teilstring im Feld „Batch ID“ gematcht.</div></div>
+  <div class="col-3"><label>Batch ID (Export)</label><input id="batch_id" placeholder="B999"/></div>
+  <div class="col-3"><label>Kampagnenname</label><input id="campaign" placeholder="z. B. Folgewoche"/></div>
+  <div class="col-12" style="display:flex;justify-content:flex-end"><button class="btn" id="btnExportNf">Abgleich & Download</button></div>
+</div></section></main>
+
+<div id="overlay"><div id="phase" style="color:#0f172a"></div>
+<div class="barwrap"><div class="bar" id="bar"></div></div></div>
+
+<script>
+const el=id=>document.getElementById(id);
+function showOverlay(msg){{el('phase').textContent=msg||'';el('overlay').style.display='flex';}}
+function hideOverlay(){{el('overlay').style.display='none';}}
+function setProgress(p){{el('bar').style.width=Math.max(0,Math.min(100,p))+'%';}}
+function _parseIDs(raw){{return raw.split(/[\\n,;]/).map(s=>s.trim()).filter(Boolean).slice(0,2);}}
+async function startExportNf(){{const ids=_parseIDs(el('nf_batch_ids').value);if(ids.length===0)return alert('Bitte mindestens eine Batch ID angeben.');
+  const bid=el('batch_id').value||'';const camp=el('campaign').value||'';
+  showOverlay('Starte Abgleich …');setProgress(5);
+  const r=await fetch('/nachfass/export_start',{{method:'POST',headers:{{'Content-Type':'application/json'}},
+  body:JSON.stringify({{nf_batch_ids:ids,batch_id:bid,campaign:camp}})}});if(!r.ok)return alert('Start fehlgeschlagen');
+  const{{job_id}}=await r.json();await poll(job_id);}}
+async function poll(job_id){{let done=false;while(!done){{await new Promise(r=>setTimeout(r,400));
+  const r=await fetch('/nachfass/export_progress?job_id='+encodeURIComponent(job_id));
+  const s=await r.json();el('phase').textContent=s.phase||'…';setProgress(s.percent||0);if(s.done)done=true;}}
+  el('phase').textContent='Download startet …';setProgress(100);
+  window.location.href='/nachfass/export_download?job_id='+job_id;
+  setTimeout(()=>window.location.href='/nachfass/summary?job_id='+job_id,1000);
+}}
+el('btnExportNf').onclick=startExportNf;
+</script></body></html>""")
 
 # -----------------------------------------------------------------------------
 # Summary – Neukontakte
