@@ -1155,6 +1155,80 @@ async function poll(job_id){{let done=false;while(!done){{await new Promise(r=>s
 el('btnExport').onclick=startExport;
 loadOptions();
 </script></body></html>""")
+# =============================================================================
+# SCHNELLERE FACHBEREICHE (NEUKONTAKTE)
+# =============================================================================
+@app.get("/neukontakte/options")
+async def neukontakte_options(
+    per_org_limit: int = Query(PER_ORG_DEFAULT_LIMIT, ge=1, le=3),
+    mode: str = Query("new"),
+):
+    """
+    Schnellere Variante mit Sampling (max. 1000 Personen) und 1h Cache.
+    """
+    now = time.time()
+    cache = _OPTIONS_CACHE.get(per_org_limit) or {}
+    if cache.get("options") and (now - cache.get("ts", 0.0) < OPTIONS_TTL_SEC):
+        return JSONResponse({"total": cache["total"], "options": cache["options"]})
+
+    fb_field = await get_person_field_by_hint(FIELD_FACHBEREICH_HINT)
+    if not fb_field:
+        return JSONResponse({"total": 0, "options": []})
+
+    fb_key = fb_field.get("key")
+    id2label = {str(o["id"]): o["label"] for o in fb_field.get("options", []) if "id" in o}
+
+    total = 0
+    counts: Dict[str, int] = {}
+    used_by_fb: Dict[str, Dict[str, int]] = {}
+    start = 0
+    last_key = "last_activity_date"
+    next_key = "next_activity_date"
+
+    SAMPLE_MAX = 1000  # <- Nur 1000 Personen prüfen
+
+    while True:
+        url = append_token(f"{PIPEDRIVE_API}/persons?filter_id={FILTER_NEUKONTAKTE}&start={start}&limit={PAGE_LIMIT}")
+        r = await http_client().get(url, headers=get_headers())
+        if r.status_code != 200:
+            raise Exception(f"Pipedrive API Fehler: {r.text}")
+        chunk = r.json().get("data") or []
+        if not chunk:
+            break
+
+        for p in chunk:
+            val = p.get(last_key) or p.get(next_key)
+            if val and is_forbidden_activity_date(val):
+                continue
+
+            fb_val = p.get(fb_key)
+            if not fb_val:
+                continue
+            fb_vals = [str(fb_val[0])] if isinstance(fb_val, list) else [str(fb_val)]
+
+            org = p.get("org_id") or {}
+            org_key = str(org.get("id") or org.get("name") or "")
+            if not org_key:
+                org_key = f"noorg:{p.get('id')}"
+
+            fb = fb_vals[0]
+            used_map = used_by_fb.setdefault(fb, {})
+            used = used_map.get(org_key, 0)
+            if used >= per_org_limit:
+                continue
+            used_map[org_key] = used + 1
+            counts[fb] = counts.get(fb, 0) + 1
+            total += 1
+
+        start += len(chunk)
+        if len(chunk) < PAGE_LIMIT or total >= SAMPLE_MAX:
+            break
+
+    options = [{"value": k, "label": id2label.get(k, k), "count": v} for k, v in counts.items()]
+    options.sort(key=lambda x: x["count"], reverse=True)
+
+    _OPTIONS_CACHE[per_org_limit] = {"ts": now, "total": total, "options": options}
+    return JSONResponse({"total": total, "options": options})
 
 # -----------------------------------------------------------------------------
 # UI – Nachfass (Frontend)
