@@ -223,7 +223,7 @@ async def load_df_text(table: str) -> pd.DataFrame:
 
 # --- Ende Teil 1/5 ---
 # =============================================================================
-# Pipedrive-Funktionen & Personenfelder
+# Pipedrive-Funktionen & Personenfelder (optimiert)
 # =============================================================================
 def get_headers() -> Dict[str, str]:
     token = user_tokens.get("default", "")
@@ -241,6 +241,15 @@ def append_token(url: str) -> str:
         return f"{url}{sep}api_token={PD_API_TOKEN}"
     return url
 
+# =============================================================================
+# API Paging-Konfiguration
+# =============================================================================
+PAGE_LIMIT = int(os.getenv("PAGE_LIMIT", "500"))       # Neukontakte
+NF_PAGE_LIMIT = int(os.getenv("NF_PAGE_LIMIT", "500")) # Nachfass
+
+# =============================================================================
+# Personenfelder
+# =============================================================================
 async def get_person_fields() -> List[dict]:
     """Lädt Personenfelder (Cache)."""
     global _PERSON_FIELDS_CACHE
@@ -262,10 +271,12 @@ async def get_person_field_by_hint(label_hint: str) -> Optional[dict]:
     return None
 
 # =============================================================================
-# Allgemeine Stream-Funktionen (Pipedrive)
+# Personen-Streams mit Paging (optimiert)
 # =============================================================================
 async def stream_persons_by_filter(filter_id: int, page_limit: int = PAGE_LIMIT) -> AsyncGenerator[List[dict], None]:
+    """Streamt Personen aus einem Filter mit korrekter Paginierung."""
     start = 0
+    total = 0
     while True:
         url = append_token(f"{PIPEDRIVE_API}/persons?filter_id={filter_id}&start={start}&limit={page_limit}&sort=name")
         r = await http_client().get(url, headers=get_headers())
@@ -275,27 +286,35 @@ async def stream_persons_by_filter(filter_id: int, page_limit: int = PAGE_LIMIT)
         if not data:
             break
         yield data
+        total += len(data)
         if len(data) < page_limit:
             break
-        start += page_limit
+        start += len(data)
+    # print(f"→ Streamed {total} Personen aus Filter {filter_id}")
 
 async def stream_organizations_by_filter(filter_id: int, page_limit: int = PAGE_LIMIT):
+    """Streamt Organisationen aus einem Filter (mit Paging)."""
     start = 0
+    total = 0
     while True:
         url = append_token(f"{PIPEDRIVE_API}/organizations?filter_id={filter_id}&start={start}&limit={page_limit}")
         r = await http_client().get(url, headers=get_headers())
         if r.status_code != 200:
-            raise Exception(f"Pipedrive Fehler (Orgs {filter_id}): {r.text}")
+            raise Exception(f"Pipedrive API Fehler (Orgs {filter_id}): {r.text}")
         data = r.json().get("data") or []
         if not data:
             break
         yield data
+        total += len(data)
         if len(data) < page_limit:
             break
-        start += page_limit
+        start += len(data)
+    # print(f"→ Streamed {total} Organisationen aus Filter {filter_id}")
 
 async def stream_person_ids_by_filter(filter_id: int, page_limit: int = PAGE_LIMIT):
+    """Streamt nur Person-IDs (speicherschonend)."""
     start = 0
+    total = 0
     while True:
         url = append_token(f"{PIPEDRIVE_API}/persons?filter_id={filter_id}&start={start}&limit={page_limit}&sort=id")
         r = await http_client().get(url, headers=get_headers())
@@ -304,91 +323,43 @@ async def stream_person_ids_by_filter(filter_id: int, page_limit: int = PAGE_LIM
         data = r.json().get("data") or []
         if not data:
             break
-        yield [str(p.get("id")) for p in data if p.get("id") is not None]
+        ids = [str(p.get("id")) for p in data if p.get("id") is not None]
+        yield ids
+        total += len(ids)
         if len(data) < page_limit:
             break
-        start += page_limit
+        start += len(data)
+    # print(f"→ Streamed {total} Person-IDs aus Filter {filter_id}")
 
 # =============================================================================
-# Feld- und Options-Hilfen
+# Nachfass – Batch-ID-Stream (optimiert)
 # =============================================================================
-def field_options_id_to_label_map(field: dict) -> Dict[str, str]:
-    opts = field.get("options") or []
-    return {str(o.get("id")): str(o.get("label") or o.get("name") or o.get("id")) for o in opts}
-
-# =============================================================================
-# UI-Optionen für Neukontakte (Cache)
-# =============================================================================
-_OPTIONS_CACHE: Dict[int, dict] = {}
-OPTIONS_TTL_SEC = int(os.getenv("OPTIONS_TTL_SEC", "900"))
-
-@app.get("/neukontakte/options")
-async def neukontakte_options(per_org_limit: int = Query(PER_ORG_DEFAULT_LIMIT, ge=1, le=3)):
-    now = time.time()
-    cache = _OPTIONS_CACHE.get(per_org_limit) or {}
-    if cache.get("options") and (now - cache.get("ts", 0.0) < OPTIONS_TTL_SEC):
-        return JSONResponse({"total": cache["total"], "options": cache["options"]})
-
-    fb_field = await get_person_field_by_hint(FIELD_FACHBEREICH_HINT)
-    if not fb_field:
-        return JSONResponse({"total": 0, "options": []})
-    fb_key = fb_field.get("key")
-    id2label = field_options_id_to_label_map(fb_field)
-
-    # Zähle Datensätze pro Fachbereich mit Orga-Limit
-    total = 0
-    counts: Dict[str, int] = {}
-    used_by_fb: Dict[str, Dict[str, int]] = {}
-    async for chunk in stream_persons_by_filter(FILTER_NEUKONTAKTE):
-        for p in chunk:
-            fb_val = p.get(fb_key)
-            if not fb_val:
-                continue
-            fb_vals = [str(fb_val)] if not isinstance(fb_val, list) else [str(x) for x in fb_val]
-            org = p.get("org_id") or {}
-            org_key = f"id:{org.get('id')}" if org.get("id") else f"name:{normalize_name(org.get('name') or '')}"
-            for fb in fb_vals:
-                used = used_by_fb.setdefault(fb, {}).get(org_key, 0)
-                if used >= per_org_limit:
-                    continue
-                used_by_fb[fb][org_key] = used + 1
-                counts[fb] = counts.get(fb, 0) + 1
-                total += 1
-    options = [
-        {"value": fb, "label": id2label.get(str(fb), str(fb)), "count": cnt}
-        for fb, cnt in counts.items()
-    ]
-    options.sort(key=lambda x: x["count"], reverse=True)
-    _OPTIONS_CACHE[per_org_limit] = {"ts": now, "total": total, "options": options}
-    return JSONResponse({"total": total, "options": options})
-
-# --- Ende Teil 2/5 ---
-# =============================================================================
-# Nachfass – Direkte Batch-ID-Suche (/persons/search)
-# =============================================================================
-async def stream_persons_by_batch_id(batch_key: str, batch_ids: List[str],
-                                     page_limit: int = NF_PAGE_LIMIT) -> AsyncGenerator[List[dict], None]:
+async def stream_persons_by_batch_id(batch_key: str, batch_ids: List[str], page_limit: int = NF_PAGE_LIMIT) -> AsyncGenerator[List[dict], None]:
     """
-    Lädt Personen direkt über /persons/search für jede angegebene Batch-ID.
-    Das reduziert drastisch die Datenmenge (statt kompletter Filterdurchlauf).
+    Lädt Personen direkt über /persons/search für jede Batch-ID (mit Paging).
+    Holt jeweils bis zu page_limit = 500 Datensätze pro Durchlauf.
     """
     for bid in batch_ids:
         start = 0
+        total = 0
         while True:
             url = append_token(
                 f"{PIPEDRIVE_API}/persons/search?term={bid}&fields={batch_key}&start={start}&limit={page_limit}"
             )
             r = await http_client().get(url, headers=get_headers())
             if r.status_code != 200:
-                raise Exception(f"Pipedrive API Fehler bei Batch {bid}: {r.text}")
+                raise Exception(f"Pipedrive Fehler bei Batch {bid}: {r.text}")
             data = r.json().get("data", {}).get("items", [])
             if not data:
                 break
             persons = [it.get("item") for it in data if it.get("item")]
             yield persons
+            total += len(persons)
             if len(persons) < page_limit:
                 break
-            start += page_limit
+            start += len(persons)
+        # print(f"→ Streamed {total} Personen für Batch {bid}")
+
 
 # =============================================================================
 # Nachfass – Aufbau Master (direkte Batch-Selektion)
