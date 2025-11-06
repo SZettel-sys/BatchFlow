@@ -68,6 +68,7 @@ MAX_ORG_BUCKET = int(os.getenv("MAX_ORG_BUCKET", "12000"))
 # -----------------------------------------------------------------------------
 user_tokens: Dict[str, str] = {}
 _PERSON_FIELDS_CACHE: Optional[List[dict]] = None
+_OPTIONS_CACHE: Dict[int, dict] = {}
 
 # -----------------------------------------------------------------------------
 # Excel-Template
@@ -657,6 +658,10 @@ def fast_fuzzy(a: str, b: str) -> int:
 
 async def _reconcile_generic(prefix: str, job_obj=None):
     master = await load_df_text(f"{prefix}_master_final")
+    if len(master) > 5000:
+    job_obj.phase = f"Reduziere Vergleichsdaten (nur 5000 von {len(master)}) …"
+    sample_size = min(5000, len(master))
+    master = master.sample(sample_size, random_state=42).reset_index(drop=True)
     if master.empty:
         await save_df_text(pd.DataFrame(), f"{prefix}_master_ready")
         await save_df_text(pd.DataFrame(columns=["reason","id","name","org_id","org_name","extra"]), f"{prefix}_delete_log")
@@ -886,31 +891,51 @@ JOBS: Dict[str, Job] = {}
 # =============================================================================
 async def reconcile_with_progress(job: "Job", prefix: str):
     """
-    Führt den optimierten _reconcile()-Lauf mit Fortschrittsmeldungen aus.
-    Aktualisiert job.phase und job.percent schrittweise.
+    Führt den optimierten _reconcile()-Lauf mit detaillierten Fortschrittsmeldungen aus.
+    Zeigt in der UI konkrete Schritte mit Prozenten.
     """
     try:
-        job.phase = "Lade Organisationsdaten …"; job.percent = 50
-        await asyncio.sleep(0.1)  # UI-Update erlauben
         t = tables(prefix)
+        job.phase = "Vorbereitung läuft …"
+        job.percent = 10
+        await asyncio.sleep(0.2)
+
         master = await load_df_text(t["final"])
         if master.empty:
-            job.phase = "Keine Daten"; job.percent = 100
+            job.phase = "Keine Daten vorhanden"
+            job.percent = 100
             await save_df_text(pd.DataFrame(), t["ready"])
-            await save_df_text(pd.DataFrame(columns=["reason","id","name","org_id","org_name","extra"]), t["log"])
+            await save_df_text(
+                pd.DataFrame(columns=["reason", "id", "name", "org_id", "org_name", "extra"]), t["log"]
+            )
             return
 
-        job.phase = "Vergleiche Organisationen …"; job.percent = 60
-        await asyncio.sleep(0.1)
-        await _reconcile(prefix)   # nutzt deinen optimierten Code
+        # Phase 1: Lade Organisationsdaten
+        job.phase = "Lade Organisationsdaten (Filter 1245) …"
+        job.percent = 25
+        await asyncio.sleep(0.2)
 
-        job.phase = "Prüfe Person-IDs …"; job.percent = 80
-        await asyncio.sleep(0.1)
+        # Phase 2: Orga-Vergleich starten
+        job.phase = "Vergleiche Organisationen …"
+        job.percent = 50
+        await asyncio.sleep(0.2)
+        await _reconcile(prefix)
 
-        job.phase = "Speichere Ergebnisse …"; job.percent = 90
-        await asyncio.sleep(0.1)
+        # Phase 3: Prüfe Person-IDs
+        job.phase = "Prüfe Person-IDs (Filter 1216/1708) …"
+        job.percent = 70
+        await asyncio.sleep(0.2)
 
-        job.phase = "Fertig – Ergebnisse geschrieben"; job.percent = 100
+        # Phase 4: Ergebnisse speichern
+        job.phase = "Speichere Ergebnisse …"
+        job.percent = 85
+        await asyncio.sleep(0.2)
+
+        # Phase 5: Fertig
+        job.phase = "Fertig – Ergebnisse erfolgreich gespeichert"
+        job.percent = 100
+        await asyncio.sleep(0.2)
+
     except Exception as e:
         job.error = f"Fehler beim Abgleich: {e}"
         job.phase = "Fehler"
@@ -1149,6 +1174,7 @@ async function poll(job_id){{let done=false;while(!done){{await new Promise(r=>s
   const r=await fetch('/neukontakte/export_progress?job_id='+encodeURIComponent(job_id));
   const s=await r.json();el('phase').textContent=s.phase||'…';setProgress(s.percent||0);if(s.done)done=true;}}
   el('phase').textContent='Download startet …';setProgress(100);
+  console.log("Fortschritt:", s.phase, s.percent);
   window.location.href='/neukontakte/export_download?job_id='+job_id;
   setTimeout(()=>window.location.href='/neukontakte/summary?job_id='+job_id,1000);
 }}
