@@ -665,7 +665,7 @@ async def _reconcile_generic(prefix: str, job_obj=None):
             continue
         # Wenn eine Organisation ID existiert, kein Fuzzy-Abgleich nötig
         if str(row.get(col_org_id) or "").strip():
-        continue
+            continue
         best = process.extractOne(norm, near, scorer=fuzz.token_set_ratio)
     
         if best and best[1] >= 95:
