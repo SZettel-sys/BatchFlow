@@ -659,9 +659,9 @@ def fast_fuzzy(a: str, b: str) -> int:
 async def _reconcile_generic(prefix: str, job_obj=None):
     master = await load_df_text(f"{prefix}_master_final")
     if len(master) > 5000:
-    job_obj.phase = f"Reduziere Vergleichsdaten (nur 5000 von {len(master)}) …"
-    sample_size = min(5000, len(master))
-    master = master.sample(sample_size, random_state=42).reset_index(drop=True)
+        job_obj.phase = f"Reduziere Vergleichsdaten (nur 5000 von {len(master)}) …"
+        sample_size = min(5000, len(master))
+        master = master.sample(sample_size, random_state=42).reset_index(drop=True)
     if master.empty:
         await save_df_text(pd.DataFrame(), f"{prefix}_master_ready")
         await save_df_text(pd.DataFrame(columns=["reason","id","name","org_id","org_name","extra"]), f"{prefix}_delete_log")
@@ -944,6 +944,9 @@ async def reconcile_with_progress(job: "Job", prefix: str):
 # -----------------------------------------------------------------------------
 # Export-Start – Neukontakte
 # -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Export-Start – Neukontakte (mit dynamischem Fortschritt)
+# -----------------------------------------------------------------------------
 @app.post("/neukontakte/export_start")
 async def export_start_nk(
     fachbereich: str = Body(...),
@@ -961,27 +964,40 @@ async def export_start_nk(
 
     import asyncio
 
+    async def update_progress(phase: str, percent: int):
+        job.phase = phase
+        job.percent = max(0, min(100, percent))
+        await asyncio.sleep(0.05)  # UI-Refresh erlauben
+
     async def _run():
         try:
-            job.phase = "Lade Neukontakte …"
-            job.percent = 10
-            await _build_nk_master_final(fachbereich, take_count, batch_id, campaign, per_org_limit, job_obj=job)
-            job.phase = "Abgleich …"
-            job.percent = 45
-            await reconcile_with_progress(job, "nk")   
-            job.phase = "Excel …"
-            job.percent = 80
+            await update_progress("Lade Neukontakte aus Pipedrive …", 5)
+            df = await _build_nk_master_final(
+                fachbereich, take_count, batch_id, campaign, per_org_limit, job_obj=job
+            )
+
+            if job_obj and len(df) > 5000:
+                await update_progress(f"Reduziere Vergleichsdaten (nur 5000 von {len(df)}) …", 52)
+                df = df.sample(5000, random_state=42)
+
+            await update_progress("Abgleich (Organisationen & IDs) …", 60)
+            await reconcile_with_progress(job, "nk")
+
+            await update_progress("Erzeuge Excel-Datei …", 85)
             ready = await load_df_text("nk_master_ready")
             export_df = build_export_from_ready(ready)
             data = _df_to_excel_bytes(export_df)
             path = f"/tmp/{job.filename_base}.xlsx"
+
+            await update_progress(f"Schreibe Datei ({len(export_df)} Zeilen) …", 90)
             with open(path, "wb") as f:
                 f.write(data)
+
+            await update_progress("Export abgeschlossen – Download startet gleich …", 100)
             job.total_rows = len(export_df)
             job.path = path
-            job.phase = f"Fertig – {job.total_rows} Zeilen"
-            job.percent = 100
             job.done = True
+
         except Exception as e:
             job.error = f"Fehler: {e}"
             job.phase = "Fehler"
@@ -1172,7 +1188,7 @@ async function startExport(){{
 }}
 async function poll(job_id){{let done=false;while(!done){{await new Promise(r=>setTimeout(r,400));
   const r=await fetch('/neukontakte/export_progress?job_id='+encodeURIComponent(job_id));
-  const s=await r.json();el('phase').textContent=s.phase||'…';setProgress(s.percent||0);if(s.done)done=true;}}
+  const s=await r.json();el('phase').textContent = (s.phase || '…') + ' (' + (s.percent || 0) + '%)';setProgress(s.percent||0);if(s.done)done=true;}}
   el('phase').textContent='Download startet …';setProgress(100);
   console.log("Fortschritt:", s.phase, s.percent);
   window.location.href='/neukontakte/export_download?job_id='+job_id;
