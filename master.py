@@ -349,8 +349,6 @@ async def stream_persons_by_batch_id(batch_key: str, batch_ids: List[str], page_
                 f"{PIPEDRIVE_API}/persons/search?term={bid}&fields={batch_key}&start={start}&limit={page_limit}"
             )
             r = await http_client().get(url, headers=get_headers())
-            if job_obj and total % 500 == 0:
-                await update_progress(job_obj, f"Verarbeite Batch {bid} ({total} Datensätze) …", min(10 + total // 200, 45))
             if r.status_code != 200:
                 raise Exception(f"Pipedrive Fehler bei Batch {bid}: {r.text}")
             data = r.json().get("data", {}).get("items", [])
@@ -415,10 +413,17 @@ async def _build_nf_master_final(
     # Sammle Personen parallel pro Batch-ID
     # -------------------------------------------------------------------------
     async def collect_batch(bid: str) -> List[dict]:
-        persons = []
-        async for chunk in stream_persons_by_batch_id(batch_key, [bid]):
-            persons.extend(chunk)
-        return persons
+    persons = []
+    page = 0
+    async for chunk in stream_persons_by_batch_id(batch_key, [bid]):
+        persons.extend(chunk)
+        page += 1
+        if job_obj and page % 2 == 0:
+            job_obj.phase = f"Lade Batch {bid} – Seite {page} ({len(persons)} Personen)"
+            job_obj.percent = min(10 + (len(persons) // 300), 40)
+            await asyncio.sleep(0.05)  # Eventloop freigeben → Fortschritt sichtbar
+    return persons
+
 
     # Parallel alle Batch-IDs abfragen
     if job_obj:
