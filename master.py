@@ -62,6 +62,26 @@ TEMPLATE_COLUMNS = [
     "Person E-Mail","XING Profil","LinkedIn URL"
 ]
 
+# -----------------------------------------------------------------------------  
+# Feldzuordnung (Personenfelder → Excel-Spalten)  
+# -----------------------------------------------------------------------------  
+PERSON_FIELD_HINTS_TO_EXPORT = {
+    "prospect": "Prospect ID",
+    "gender": "Person Geschlecht",
+    "geschlecht": "Person Geschlecht",
+    "titel": "Person Titel",
+    "title": "Person Titel",
+    "anrede": "Person Titel",
+    "position": "Person Position",
+    "xing": "XING Profil",
+    "xing url": "XING Profil",
+    "xing profil": "XING Profil",
+    "linkedin": "LinkedIn URL",
+    "email büro": "Person E-Mail",
+    "email buero": "Person E-Mail",
+    "office email": "Person E-Mail",
+}
+
 # -----------------------------------------------------------------------------
 # Startup / Shutdown
 # -----------------------------------------------------------------------------
