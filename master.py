@@ -1071,10 +1071,26 @@ async def nachfass_summary(job_id: str = Query(...)):
     return HTMLResponse(html)
 
 # =============================================================================
-# Catch-All (Fallback)
+# Redirects & Fallbacks (fix für /overview & ungültige Pfade)
 # =============================================================================
+
+@app.get("/overview", response_class=HTMLResponse)
+async def overview_redirect():
+    """
+    Fängt alte oder externe Aufrufe von Pipedrive ab,
+    z. B. /overview?resource=person&view=list…
+    Leitet automatisch zur Kampagnenauswahl weiter.
+    """
+    return RedirectResponse("/campaign", status_code=302)
+
+
 @app.get("/{full_path:path}", include_in_schema=False)
 async def catch_all(full_path: str, request: Request):
+    """
+    Sauberer Fallback für alle unbekannten URLs:
+    - /overview    → wird separat abgefangen
+    - /irgendwas   → leitet automatisch auf /campaign
+    """
     if full_path in ("campaign", "", "/"):
-        return RedirectResponse("/campaign")
-    return HTMLResponse("<h3>BatchFlow läuft – Seite nicht gefunden.</h3>")
+        return RedirectResponse("/campaign", status_code=302)
+    return RedirectResponse("/campaign", status_code=302)
