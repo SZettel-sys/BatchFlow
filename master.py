@@ -311,7 +311,7 @@ async def _build_nf_master_final(
     hint_to_key: Dict[str, str] = {}
     for f in fields:
         nm = (f.get("name") or "").lower()
-        for hint in PERSON_FIELD_HINTS_TO_EXPORT.keys():
+        for hint in PERSON_FIELDS_HINTS_TO_EXPORT.keys():
             if hint in nm and hint not in hint_to_key:
                 hint_to_key[hint] = f.get("key")
 
@@ -331,16 +331,21 @@ async def _build_nf_master_final(
         return str(v)
 
     # ---------------------------------------------------------------------
+        # ---------------------------------------------------------------------
     async def collect_batch(bid: str) -> List[dict]:
         persons = []
         page = 0
         async for chunk in stream_persons_by_batch_id(batch_key, [bid]):
             persons.extend(chunk)
             page += 1
-            if job_obj and page % 2 == 0:
+            # 🔄 Fortschritt im Backend sichtbar machen
+            if job_obj:
                 job_obj.phase = f"Lade Batch {bid} – Seite {page} ({len(persons)} Personen)"
-                job_obj.percent = min(5 + (len(persons) // 300), 35)
-                await asyncio.sleep(0.05)
+                # Prozent dynamisch je Batch und Seite
+                job_obj.percent = min(5 + (len(persons) // 250), 45)
+            await asyncio.sleep(0.1)  # UI-Polling-Intervall
+        if job_obj:
+            job_obj.phase = f"Batch {bid} abgeschlossen – {len(persons)} Personen"
         return persons
 
     if job_obj:
@@ -1108,22 +1113,42 @@ async function startExportNf() {{
   }}
 }}
 
-async function poll(job_id) {{
-  let done=false;
-  while(!done){{
-    await new Promise(r=>setTimeout(r,600));
-    const r=await fetch('/nachfass/export_progress?job_id='+encodeURIComponent(job_id));
-    if(!r.ok) break;
-    const s=await r.json();
-    el('phase').textContent=(s.phase||'…')+' ('+(s.percent||0)+'%)';
-    setProgress(s.percent||0);
-    if(s.error){{alert(s.error);hideOverlay();return;}}
-    done=s.done;
-  }}
-  el('phase').textContent='Download startet …'; setProgress(100);
-  window.location.href='/nachfass/export_download?job_id='+encodeURIComponent(job_id);
-  setTimeout(()=>window.location.href='/nachfass/summary?job_id='+job_id,1500);
-}}
+<script>
+async function poll(job_id) {
+  let done = false;
+  let lastPhase = "";
+  while (!done) {
+    await new Promise(r => setTimeout(r, 600));
+    const r = await fetch('/nachfass/export_progress?job_id=' + encodeURIComponent(job_id));
+    if (!r.ok) break;
+    const s = await r.json();
+
+    // Aktualisiere Fortschrittstext nur, wenn er sich geändert hat
+    if (s.phase && s.phase !== lastPhase) {
+      console.log("Phase:", s.phase);
+      el('phase').textContent = s.phase + " (" + (s.percent || 0) + "%)";
+      lastPhase = s.phase;
+    }
+
+    // Fortschrittsbalken
+    setProgress(s.percent || 0);
+
+    if (s.error) {
+      alert(s.error);
+      hideOverlay();
+      return;
+    }
+    done = s.done;
+  }
+
+  // Abschlussanzeige
+  el('phase').textContent = "Download startet …";
+  setProgress(100);
+  window.location.href = '/nachfass/export_download?job_id=' + encodeURIComponent(job_id);
+  setTimeout(() => window.location.href = '/nachfass/summary?job_id=' + job_id, 1500);
+}
+</script>
+
 
 el('btnExportNf').addEventListener('click', startExportNf);
 </script></body></html>""")
