@@ -284,60 +284,68 @@ async def stream_persons_by_batch_id(
             start += len(persons)
 
 # =============================================================================
-# NACHFASS-MASTER (paralleler Aufbau, optimiert)
+# Nachfass – Aufbau Master (robust & progressiv)
 # =============================================================================
 async def _build_nf_master_final(
     nf_batch_ids: List[str],
     batch_id: str,
     campaign: str,
-    job_obj=None
+    job_obj=None,
 ) -> pd.DataFrame:
-    """
-    Erzeugt den Nachfass-Master: holt Personen nach Batch-ID, extrahiert relevante Felder
-    und speichert sie als Tabelle nf_master_final.
-    """
+    """Baut Nachfass-Daten mit Fortschritt & robuster Feldsuche."""
+    import asyncio
+
     fields = await get_person_fields()
+    batch_key = None
+    # 🔍 Batch-Feld tolerant finden
+    for f in fields:
+        nm = (f.get("name") or "").lower()
+        if any(x in nm for x in ("batch", "batchid", "batch id")):
+            batch_key = f.get("key")
+            break
 
-    # Suche Batch-ID-Feld
-    batch_key = next((f.get("key") for f in fields if "batch" in (f.get("name") or "").lower()), None)
     if not batch_key:
-        raise RuntimeError("Personenfeld 'Batch ID' wurde nicht gefunden.")
+        raise RuntimeError("Kein passendes Personenfeld für 'Batch ID' gefunden!")
 
-    # Feldmapping vorbereiten
+    # 🔑 Feldzuordnung vorbereiten
     hint_to_key: Dict[str, str] = {}
     for f in fields:
         nm = (f.get("name") or "").lower()
-        for hint in ["prospect", "gender", "geschlecht", "titel", "title", "anrede",
-                     "position", "xing", "xing url", "xing profil", "linkedin", "email büro", "email buero", "office email"]:
+        for hint in PERSON_FIELD_HINTS_TO_EXPORT.keys():
             if hint in nm and hint not in hint_to_key:
                 hint_to_key[hint] = f.get("key")
 
     def get_field(p: dict, hint: str) -> str:
-        """Sicherer Feldzugriff nach Hint."""
         key = hint_to_key.get(hint)
-        if not key: return ""
+        if not key:
+            return ""
         v = p.get(key)
         if isinstance(v, dict) and "label" in v:
             return str(v.get("label") or "")
         if isinstance(v, list):
             if v and isinstance(v[0], dict) and "value" in v[0]:
-                return str(v[0]["value"])
+                return str(v[0].get("value") or "")
             return ", ".join([str(x) for x in v if x])
-        return str(v or "")
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return ""
+        return str(v)
 
-    # ---------------------------------------------------------------
-    # Fortschritt initialisieren
-    # ---------------------------------------------------------------
-    if job_obj:
-        job_obj.phase = "Starte Batch-Datenabruf …"
-        job_obj.percent = 5
-
-    # Parallel alle Batch-IDs abrufen
+    # ---------------------------------------------------------------------
     async def collect_batch(bid: str) -> List[dict]:
         persons = []
-        async for chunk in stream_persons_by_batch_id(batch_key, [bid], job_obj=job_obj):
+        page = 0
+        async for chunk in stream_persons_by_batch_id(batch_key, [bid]):
             persons.extend(chunk)
+            page += 1
+            if job_obj and page % 2 == 0:
+                job_obj.phase = f"Lade Batch {bid} – Seite {page} ({len(persons)} Personen)"
+                job_obj.percent = min(5 + (len(persons) // 300), 35)
+                await asyncio.sleep(0.05)
         return persons
+
+    if job_obj:
+        job_obj.phase = "Starte parallele Batch-Abfragen …"
+        job_obj.percent = 5
 
     results = await asyncio.gather(
         *[collect_batch(bid) for bid in nf_batch_ids],
@@ -350,11 +358,11 @@ async def _build_nf_master_final(
         if isinstance(res, Exception):
             print(f"[WARN] Batch {nf_batch_ids[idx]} Fehler: {res}")
             continue
-
+        count = len(res)
+        print(f"[INFO] Batch {nf_batch_ids[idx]} → {count} Treffer")
         if job_obj:
-            job_obj.phase = f"Verarbeite Batch {nf_batch_ids[idx]} ({len(res)} Treffer)"
-            job_obj.percent = 15 + int((idx + 1) / len(results) * 20)
-
+            job_obj.phase = f"Verarbeite Batch {nf_batch_ids[idx]} ({count} Personen)"
+            job_obj.percent = 40 + int((idx + 1) / len(results) * 10)
         for p in res:
             if total >= NF_MAX_ROWS:
                 break
@@ -363,6 +371,8 @@ async def _build_nf_master_final(
             org_id = str(org.get("id") or "")
             emails = _as_list_email(p.get("email"))
             email = emails[0] if emails else ""
+            first = p.get("first_name") or ""
+            last = p.get("last_name") or ""
             rows.append({
                 "Batch ID": batch_id or "",
                 "Channel": DEFAULT_CHANNEL,
@@ -371,8 +381,8 @@ async def _build_nf_master_final(
                 "Organisation ID": org_id,
                 "Organisation Name": org_name,
                 "Person ID": str(p.get("id") or ""),
-                "Person Vorname": p.get("first_name") or "",
-                "Person Nachname": p.get("last_name") or "",
+                "Person Vorname": first,
+                "Person Nachname": last,
                 "Person Titel": get_field(p, "titel") or get_field(p, "title") or get_field(p, "anrede"),
                 "Person Geschlecht": get_field(p, "gender") or get_field(p, "geschlecht"),
                 "Person Position": get_field(p, "position"),
@@ -388,10 +398,10 @@ async def _build_nf_master_final(
     await save_df_text(df, "nf_master_final")
 
     if job_obj:
-        job_obj.phase = f"Daten gesammelt: {len(df)} Zeilen"
-        job_obj.percent = 40
-
+        job_obj.phase = f"Nachfass-Daten gesammelt: {len(df)} Zeilen"
+        job_obj.percent = 50
     return df
+
 # master_fixed_v2_part3.py — Teil 3/5
 # Neukontakte-Aufbau + Basis-Abgleich (Organisationen & Personen)
 
@@ -776,40 +786,51 @@ async def export_start_nf(
     job_id = str(uuid.uuid4())
     job = Job()
     JOBS[job_id] = job
-    job.phase = "Initialisiere Nachfass …"; job.percent = 1
+    job.phase = "Initialisiere Nachfass …"
+    job.percent = 1
     job.filename_base = slugify_filename(campaign or "BatchFlow_Export")
 
-    async def update_progress(phase: str, percent: int):
-        job.phase = phase
-        job.percent = min(100, max(0, percent))
+    import asyncio
+
+    async def update_progress(msg: str, pct: int):
+        job.phase = msg
+        job.percent = min(100, max(0, pct))
         await asyncio.sleep(0.05)
 
     async def _run():
         try:
-            # 1️⃣ Nachfassdaten sammeln
-            await update_progress("Lade Nachfass-Daten …", 5)
+            # 1️⃣ Lade Personen
+            await update_progress("Lade Nachfass-Daten aus Pipedrive …", 5)
             df = await _build_nf_master_final(nf_batch_ids, batch_id, campaign, job_obj=job)
 
             if df.empty:
                 job.error = "Keine Daten für Batch-ID(s) gefunden."
-                job.phase = "Keine Daten"; job.done = True; job.percent = 100
+                job.phase = "Keine Daten"
+                job.percent = 100
+                job.done = True
                 return
 
-            # 2️⃣ Abgleich durchführen
-            await update_progress("Führe Abgleich (Orga & IDs) durch …", 55)
+            total = len(df)
+            if total > 8000:
+                await update_progress(f"Reduziere Vergleichsdaten (nur 8000 von {total}) …", 40)
+                df = df.sample(8000, random_state=42)
+
+            # 2️⃣ Abgleich / Dublettenprüfung
+            await update_progress("Starte Abgleich (Organisationen & IDs) …", 55)
             await reconcile_with_progress(job, "nf")
 
-            # 3️⃣ Excel-Datei generieren (im RAM)
-            await update_progress("Erzeuge Excel-Datei …", 80)
+            # 3️⃣ Excel erzeugen
+            await update_progress("Erzeuge Excel-Datei …", 85)
             ready = await load_df_text("nf_master_ready")
             export_df = build_export_from_ready(ready)
             job.excel_bytes = _df_to_excel_bytes(export_df)
-            job.total_rows = len(export_df)
 
             # 4️⃣ Abschluss
-            await update_progress(f"Export abgeschlossen – {len(export_df)} Zeilen", 100)
+            await update_progress(f"Fertig – {len(export_df)} Zeilen exportiert", 100)
+            job.total_rows = len(export_df)
             job.done = True
-            print(f"[Nachfass] Export abgeschlossen ({len(export_df)} Zeilen) – Job-ID: {job_id}")
+            print(f"[Nachfass] Export abgeschlossen ({len(export_df)} Zeilen)")
+
         except Exception as e:
             job.error = f"Fehler: {e}"
             job.phase = "Fehler"
@@ -818,6 +839,7 @@ async def export_start_nf(
 
     asyncio.create_task(_run())
     return JSONResponse({"job_id": job_id})
+
 
 # =============================================================================
 # EXPORT-FORTSCHRITT & DOWNLOAD-ENDPUNKTE
