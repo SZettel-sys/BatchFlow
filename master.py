@@ -1087,49 +1087,59 @@ async def nachfass_page(request: Request):
 
 <script>
 const el = id => document.getElementById(id);
-function showOverlay(msg){{el('phase').textContent = msg || ''; el('overlay').style.display = 'flex';}}
-function hideOverlay(){{el('overlay').style.display = 'none';}}
-function setProgress(p){{el('bar').style.width = Math.max(0, Math.min(100, p)) + '%';}}
-function parseIDs(raw){{return raw.split(/[\\n,;]/).map(s=>s.trim()).filter(Boolean).slice(0,2);}}
 
-async function startExportNf() {{
-  const ids = parseIDs(el('nf_batch_ids').value);
-  if (ids.length === 0) return alert('Bitte mindestens eine Batch-ID angeben.');
+// Overlay Steuerung
+function showOverlay(msg) { el('phase').textContent = msg || ''; el('overlay').style.display = 'flex'; }
+function hideOverlay() { el('overlay').style.display = 'none'; }
+function setProgress(p) { el('bar').style.width = Math.max(0, Math.min(100, p)) + '%'; }
+
+// Batch IDs parsen (max. 2)
+function _parseIDs(raw) {
+  return raw.split(/[\n,;]/).map(s => s.trim()).filter(Boolean).slice(0, 2);
+}
+
+// Export starten
+async function startExportNf() {
+  const ids = _parseIDs(el('nf_batch_ids').value);
+  if (ids.length === 0) return alert('Bitte mindestens eine Batch ID angeben.');
   const bid = el('batch_id').value || '';
   const camp = el('campaign').value || '';
-  showOverlay('Starte Nachfass …'); setProgress(5);
-  try {{
-    const r = await fetch('/nachfass/export_start', {{
-      method:'POST',
-      headers:{{'Content-Type':'application/json'}},
-      body:JSON.stringify({{nf_batch_ids:ids,batch_id:bid,campaign:camp}})
-    }});
-    if(!r.ok) throw new Error('Start fehlgeschlagen.');
-    const {{job_id}} = await r.json();
-    await poll(job_id);
-  }} catch(e) {{
-    alert(e.message || 'Fehler beim Starten.');
-    hideOverlay();
-  }}
-}}
 
+  showOverlay('Starte Abgleich …');
+  setProgress(5);
+
+  try {
+    const r = await fetch('/nachfass/export_start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ nf_batch_ids: ids, batch_id: bid, campaign: camp })
+    });
+    if (!r.ok) throw new Error('Start fehlgeschlagen.');
+    const { job_id } = await r.json();
+    await poll(job_id);
+  } catch (err) {
+    alert(err.message || 'Fehler beim Starten.');
+    hideOverlay();
+  }
+}
+
+// Fortschritt regelmäßig abfragen
 async function poll(job_id) {
   let done = false;
-  let lastPhase = "";
+  let lastPhase = '';
   while (!done) {
     await new Promise(r => setTimeout(r, 600));
     const r = await fetch('/nachfass/export_progress?job_id=' + encodeURIComponent(job_id));
     if (!r.ok) break;
     const s = await r.json();
 
-    // Aktualisiere Fortschrittstext nur, wenn er sich geändert hat
+    // Fortschrittstext aktualisieren
     if (s.phase && s.phase !== lastPhase) {
-      console.log("Phase:", s.phase);
-      el('phase').textContent = s.phase + " (" + (s.percent || 0) + "%)";
+      el('phase').textContent = s.phase + ' (' + (s.percent || 0) + '%)';
       lastPhase = s.phase;
     }
 
-    // Fortschrittsbalken
+    // Balken bewegen
     setProgress(s.percent || 0);
 
     if (s.error) {
@@ -1137,18 +1147,21 @@ async function poll(job_id) {
       hideOverlay();
       return;
     }
+
     done = s.done;
   }
 
   // Abschlussanzeige
-  el('phase').textContent = "Download startet …";
+  el('phase').textContent = 'Download startet …';
   setProgress(100);
   window.location.href = '/nachfass/export_download?job_id=' + encodeURIComponent(job_id);
   setTimeout(() => window.location.href = '/nachfass/summary?job_id=' + job_id, 1500);
 }
 
+// Button aktivieren
 el('btnExportNf').addEventListener('click', startExportNf);
-</script></body></html>""")
+</script>
+</body></html>""")
 
 # =============================================================================
 # Summary-Seiten
