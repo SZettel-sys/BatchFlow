@@ -1113,7 +1113,6 @@ async function startExportNf() {{
   }}
 }}
 
-<script>
 async function poll(job_id) {
   let done = false;
   let lastPhase = "";
@@ -1147,8 +1146,6 @@ async function poll(job_id) {
   window.location.href = '/nachfass/export_download?job_id=' + encodeURIComponent(job_id);
   setTimeout(() => window.location.href = '/nachfass/summary?job_id=' + job_id, 1500);
 }
-</script>
-
 
 el('btnExportNf').addEventListener('click', startExportNf);
 </script></body></html>""")
