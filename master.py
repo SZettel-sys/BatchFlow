@@ -311,7 +311,7 @@ async def _build_nf_master_final(
     hint_to_key: Dict[str, str] = {}
     for f in fields:
         nm = (f.get("name") or "").lower()
-        for hint in PERSON_FIELDS_HINTS_TO_EXPORT.keys():
+        for hint in PERSON_FIELD_HINTS_TO_EXPORT.keys():
             if hint in nm and hint not in hint_to_key:
                 hint_to_key[hint] = f.get("key")
 
