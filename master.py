@@ -271,6 +271,7 @@ async def stream_persons_by_batch_id(
     page_limit: int = NF_PAGE_LIMIT,
     job_obj=None
 ) -> AsyncGenerator[List[dict], None]:
+    page_limit = min(page_limit, 100)
     """
     Holt Personen aus Pipedrive anhand der Batch-ID-Felder (term-Suche).
     Bei großen Datenmengen seitenweise (Paging) mit Fortschritt.
