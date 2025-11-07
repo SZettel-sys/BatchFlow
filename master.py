@@ -919,6 +919,94 @@ async def campaign_home():
 </main></body></html>""")
 
 # =============================================================================
+# Frontend – Neukontakte
+# =============================================================================
+@app.get("/neukontakte", response_class=HTMLResponse)
+async def neukontakte_page(request: Request, mode: str = Query("new")):
+    authed = bool(user_tokens.get("default") or PD_API_TOKEN)
+    authed_html = "<span class='muted'>angemeldet</span>" if authed else "<a href='/login'>Anmelden</a>"
+
+    return HTMLResponse(f"""<!doctype html><html lang="de">
+<head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Neukontakte – BatchFlow</title>
+<style>
+  body{{margin:0;background:#f6f8fb;color:#0f172a;font:16px/1.6 Inter,sans-serif}}
+  header{{background:#fff;border-bottom:1px solid #e2e8f0}}
+  .hwrap{{max-width:1120px;margin:0 auto;padding:14px 20px;display:flex;align-items:center;
+          justify-content:space-between;gap:12px}}
+  main{{max-width:1120px;margin:28px auto;padding:0 20px}}
+  .card{{background:#fff;border:1px solid #e2e8f0;border-radius:14px;padding:20px;
+         box-shadow:0 2px 8px rgba(2,8,23,.04)}}
+  .grid{{display:grid;grid-template-columns:repeat(12,1fr);gap:16px}}
+  label{{display:block;font-weight:600;margin:8px 0 6px}}
+  select,input{{width:100%;padding:10px 12px;border:1px solid #cbd5e1;border-radius:10px;background:#fff}}
+  .btn{{background:#0ea5e9;border:none;color:#fff;border-radius:10px;padding:12px 16px;cursor:pointer}}
+  .btn:disabled{{opacity:.5;cursor:not-allowed}}
+  #overlay{{display:none;position:fixed;inset:0;background:rgba(255,255,255,.7);backdrop-filter:blur(2px);
+            z-index:9999;align-items:center;justify-content:center;flex-direction:column;gap:10px}}
+  .barwrap{{width:min(520px,90vw);height:10px;border-radius:999px;background:#e2e8f0;overflow:hidden}}
+  .bar{{height:100%;width:0%;background:#0ea5e9;transition:width .2s linear}}
+</style>
+</head>
+<body>
+<header><div class="hwrap">
+  <div><a href="/campaign" style="color:#0a66c2;text-decoration:none">← Kampagne wählen</a></div>
+  <div><b>Neukontakte</b></div>
+  <div>{authed_html}</div>
+</div></header>
+
+<main><section class="card">
+  <div class="grid">
+    <div class="col-4"><label>Fachbereich</label>
+      <select id="fachbereich"><option value="">– bitte auswählen –</option></select></div>
+    <div class="col-3"><label>Batch ID</label><input id="batch_id" placeholder="Bxxx"/></div>
+    <div class="col-3"><label>Kampagne</label><input id="campaign" placeholder="z. B. Frühling 2025"/></div>
+    <div class="col-2" style="display:flex;align-items:flex-end;justify-content:flex-end">
+      <button class="btn" id="btnExport" disabled>Abgleich & Download</button>
+    </div>
+  </div>
+</section></main>
+
+<div id="overlay"><div id="phase"></div>
+<div class="barwrap"><div class="bar" id="bar"></div></div></div>
+
+<script>
+const el = id => document.getElementById(id);
+function showOverlay(msg){{el('phase').textContent=msg;el('overlay').style.display='flex';}}
+function setProgress(p){{el('bar').style.width=Math.min(100,Math.max(0,p))+'%';}}
+async function loadOptions(){{
+  showOverlay('Lade Fachbereiche …');setProgress(15);
+  const r=await fetch('/neukontakte/options');
+  const data=await r.json();
+  const sel=el('fachbereich');
+  sel.innerHTML='<option value="">– bitte auswählen –</option>';
+  data.options.forEach(o=>{{const opt=document.createElement('option');opt.value=o.value;
+    opt.textContent=o.label+' ('+o.count+')';sel.appendChild(opt);}});
+  el('overlay').style.display='none';
+  sel.onchange=()=>el('btnExport').disabled=!sel.value;
+}}
+async function startExport(){{
+  const fb=el('fachbereich').value;if(!fb)return alert('Bitte Fachbereich wählen');
+  const bid=el('batch_id').value;const camp=el('campaign').value;
+  showOverlay('Starte Export …');setProgress(10);
+  const r=await fetch('/neukontakte/export_start',{{method:'POST',
+    headers:{{'Content-Type':'application/json'}},
+    body:JSON.stringify({{fachbereich:fb,batch_id:bid,campaign:camp}})}}); 
+  if(!r.ok)return alert('Fehler beim Start');
+  const{{job_id}}=await r.json();
+  let done=false;while(!done){{await new Promise(r=>setTimeout(r,500));
+    const p=await fetch('/neukontakte/export_progress?job_id='+job_id);
+    const s=await p.json();el('phase').textContent=s.phase+' ('+s.percent+'%)';
+    setProgress(s.percent);done=s.done;}}
+  window.location.href='/neukontakte/export_download?job_id='+job_id;
+}}
+el('btnExport').onclick=startExport;
+loadOptions();
+</script>
+</body></html>""")
+
+
+# =============================================================================
 # Frontend – Nachfass
 # =============================================================================
 @app.get("/nachfass", response_class=HTMLResponse)
