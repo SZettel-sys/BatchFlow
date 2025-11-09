@@ -265,44 +265,34 @@ async def stream_person_ids_by_filter(filter_id: int, page_limit: int = PAGE_LIM
 # =============================================================================
 # STREAM – PERSONEN NACH BATCH-ID
 # =============================================================================
-async def stream_persons_by_batch_id(
-    batch_key: str,
-    batch_ids: List[str],
-    page_limit: int = NF_PAGE_LIMIT,
-    job_obj=None
-) -> AsyncGenerator[List[dict], None]:
-    page_limit = min(page_limit, 100)
-    """
-    Holt Personen aus Pipedrive anhand der Batch-ID-Felder (term-Suche).
-    Bei großen Datenmengen seitenweise (Paging) mit Fortschritt.
-    """
+async def stream_persons_by_batch_id(batch_key: str, batch_ids: List[str],
+                                     page_limit: int = 100, job_obj=None, update_progress=None) -> AsyncGenerator[List[dict], None]:
+    """Lädt Personen direkt über /persons/search (max 100 pro Seite)."""
     for bid in batch_ids:
         start = 0
         total = 0
         while True:
+            # --- korrigierte Version ---
             url = append_token(
-                f"{PIPEDRIVE_API}/persons/search?term={bid}&fields={batch_key}&start={start}&limit={page_limit}"
+                f"{PIPEDRIVE_API}/persons/search?term={bid}&fields=custom_fields&start={start}&limit=100"
             )
             r = await http_client().get(url, headers=get_headers())
             if r.status_code != 200:
-                raise Exception(f"Pipedrive Fehler bei Batch {bid}: {r.text}")
-
-            items = r.json().get("data", {}).get("items", [])
-            if not items:
+                print(f"[WARN] Batch {bid} Fehler: {r.text}")
+                break
+            data = r.json().get("data", {}).get("items", [])
+            if not data:
                 break
 
-            persons = [it.get("item") for it in items if it.get("item")]
+            persons = [it.get("item") for it in data if it.get("item")]
             yield persons
+
             total += len(persons)
-
-            if job_obj and total % 400 == 0:
-                job_obj.phase = f"Lade Batch {bid} – {total} Datensätze …"
-                job_obj.percent = min(10 + total // 250, 45)
-                await asyncio.sleep(0.05)
-
-            if len(persons) < page_limit:
+            if len(persons) < 100:
                 break
             start += len(persons)
+
+        print(f"[INFO] Batch {bid}: {total} Personen gefunden")
 
 # =============================================================================
 # Nachfass – Aufbau Master (robust & progressiv)
