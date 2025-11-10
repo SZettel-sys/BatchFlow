@@ -390,7 +390,13 @@ async def fetch_person_details(person_ids: List[str]) -> List[dict]:
 # =============================================================================
 # Nachfass – Aufbau Master (funktionierend & performant, wie in der alten Version)
 # =============================================================================
-async def _build_nf_master_final(nf_batch_ids: List[str], batch_id: str, campaign: str) -> pd.DataFrame:
+async def _build_nf_master_final(
+    nf_batch_ids: List[str],
+    batch_id: str,
+    campaign: str,
+    job_obj=None
+) -> pd.DataFrame:
+
     """Baut Nachfass-Daten (Batch-ID Filter) wie in der stabilen früheren Version."""
     person_fields = await get_person_fields()
 
