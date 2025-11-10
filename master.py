@@ -312,10 +312,31 @@ async def stream_persons_by_batch_id(
 
         print(f"[INFO] Batch {bid}: {total} Personen gefunden")
 
+# =============================================================================
+# Nachfass – Aufbau Master (robust, progressiv & vollständig)
+# =============================================================================
+import asyncio
 
-# =============================================================================
-# Nachfass – Aufbau Master (robust & progressiv)
-# =============================================================================
+async def fetch_person_details(person_ids: List[str]) -> List[dict]:
+    """Lädt vollständige Datensätze für Personen-IDs parallel."""
+    results = []
+    sem = asyncio.Semaphore(6)  # Max. 6 gleichzeitige Requests für Render
+
+    async def fetch_one(pid):
+        async with sem:
+            url = append_token(f"{PIPEDRIVE_API}/persons/{pid}")
+            r = await http_client().get(url, headers=get_headers())
+            if r.status_code == 200:
+                data = r.json().get("data")
+                if data:
+                    results.append(data)
+            await asyncio.sleep(0.05)  # Eventloop frei lassen
+
+    await asyncio.gather(*[fetch_one(pid) for pid in person_ids])
+    print(f"[DEBUG] Vollständige Personendaten geladen: {len(results)}")
+    return results
+
+
 async def _build_nf_master_final(
     nf_batch_ids: List[str],
     batch_id: str,
@@ -323,21 +344,19 @@ async def _build_nf_master_final(
     job_obj=None,
 ) -> pd.DataFrame:
     """Baut Nachfass-Daten mit Fortschritt & robuster Feldsuche."""
-    import asyncio
-
     fields = await get_person_fields()
+
+    # Batch-Feld tolerant finden
     batch_key = None
-    # 🔍 Batch-Feld tolerant finden
     for f in fields:
         nm = (f.get("name") or "").lower()
         if any(x in nm for x in ("batch", "batchid", "batch id")):
             batch_key = f.get("key")
             break
-
     if not batch_key:
-        raise RuntimeError("Kein passendes Personenfeld für 'Batch ID' gefunden!")
+        raise RuntimeError("Personenfeld „Batch ID“ wurde nicht gefunden.")
 
-    # 🔑 Feldzuordnung vorbereiten
+    # Feldzuordnung für Export
     hint_to_key: Dict[str, str] = {}
     for f in fields:
         nm = (f.get("name") or "").lower()
@@ -353,92 +372,161 @@ async def _build_nf_master_final(
         if isinstance(v, dict) and "label" in v:
             return str(v.get("label") or "")
         if isinstance(v, list):
-            if v and isinstance(v[0], dict) and "value" in v[0]:
-                return str(v[0].get("value") or "")
-            return ", ".join([str(x) for x in v if x])
+            vals = []
+            for x in v:
+                if isinstance(x, dict):
+                    x = x.get("value")
+                if x:
+                    vals.append(str(x))
+            return ", ".join(vals)
         if v is None or (isinstance(v, float) and pd.isna(v)):
             return ""
         return str(v)
 
-    # ---------------------------------------------------------------------
-        # ---------------------------------------------------------------------
-    async def collect_batch(bid: str) -> List[dict]:
-        persons = []
-        page = 0
-        async for chunk in stream_persons_by_batch_id(batch_key, [bid]):
-            persons.extend(chunk)
-            page += 1
-            # 🔄 Fortschritt im Backend sichtbar machen
-            if job_obj:
-                job_obj.phase = f"Lade Batch {bid} – Seite {page} ({len(persons)} Personen)"
-                # Prozent dynamisch je Batch und Seite
-                job_obj.percent = min(5 + (len(persons) // 250), 45)
-            await asyncio.sleep(0.1)  # UI-Polling-Intervall
-        if job_obj:
-            job_obj.phase = f"Batch {bid} abgeschlossen – {len(persons)} Personen"
-        return persons
+    persons: List[dict] = []
+    total = 0
+    page_count = 0
 
     if job_obj:
-        job_obj.phase = "Starte parallele Batch-Abfragen …"
+        job_obj.phase = "Starte Nachfass …"
         job_obj.percent = 5
 
-    results = await asyncio.gather(
-        *[collect_batch(bid) for bid in nf_batch_ids],
-        return_exceptions=True,
-    )
+    # Personen nach Batch-ID suchen
+    for bid in nf_batch_ids:
+        async for chunk in stream_persons_by_batch_id(batch_key, [bid]):
+            ids = [str(p.get("id")) for p in chunk if p.get("id")]
+            if not ids:
+                continue
 
-    rows: List[dict] = []
-    total = 0
-    for idx, res in enumerate(results):
-        if isinstance(res, Exception):
-            print(f"[WARN] Batch {nf_batch_ids[idx]} Fehler: {res}")
-            continue
-        count = len(res)
-        print(f"[INFO] Batch {nf_batch_ids[idx]} → {count} Treffer")
-        if job_obj:
-            job_obj.phase = f"Verarbeite Batch {nf_batch_ids[idx]} ({count} Personen)"
-            job_obj.percent = 40 + int((idx + 1) / len(results) * 10)
-        for p in res:
-            if total >= NF_MAX_ROWS:
-                break
-            org = p.get("org_id") or {}
-            org_name = org.get("name") or p.get("org_name") or "-"
-            org_id = str(org.get("id") or "")
-            emails = _as_list_email(p.get("email"))
-            email = emails[0] if emails else ""
-            first = p.get("first_name") or ""
-            last = p.get("last_name") or ""
-            rows.append({
-                "Batch ID": batch_id or "",
-                "Channel": DEFAULT_CHANNEL,
-                "Cold-Mailing Import": campaign or "",
-                "Prospect ID": get_field(p, "prospect"),
-                "Organisation ID": org_id,
-                "Organisation Name": org_name,
-                "Person ID": str(p.get("id") or ""),
-                "Person Vorname": first,
-                "Person Nachname": last,
-                "Person Titel": get_field(p, "titel") or get_field(p, "title") or get_field(p, "anrede"),
-                "Person Geschlecht": get_field(p, "gender") or get_field(p, "geschlecht"),
-                "Person Position": get_field(p, "position"),
-                "Person E-Mail": email,
-                "XING Profil": get_field(p, "xing") or get_field(p, "xing url") or get_field(p, "xing profil"),
-                "LinkedIn URL": get_field(p, "linkedin"),
-            })
-            total += 1
-        if total >= NF_MAX_ROWS:
-            break
+            # Details laden
+            details = await fetch_person_details(ids)
+            for p in details:
+                if str(p.get(batch_key)) not in nf_batch_ids:
+                    continue
+                persons.append(p)
+
+            total += len(details)
+            page_count += 1
+            if job_obj:
+                job_obj.phase = f"Lade Batch {bid} – Seite {page_count} ({total} Personen)"
+                job_obj.percent = min(10 + (total // 50), 40)
+            await asyncio.sleep(0.05)
+
+        print(f"[INFO] Batch {bid}: {total} Personen geladen.")
+
+    if not persons:
+        print("[WARN] Keine Personen gefunden.")
+        return pd.DataFrame(columns=TEMPLATE_COLUMNS)
+
+    # DataFrame aufbauen
+    rows = []
+    for p in persons:
+        org = p.get("org_id") or {}
+        org_name = org.get("name") or p.get("org_name") or "-"
+        org_id = str(org.get("id") or "")
+        emails = _as_list_email(p.get("email"))
+        email = emails[0] if emails else ""
+        first = p.get("first_name") or ""
+        last = p.get("last_name") or ""
+
+        rows.append({
+            "Batch ID": batch_id or "",
+            "Channel": DEFAULT_CHANNEL,
+            "Cold-Mailing Import": campaign or "",
+            "Prospect ID": get_field(p, "prospect"),
+            "Organisation ID": org_id,
+            "Organisation Name": org_name,
+            "Person ID": str(p.get("id") or ""),
+            "Person Vorname": first,
+            "Person Nachname": last,
+            "Person Titel": get_field(p, "titel") or get_field(p, "title") or get_field(p, "anrede"),
+            "Person Geschlecht": get_field(p, "gender") or get_field(p, "geschlecht"),
+            "Person Position": get_field(p, "position"),
+            "Person E-Mail": email,
+            "XING Profil": get_field(p, "xing") or get_field(p, "xing url") or get_field(p, "xing profil"),
+            "LinkedIn URL": get_field(p, "linkedin"),
+        })
 
     df = pd.DataFrame(rows, columns=TEMPLATE_COLUMNS)
+    print(f"[DEBUG] DataFrame für Nachfass: {len(df)} Zeilen × {len(df.columns)} Spalten")
+    print(f"[DEBUG] Beispielzeile: {df.head(1).to_dict(orient='records')}")
+
+    # In DB speichern
     await save_df_text(df, "nf_master_final")
 
     if job_obj:
-        job_obj.phase = f"Nachfass-Daten gesammelt: {len(df)} Zeilen"
-        job_obj.percent = 50
+        job_obj.phase = f"Nachfass abgeschlossen – {len(df)} Zeilen"
+        job_obj.percent = 45
+
     return df
 
-# master_fixed_v2_part3.py — Teil 3/5
-# Neukontakte-Aufbau + Basis-Abgleich (Organisationen & Personen)
+
+# =============================================================================
+# Export-Start – Nachfass (unverändert, ruft oben stehende Funktion auf)
+# =============================================================================
+@app.post("/nachfass/export_start")
+async def export_start_nf(
+    nf_batch_ids: List[str] = Body(..., embed=True),
+    batch_id: str = Body(...),
+    campaign: str = Body(...),
+):
+    job_id = str(uuid.uuid4())
+    job = Job()
+    JOBS[job_id] = job
+    job.phase = "Initialisiere Nachfass …"
+    job.percent = 1
+    job.filename_base = slugify_filename(campaign or "BatchFlow_Export")
+
+    async def update_progress(phase: str, percent: int):
+        job.phase = phase
+        job.percent = max(0, min(100, percent))
+        await asyncio.sleep(0.05)
+
+    async def _run():
+        try:
+            # 1️⃣ Lade Personen
+            await update_progress("Lade Nachfass-Daten aus Pipedrive …", 5)
+            df = await _build_nf_master_final(nf_batch_ids, batch_id, campaign, job_obj=job)
+
+            if df.empty:
+                job.error = "Keine Daten für Batch-ID(s) gefunden."
+                job.phase = "Keine Daten"
+                job.percent = 100
+                job.done = True
+                return
+
+            total = len(df)
+            if total > 8000:
+                await update_progress(f"Reduziere Vergleichsdaten (nur 8000 von {total}) …", 30)
+                df = df.sample(8000, random_state=42)
+
+            # 2️⃣ Abgleich / Dublettenprüfung
+            await update_progress("Führe Abgleich (Organisationen & IDs) durch …", 55)
+            await reconcile_with_progress(job, "nf")
+
+            # 3️⃣ Excel erzeugen
+            await update_progress("Erzeuge Excel-Datei …", 80)
+            ready = await load_df_text("nf_master_ready")
+            export_df = build_export_from_ready(ready)
+            job.excel_bytes = _df_to_excel_bytes(export_df)
+
+            # 4️⃣ Abschluss
+            await update_progress(f"Export abgeschlossen – {len(export_df)} Zeilen", 100)
+            job.total_rows = len(export_df)
+            job.done = True
+
+            print(f"[Nachfass] Export abgeschlossen – {job.total_rows} Zeilen, Job-ID: {job_id}")
+
+        except Exception as e:
+            job.error = f"Fehler: {e}"
+            job.phase = "Fehler"
+            job.percent = 100
+            job.done = True
+
+    asyncio.create_task(_run())
+    return JSONResponse({"job_id": job_id})
+
+
 
 # =============================================================================
 # NEUKONTAKTE – MASTER FINAL
