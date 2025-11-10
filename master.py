@@ -446,7 +446,19 @@ async def _build_nf_master_final(
                         print(f"[WARN] Fehler bei Page {start}: {r.text[:100]}")
                         return []
                     data = (r.json() or {}).get("data") or []
-                    return [p for p in data if str(p.get(batch_key, "")).strip() == str(bid)]
+                    valid = []
+                    for p in data:
+                        val = p.get(batch_key)
+                        if isinstance(val, dict):
+                            val = val.get("value")
+                        elif isinstance(val, list) and val:
+                            first = val[0]
+                            if isinstance(first, dict) and "value" in first:
+                                val = first["value"]
+                        if str(val or "").strip().lower() == str(bid).strip().lower():
+                            valid.append(p)
+                    return valid
+
                 except Exception as e:
                     print(f"[ERROR] Ausnahme bei fetch_page({start}): {e}")
                     return []
