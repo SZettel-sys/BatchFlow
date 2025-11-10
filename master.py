@@ -367,9 +367,8 @@ async def fetch_person_details(person_ids: List[str]) -> List[dict]:
     await asyncio.gather(*[fetch_one(pid) for pid in person_ids])
     print(f"[DEBUG] Vollständige Personendaten geladen: {len(results)}")
     return results
-
 # =============================================================================
-# Nachfass – Aufbau Master (schnell & vollständig)
+# Nachfass – Aufbau Master (robust, parallel & vollständig)
 # =============================================================================
 async def _build_nf_master_final(
     nf_batch_ids: List[str],
@@ -377,16 +376,17 @@ async def _build_nf_master_final(
     campaign: str,
     job_obj=None,
 ) -> pd.DataFrame:
-    """Baut Nachfass-Daten robust und performant (volle Felder, 500+ Zeilen)."""
+    """Baut Nachfass-Daten performant & robust – inkl. parallelem Abruf & Feldmapping."""
     import asyncio
 
     if job_obj:
         job_obj.phase = "Initialisiere Nachfass-Datenabruf …"
         job_obj.percent = 5
 
+    # -------------------------------------------------------------
+    # Personenfelder & Hilfsmapping vorbereiten
+    # -------------------------------------------------------------
     fields = await get_person_fields()
-
-    # Batch-ID-Feld automatisch erkennen
     batch_key = None
     for f in fields:
         nm = (f.get("name") or "").lower()
@@ -396,16 +396,15 @@ async def _build_nf_master_final(
     if not batch_key:
         raise RuntimeError("Batch-ID-Feld wurde in Pipedrive nicht gefunden.")
 
-    # Feld-Mapping für Export
     hint_to_key: Dict[str, str] = {}
     gender_map: Dict[str, str] = {}
+
     for f in fields:
         nm = (f.get("name") or "").lower()
         for hint in PERSON_FIELD_HINTS_TO_EXPORT.keys():
             if hint in nm and hint not in hint_to_key:
                 hint_to_key[hint] = f.get("key")
         if any(x in nm for x in ("gender", "geschlecht")):
-            # Mappe ID→Label für Geschlecht
             opts = f.get("options") or []
             gender_map = {str(o.get("id")): o.get("label") for o in opts if o.get("id")}
 
@@ -428,9 +427,139 @@ async def _build_nf_master_final(
             return gender_map.get(str(v), str(v))
         return str(v or "")
 
-# =============================================================================
-# Personen-Streaming (parallelisiert & asynchron)
-# =============================================================================
+    # -------------------------------------------------------------
+    # Personen aus Filter (parallel & robust)
+    # -------------------------------------------------------------
+    async def stream_persons_for_batch(bid: str) -> List[dict]:
+        persons: List[dict] = []
+        sem = asyncio.Semaphore(12)  # max. gleichzeitige Requests
+
+        async def fetch_page(start: int):
+            async with sem:
+                try:
+                    url = append_token(
+                        f"{PIPEDRIVE_API}/persons?filter_id={FILTER_NACHFASS}"
+                        f"&start={start}&limit={NF_PAGE_LIMIT}&sort=id"
+                    )
+                    r = await http_client().get(url, headers=get_headers())
+                    if r.status_code != 200:
+                        print(f"[WARN] Fehler bei Page {start}: {r.text[:100]}")
+                        return []
+                    data = (r.json() or {}).get("data") or []
+                    return [p for p in data if str(p.get(batch_key, "")).strip() == str(bid)]
+                except Exception as e:
+                    print(f"[ERROR] Ausnahme bei fetch_page({start}): {e}")
+                    return []
+
+        try:
+            url0 = append_token(
+                f"{PIPEDRIVE_API}/persons?filter_id={FILTER_NACHFASS}&start=0&limit={NF_PAGE_LIMIT}&sort=id"
+            )
+            r0 = await http_client().get(url0, headers=get_headers())
+            if r0.status_code != 200:
+                print(f"[WARN] Fehler beim Initialabruf für Batch {bid}: {r0.text[:100]}")
+                return []
+
+            data0 = (r0.json() or {}).get("data") or []
+            if not data0:
+                print(f"[INFO] Keine Personen im Filter {FILTER_NACHFASS} gefunden.")
+                return []
+
+            persons.extend([p for p in data0 if str(p.get(batch_key, "")) == str(bid)])
+
+            # Falls mehr Seiten existieren – parallel laden
+            if len(data0) == NF_PAGE_LIMIT:
+                starts = list(range(NF_PAGE_LIMIT, NF_PAGE_LIMIT * 20, NF_PAGE_LIMIT))
+                results = await asyncio.gather(*[fetch_page(s) for s in starts])
+                for chunk in results:
+                    if chunk:
+                        persons.extend(chunk)
+
+            print(f"[INFO] Batch {bid}: {len(persons)} Personen geladen.")
+            return persons
+
+        except Exception as e:
+            print(f"[ERROR] stream_persons_for_batch({bid}) fehlgeschlagen: {e}")
+            return []
+
+    # -------------------------------------------------------------
+    # Paralleles Laden mehrerer Batch-IDs
+    # -------------------------------------------------------------
+    if job_obj:
+        job_obj.phase = "Lade Nachfass-Personen (Pipedrive)…"
+        job_obj.percent = 15
+
+    sem = asyncio.Semaphore(8)
+
+    async def safe_fetch(bid):
+        async with sem:
+            try:
+                return await stream_persons_for_batch(bid)
+            except Exception as e:
+                print(f"[WARN] Batch {bid} Fehler: {e}")
+                return []
+
+    results = await asyncio.gather(*(safe_fetch(bid) for bid in nf_batch_ids))
+    persons = [p for sub in results if sub for p in sub]
+    total = len(persons)
+    if job_obj:
+        job_obj.phase = f"{total} Nachfass-Personen gesammelt"
+        job_obj.percent = 40
+
+    # -------------------------------------------------------------
+    # Zu DataFrame konvertieren
+    # -------------------------------------------------------------
+    rows: List[dict] = []
+    for p in persons or []:
+        try:
+            org = p.get("org_id") or {}
+            org_name = org.get("name") or p.get("org_name") or "-"
+            org_id = str(org.get("id") or "")
+            emails = _as_list_email(p.get("email"))
+            email = emails[0] if emails else ""
+            first = p.get("first_name") or ""
+            last = p.get("last_name") or ""
+
+            rows.append({
+                "Batch ID": batch_id or "",
+                "Channel": DEFAULT_CHANNEL,
+                "Cold-Mailing Import": campaign or "",
+                "Prospect ID": get_field(p, "prospect"),
+                "Organisation ID": org_id,
+                "Organisation Name": org_name,
+                "Person ID": str(p.get("id") or ""),
+                "Person Vorname": first,
+                "Person Nachname": last,
+                "Person Titel": get_field(p, "titel") or get_field(p, "title") or get_field(p, "anrede"),
+                "Person Geschlecht": get_field(p, "gender") or get_field(p, "geschlecht"),
+                "Person Position": get_field(p, "position"),
+                "Person E-Mail": email,
+                "XING Profil": get_field(p, "xing") or get_field(p, "xing url") or get_field(p, "xing profil"),
+                "LinkedIn URL": get_field(p, "linkedin"),
+            })
+        except Exception as e:
+            print(f"[WARN] Fehler bei Personendatensatz: {e}")
+
+    # Leeres DataFrame als Fallback
+    df = pd.DataFrame(rows, columns=TEMPLATE_COLUMNS)
+    if df is None:
+        print("[ERROR] _build_nf_master_final hat kein DataFrame erzeugt!")
+        df = pd.DataFrame(columns=TEMPLATE_COLUMNS)
+
+    # Speichern
+    try:
+        await save_df_text(df, "nf_master_final")
+        print(f"[INFO] Nachfass Export abgeschlossen ({len(df)} Zeilen)")
+    except Exception as e:
+        print(f"[ERROR] Speichern fehlgeschlagen: {e}")
+
+    if job_obj:
+        job_obj.phase = f"Daten gespeichert ({len(df)} Zeilen)"
+        job_obj.percent = 60
+
+    return df
+
+
 # =============================================================================
 # Personen-Streaming (parallelisiert & robust)
 # =============================================================================
