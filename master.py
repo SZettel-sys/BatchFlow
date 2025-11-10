@@ -337,22 +337,24 @@ async def fetch_person_details(person_ids: List[str]) -> List[dict]:
     return results
 
 # =============================================================================
-# Nachfass build_nf
+# Nachfass – Aufbau Master (schnell & vollständig)
 # =============================================================================
-import asyncio
-
 async def _build_nf_master_final(
     nf_batch_ids: List[str],
     batch_id: str,
     campaign: str,
     job_obj=None,
 ) -> pd.DataFrame:
-    """Baut Nachfass-Daten mit korrekter Feldzuordnung & Paging."""
+    """Baut Nachfass-Daten robust und performant (volle Felder, 500+ Zeilen)."""
+    import asyncio
+
+    if job_obj:
+        job_obj.phase = "Initialisiere Nachfass-Datenabruf …"
+        job_obj.percent = 5
+
     fields = await get_person_fields()
 
-    # ----------------------------------------------
-    # Batch-Feld tolerant finden
-    # ----------------------------------------------
+    # Batch-ID-Feld automatisch erkennen
     batch_key = None
     for f in fields:
         nm = (f.get("name") or "").lower()
@@ -360,21 +362,18 @@ async def _build_nf_master_final(
             batch_key = f.get("key")
             break
     if not batch_key:
-        raise RuntimeError("Personenfeld 'Batch ID' wurde nicht gefunden.")
+        raise RuntimeError("Batch-ID-Feld wurde in Pipedrive nicht gefunden.")
 
-    # ----------------------------------------------
-    # Feldzuordnung (inkl. Geschlecht-Map)
-    # ----------------------------------------------
+    # Feld-Mapping für Export
     hint_to_key: Dict[str, str] = {}
     gender_map: Dict[str, str] = {}
-
     for f in fields:
         nm = (f.get("name") or "").lower()
         for hint in PERSON_FIELD_HINTS_TO_EXPORT.keys():
             if hint in nm and hint not in hint_to_key:
                 hint_to_key[hint] = f.get("key")
-        # Geschlecht: Pipedrive options → Label
-        if "geschlecht" in nm or "gender" in nm:
+        if any(x in nm for x in ("gender", "geschlecht")):
+            # Mappe ID→Label für Geschlecht
             opts = f.get("options") or []
             gender_map = {str(o.get("id")): o.get("label") for o in opts if o.get("id")}
 
@@ -383,70 +382,82 @@ async def _build_nf_master_final(
         if not key:
             return ""
         v = p.get(key)
-        if isinstance(v, dict):
-            return str(v.get("label") or v.get("value") or "")
+        if isinstance(v, dict) and "label" in v:
+            return str(v["label"] or "")
         if isinstance(v, list):
             vals = []
             for x in v:
-                if isinstance(x, dict):
-                    x = x.get("label") or x.get("value")
-                if x:
-                    vals.append(str(x))
+                if isinstance(x, dict) and "value" in x:
+                    vals.append(str(x["value"]))
+                elif isinstance(x, str):
+                    vals.append(x)
             return ", ".join(vals)
-        if v is None or (isinstance(v, float) and pd.isna(v)):
-            return ""
-        sv = str(v)
         if hint in ("gender", "geschlecht") and gender_map:
-            return gender_map.get(sv, sv)
-        return sv
+            return gender_map.get(str(v), str(v))
+        return str(v or "")
 
-    persons = []
-    total = 0
-
-    if job_obj:
-        job_obj.phase = "Lade Nachfass-Daten …"
-        job_obj.percent = 5
-
-    # ----------------------------------------------
-    # Personen über Filter mit Batch-ID laden
-    # ----------------------------------------------
-    for bid in nf_batch_ids:
+    # -------------------------------------------------------------------------
+    # Personen-Streaming (Filter-basiert, sehr schnell)
+    # -------------------------------------------------------------------------
+    async def stream_persons_for_batch(bid: str) -> List[dict]:
+        persons = []
         start = 0
         while True:
             url = append_token(
-                f"{PIPEDRIVE_API}/persons?start={start}&limit=500&sort=id&"
-                f"filter_id={FILTER_NACHFASS}"
+                f"{PIPEDRIVE_API}/persons?filter_id={FILTER_NACHFASS}&start={start}&limit={NF_PAGE_LIMIT}&sort=id"
             )
             r = await http_client().get(url, headers=get_headers())
             if r.status_code != 200:
-                raise RuntimeError(f"Pipedrive-Fehler bei Batch {bid}: {r.text}")
+                raise Exception(f"Pipedrive Fehler bei Batch {bid}: {r.text}")
             data = r.json().get("data") or []
             if not data:
                 break
-            # Nur Personen mit passender Batch-ID
-            for p in data:
-                if str(p.get(batch_key)) == bid:
-                    persons.append(p)
-            total += len(data)
-            start += len(data)
-            if len(data) < 500:
+            # Nur Personen behalten, deren Batch-Feld exakt matcht
+            persons.extend(
+                [p for p in data if str(p.get(batch_key, "")).strip() == str(bid)]
+            )
+            if len(data) < NF_PAGE_LIMIT:
                 break
-        print(f"[INFO] Batch {bid}: {len(persons)} Personen gesammelt")
+            start += NF_PAGE_LIMIT
+        print(f"[INFO] Batch {bid}: {len(persons)} Personen gefunden")
+        return persons
 
-    if not persons:
-        print("[WARN] Keine Personen für Nachfass gefunden.")
-        return pd.DataFrame(columns=TEMPLATE_COLUMNS)
+    # -------------------------------------------------------------------------
+    # Parallel mehrere Batch-IDs laden
+    # -------------------------------------------------------------------------
+    if job_obj:
+        job_obj.phase = "Lade Nachfass-Personen (Pipedrive)…"
+        job_obj.percent = 10
 
-    # ----------------------------------------------
-    # DataFrame aufbauen
-    # ----------------------------------------------
-    rows = []
+    sem = asyncio.Semaphore(12)  # gute Balance zwischen Speed & Rate-Limit
+
+    async def safe_fetch(bid):
+        async with sem:
+            try:
+                return await stream_persons_for_batch(bid)
+            except Exception as e:
+                print(f"[WARN] Batch {bid} Fehler: {e}")
+                return []
+
+    results = await asyncio.gather(*(safe_fetch(bid) for bid in nf_batch_ids))
+    persons = [p for sub in results for p in sub]
+    total = len(persons)
+    if job_obj:
+        job_obj.phase = f"{total} Nachfass-Personen gesammelt"
+        job_obj.percent = 40
+
+    # -------------------------------------------------------------------------
+    # Zu DataFrame konvertieren
+    # -------------------------------------------------------------------------
+    rows: List[dict] = []
     for p in persons:
         org = p.get("org_id") or {}
-        org_id = str(org.get("id") or org.get("value") or "")
         org_name = org.get("name") or p.get("org_name") or "-"
+        org_id = str(org.get("id") or "")
         emails = _as_list_email(p.get("email"))
         email = emails[0] if emails else ""
+        first = p.get("first_name") or ""
+        last = p.get("last_name") or ""
 
         rows.append({
             "Batch ID": batch_id or "",
@@ -456,8 +467,8 @@ async def _build_nf_master_final(
             "Organisation ID": org_id,
             "Organisation Name": org_name,
             "Person ID": str(p.get("id") or ""),
-            "Person Vorname": p.get("first_name") or "",
-            "Person Nachname": p.get("last_name") or "",
+            "Person Vorname": first,
+            "Person Nachname": last,
             "Person Titel": get_field(p, "titel") or get_field(p, "title") or get_field(p, "anrede"),
             "Person Geschlecht": get_field(p, "gender") or get_field(p, "geschlecht"),
             "Person Position": get_field(p, "position"),
@@ -467,15 +478,17 @@ async def _build_nf_master_final(
         })
 
     df = pd.DataFrame(rows, columns=TEMPLATE_COLUMNS)
+    print(f"[Nachfass] Export abgeschlossen ({len(df)} Zeilen)")
+
     await save_df_text(df, "nf_master_final")
 
     if job_obj:
-        job_obj.phase = f"Nachfass abgeschlossen – {len(df)} Zeilen"
-        job_obj.percent = 45
+        job_obj.phase = f"Daten gespeichert ({len(df)} Zeilen)"
+        job_obj.percent = 60
 
-    print(f"[OK] Nachfass-Export aufgebaut: {len(df)} Zeilen")
-    print(f"[DEBUG] Beispiel: {df.head(1).to_dict(orient='records')}")
     return df
+
+
 
 
 
