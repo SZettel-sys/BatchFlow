@@ -320,7 +320,7 @@ import asyncio
 async def fetch_person_details(person_ids: List[str]) -> List[dict]:
     """Lädt vollständige Datensätze für Personen-IDs parallel."""
     results = []
-    sem = asyncio.Semaphore(6)  # Max. 6 gleichzeitige Requests für Render
+    sem = asyncio.Semaphore(15)  # Max. 6 gleichzeitige Requests für Render
 
     async def fetch_one(pid):
         async with sem:
