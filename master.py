@@ -431,47 +431,61 @@ async def _build_nf_master_final(
 # =============================================================================
 # Personen-Streaming (parallelisiert & asynchron)
 # =============================================================================
+# =============================================================================
+# Personen-Streaming (parallelisiert & robust)
+# =============================================================================
 async def stream_persons_for_batch(bid: str) -> List[dict]:
     persons: List[dict] = []
-    sem = asyncio.Semaphore(12)  # Max. 12 gleichzeitige Requests
+    sem = asyncio.Semaphore(12)  # Max. gleichzeitige Requests
 
     async def fetch_page(start: int):
         async with sem:
-            url = append_token(
-                f"{PIPEDRIVE_API}/persons?filter_id={FILTER_NACHFASS}"
-                f"&start={start}&limit={NF_PAGE_LIMIT}&sort=id"
-            )
-            r = await http_client().get(url, headers=get_headers())
-            if r.status_code != 200:
-                print(f"[WARN] Fehler bei Page {start}: {r.text[:120]}")
+            try:
+                url = append_token(
+                    f"{PIPEDRIVE_API}/persons?filter_id={FILTER_NACHFASS}"
+                    f"&start={start}&limit={NF_PAGE_LIMIT}&sort=id"
+                )
+                r = await http_client().get(url, headers=get_headers())
+                if r.status_code != 200:
+                    print(f"[WARN] Fehler bei Page {start}: {r.text[:100]}")
+                    return []
+                data = (r.json() or {}).get("data") or []
+                return [p for p in data if str(p.get(batch_key, "")).strip() == str(bid)]
+            except Exception as e:
+                print(f"[ERROR] Ausnahme bei fetch_page({start}): {e}")
                 return []
-            data = r.json().get("data") or []
-            # Filter direkt anwenden (Batch-ID-Match)
-            return [p for p in data if str(p.get(batch_key, "")).strip() == str(bid)]
 
-    # Erste Seite holen, um Gesamtzahl zu bestimmen
-    url0 = append_token(
-        f"{PIPEDRIVE_API}/persons?filter_id={FILTER_NACHFASS}&start=0&limit={NF_PAGE_LIMIT}&sort=id"
-    )
-    r0 = await http_client().get(url0, headers=get_headers())
-    if r0.status_code != 200:
-        raise Exception(f"Pipedrive Fehler bei Batch {bid}: {r0.text}")
-    data0 = r0.json().get("data") or []
-    if not data0:
+    try:
+        # Erste Seite laden
+        url0 = append_token(
+            f"{PIPEDRIVE_API}/persons?filter_id={FILTER_NACHFASS}&start=0&limit={NF_PAGE_LIMIT}&sort=id"
+        )
+        r0 = await http_client().get(url0, headers=get_headers())
+        if r0.status_code != 200:
+            print(f"[WARN] Fehler beim Initialabruf für Batch {bid}: {r0.text[:100]}")
+            return []
+
+        data0 = (r0.json() or {}).get("data") or []
+        if not data0:
+            print(f"[INFO] Keine Personen im Filter {FILTER_NACHFASS} gefunden.")
+            return []
+
+        persons.extend([p for p in data0 if str(p.get(batch_key, "")) == str(bid)])
+
+        # Prüfen, ob es mehr Seiten gibt
+        if len(data0) == NF_PAGE_LIMIT:
+            starts = list(range(NF_PAGE_LIMIT, NF_PAGE_LIMIT * 20, NF_PAGE_LIMIT))  # bis 10 000
+            results = await asyncio.gather(*[fetch_page(s) for s in starts])
+            for chunk in results:
+                if chunk:
+                    persons.extend(chunk)
+
+        print(f"[INFO] Batch {bid}: {len(persons)} Personen geladen.")
+        return persons
+
+    except Exception as e:
+        print(f"[ERROR] stream_persons_for_batch({bid}) fehlgeschlagen: {e}")
         return []
-
-    persons.extend([p for p in data0 if str(p.get(batch_key, "")) == str(bid)])
-    more = len(data0) == NF_PAGE_LIMIT
-
-    if more:
-        # Sammle Startwerte aller weiteren Seiten
-        starts = list(range(NF_PAGE_LIMIT, NF_PAGE_LIMIT * 20, NF_PAGE_LIMIT))  # bis zu 10 000 Einträge
-        results = await asyncio.gather(*[fetch_page(s) for s in starts])
-        for chunk in results:
-            persons.extend(chunk)
-
-    print(f"[INFO] Batch {bid}: {len(persons)} Personen geladen.")
-    return persons
 
 
 
