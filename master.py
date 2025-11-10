@@ -767,10 +767,12 @@ async def _reconcile(prefix: str) -> None:
     """
     t = tables(prefix)
     master = await load_df_text(t["final"])
-    if master.empty:
+    if master is None or isinstance(master, type(None)) or master.empty:
+        print(f"[WARN] Kein Inhalt in {t['final']} – Abgleich wird übersprungen.")
         await save_df_text(pd.DataFrame(), t["ready"])
-        await save_df_text(pd.DataFrame(columns=["reason", "id", "name", "org_id", "org_name", "extra"]), t["log"])
+        await save_df_text(pd.DataFrame(columns=["reason","id","name","org_id","org_name","extra"]), t["log"])
         return
+
 
     col_person_id = "Person ID"
     col_org_name  = "Organisation Name"
