@@ -386,46 +386,25 @@ async def fetch_person_details(person_ids: List[str]) -> List[dict]:
     await asyncio.gather(*[fetch_one(pid) for pid in person_ids])
     print(f"[DEBUG] Vollständige Personendaten geladen: {len(results)}")
     return results
+
 # =============================================================================
-# Nachfass – Aufbau Master (robust, parallel & vollständig)
+# Nachfass – Aufbau Master (funktionierend & performant, wie in der alten Version)
 # =============================================================================
-async def _build_nf_master_final(
-    nf_batch_ids: List[str],
-    batch_id: str,
-    campaign: str,
-    job_obj=None,
-) -> pd.DataFrame:
-    """Baut Nachfass-Daten performant & robust – inkl. parallelem Abruf & Feldmapping."""
-    import asyncio
+async def _build_nf_master_final(nf_batch_ids: List[str], batch_id: str, campaign: str) -> pd.DataFrame:
+    """Baut Nachfass-Daten (Batch-ID Filter) wie in der stabilen früheren Version."""
+    person_fields = await get_person_fields()
 
-    if job_obj:
-        job_obj.phase = "Initialisiere Nachfass-Datenabruf …"
-        job_obj.percent = 5
-
-    # -------------------------------------------------------------
-    # Personenfelder & Hilfsmapping vorbereiten
-    # -------------------------------------------------------------
-    fields = await get_person_fields()
-    batch_key = None
-    for f in fields:
-        nm = (f.get("name") or "").lower()
-        if any(x in nm for x in ("batch", "batchid", "batch id")):
-            batch_key = f.get("key")
-            break
-    if not batch_key:
-        raise RuntimeError("Batch-ID-Feld wurde in Pipedrive nicht gefunden.")
-
+    # Feldmapping für Export
     hint_to_key: Dict[str, str] = {}
     gender_map: Dict[str, str] = {}
 
-    for f in fields:
+    for f in person_fields:
         nm = (f.get("name") or "").lower()
         for hint in PERSON_FIELD_HINTS_TO_EXPORT.keys():
             if hint in nm and hint not in hint_to_key:
                 hint_to_key[hint] = f.get("key")
         if any(x in nm for x in ("gender", "geschlecht")):
-            opts = f.get("options") or []
-            gender_map = {str(o.get("id")): o.get("label") for o in opts if o.get("id")}
+            gender_map = field_options_id_to_label_map(f)
 
     def get_field(p: dict, hint: str) -> str:
         key = hint_to_key.get(hint)
@@ -433,163 +412,120 @@ async def _build_nf_master_final(
             return ""
         v = p.get(key)
         if isinstance(v, dict) and "label" in v:
-            return str(v["label"] or "")
+            return str(v.get("label") or "")
         if isinstance(v, list):
-            vals = []
-            for x in v:
-                if isinstance(x, dict) and "value" in x:
-                    vals.append(str(x["value"]))
-                elif isinstance(x, str):
-                    vals.append(x)
-            return ", ".join(vals)
+            if v and isinstance(v[0], dict) and "value" in v[0]:
+                return str(v[0].get("value") or "")
+            return ", ".join([str(x) for x in v if x])
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return ""
+        sv = str(v)
         if hint in ("gender", "geschlecht") and gender_map:
-            return gender_map.get(str(v), str(v))
-        return str(v or "")
+            return gender_map.get(sv, sv)
+        return sv
 
-    # -------------------------------------------------------------
-    # Personen aus Filter (parallel & robust)
-    # -------------------------------------------------------------
-    async def stream_persons_for_batch(bid: str) -> List[dict]:
-        persons: List[dict] = []
-        sem = asyncio.Semaphore(12)  # max. gleichzeitige Requests
+    # Aktivitätsfelder
+    last_key = await get_last_activity_key()
+    next_key = await get_next_activity_key()
+    batch_key = await get_batch_field_key()
+    if not batch_key:
+        raise RuntimeError("Personenfeld 'Batch ID' wurde nicht gefunden.")
 
-        async def fetch_page(start: int):
-            async with sem:
-                try:
-                    url = append_token(
-                        f"{PIPEDRIVE_API}/persons?filter_id={FILTER_NACHFASS}"
-                        f"&start={start}&limit={NF_PAGE_LIMIT}&sort=id"
-                    )
-                    r = await http_client().get(url, headers=get_headers())
-                    if r.status_code != 200:
-                        print(f"[WARN] Fehler bei Page {start}: {r.text[:100]}")
-                        return []
-                    data = (r.json() or {}).get("data") or []
-                    valid = []
-                    for p in data:
-                        val = p.get(batch_key)
-                        if isinstance(val, dict):
-                            val = val.get("value")
-                        elif isinstance(val, list) and val:
-                            first = val[0]
-                            if isinstance(first, dict) and "value" in first:
-                                val = first["value"]
-                        if str(val or "").strip().lower() == str(bid).strip().lower():
-                            valid.append(p)
-                    return valid
+    # Robust-Funktion zum Erkennen der Batch-ID im Feld
+    def _contains_any_text(val, wanted: List[str]) -> bool:
+        """Prüft robust, ob val einen der gesuchten Texte enthält."""
+        if not wanted:
+            return True
+        if val is None or (isinstance(val, float) and pd.isna(val)):
+            return False
+        if isinstance(val, dict):
+            val = val.get("value")
+        if isinstance(val, (list, tuple, np.ndarray)):
+            flat = []
+            for x in val:
+                if isinstance(x, dict):
+                    x = x.get("value")
+                if x:
+                    flat.append(str(x))
+            val = " | ".join(flat)
+        s = str(val).lower().strip()
+        return any(k.lower() in s for k in wanted if k)
 
-                except Exception as e:
-                    print(f"[ERROR] Ausnahme bei fetch_page({start}): {e}")
-                    return []
+    # Personen nach Filter streamen
+    selected: List[dict] = []
+    async for chunk in stream_persons_by_filter(FILTER_NACHFASS):
+        for p in chunk:
+            # Aktivitätsfilter (keine Zukunft, keine innerhalb der letzten 3 Monate)
+            av = extract_field_date(p, last_key) or extract_field_date(p, next_key)
+            if is_forbidden_activity_date(av):
+                continue
+            # Nachfass Batch-ID prüfen
+            if not _contains_any_text(p.get(batch_key), nf_batch_ids):
+                continue
+            selected.append(p)
 
-        try:
-            url0 = append_token(
-                f"{PIPEDRIVE_API}/persons?filter_id={FILTER_NACHFASS}&start=0&limit={NF_PAGE_LIMIT}&sort=id"
-            )
-            r0 = await http_client().get(url0, headers=get_headers())
-            if r0.status_code != 200:
-                print(f"[WARN] Fehler beim Initialabruf für Batch {bid}: {r0.text[:100]}")
-                return []
+    # Personen aufbereiten
+    rows = []
+    for p in selected:
+        pid = p.get("id")
+        vor, nach = split_name(p.get("first_name"), p.get("last_name"), p.get("name"))
 
-            data0 = (r0.json() or {}).get("data") or []
-            if not data0:
-                print(f"[INFO] Keine Personen im Filter {FILTER_NACHFASS} gefunden.")
-                return []
-
-            persons.extend([p for p in data0 if str(p.get(batch_key, "")) == str(bid)])
-
-            # Falls mehr Seiten existieren – parallel laden
-            if len(data0) == NF_PAGE_LIMIT:
-                starts = list(range(NF_PAGE_LIMIT, NF_PAGE_LIMIT * 20, NF_PAGE_LIMIT))
-                results = await asyncio.gather(*[fetch_page(s) for s in starts])
-                for chunk in results:
-                    if chunk:
-                        persons.extend(chunk)
-
-            print(f"[INFO] Batch {bid}: {len(persons)} Personen geladen.")
-            return persons
-
-        except Exception as e:
-            print(f"[ERROR] stream_persons_for_batch({bid}) fehlgeschlagen: {e}")
-            return []
-
-    # -------------------------------------------------------------
-    # Paralleles Laden mehrerer Batch-IDs
-    # -------------------------------------------------------------
-    if job_obj:
-        job_obj.phase = "Lade Nachfass-Personen (Pipedrive)…"
-        job_obj.percent = 15
-
-    sem = asyncio.Semaphore(8)
-
-    async def safe_fetch(bid):
-        async with sem:
-            try:
-                return await stream_persons_for_batch(bid)
-            except Exception as e:
-                print(f"[WARN] Batch {bid} Fehler: {e}")
-                return []
-
-    results = await asyncio.gather(*(safe_fetch(bid) for bid in nf_batch_ids))
-    persons = [p for sub in results if sub for p in sub]
-    total = len(persons)
-    if job_obj:
-        job_obj.phase = f"{total} Nachfass-Personen gesammelt"
-        job_obj.percent = 40
-
-    # -------------------------------------------------------------
-    # Zu DataFrame konvertieren
-    # -------------------------------------------------------------
-    rows: List[dict] = []
-    for p in persons or []:
-        try:
-            org = p.get("org_id") or {}
+        # Organisation
+        org_name, org_id = "-", ""
+        org = p.get("org_id")
+        if isinstance(org, dict):
             org_name = org.get("name") or p.get("org_name") or "-"
-            org_id = str(org.get("id") or "")
-            emails = _as_list_email(p.get("email"))
-            email = emails[0] if emails else ""
-            first = p.get("first_name") or ""
-            last = p.get("last_name") or ""
+            oid = org.get("id") if org.get("id") is not None else org.get("value")
+            if oid is not None and str(oid).strip():
+                org_id = str(oid)
+        elif isinstance(org, (int, str)) and str(org).strip():
+            org_id = str(org).strip()
+            org_name = (p.get("org_name") or org_name)
+        else:
+            org_name = (p.get("org_name") or org_name)
 
-            rows.append({
-                "Batch ID": batch_id or "",
-                "Channel": DEFAULT_CHANNEL,
-                "Cold-Mailing Import": campaign or "",
-                "Prospect ID": get_field(p, "prospect"),
-                "Organisation ID": org_id,
-                "Organisation Name": org_name,
-                "Person ID": str(p.get("id") or ""),
-                "Person Vorname": first,
-                "Person Nachname": last,
-                "Person Titel": get_field(p, "titel") or get_field(p, "title") or get_field(p, "anrede"),
-                "Person Geschlecht": get_field(p, "gender") or get_field(p, "geschlecht"),
-                "Person Position": get_field(p, "position"),
-                "Person E-Mail": email,
-                "XING Profil": get_field(p, "xing") or get_field(p, "xing url") or get_field(p, "xing profil"),
-                "LinkedIn URL": get_field(p, "linkedin"),
-            })
-        except Exception as e:
-            print(f"[WARN] Fehler bei Personendatensatz: {e}")
+        # E-Mail
+        def _list_email(v):
+            if v is None or (isinstance(v, float) and pd.isna(v)):
+                return []
+            if isinstance(v, dict):
+                v = v.get("value")
+                return [v] if v else []
+            if isinstance(v, (list, tuple, np.ndarray)):
+                out = []
+                for x in v:
+                    if isinstance(x, dict):
+                        x = x.get("value")
+                    if x:
+                        out.append(str(x))
+                return out
+            return [str(v)]
 
-    # Leeres DataFrame als Fallback
+        emails = _list_email(p.get("email"))
+        email = emails[0] if emails else ""
+
+        rows.append({
+            "Batch ID": batch_id or "",
+            "Channel": DEFAULT_CHANNEL,
+            "Cold-Mailing Import": campaign or "",
+            "Prospect ID": get_field(p, "prospect"),
+            "Organisation ID": org_id,
+            "Organisation Name": org_name,
+            "Person ID": str(pid or ""),
+            "Person Vorname": vor,
+            "Person Nachname": nach,
+            "Person Titel": get_field(p, "titel") or get_field(p, "title") or get_field(p, "anrede"),
+            "Person Geschlecht": get_field(p, "gender") or get_field(p, "geschlecht"),
+            "Person Position": get_field(p, "position"),
+            "Person E-Mail": email,
+            "XING Profil": get_field(p, "xing") or get_field(p, "xing url") or get_field(p, "xing profil"),
+            "LinkedIn URL": get_field(p, "linkedin"),
+        })
+
     df = pd.DataFrame(rows, columns=TEMPLATE_COLUMNS)
-    if df is None:
-        print("[ERROR] _build_nf_master_final hat kein DataFrame erzeugt!")
-        df = pd.DataFrame(columns=TEMPLATE_COLUMNS)
-
-    # Speichern
-    try:
-        await save_df_text(df, "nf_master_final")
-        print(f"[INFO] Nachfass Export abgeschlossen ({len(df)} Zeilen)")
-    except Exception as e:
-        print(f"[ERROR] Speichern fehlgeschlagen: {e}")
-
-    if job_obj:
-        job_obj.phase = f"Daten gespeichert ({len(df)} Zeilen)"
-        job_obj.percent = 60
-
+    await save_df_text(df, tables("nf")["final"])
+    print(f"[Nachfass] Export abgeschlossen ({len(df)} Zeilen)")
     return df
-
 
 # =============================================================================
 # Personen-Streaming (parallelisiert & robust)
