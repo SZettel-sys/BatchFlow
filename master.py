@@ -107,6 +107,25 @@ def normalize_name(s: str) -> str:
     if not s: return ""
     s = re.sub(r"[^a-z0-9 ]", "", s.lower())
     return re.sub(r"\s+", " ", s).strip()
+    
+def _contains_any_text(val, wanted: List[str]) -> bool:
+    """Hilfsfunktion: prüft robust, ob val einen der Strings in wanted enthält."""
+    if not wanted:
+        return True
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return False
+    if isinstance(val, dict):
+        val = val.get("value")
+    if isinstance(val, (list, tuple, np.ndarray)):
+        flat = []
+        for x in val:
+            if isinstance(x, dict):
+                x = x.get("value")
+            if x:
+                flat.append(str(x))
+        val = " | ".join(flat)
+    s = str(val).lower().strip()
+    return any(k.lower() in s for k in wanted if k)
 
 def parse_pd_date(d: Optional[str]) -> Optional[datetime]:
     try: return datetime.strptime(d, "%Y-%m-%d").replace(tzinfo=timezone.utc)
@@ -591,7 +610,7 @@ async def stream_persons_for_batch(bid: str) -> List[dict]:
                     print(f"[WARN] Fehler bei Page {start}: {r.text[:100]}")
                     return []
                 data = (r.json() or {}).get("data") or []
-                return [p for p in data if str(p.get(batch_key, "")).strip() == str(bid)]
+                return [p for p in data if _contains_any_text(p.get(batch_key), [bid])]
             except Exception as e:
                 print(f"[ERROR] Ausnahme bei fetch_page({start}): {e}")
                 return []
