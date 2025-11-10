@@ -261,6 +261,38 @@ async def stream_person_ids_by_filter(filter_id: int, page_limit: int = PAGE_LIM
         if len(data) < page_limit:
             break
         start += len(data)
+# =============================================================================
+# Organisationen – Bucketing + Kappung (Performanceoptimiert)
+# =============================================================================
+async def _fetch_org_names_for_filter_capped(
+    filter_id: int,
+    page_limit: int,
+    cap_total: int,
+    cap_bucket: int
+) -> Dict[str, List[str]]:
+    """
+    Holt Organisationsnamen aus einem Pipedrive-Filter, normalisiert sie und
+    legt sie in Buckets nach Anfangsbuchstaben. Die Gesamtanzahl (cap_total)
+    und die maximale Bucketgröße (cap_bucket) werden begrenzt.
+    """
+    buckets: Dict[str, List[str]] = {}
+    total = 0
+
+    async for chunk in stream_organizations_by_filter(filter_id, page_limit):
+        for o in chunk:
+            n = normalize_name(o.get("name") or "")
+            if not n:
+                continue
+            b = n[0]
+            lst = buckets.setdefault(b, [])
+            if len(lst) >= cap_bucket:
+                continue
+            if not lst or lst[-1] != n:
+                lst.append(n)
+                total += 1
+                if total >= cap_total:
+                    return buckets
+    return buckets
 
 # =============================================================================
 # Nachfass – Personen laden nach Batch-ID (mit Paging & Fortschritt)
@@ -703,56 +735,70 @@ def fast_fuzzy(a: str, b: str) -> int:
     """Schnellerer Fuzzy-Matcher (partial_ratio)."""
     return fuzz.partial_ratio(a, b)
 
-
-async def _reconcile_generic(prefix: str, job_obj=None):
-    """Führt vereinfachten, performanten Abgleich durch."""
-    master = await load_df_text(f"{prefix}_master_final")
+# =============================================================================
+# Nachfass – Performanter Organisations- und Personenabgleich
+# =============================================================================
+async def _reconcile(prefix: str) -> None:
+    """
+    Fuzzy-Abgleich auf Organisationsebene (≥95 %) und Entfernen bereits
+    kontaktierter Personen (Filter 1216/1708). Nutzt Bucketing-Strategie
+    und drei Organisationsfilter für maximale Genauigkeit.
+    """
+    t = tables(prefix)
+    master = await load_df_text(t["final"])
     if master.empty:
-        await save_df_text(pd.DataFrame(), f"{prefix}_master_ready")
-        await save_df_text(
-            pd.DataFrame(columns=["reason", "id", "name", "org_id", "org_name", "extra"]),
-            f"{prefix}_delete_log",
-        )
+        await save_df_text(pd.DataFrame(), t["ready"])
+        await save_df_text(pd.DataFrame(columns=["reason", "id", "name", "org_id", "org_name", "extra"]), t["log"])
         return
 
-    if len(master) > 5000:
-        master = master.sample(5000, random_state=42).reset_index(drop=True)
-        if job_obj:
-            job_obj.phase = f"Reduziere Vergleichsdaten (5000 von {len(master)})"
-            job_obj.percent = 45
-
     col_person_id = "Person ID"
-    col_org_name = "Organisation Name"
-    col_org_id = "Organisation ID"
-
+    col_org_name  = "Organisation Name"
+    col_org_id    = "Organisation ID"
     delete_rows: List[Dict[str, str]] = []
-    drop_idx = []
 
-    # 1️⃣ Organisations-Dubletten
-    filter_ids_org = [1245]
-    if job_obj:
-        job_obj.phase = "Orga-Abgleich läuft …"
-        job_obj.percent = 55
+    # -------------------------------------------------------------------------
+    # 1️⃣ Organisations-Duplikate via ≥95 % Fuzzy-Match
+    # -------------------------------------------------------------------------
+    filter_ids_org = [1245, 821, 1521]   # alle drei relevanten Filter berücksichtigen
+    buckets_all: Dict[str, List[str]] = {}
+    collected_total = 0
 
-    buckets_all = {}
     for fid in filter_ids_org:
-        caps = await _fetch_org_names_for_filter_capped(fid, PAGE_LIMIT, MAX_ORG_NAMES, MAX_ORG_BUCKET)
-        for k, lst in caps.items():
+        caps_left = max(0, MAX_ORG_NAMES - collected_total)
+        if caps_left <= 0:
+            break
+        buckets = await _fetch_org_names_for_filter_capped(fid, PAGE_LIMIT, caps_left, MAX_ORG_BUCKET)
+        print(f"[DEBUG] Filter {fid}: {sum(len(v) for v in buckets.values())} Organisationen geladen")
+        for k, lst in buckets.items():
             slot = buckets_all.setdefault(k, [])
-            slot.extend(lst[:MAX_ORG_BUCKET])
+            for n in lst:
+                if len(slot) >= MAX_ORG_BUCKET:
+                    break
+                if not slot or slot[-1] != n:
+                    slot.append(n)
+                    collected_total += 1
+                    if collected_total >= MAX_ORG_NAMES:
+                        break
+            if collected_total >= MAX_ORG_NAMES:
+                break
+        if collected_total >= MAX_ORG_NAMES:
+            break
 
+    print(f"[INFO] Insgesamt {collected_total} Organisationsnamen aus Filtern {filter_ids_org} gesammelt.")
+
+    drop_idx = []
     for idx, row in master.iterrows():
         cand = str(row.get(col_org_name) or "").strip()
-        norm = normalize_name(cand)
-        if not norm or row.get(col_org_id):
+        cand_norm = normalize_name(cand)
+        if not cand_norm:
             continue
-        bucket = buckets_all.get(norm[:1])
+        bucket = buckets_all.get(cand_norm[0])
         if not bucket:
             continue
-        near = [n for n in bucket if abs(len(n) - len(norm)) <= 3]
+        near = [n for n in bucket if abs(len(n) - len(cand_norm)) <= 4]
         if not near:
             continue
-        best = process.extractOne(norm, near, scorer=fast_fuzzy)
+        best = process.extractOne(cand_norm, near, scorer=fuzz.token_sort_ratio)
         if best and best[1] >= 95:
             drop_idx.append(idx)
             delete_rows.append({
@@ -761,26 +807,24 @@ async def _reconcile_generic(prefix: str, job_obj=None):
                 "name": f"{row.get('Person Vorname') or ''} {row.get('Person Nachname') or ''}".strip(),
                 "org_id": str(row.get(col_org_id) or ""),
                 "org_name": cand,
-                "extra": f"Best Match: {best[0]} ({best[1]}%)",
+                "extra": f"Best Match: {best[0]} ({best[1]} %)"
             })
 
     if drop_idx:
         master = master.drop(index=drop_idx)
 
-    # 2️⃣ Personen-ID-Dubletten
-    if job_obj:
-        job_obj.phase = "Prüfe Personen-IDs …"
-        job_obj.percent = 70
-
+    # -------------------------------------------------------------------------
+    # 2️⃣ Entfernen von Personen-IDs, die in Filtern 1216 / 1708 auftreten
+    # -------------------------------------------------------------------------
     suspect_ids = set()
-    async for ids in stream_person_ids_by_filter(1216, PAGE_LIMIT):
-        suspect_ids.update(ids)
-    async for ids in stream_person_ids_by_filter(1708, PAGE_LIMIT):
-        suspect_ids.update(ids)
+    async for page in stream_person_ids_by_filter(1216):
+        suspect_ids.update(page)
+    async for page in stream_person_ids_by_filter(1708):
+        suspect_ids.update(page)
 
     if suspect_ids:
-        mask = master[col_person_id].astype(str).isin(suspect_ids)
-        removed = master[mask]
+        mask_pid = master[col_person_id].astype(str).isin(suspect_ids)
+        removed = master[mask_pid].copy()
         for _, r in removed.iterrows():
             delete_rows.append({
                 "reason": "person_id_match",
@@ -788,22 +832,20 @@ async def _reconcile_generic(prefix: str, job_obj=None):
                 "name": f"{r.get('Person Vorname') or ''} {r.get('Person Nachname') or ''}".strip(),
                 "org_id": str(r.get(col_org_id) or ""),
                 "org_name": str(r.get(col_org_name) or ""),
-                "extra": "ID in Filter 1216/1708",
+                "extra": "ID in Filter 1216/1708"
             })
-        master = master[~mask]
+        master = master[~mask_pid].copy()
 
-    # 3️⃣ Speichern
-    await save_df_text(master, f"{prefix}_master_ready")
-    await save_df_text(
-        pd.DataFrame(delete_rows, columns=["reason", "id", "name", "org_id", "org_name", "extra"]),
-        f"{prefix}_delete_log",
-    )
+    # -------------------------------------------------------------------------
+    # 3️⃣ Ergebnisse speichern
+    # -------------------------------------------------------------------------
+    await save_df_text(master, t["ready"])
+    log_df = pd.DataFrame(delete_rows, columns=["reason", "id", "name", "org_id", "org_name", "extra"])
+    await save_df_text(log_df, t["log"])
 
-    if job_obj:
-        job_obj.phase = "Abgleich abgeschlossen"
-        job_obj.percent = 85
-# master_fixed_v2_part4.py — Teil 4/5
-# Job-System, Fortschritt, Excel-Erzeugung & Export-Endpunkte
+    print(f"[INFO] Abgleich abgeschlossen – {len(delete_rows)} Entfernungen vorgenommen.")
+
+
 
 # =============================================================================
 # Excel-Export-Helfer
