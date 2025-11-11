@@ -583,19 +583,44 @@ async def _build_nf_master_final(
 
     selected = []
     for p in persons:
+        # --- Batch-Feld robust prüfen ---
         val = p.get(batch_key)
+
+        # Fall 1: dict mit value/label
         if isinstance(val, dict):
             val = val.get("value") or val.get("label") or ""
+
+        # Fall 2: Liste (mehrere Werte)
+        elif isinstance(val, list):
+            values = []
+            for x in val:
+                if isinstance(x, dict):
+                    values.append(x.get("value") or x.get("label") or "")
+                else:
+                    values.append(str(x))
+            val = " ".join(values)
+
+        # Fall 3: direkter String oder None
+        else:
+            val = str(val or "")
+
+        # Debug-Check (kannst du nachher wieder entfernen)
+        # print(f"[DEBUG] Person {p.get('id')}: Batch-Feld = {val}")
+
         if not _contains_any_text(val, nf_batch_ids):
             continue
+
+        # --- Aktivitätsfilter prüfen ---
         av = extract_field_date(p, last_key) or extract_field_date(p, next_key)
         if is_forbidden_activity_date(av):
             continue
+
         selected.append(p)
 
     if job_obj:
         job_obj.phase = f"{len(selected)} Nachfass-Personen nach Filter"
         job_obj.percent = 40
+  
 
     rows = []
     for p in selected:
