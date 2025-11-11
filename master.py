@@ -505,7 +505,7 @@ def field_options_id_to_label_map(field: dict) -> Dict[str, str]:
 # -----------------------------------------------------------------------------
 # STREAMING-FUNKTION
 # -----------------------------------------------------------------------------
-async def stream_persons_by_filter_fast(filter_id: int, page_limit: int = NF_PAGE_LIMIT) -> list[dict]:
+async def stream_persons_by_filter(filter_id: int, page_limit: int = NF_PAGE_LIMIT) -> list[dict]:
     """
     Holt alle Personen aus einem Filter mit asynchronem Paging (parallelisiert).
     Bis zu 20 Seiten (~10.000 Datensätze) werden parallel geladen.
