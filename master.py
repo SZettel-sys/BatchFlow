@@ -771,7 +771,7 @@ async def _build_nk_master_final(
         job_obj.phase = "Lade Neukontakte aus Pipedrive …"
         job_obj.percent = 10
 
-    persons = await stream_persons_by_filter(FILTER_NEUKONTAKTE)
+ async for chunk in stream_persons_by_filter(FILTER_NEUKONTAKTE):
     for p in chunk:
         if str(p.get(fb_key)) != str(fachbereich):
             continue
@@ -784,8 +784,9 @@ async def _build_nk_master_final(
         selected.append(p)
         if take_count and len(selected) >= take_count:
             break
-        if take_count and len(selected) >= take_count:
-            break
+    if take_count and len(selected) >= take_count:
+        break
+   
 
     if job_obj:
         job_obj.phase = f"Neukontakte gesammelt: {len(selected)}"
