@@ -772,18 +772,18 @@ async def _build_nk_master_final(
         job_obj.percent = 10
 
     persons = await stream_persons_by_filter(FILTER_NEUKONTAKTE)
-         for p in chunk:
-            if str(p.get(fb_key)) != str(fachbereich):
-                continue
-            org = p.get("org_id") or {}
-            org_key = f"id:{org.get('id')}" if org.get("id") else f"name:{normalize_name(org.get('name') or '')}"
-            used = org_used.get(org_key, 0)
-            if used >= per_org_limit:
-                continue
-            org_used[org_key] = used + 1
-            selected.append(p)
-            if take_count and len(selected) >= take_count:
-                break
+    for p in chunk:
+        if str(p.get(fb_key)) != str(fachbereich):
+            continue
+        org = p.get("org_id") or {}
+        org_key = f"id:{org.get('id')}" if org.get("id") else f"name:{normalize_name(org.get('name') or '')}"
+        used = org_used.get(org_key, 0)
+        if used >= per_org_limit:
+            continue
+        org_used[org_key] = used + 1
+        selected.append(p)
+        if take_count and len(selected) >= take_count:
+            break
         if take_count and len(selected) >= take_count:
             break
 
