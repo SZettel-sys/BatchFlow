@@ -519,7 +519,7 @@ async def stream_persons_by_filter(filter_id: int, page_limit: int = NF_PAGE_LIM
 # -----------------------------------------------------------------------------
 # NACHFASS MASTER FINAL
 # -----------------------------------------------------------------------------
-async def build_nf_master_final(
+async def _build_nf_master_final(
     nf_batch_ids: List[str],
     batch_id: str,
     campaign: str,
