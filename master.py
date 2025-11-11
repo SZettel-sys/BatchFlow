@@ -397,30 +397,28 @@ async def fetch_person_details(person_ids: List[str]) -> List[dict]:
     await asyncio.gather(*[fetch_one(pid) for pid in person_ids])
     print(f"[DEBUG] Vollständige Personendaten geladen: {len(results)}")
     return results
-# =============================================================================
-# Nachfass – Hilfsfunktionen
-# =============================================================================
+# -----------------------------------------------------------------------------
+# INTERNER CACHE
+# -----------------------------------------------------------------------------
 _NEXT_ACTIVITY_KEY: Optional[str] = None
 _LAST_ACTIVITY_KEY: Optional[str] = None
+_BATCH_FIELD_KEY: Optional[str] = None
 
-
+# -----------------------------------------------------------------------------
+# PIPEDRIVE HILFSFUNKTIONEN
+# -----------------------------------------------------------------------------
 async def get_next_activity_key() -> Optional[str]:
-    """Ermittelt das Feld für 'Nächste Aktivität' (next_activity_date) aus Pipedrive."""
+    """Ermittelt das Feld für 'Nächste Aktivität'."""
     global _NEXT_ACTIVITY_KEY
     if _NEXT_ACTIVITY_KEY is not None:
         return _NEXT_ACTIVITY_KEY
     _NEXT_ACTIVITY_KEY = "next_activity_date"
     try:
         fields = await get_person_fields()
-        want = [
-            "next activity", "next_activity_date", "nächste aktivität",
-            "naechste aktivitaet", "datum nächste aktivität"
-        ]
-        wl = [(w, w.replace("ä", "ae").replace("ö", "oe").replace("ü", "ue")) for w in want]
         for f in fields:
             nm = (f.get("name") or "").lower()
-            if any((w in nm) or (wa in nm) for w, wa in wl):
-                _NEXT_ACTIVITY_KEY = f.get("key") or _NEXT_ACTIVITY_KEY
+            if "next activity" in nm or "nächste" in nm:
+                _NEXT_ACTIVITY_KEY = f.get("key")
                 break
     except Exception:
         pass
@@ -428,28 +426,22 @@ async def get_next_activity_key() -> Optional[str]:
 
 
 async def get_last_activity_key() -> Optional[str]:
-    """Ermittelt das Feld für 'Letzte Aktivität' (last_activity_date) aus Pipedrive."""
+    """Ermittelt das Feld für 'Letzte Aktivität'."""
     global _LAST_ACTIVITY_KEY
     if _LAST_ACTIVITY_KEY is not None:
         return _LAST_ACTIVITY_KEY
     _LAST_ACTIVITY_KEY = "last_activity_date"
     try:
         fields = await get_person_fields()
-        want = [
-            "last activity", "last_activity_date", "letzte aktivität",
-            "letzte aktivitaet", "datum letzte aktivität"
-        ]
-        wl = [(w, w.replace("ä", "ae").replace("ö", "oe").replace("ü", "ue")) for w in want]
         for f in fields:
             nm = (f.get("name") or "").lower()
-            if any((w in nm) or (wa in nm) for w, wa in wl):
-                _LAST_ACTIVITY_KEY = f.get("key") or _LAST_ACTIVITY_KEY
+            if "last activity" in nm or "letzte" in nm:
+                _LAST_ACTIVITY_KEY = f.get("key")
                 break
     except Exception:
         pass
     return _LAST_ACTIVITY_KEY
 
-_BATCH_FIELD_KEY: Optional[str] = None
 
 async def get_batch_field_key() -> Optional[str]:
     """Sucht das Personenfeld in Pipedrive, das die Batch-ID enthält."""
@@ -458,35 +450,89 @@ async def get_batch_field_key() -> Optional[str]:
         return _BATCH_FIELD_KEY
 
     fields = await get_person_fields()
-    candidates = ["batch id", "batch-id", "batch_id", "batch"]
     for f in fields:
         nm = (f.get("name") or "").lower()
-        if any(c in nm for c in candidates):
+        if any(x in nm for x in ("batch id", "batch-id", "batch_id", "batch")):
             _BATCH_FIELD_KEY = f.get("key")
             break
-
     return _BATCH_FIELD_KEY
 
-# =============================================================================
-# Nachfass – Aufbau Master (funktionierend & performant, wie in der alten Version)
-# =============================================================================
-async def _build_nf_master_final(
+
+def extract_field_date(p: dict, key: Optional[str]) -> Optional[str]:
+    """Extrahiert ein Datumsfeld aus einer Person."""
+    if not key:
+        return None
+    v = p.get(key)
+    if isinstance(v, dict):
+        v = v.get("value")
+    elif isinstance(v, list):
+        v = v[0] if v else None
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return None
+    return str(v)
+
+
+def split_name(first: Optional[str], last: Optional[str], full: Optional[str]) -> tuple[str, str]:
+    """Zerlegt Namen in Vor- und Nachname."""
+    if first or last:
+        return first or "", last or ""
+    if not full:
+        return "", ""
+    parts = full.strip().split()
+    if len(parts) == 1:
+        return parts[0], ""
+    return " ".join(parts[:-1]), parts[-1]
+
+
+def field_options_id_to_label_map(field: dict) -> Dict[str, str]:
+    """Erstellt ein Mapping von ID → Label für Dropdown-Optionen."""
+    opts = field.get("options") or []
+    mp: Dict[str, str] = {}
+    for o in opts:
+        oid = str(o.get("id"))
+        lab = str(o.get("label") or o.get("name") or oid)
+        mp[oid] = lab
+    return mp
+
+
+# -----------------------------------------------------------------------------
+# STREAMING-FUNKTION
+# -----------------------------------------------------------------------------
+async def stream_persons_by_filter(filter_id: int, page_limit: int = NF_PAGE_LIMIT):
+    """Streamt Personen aus Pipedrive-Filter mit Paging."""
+    start = 0
+    while True:
+        url = append_token(f"{PIPEDRIVE_API}/persons?filter_id={filter_id}&start={start}&limit={page_limit}")
+        r = await http_client().get(url)
+        if r.status_code != 200:
+            raise Exception(f"Pipedrive API Fehler: {r.text}")
+        data = (r.json() or {}).get("data") or []
+        if not data:
+            break
+        yield data
+        if len(data) < page_limit:
+            break
+        start += page_limit
+        await asyncio.sleep(0.05)
+
+
+# -----------------------------------------------------------------------------
+# NACHFASS MASTER FINAL
+# -----------------------------------------------------------------------------
+async def build_nf_master_final(
     nf_batch_ids: List[str],
     batch_id: str,
     campaign: str,
-    job_obj=None
+    job_obj=None,
 ) -> pd.DataFrame:
-
-    """Baut Nachfass-Daten (Batch-ID Filter) wie in der stabilen früheren Version."""
+    """Baut Nachfass-Daten robust & performant (finale geprüfte Version)."""
     person_fields = await get_person_fields()
-
-    # Feldmapping für Export
     hint_to_key: Dict[str, str] = {}
     gender_map: Dict[str, str] = {}
 
     for f in person_fields:
         nm = (f.get("name") or "").lower()
-        for hint in PERSON_FIELD_HINTS_TO_EXPORT.keys():
+        for hint in PERSON_FIELD_HINTS_TO_EXPORT:
             if hint in nm and hint not in hint_to_key:
                 hint_to_key[hint] = f.get("key")
         if any(x in nm for x in ("gender", "geschlecht")):
@@ -510,84 +556,34 @@ async def _build_nf_master_final(
             return gender_map.get(sv, sv)
         return sv
 
-    # Aktivitätsfelder
     last_key = await get_last_activity_key()
     next_key = await get_next_activity_key()
     batch_key = await get_batch_field_key()
     if not batch_key:
         raise RuntimeError("Personenfeld 'Batch ID' wurde nicht gefunden.")
 
-    # Robust-Funktion zum Erkennen der Batch-ID im Feld
-    def _contains_any_text(val, wanted: List[str]) -> bool:
-        """Prüft robust, ob val einen der gesuchten Texte enthält."""
-        if not wanted:
-            return True
-        if val is None or (isinstance(val, float) and pd.isna(val)):
-            return False
-        if isinstance(val, dict):
-            val = val.get("value")
-        if isinstance(val, (list, tuple, np.ndarray)):
-            flat = []
-            for x in val:
-                if isinstance(x, dict):
-                    x = x.get("value")
-                if x:
-                    flat.append(str(x))
-            val = " | ".join(flat)
-        s = str(val).lower().strip()
-        return any(k.lower() in s for k in wanted if k)
-
-    # Personen nach Filter streamen
     selected: List[dict] = []
     async for chunk in stream_persons_by_filter(FILTER_NACHFASS):
         for p in chunk:
-            # Aktivitätsfilter (keine Zukunft, keine innerhalb der letzten 3 Monate)
             av = extract_field_date(p, last_key) or extract_field_date(p, next_key)
             if is_forbidden_activity_date(av):
                 continue
-            # Nachfass Batch-ID prüfen
-            if not _contains_any_text(p.get(batch_key), nf_batch_ids):
+            val = p.get(batch_key)
+            if not val:
+                continue
+            s_val = str(val).lower()
+            if not any(str(b).lower() in s_val for b in nf_batch_ids):
                 continue
             selected.append(p)
 
-    # Personen aufbereiten
-    rows = []
+    rows: List[dict] = []
     for p in selected:
         pid = p.get("id")
         vor, nach = split_name(p.get("first_name"), p.get("last_name"), p.get("name"))
-
-        # Organisation
-        org_name, org_id = "-", ""
-        org = p.get("org_id")
-        if isinstance(org, dict):
-            org_name = org.get("name") or p.get("org_name") or "-"
-            oid = org.get("id") if org.get("id") is not None else org.get("value")
-            if oid is not None and str(oid).strip():
-                org_id = str(oid)
-        elif isinstance(org, (int, str)) and str(org).strip():
-            org_id = str(org).strip()
-            org_name = (p.get("org_name") or org_name)
-        else:
-            org_name = (p.get("org_name") or org_name)
-
-        # E-Mail
-        def _list_email(v):
-            if v is None or (isinstance(v, float) and pd.isna(v)):
-                return []
-            if isinstance(v, dict):
-                v = v.get("value")
-                return [v] if v else []
-            if isinstance(v, (list, tuple, np.ndarray)):
-                out = []
-                for x in v:
-                    if isinstance(x, dict):
-                        x = x.get("value")
-                    if x:
-                        out.append(str(x))
-                return out
-            return [str(v)]
-
-        emails = _list_email(p.get("email"))
+        org = p.get("org_id") or {}
+        org_name = org.get("name") or p.get("org_name") or "-"
+        org_id = str(org.get("id") or org.get("value") or "")
+        emails = _as_list_email(p.get("email"))
         email = emails[0] if emails else ""
 
         rows.append({
@@ -612,7 +608,6 @@ async def _build_nf_master_final(
     await save_df_text(df, tables("nf")["final"])
     print(f"[Nachfass] Export abgeschlossen ({len(df)} Zeilen)")
     return df
-
 # =============================================================================
 # Personen-Streaming (parallelisiert & robust)
 # =============================================================================
