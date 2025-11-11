@@ -598,11 +598,11 @@ async def _build_nf_master_final(
     selected = []
     for p in persons:
         if len(persons) > 0:
-        import json
-        print("[DEBUG] Beispielperson – erster Datensatz:")
-        print(json.dumps(persons[0], indent=2)[:1500])
+            import json
+            print("[DEBUG] Beispielperson – erster Datensatz:")
+            print(json.dumps(persons[0], indent=2)[:1500])
         # nach 1. Lauf wieder auskommentieren!
-        break
+            break
         # --- Batch-Feld robust prüfen ---
         val = p.get(batch_key)
         print(f"[DEBUG] Person {p.get('id')} Batch-Wert: {val}")
