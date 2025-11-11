@@ -397,6 +397,58 @@ async def fetch_person_details(person_ids: List[str]) -> List[dict]:
     await asyncio.gather(*[fetch_one(pid) for pid in person_ids])
     print(f"[DEBUG] Vollständige Personendaten geladen: {len(results)}")
     return results
+# =============================================================================
+# Nachfass – Hilfsfunktionen
+# =============================================================================
+_NEXT_ACTIVITY_KEY: Optional[str] = None
+_LAST_ACTIVITY_KEY: Optional[str] = None
+
+
+async def get_next_activity_key() -> Optional[str]:
+    """Ermittelt das Feld für 'Nächste Aktivität' (next_activity_date) aus Pipedrive."""
+    global _NEXT_ACTIVITY_KEY
+    if _NEXT_ACTIVITY_KEY is not None:
+        return _NEXT_ACTIVITY_KEY
+    _NEXT_ACTIVITY_KEY = "next_activity_date"
+    try:
+        fields = await get_person_fields()
+        want = [
+            "next activity", "next_activity_date", "nächste aktivität",
+            "naechste aktivitaet", "datum nächste aktivität"
+        ]
+        wl = [(w, w.replace("ä", "ae").replace("ö", "oe").replace("ü", "ue")) for w in want]
+        for f in fields:
+            nm = (f.get("name") or "").lower()
+            if any((w in nm) or (wa in nm) for w, wa in wl):
+                _NEXT_ACTIVITY_KEY = f.get("key") or _NEXT_ACTIVITY_KEY
+                break
+    except Exception:
+        pass
+    return _NEXT_ACTIVITY_KEY
+
+
+async def get_last_activity_key() -> Optional[str]:
+    """Ermittelt das Feld für 'Letzte Aktivität' (last_activity_date) aus Pipedrive."""
+    global _LAST_ACTIVITY_KEY
+    if _LAST_ACTIVITY_KEY is not None:
+        return _LAST_ACTIVITY_KEY
+    _LAST_ACTIVITY_KEY = "last_activity_date"
+    try:
+        fields = await get_person_fields()
+        want = [
+            "last activity", "last_activity_date", "letzte aktivität",
+            "letzte aktivitaet", "datum letzte aktivität"
+        ]
+        wl = [(w, w.replace("ä", "ae").replace("ö", "oe").replace("ü", "ue")) for w in want]
+        for f in fields:
+            nm = (f.get("name") or "").lower()
+            if any((w in nm) or (wa in nm) for w, wa in wl):
+                _LAST_ACTIVITY_KEY = f.get("key") or _LAST_ACTIVITY_KEY
+                break
+    except Exception:
+        pass
+    return _LAST_ACTIVITY_KEY
+
 
 # =============================================================================
 # Nachfass – Aufbau Master (funktionierend & performant, wie in der alten Version)
