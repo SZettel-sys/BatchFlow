@@ -571,6 +571,20 @@ async def _build_nf_master_final(
     next_key = await get_next_activity_key()
     batch_key = await get_batch_field_key()
     if not batch_key:
+        print("[WARN] Batch-Feldschlüssel nicht gefunden – Fallback aktiv.")
+        # 🔍 Fallback: suche in allen Person-Feldern manuell nach 'batch'
+        person_fields = await get_person_fields()
+        for f in person_fields:
+            name = (f.get("name") or "").lower()
+            key = f.get("key")
+            if "batch" in name and key:
+                batch_key = key
+                print(f"[INFO] Fallback Batch-Key erkannt: {batch_key}")
+                break
+
+    if not batch_key:
+        raise RuntimeError("Kein passendes Batch-Feld in Pipedrive gefunden.")
+    if not batch_key:
         raise RuntimeError("Personenfeld 'Batch ID' wurde nicht gefunden.")
 
     if job_obj:
@@ -585,7 +599,7 @@ async def _build_nf_master_final(
     for p in persons:
         # --- Batch-Feld robust prüfen ---
         val = p.get(batch_key)
-
+        print(f"[DEBUG] Person {p.get('id')} Batch-Wert: {val}")
         # Fall 1: dict mit value/label
         if isinstance(val, dict):
             val = val.get("value") or val.get("label") or ""
