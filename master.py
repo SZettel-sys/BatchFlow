@@ -342,12 +342,8 @@ async def stream_persons_by_batch_id(
     page_limit: int = 100,
     job_obj=None
 ) -> List[dict]:
-    """
-    Lädt Personen für mehrere Batch-IDs parallel über /persons/search.
-    Extrem performant durch asynchrone Requests.
-    """
     results: List[dict] = []
-    sem = asyncio.Semaphore(12)  # bis zu 12 gleichzeitige Requests
+    sem = asyncio.Semaphore(6)  # gedrosselt, um 429 zu vermeiden
 
     async def fetch_one(bid: str):
         start = 0
@@ -359,6 +355,10 @@ async def stream_persons_by_batch_id(
                     f"{PIPEDRIVE_API}/persons/search?term={bid}&fields=custom_fields&start={start}&limit={page_limit}"
                 )
                 r = await http_client().get(url, headers=get_headers())
+                if r.status_code == 429:
+                    print(f"[WARN] Rate limit erreicht, warte 2 Sekunden ...")
+                    await asyncio.sleep(2)
+                    continue
                 if r.status_code != 200:
                     print(f"[WARN] Batch {bid} Fehler: {r.text}")
                     break
@@ -373,7 +373,7 @@ async def stream_persons_by_batch_id(
 
                 if len(persons) < page_limit:
                     break
-                await asyncio.sleep(0.05)
+                await asyncio.sleep(0.1)  # minimale Pause zwischen Seiten
 
         print(f"[DEBUG] Batch {bid}: {total} Personen geladen")
         results.extend(local)
@@ -381,6 +381,7 @@ async def stream_persons_by_batch_id(
     await asyncio.gather(*[fetch_one(bid) for bid in batch_ids])
     print(f"[INFO] Alle Batch-IDs geladen: {len(results)} Personen gesamt")
     return results
+
 
 # =============================================================================
 # Nachfass – Aufbau Master (robust, progressiv & vollständig)
