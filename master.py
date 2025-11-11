@@ -604,13 +604,22 @@ async def _build_nf_master_final(
         # nach 1. Lauf wieder auskommentieren!
             break
         # --- Batch-Feld robust prüfen ---
+  
+                # --- Batch-Feld robust prüfen ---
         val = p.get(batch_key)
-        print(f"[DEBUG] Person {p.get('id')} Batch-Wert: {val}")
-        # Fall 1: dict mit value/label
+
+        # 🔹 1) Falls None: auch in custom_fields nachsehen
+        if not val:
+            cf = p.get("custom_fields", [])
+            if isinstance(cf, list):
+                for x in cf:
+                    if isinstance(x, str) and any(bid.lower() in x.lower() for bid in nf_batch_ids):
+                        val = x
+                        break
+
+        # 🔹 2) Standardbehandlung (dict, list, str)
         if isinstance(val, dict):
             val = val.get("value") or val.get("label") or ""
-
-        # Fall 2: Liste (mehrere Werte)
         elif isinstance(val, list):
             values = []
             for x in val:
@@ -619,10 +628,14 @@ async def _build_nf_master_final(
                 else:
                     values.append(str(x))
             val = " ".join(values)
-
-        # Fall 3: direkter String oder None
         else:
             val = str(val or "")
+
+        # Debug zur Kontrolle
+        print(f"[DEBUG] Person {p.get('id')} Batch-Wert: {val}")
+
+        if not _contains_any_text(val, nf_batch_ids):
+            continue
 
         # Debug-Check (kannst du nachher wieder entfernen)
         # print(f"[DEBUG] Person {p.get('id')}: Batch-Feld = {val}")
