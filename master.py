@@ -220,6 +220,17 @@ async def get_person_fields() -> List[dict]:
     _PERSON_FIELDS_CACHE = r.json().get("data") or []
     return _PERSON_FIELDS_CACHE
 
+def field_options_id_to_label_map(field: dict) -> Dict[str, str]:
+    """Erstellt ein Mapping von ID → Label für Dropdown-Optionen eines Pipedrive-Feldes."""
+    opts = field.get("options") or []
+    mp: Dict[str, str] = {}
+    for o in opts:
+        oid = str(o.get("id"))
+        lab = str(o.get("label") or o.get("name") or oid)
+        mp[oid] = lab
+    return mp
+
+
 async def get_person_field_by_hint(label_hint: str) -> Optional[dict]:
     """Findet ein Personenfeld anhand eines Text-Hints (z. B. 'fachbereich')."""
     fields = await get_person_fields()
