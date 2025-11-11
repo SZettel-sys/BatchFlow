@@ -109,23 +109,24 @@ def normalize_name(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
     
 def _contains_any_text(val, wanted: List[str]) -> bool:
-    """Hilfsfunktion: prüft robust, ob val einen der Strings in wanted enthält."""
+    """Robust: prüft, ob ein Wert oder ein Value-Feld eines Dicts einen Suchtext enthält."""
     if not wanted:
         return True
     if val is None or (isinstance(val, float) and pd.isna(val)):
         return False
     if isinstance(val, dict):
-        val = val.get("value")
+        val = val.get("value") or val.get("label") or ""
     if isinstance(val, (list, tuple, np.ndarray)):
         flat = []
         for x in val:
             if isinstance(x, dict):
-                x = x.get("value")
+                x = x.get("value") or x.get("label")
             if x:
                 flat.append(str(x))
         val = " | ".join(flat)
     s = str(val).lower().strip()
     return any(k.lower() in s for k in wanted if k)
+
 
 def parse_pd_date(d: Optional[str]) -> Optional[datetime]:
     try: return datetime.strptime(d, "%Y-%m-%d").replace(tzinfo=timezone.utc)
@@ -589,8 +590,12 @@ async def _build_nf_master_final(
             pid = str(p.get("id") or "")
             if not pid or pid in seen:
                 continue
-            if not _contains_any_text(p.get(batch_key), nf_batch_ids):
+            val = p.get(batch_key)
+            if isinstance(val, dict):
+                val = val.get("value") or val.get("label") or ""
+            if not _contains_any_text(val, nf_batch_ids):
                 continue
+
             av = extract_field_date(p, last_key) or extract_field_date(p, next_key)
             if is_forbidden_activity_date(av):
                 continue
