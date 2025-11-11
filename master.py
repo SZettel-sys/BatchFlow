@@ -244,22 +244,6 @@ async def get_person_field_by_hint(label_hint: str) -> Optional[dict]:
 # =============================================================================
 # STREAMING-FUNKTIONEN (mit Paging)
 # =============================================================================
-async def stream_persons_by_filter(filter_id: int, page_limit: int = PAGE_LIMIT) -> AsyncGenerator[List[dict], None]:
-    """Streamt Personen aus einem Filter mit Pagination."""
-    start = 0
-    while True:
-        url = append_token(f"{PIPEDRIVE_API}/persons?filter_id={filter_id}&start={start}&limit={page_limit}")
-        r = await http_client().get(url, headers=get_headers())
-        if r.status_code != 200:
-            raise Exception(f"Pipedrive Fehler: {r.text}")
-        data = r.json().get("data") or []
-        if not data:
-            break
-        yield data
-        if len(data) < page_limit:
-            break
-        start += len(data)
-
 async def stream_organizations_by_filter(filter_id: int, page_limit: int = PAGE_LIMIT) -> AsyncGenerator[List[dict], None]:
     """Streamt Organisationen mit Pagination."""
     start = 0
@@ -323,7 +307,15 @@ async def _fetch_org_names_for_filter_capped(
                 if total >= cap_total:
                     return buckets
     return buckets
-
+    
+def _pretty_reason(reason: str, extra: str = "") -> str:
+    """Liefert verständlichen Grundtext für entfernte Zeilen."""
+    reason = (reason or "").lower()
+    base = {
+        "org_match_95": "Organisations-Duplikat (≥95 % Ähnlichkeit)",
+        "person_id_match": "Person bereits kontaktiert (Filter 1216 / 1708)"
+    }.get(reason, "Entfernt")
+    return f"{base}{(' – ' + extra) if extra else ''}"
 # =============================================================================
 # Nachfass – Personen laden nach Batch-ID (mit Paging & Fortschritt)
 # =============================================================================
@@ -498,22 +490,47 @@ def field_options_id_to_label_map(field: dict) -> Dict[str, str]:
 # -----------------------------------------------------------------------------
 # STREAMING-FUNKTION
 # -----------------------------------------------------------------------------
-async def stream_persons_by_filter(filter_id: int, page_limit: int = NF_PAGE_LIMIT):
-    """Streamt Personen aus Pipedrive-Filter mit Paging."""
-    start = 0
-    while True:
-        url = append_token(f"{PIPEDRIVE_API}/persons?filter_id={filter_id}&start={start}&limit={page_limit}")
-        r = await http_client().get(url)
-        if r.status_code != 200:
-            raise Exception(f"Pipedrive API Fehler: {r.text}")
-        data = (r.json() or {}).get("data") or []
-        if not data:
-            break
-        yield data
-        if len(data) < page_limit:
-            break
-        start += page_limit
-        await asyncio.sleep(0.05)
+async def stream_persons_by_filter_fast(filter_id: int, page_limit: int = NF_PAGE_LIMIT) -> list[dict]:
+    """
+    Holt alle Personen aus einem Filter mit asynchronem Paging (parallelisiert).
+    Bis zu 20 Seiten (~10.000 Datensätze) werden parallel geladen.
+    """
+    import asyncio
+    sem = asyncio.Semaphore(8)  # Anzahl gleichzeitiger Requests
+    all_persons = []
+
+    async def fetch_page(start: int):
+        async with sem:
+            url = append_token(
+                f"{PIPEDRIVE_API}/persons?filter_id={filter_id}&start={start}&limit={page_limit}&sort=id"
+            )
+            r = await http_client().get(url)
+            if r.status_code != 200:
+                print(f"[WARN] Pipedrive Fehler bei Start={start}: {r.text[:120]}")
+                return []
+            data = (r.json() or {}).get("data") or []
+            return data
+
+    # Erstes Paket holen (um Gesamtmenge zu kennen)
+    url0 = append_token(f"{PIPEDRIVE_API}/persons?filter_id={filter_id}&start=0&limit={page_limit}&sort=id")
+    r0 = await http_client().get(url0)
+    if r0.status_code != 200:
+        raise Exception(f"Pipedrive Fehler: {r0.text}")
+    data0 = (r0.json() or {}).get("data") or []
+    all_persons.extend(data0)
+
+    if len(data0) == page_limit:
+        starts = list(range(page_limit, page_limit * 20, page_limit))
+        results = await asyncio.gather(*[fetch_page(s) for s in starts])
+        for chunk in results:
+            if not chunk:
+                continue
+            all_persons.extend(chunk)
+            if len(chunk) < page_limit:
+                break
+
+    print(f"[INFO] Filter {filter_id}: {len(all_persons)} Personen geladen.")
+    return all_persons
 
 
 # -----------------------------------------------------------------------------
@@ -563,18 +580,20 @@ async def _build_nf_master_final(
         raise RuntimeError("Personenfeld 'Batch ID' wurde nicht gefunden.")
 
     selected: List[dict] = []
-    async for chunk in stream_persons_by_filter(FILTER_NACHFASS):
-        for p in chunk:
-            av = extract_field_date(p, last_key) or extract_field_date(p, next_key)
-            if is_forbidden_activity_date(av):
-                continue
-            val = p.get(batch_key)
-            if not val:
-                continue
-            s_val = str(val).lower()
-            if not any(str(b).lower() in s_val for b in nf_batch_ids):
-                continue
-            selected.append(p)
+    persons = await stream_persons_by_filter_fast(FILTER_NACHFASS)
+    
+    for p in persons:
+        av = extract_field_date(p, last_key) or extract_field_date(p, next_key)
+        if is_forbidden_activity_date(av):
+            continue
+        val = p.get(batch_key)
+        if not val:
+            continue
+        s_val = str(val).lower()
+        if not any(str(b).lower() in s_val for b in nf_batch_ids):
+            continue
+        selected.append(p)
+
 
     rows: List[dict] = []
     for p in selected:
