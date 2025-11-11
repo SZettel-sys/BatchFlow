@@ -591,10 +591,26 @@ async def _build_nf_master_final(
             if not pid or pid in seen:
                 continue
             val = p.get(batch_key)
+            # Batch-Feld prüfen (string, dict oder liste möglich)
+            val = p.get(batch_key)
             if isinstance(val, dict):
                 val = val.get("value") or val.get("label") or ""
-            if not _contains_any_text(val, nf_batch_ids):
-                continue
+            elif isinstance(val, (list, tuple)):
+                vals = []
+                for x in val:
+                    if isinstance(x, dict):
+                        x = x.get("value") or x.get("label")
+                    if x:
+                        vals.append(str(x))
+                val = " | ".join(vals)
+            else:
+                val = str(val or "")
+
+        # Falls keine Übereinstimmung mit gesuchten Batch-IDs → überspringen
+        if not any(bid.lower() in val.lower() for bid in nf_batch_ids if bid):
+            continue
+
+            
 
             av = extract_field_date(p, last_key) or extract_field_date(p, next_key)
             if is_forbidden_activity_date(av):
