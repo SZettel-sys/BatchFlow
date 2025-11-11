@@ -665,23 +665,62 @@ async def _build_nf_master_final(
         emails = _as_list_email(p.get("email"))
         email = emails[0] if emails else ""
 
+        # -----------------------------------------------------------------
+        # Zeilenaufbau – robust für Search-Ergebnisse (wie in deinem JSON)
+        # -----------------------------------------------------------------
+        pid = p.get("id")
+        name = p.get("name") or ""
+        org_data = p.get("organization") or {}
+        org_name = org_data.get("name") or "-"
+        org_id = str(org_data.get("id") or "")
+        emails = p.get("emails") or []
+        email = ""
+        if isinstance(emails, list) and emails:
+            email = str(emails[0])
+        elif isinstance(emails, str):
+            email = emails
+
+        # LinkedIn / Xing Profil aus custom_fields extrahieren
+        cf = p.get("custom_fields") or []
+        linkedin_url = ""
+        xing_url = ""
+        position = ""
+        batch_val = ""
+        for item in cf:
+            if isinstance(item, str):
+                if "linkedin.com" in item.lower():
+                    linkedin_url = item
+                elif "xing.com" in item.lower():
+                    xing_url = item
+                elif "projektleiter" in item.lower() or "leiter" in item.lower():
+                    position = item
+                elif any(bid.lower() in item.lower() for bid in nf_batch_ids):
+                    batch_val = item
+
+        # Vor- und Nachname (falls nur "name" gegeben ist)
+        name_parts = name.split(" ", 1)
+        vor = name_parts[0] if len(name_parts) > 0 else ""
+        nach = name_parts[1] if len(name_parts) > 1 else ""
+
         rows.append({
-            "Batch ID": batch_id or "",
+            "Batch ID": batch_id or batch_val or "",
             "Channel": DEFAULT_CHANNEL,
             "Cold-Mailing Import": campaign or "",
-            "Prospect ID": get_field(p, "prospect"),
+            "Prospect ID": "",  # nicht in Search-Daten enthalten
             "Organisation ID": org_id,
             "Organisation Name": org_name,
             "Person ID": str(pid or ""),
             "Person Vorname": vor,
             "Person Nachname": nach,
-            "Person Titel": get_field(p, "titel") or get_field(p, "title") or get_field(p, "anrede"),
-            "Person Geschlecht": get_field(p, "gender") or get_field(p, "geschlecht"),
-            "Person Position": get_field(p, "position"),
+            "Person Titel": "",
+            "Person Geschlecht": "",
+            "Person Position": position,
             "Person E-Mail": email,
-            "XING Profil": get_field(p, "xing") or get_field(p, "xing url") or get_field(p, "xing profil"),
-            "LinkedIn URL": get_field(p, "linkedin"),
+            "XING Profil": xing_url,
+            "LinkedIn URL": linkedin_url,
         })
+
+        
 
     df = pd.DataFrame(rows, columns=TEMPLATE_COLUMNS)
     await save_df_text(df, tables("nf")["final"])
