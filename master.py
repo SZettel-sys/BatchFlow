@@ -1155,7 +1155,7 @@ async def reconcile_with_progress(job: "Job", prefix: str):
         job.phase = "Lade Vergleichsdaten …"; job.percent = 25
         await asyncio.sleep(0.2)
 
-        await _reconcile_generic(prefix, job_obj=job)
+        await _reconcile(prefix, job_obj=job)
 
         job.phase = "Abgleich abgeschlossen"; job.percent = 100
         job.done = True
