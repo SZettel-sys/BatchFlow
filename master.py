@@ -548,23 +548,35 @@ async def stream_persons_by_filter_fast(filter_id: int, page_limit: int = NF_PAG
     return all_persons
 
 
-# -----------------------------------------------------------------------------
-# NACHFASS MASTER FINAL
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Nachfass – Aufbau Master (final, schnell & robust)
+# =============================================================================
 async def _build_nf_master_final(
     nf_batch_ids: List[str],
     batch_id: str,
     campaign: str,
-    job_obj=None,
+    job_obj=None
 ) -> pd.DataFrame:
-    """Baut Nachfass-Daten robust & performant (finale geprüfte Version)."""
+    """Baut Nachfass-Daten robust & performant (direkte Batch-ID-Suche)."""
+    import asyncio
+
+    # --- Schritt 1: Initialisieren
+    if job_obj:
+        job_obj.phase = "Initialisiere Nachfass-Datenabruf …"
+        job_obj.percent = 5
+
     person_fields = await get_person_fields()
+    batch_key = await get_batch_field_key()
+    if not batch_key:
+        raise RuntimeError("Batch-ID-Feld wurde in Pipedrive nicht gefunden.")
+    print(f"[DEBUG] Gefundener Batch-Key: {batch_key}")
+
+    # --- Schritt 2: Feldzuordnung (Mapping)
     hint_to_key: Dict[str, str] = {}
     gender_map: Dict[str, str] = {}
-
     for f in person_fields:
         nm = (f.get("name") or "").lower()
-        for hint in PERSON_FIELD_HINTS_TO_EXPORT:
+        for hint in PERSON_FIELD_HINTS_TO_EXPORT.keys():
             if hint in nm and hint not in hint_to_key:
                 hint_to_key[hint] = f.get("key")
         if any(x in nm for x in ("gender", "geschlecht")):
@@ -576,47 +588,90 @@ async def _build_nf_master_final(
             return ""
         v = p.get(key)
         if isinstance(v, dict) and "label" in v:
-            return str(v.get("label") or "")
+            return str(v["label"])
         if isinstance(v, list):
-            if v and isinstance(v[0], dict) and "value" in v[0]:
-                return str(v[0].get("value") or "")
-            return ", ".join([str(x) for x in v if x])
-        if v is None or (isinstance(v, float) and pd.isna(v)):
-            return ""
-        sv = str(v)
+            vals = []
+            for x in v:
+                if isinstance(x, dict) and "value" in x:
+                    vals.append(str(x["value"]))
+                elif isinstance(x, str):
+                    vals.append(x)
+            return ", ".join(vals)
         if hint in ("gender", "geschlecht") and gender_map:
-            return gender_map.get(sv, sv)
-        return sv
+            return gender_map.get(str(v), str(v))
+        return str(v or "")
 
-    last_key = await get_last_activity_key()
-    next_key = await get_next_activity_key()
-    batch_key = await get_batch_field_key()
-    if not batch_key:
-        raise RuntimeError("Personenfeld 'Batch ID' wurde nicht gefunden.")
+    # --- Schritt 3: Batchweise Personen abrufen (direkte Suche)
+    async def fetch_batch_persons(bid: str) -> List[dict]:
+        """Sucht Personen mit dieser Batch-ID über /persons/search."""
+        all_items = []
+        start = 0
+        limit = 100
+        sem = asyncio.Semaphore(8)
+        bid_norm = str(bid).strip().lower().replace(" ", "")
+        print(f"[INFO] Starte Suche für Batch {bid_norm}")
 
-    selected: List[dict] = []
-    persons = await stream_persons_by_filter_fast(FILTER_NACHFASS)
-    
-    for p in persons:
-        av = extract_field_date(p, last_key) or extract_field_date(p, next_key)
-        if is_forbidden_activity_date(av):
-            continue
-        val = p.get(batch_key)
-        if not val:
-            continue
-        s_val = str(val).lower()
-        if not any(str(b).lower() in s_val for b in nf_batch_ids):
-            continue
-        selected.append(p)
+        async def fetch_page(offset: int):
+            async with sem:
+                url = append_token(
+                    f"{PIPEDRIVE_API}/persons/search?"
+                    f"term={bid}&fields=custom_fields&start={offset}&limit={limit}"
+                )
+                r = await http_client().get(url, headers=get_headers())
+                if r.status_code != 200:
+                    print(f"[WARN] Suche {bid} offset={offset} → {r.status_code}")
+                    return []
+                data = r.json().get("data", {}).get("items", [])
+                return [it.get("item") for it in data if it.get("item")]
 
+        # erste Seite
+        r0 = await http_client().get(
+            append_token(
+                f"{PIPEDRIVE_API}/persons/search?term={bid}&fields=custom_fields&start=0&limit={limit}"
+            ),
+            headers=get_headers()
+        )
+        if r0.status_code != 200:
+            print(f"[ERROR] Initialsuche für {bid} fehlgeschlagen: {r0.text[:200]}")
+            return []
+        data0 = r0.json().get("data", {}).get("items", [])
+        first = [it.get("item") for it in data0 if it.get("item")]
+        all_items.extend(first)
 
+        total = r0.json().get("data", {}).get("total_items", len(first))
+        if total > limit:
+            starts = list(range(limit, total, limit))
+            results = await asyncio.gather(*[fetch_page(s) for s in starts])
+            for chunk in results:
+                if chunk:
+                    all_items.extend(chunk)
+
+        print(f"[INFO] Batch {bid}: {len(all_items)} Personen gefunden")
+        return all_items
+
+    # --- Schritt 4: Alle Batches parallel abrufen
+    if job_obj:
+        job_obj.phase = "Lade Nachfass-Personen aus Pipedrive …"
+        job_obj.percent = 15
+
+    results = await asyncio.gather(*[fetch_batch_persons(bid) for bid in nf_batch_ids])
+    persons = [p for sub in results for p in sub]
+    total = len(persons)
+    print(f"[INFO] Gesamtanzahl Personen in allen Batches: {total}")
+
+    if not persons:
+        raise RuntimeError("Keine Personen zu diesen Batch-IDs gefunden.")
+
+    if job_obj:
+        job_obj.phase = f"{total} Nachfass-Personen gesammelt"
+        job_obj.percent = 40
+
+    # --- Schritt 5: Zu DataFrame umwandeln
     rows: List[dict] = []
-    for p in selected:
-        pid = p.get("id")
-        vor, nach = split_name(p.get("first_name"), p.get("last_name"), p.get("name"))
+    for p in persons:
         org = p.get("org_id") or {}
         org_name = org.get("name") or p.get("org_name") or "-"
-        org_id = str(org.get("id") or org.get("value") or "")
+        org_id = str(org.get("id") or "")
         emails = _as_list_email(p.get("email"))
         email = emails[0] if emails else ""
 
@@ -627,9 +682,9 @@ async def _build_nf_master_final(
             "Prospect ID": get_field(p, "prospect"),
             "Organisation ID": org_id,
             "Organisation Name": org_name,
-            "Person ID": str(pid or ""),
-            "Person Vorname": vor,
-            "Person Nachname": nach,
+            "Person ID": str(p.get("id") or ""),
+            "Person Vorname": p.get("first_name") or "",
+            "Person Nachname": p.get("last_name") or "",
             "Person Titel": get_field(p, "titel") or get_field(p, "title") or get_field(p, "anrede"),
             "Person Geschlecht": get_field(p, "gender") or get_field(p, "geschlecht"),
             "Person Position": get_field(p, "position"),
@@ -641,62 +696,10 @@ async def _build_nf_master_final(
     df = pd.DataFrame(rows, columns=TEMPLATE_COLUMNS)
     await save_df_text(df, tables("nf")["final"])
     print(f"[Nachfass] Export abgeschlossen ({len(df)} Zeilen)")
+    if job_obj:
+        job_obj.phase = f"Nachfass-Daten gespeichert ({len(df)} Zeilen)"
+        job_obj.percent = 60
     return df
-# =============================================================================
-# Personen-Streaming (parallelisiert & robust)
-# =============================================================================
-async def stream_persons_for_batch(bid: str) -> List[dict]:
-    persons: List[dict] = []
-    sem = asyncio.Semaphore(12)  # Max. gleichzeitige Requests
-
-    async def fetch_page(start: int):
-        async with sem:
-            try:
-                url = append_token(
-                    f"{PIPEDRIVE_API}/persons?filter_id={FILTER_NACHFASS}"
-                    f"&start={start}&limit={NF_PAGE_LIMIT}&sort=id"
-                )
-                r = await http_client().get(url, headers=get_headers())
-                if r.status_code != 200:
-                    print(f"[WARN] Fehler bei Page {start}: {r.text[:100]}")
-                    return []
-                data = (r.json() or {}).get("data") or []
-                return [p for p in data if _contains_any_text(p.get(batch_key), [bid])]
-            except Exception as e:
-                print(f"[ERROR] Ausnahme bei fetch_page({start}): {e}")
-                return []
-
-    try:
-        # Erste Seite laden
-        url0 = append_token(
-            f"{PIPEDRIVE_API}/persons?filter_id={FILTER_NACHFASS}&start=0&limit={NF_PAGE_LIMIT}&sort=id"
-        )
-        r0 = await http_client().get(url0, headers=get_headers())
-        if r0.status_code != 200:
-            print(f"[WARN] Fehler beim Initialabruf für Batch {bid}: {r0.text[:100]}")
-            return []
-
-        data0 = (r0.json() or {}).get("data") or []
-        if not data0:
-            print(f"[INFO] Keine Personen im Filter {FILTER_NACHFASS} gefunden.")
-            return []
-
-        persons.extend([p for p in data0 if str(p.get(batch_key, "")) == str(bid)])
-
-        # Prüfen, ob es mehr Seiten gibt
-        if len(data0) == NF_PAGE_LIMIT:
-            starts = list(range(NF_PAGE_LIMIT, NF_PAGE_LIMIT * 20, NF_PAGE_LIMIT))  # bis 10 000
-            results = await asyncio.gather(*[fetch_page(s) for s in starts])
-            for chunk in results:
-                if chunk:
-                    persons.extend(chunk)
-
-        print(f"[INFO] Batch {bid}: {len(persons)} Personen geladen.")
-        return persons
-
-    except Exception as e:
-        print(f"[ERROR] stream_persons_for_batch({bid}) fehlgeschlagen: {e}")
-        return []
 
 
 
