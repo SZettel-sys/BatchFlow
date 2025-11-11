@@ -674,7 +674,7 @@ async def _build_nf_master_final(
     # -------------------------------------------------------------------------
     rows: List[dict] = []
     for p in persons:
-        org = p.get("org_id") or {
+        org = p.get("org_id") or {}
         org_name = org.get("name") or p.get("org_name") or "-"
         org_id = str(org.get("id") or "")
         emails = _as_list_email(p.get("email"))
