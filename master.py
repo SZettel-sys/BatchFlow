@@ -547,26 +547,25 @@ async def stream_persons_by_filter(
         # Nächste Seite
         start += page_limit
 
+    # -------------------------------------------------------------------------
+    # NACHFASS
+    # -------------------------------------------------------------------------
 
-# =============================================================================
-# Nachfass – Vollständiger, performanter Datenaufbau (stabile Version)
-# =============================================================================
-async def _build_nf_master_final(
+    async def _build_nf_master_final(
     nf_batch_ids: List[str],
     batch_id: str,
     campaign: str,
     job_obj=None
 ) -> pd.DataFrame:
     """
-    Lädt alle Personen aus Filter 3024 (Nachfass), filtert nach Batch IDs,
-    prüft Aktivitäten und baut vollständigen Export-Datensatz.
+    Schneller Nachfass-Aufbau:
+    - pro Batch-ID via /persons/search paginieren
+    - Aktivitätsfenster filtern
+    - Felder robust mappen
+    - Ergebnis in nf_master_final sichern
     """
-
-    # -------------------------------------------------------------------------
-    # 1️⃣ Personenfelder abrufen + Mapping vorbereiten
-    # -------------------------------------------------------------------------
+    # 1) Feld-Mapping vorbereiten
     person_fields = await get_person_fields()
-
     hint_to_key: Dict[str, str] = {}
     gender_map: Dict[str, str] = {}
 
@@ -579,7 +578,6 @@ async def _build_nf_master_final(
             gender_map = field_options_id_to_label_map(f)
 
     def get_field(p: dict, hint: str) -> str:
-        """Liest Feldwerte anhand des Mapping-Hints aus."""
         key = hint_to_key.get(hint)
         if not key:
             return ""
@@ -597,54 +595,42 @@ async def _build_nf_master_final(
             return gender_map.get(sv, sv)
         return sv
 
-    # -------------------------------------------------------------------------
-    # 2️⃣ Feld-Keys für Aktivitäten & Batch ID
-    # -------------------------------------------------------------------------
-    last_key = await get_last_activity_key()
-    next_key = await get_next_activity_key()
+    # 2) Schlüssel für Aktivität + Batch-Feld holen
+    last_key  = await get_last_activity_key()
+    next_key  = await get_next_activity_key()
     batch_key = await get_batch_field_key()
     if not batch_key:
         raise RuntimeError("Personenfeld 'Batch ID' wurde nicht gefunden.")
 
-    # -------------------------------------------------------------------------
-    # 3️⃣ Personen aus Filter 3024 (Nachfass) streamen
-    # -------------------------------------------------------------------------
-    selected: List[dict] = []
-    count = 0
-
+    # 3) Personen gezielt pro Batch-ID laden (Search)
     if job_obj:
-        job_obj.phase = "Lade Nachfass-Personen (Pipedrive)…"
+        job_obj.phase   = "Lade Nachfass-Daten aus Pipedrive …"
         job_obj.percent = 10
 
-    async for chunk in stream_persons_by_filter(FILTER_NACHFASS):
-        for p in chunk:
-            # Aktivitäten prüfen: keine zukünftigen oder <= 3 Monate alten
+    selected: List[dict] = []
+    seen: set[str] = set()
+
+    async for page in stream_persons_by_batch_id(batch_key, nf_batch_ids, page_limit=100, job_obj=job_obj):
+        for p in page:
+            pid = str(p.get("id") or "")
+            if not pid or pid in seen:
+                continue
+            # Sicherstellen, dass das Batch-Feld wirklich zur gesuchten ID passt
+            if not _contains_any_text(p.get(batch_key), nf_batch_ids):
+                continue
+            # Aktivitätsfenster (keine Zukunft, nichts in den letzten 3 Monaten)
             av = extract_field_date(p, last_key) or extract_field_date(p, next_key)
             if is_forbidden_activity_date(av):
                 continue
-
-            # Batch-ID prüfen
-            if not _contains_any_text(p.get(batch_key), nf_batch_ids):
-                continue
-
+            seen.add(pid)
             selected.append(p)
-            count += 1
 
-        # optionaler Zwischenfortschritt
-        if job_obj and count % 200 == 0:
-            job_obj.phase = f"{count} Nachfass-Personen geladen …"
-            job_obj.percent = min(40, 10 + (count // 50))
+    if job_obj:
+        job_obj.phase   = f"{len(selected)} Nachfass-Personen gefunden"
+        job_obj.percent = 40
 
-    print(f"[INFO] Filter {FILTER_NACHFASS}: {count} Personen geladen.")
-    if not selected:
-        print("[WARN] Keine passenden Personen im Nachfass-Filter gefunden.")
-        await save_df_text(pd.DataFrame(columns=TEMPLATE_COLUMNS), tables("nf")["final"])
-        return pd.DataFrame(columns=TEMPLATE_COLUMNS)
-
-    # -------------------------------------------------------------------------
-    # 4️⃣ Zeilen für Excel/DB aufbauen
-    # -------------------------------------------------------------------------
-    rows = []
+    # 4) Zeilen fürs Excel aufbauen
+    rows: List[dict] = []
     for p in selected:
         pid = p.get("id")
         vor, nach = split_name(p.get("first_name"), p.get("last_name"), p.get("name"))
@@ -663,7 +649,7 @@ async def _build_nf_master_final(
         else:
             org_name = (p.get("org_name") or org_name)
 
-        # E-Mail extrahieren
+        # E-Mail (erste vorhandene)
         def _list_email(v):
             if v is None or (isinstance(v, float) and pd.isna(v)):
                 return []
@@ -681,7 +667,7 @@ async def _build_nf_master_final(
             return [str(v)]
 
         emails = _list_email(p.get("email"))
-        email = emails[0] if emails else ""
+        email  = emails[0] if emails else ""
 
         rows.append({
             "Batch ID": batch_id or "",
@@ -701,44 +687,15 @@ async def _build_nf_master_final(
             "LinkedIn URL": get_field(p, "linkedin"),
         })
 
-    # -------------------------------------------------------------------------
-    # 5️⃣ Speichern & Rückgabe
-    # -------------------------------------------------------------------------
     df = pd.DataFrame(rows, columns=TEMPLATE_COLUMNS)
-    await save_df_text(df, tables("nf")["final"])
-    print(f"[Nachfass] Export abgeschlossen ({len(df)} Zeilen).")
-
+    await save_df_text(df, tables("nf")["final"])  # <-- Einheitliche Tabellennamen
     if job_obj:
-        job_obj.phase = f"Daten geladen ({len(df)} Zeilen)"
-        job_obj.percent = 50
-
+        job_obj.phase   = f"Daten gespeichert ({len(df)} Zeilen)"
+        job_obj.percent = 60
+    print(f"[Nachfass] Export abgeschlossen ({len(df)} Zeilen).")
     return df
 
 
-
-    # -------------------------------------------------------------------------
-    # Parallel mehrere Batch-IDs laden
-    # -------------------------------------------------------------------------
-    if job_obj:
-        job_obj.phase = "Lade Nachfass-Personen (Pipedrive)…"
-        job_obj.percent = 10
-
-    sem = asyncio.Semaphore(12)  # gute Balance zwischen Speed & Rate-Limit
-
-    async def safe_fetch(bid):
-        async with sem:
-            try:
-                return await stream_persons_for_batch(bid)
-            except Exception as e:
-                print(f"[WARN] Batch {bid} Fehler: {e}")
-                return []
-
-    results = await asyncio.gather(*(safe_fetch(bid) for bid in nf_batch_ids))
-    persons = [p for sub in results for p in sub]
-    total = len(persons)
-    if job_obj:
-        job_obj.phase = f"{total} Nachfass-Personen gesammelt"
-        job_obj.percent = 40
 
     # -------------------------------------------------------------------------
     # Zu DataFrame konvertieren
@@ -781,76 +738,6 @@ async def _build_nf_master_final(
         job_obj.percent = 60
 
     return df
-
-
-
-
-
-# =============================================================================
-# Export-Start – Nachfass (unverändert, ruft oben stehende Funktion auf)!!
-# =============================================================================
-@app.post("/nachfass/export_start")
-async def export_start_nf(
-    nf_batch_ids: List[str] = Body(..., embed=True),
-    batch_id: str = Body(...),
-    campaign: str = Body(...),
-):
-    job_id = str(uuid.uuid4())
-    job = Job()
-    JOBS[job_id] = job
-    job.phase = "Initialisiere Nachfass …"
-    job.percent = 1
-    job.filename_base = slugify_filename(campaign or "BatchFlow_Export")
-
-    async def update_progress(phase: str, percent: int):
-        job.phase = phase
-        job.percent = max(0, min(100, percent))
-        await asyncio.sleep(0.05)
-
-    async def _run():
-        try:
-            # 1️⃣ Lade Personen
-            await update_progress("Lade Nachfass-Daten aus Pipedrive …", 5)
-            df = await _build_nf_master_final(nf_batch_ids, batch_id, campaign, job_obj=job)
-
-            if df.empty:
-                job.error = "Keine Daten für Batch-ID(s) gefunden."
-                job.phase = "Keine Daten"
-                job.percent = 100
-                job.done = True
-                return
-
-            total = len(df)
-            if total > 8000:
-                await update_progress(f"Reduziere Vergleichsdaten (nur 8000 von {total}) …", 30)
-                df = df.sample(8000, random_state=42)
-
-            # 2️⃣ Abgleich / Dublettenprüfung
-            await update_progress("Führe Abgleich (Organisationen & IDs) durch …", 55)
-            await reconcile_with_progress(job, "nf")
-
-            # 3️⃣ Excel erzeugen
-            await update_progress("Erzeuge Excel-Datei …", 80)
-            ready = await load_df_text("nf_master_ready")
-            export_df = build_export_from_ready(ready)
-            job.excel_bytes = _df_to_excel_bytes(export_df)
-
-            # 4️⃣ Abschluss
-            await update_progress(f"Export abgeschlossen – {len(export_df)} Zeilen", 100)
-            job.total_rows = len(export_df)
-            job.done = True
-
-            print(f"[Nachfass] Export abgeschlossen – {job.total_rows} Zeilen, Job-ID: {job_id}")
-
-        except Exception as e:
-            job.error = f"Fehler: {e}"
-            job.phase = "Fehler"
-            job.percent = 100
-            job.done = True
-
-    asyncio.create_task(_run())
-    return JSONResponse({"job_id": job_id})
-
 
 
 # =============================================================================
@@ -912,8 +799,8 @@ async def _build_nk_master_final(
         job_obj.phase = "Lade Neukontakte aus Pipedrive …"
         job_obj.percent = 10
 
-    async for chunk in stream_persons_by_filter(FILTER_NEUKONTAKTE):
-        for p in chunk:
+    persons = await stream_persons_by_filter(FILTER_NEUKONTAKTE)
+         for p in chunk:
             if str(p.get(fb_key)) != str(fachbereich):
                 continue
             org = p.get("org_id") or {}
@@ -1002,45 +889,29 @@ def fast_fuzzy(a: str, b: str) -> int:
 # =============================================================================
 async def _reconcile(prefix: str) -> None:
     """
-    Fuzzy-Abgleich auf Organisationsebene (≥95 %) und Entfernen bereits
-    kontaktierter Personen (Filter 1216/1708). Nutzt drei Organisationsfilter
-    (1245, 851, 1521) und erstellt ein detailliertes Löschprotokoll.
+    Fuzzy-Abgleich (≥95 %) + Entfernen bereits kontaktierter Personen.
+    Orga-Filter: 1245, 851, 1521. Personen-ID-Filter: 1216, 1708.
+    Ergebnis: *_master_ready + *_delete_log
     """
     t = tables(prefix)
     master = await load_df_text(t["final"])
     if master is None or master.empty:
-        print(f"[WARN] Kein Inhalt in {t['final']} – Abgleich wird übersprungen.")
         await save_df_text(pd.DataFrame(), t["ready"])
-        await save_df_text(
-            pd.DataFrame(columns=["reason", "id", "name", "org_id", "org_name", "extra"]),
-            t["log"],
-        )
+        await save_df_text(pd.DataFrame(columns=["reason","id","name","org_id","org_name","extra"]), t["log"])
         return
 
-    col_person_id = "Person ID"
-    col_org_name = "Organisation Name"
-    col_org_id = "Organisation ID"
+    col_person_id, col_org_name, col_org_id = "Person ID", "Organisation Name", "Organisation ID"
     delete_rows: List[Dict[str, str]] = []
 
-    # -------------------------------------------------------------------------
-    # 1️⃣ Organisationen laden & Buckets aufbauen
-    # -------------------------------------------------------------------------
+    # 1) Orgas einsammeln (1245, 851, 1521)
     filter_ids_org = [1245, 851, 1521]
     buckets_all: Dict[str, List[str]] = {}
     collected_total = 0
-
     for fid in filter_ids_org:
-        remaining = max(0, MAX_ORG_NAMES - collected_total)
-        if remaining <= 0:
+        caps_left = max(0, MAX_ORG_NAMES - collected_total)
+        if caps_left <= 0:
             break
-
-        buckets = await _fetch_org_names_for_filter_capped(
-            fid, PAGE_LIMIT, remaining, MAX_ORG_BUCKET
-        )
-        total_loaded = sum(len(v) for v in buckets.values())
-        collected_total += total_loaded
-        print(f"[DEBUG] Filter {fid}: {total_loaded} Organisationen geladen")
-
+        buckets = await _fetch_org_names_for_filter_capped(fid, PAGE_LIMIT, caps_left, MAX_ORG_BUCKET)
         for k, lst in buckets.items():
             slot = buckets_all.setdefault(k, [])
             for n in lst:
@@ -1048,30 +919,23 @@ async def _reconcile(prefix: str) -> None:
                     break
                 if n not in slot:
                     slot.append(n)
+                    collected_total += 1
         if collected_total >= MAX_ORG_NAMES:
             break
 
-    print(f"[INFO] Insgesamt {collected_total} Organisationsnamen aus {filter_ids_org} gesammelt.")
-
-    # -------------------------------------------------------------------------
-    # 2️⃣ Fuzzy-Abgleich ≥95 % gegen bestehende Organisationen
-    # -------------------------------------------------------------------------
+    # 2) Fuzzy ≥95 %
     drop_idx = []
     for idx, row in master.iterrows():
         cand = str(row.get(col_org_name) or "").strip()
         cand_norm = normalize_name(cand)
         if not cand_norm:
             continue
-
         bucket = buckets_all.get(cand_norm[0])
         if not bucket:
             continue
-
-        # Eingrenzen auf ähnliche Längen
         near = [n for n in bucket if abs(len(n) - len(cand_norm)) <= 4]
         if not near:
             continue
-
         best = process.extractOne(cand_norm, near, scorer=fuzz.token_sort_ratio)
         if best and best[1] >= 95:
             drop_idx.append(idx)
@@ -1081,25 +945,21 @@ async def _reconcile(prefix: str) -> None:
                 "name": f"{row.get('Person Vorname') or ''} {row.get('Person Nachname') or ''}".strip(),
                 "org_id": str(row.get(col_org_id) or ""),
                 "org_name": cand,
-                "extra": f"Ähnlichkeit: {best[0]} ({best[1]} %)",
+                "extra": f"Ähnlichkeit: {best[0]} ({best[1]} %)"
             })
 
     if drop_idx:
         master = master.drop(index=drop_idx)
-    print(f"[INFO] {len(drop_idx)} Zeilen aufgrund Orga-Match entfernt.")
 
-    # -------------------------------------------------------------------------
-    # 3️⃣ Entfernen von Personen-IDs aus Filtern 1216 / 1708
-    # -------------------------------------------------------------------------
+    # 3) Bereits kontaktierte Personen entfernen (1216/1708)
     suspect_ids = set()
     for f_id in (1216, 1708):
         async for page in stream_person_ids_by_filter(f_id):
             suspect_ids.update(page)
-        print(f"[DEBUG] Filter {f_id}: {len(suspect_ids)} IDs geladen.")
 
     if suspect_ids:
-        mask_pid = master[col_person_id].astype(str).isin(suspect_ids)
-        removed = master[mask_pid].copy()
+        mask = master[col_person_id].astype(str).isin(suspect_ids)
+        removed = master[mask].copy()
         for _, r in removed.iterrows():
             delete_rows.append({
                 "reason": "person_id_match",
@@ -1107,22 +967,14 @@ async def _reconcile(prefix: str) -> None:
                 "name": f"{r.get('Person Vorname') or ''} {r.get('Person Nachname') or ''}".strip(),
                 "org_id": str(r.get(col_org_id) or ""),
                 "org_name": str(r.get(col_org_name) or ""),
-                "extra": "Bereits in Filter 1216/1708",
+                "extra": "Bereits in Filter 1216/1708"
             })
-        master = master[~mask_pid].copy()
-        print(f"[INFO] {len(removed)} Personen wegen ID-Match entfernt.")
+        master = master[~mask].copy()
 
-    # -------------------------------------------------------------------------
-    # 4️⃣ Ergebnisse speichern (Master + Log)
-    # -------------------------------------------------------------------------
+    # 4) Speichern
     await save_df_text(master, t["ready"])
-    log_df = pd.DataFrame(
-        delete_rows,
-        columns=["reason", "id", "name", "org_id", "org_name", "extra"],
-    )
+    log_df = pd.DataFrame(delete_rows, columns=["reason","id","name","org_id","org_name","extra"])
     await save_df_text(log_df, t["log"])
-
-    print(f"[INFO] Abgleich abgeschlossen – {len(delete_rows)} Einträge im Löschprotokoll gespeichert.")
 
 
 # =============================================================================
