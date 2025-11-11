@@ -339,49 +339,48 @@ def _pretty_reason(reason: str, extra: str = "") -> str:
 async def stream_persons_by_batch_id(
     batch_key: str,
     batch_ids: List[str],
-    page_limit: int = 100,   # Pipedrive erlaubt max. 100
-    job_obj=None,
-    update_progress=None
-) -> AsyncGenerator[List[dict], None]:
+    page_limit: int = 100,
+    job_obj=None
+) -> List[dict]:
     """
-    Lädt Personen für jede Batch-ID über /persons/search mit Paging.
-    Holt alle Treffer, nicht nur die erste Seite.
+    Lädt Personen für mehrere Batch-IDs parallel über /persons/search.
+    Extrem performant durch asynchrone Requests.
     """
-    for bid in batch_ids:
+    results: List[dict] = []
+    sem = asyncio.Semaphore(12)  # bis zu 12 gleichzeitige Requests
+
+    async def fetch_one(bid: str):
         start = 0
         total = 0
-        page = 0
-        while True:
-            url = append_token(
-                f"{PIPEDRIVE_API}/persons/search?term={bid}&fields=custom_fields&start={start}&limit={page_limit}"
-            )
-            r = await http_client().get(url, headers=get_headers())
-            if r.status_code != 200:
-                print(f"[WARN] Batch {bid} Fehler: {r.text}")
-                break
+        local = []
+        async with sem:
+            while True:
+                url = append_token(
+                    f"{PIPEDRIVE_API}/persons/search?term={bid}&fields=custom_fields&start={start}&limit={page_limit}"
+                )
+                r = await http_client().get(url, headers=get_headers())
+                if r.status_code != 200:
+                    print(f"[WARN] Batch {bid} Fehler: {r.text}")
+                    break
+                data = r.json().get("data", {}).get("items", [])
+                if not data:
+                    break
 
-            data = r.json().get("data", {}).get("items", [])
-            if not data:
-                break
+                persons = [it.get("item") for it in data if it.get("item")]
+                local.extend(persons)
+                total += len(persons)
+                start += len(persons)
 
-            persons = [it.get("item") for it in data if it.get("item")]
-            yield persons
+                if len(persons) < page_limit:
+                    break
+                await asyncio.sleep(0.05)
 
-            total += len(persons)
-            page += 1
-            start += len(persons)
+        print(f"[DEBUG] Batch {bid}: {total} Personen geladen")
+        results.extend(local)
 
-            # Fortschrittsanzeige (optional)
-            if job_obj:
-                job_obj.phase = f"Batch {bid}: Seite {page}, {total} Personen geladen"
-                job_obj.percent = min(20 + (total // 100), 60)
-            print(f"[DEBUG] Batch {bid}: Seite {page}, {len(persons)} Personen (Start={start})")
-
-            # Abbruch, wenn weniger als page_limit
-            if len(persons) < page_limit:
-                break
-
-        print(f"[INFO] Batch {bid}: {total} Personen gefunden")
+    await asyncio.gather(*[fetch_one(bid) for bid in batch_ids])
+    print(f"[INFO] Alle Batch-IDs geladen: {len(results)} Personen gesamt")
+    return results
 
 # =============================================================================
 # Nachfass – Aufbau Master (robust, progressiv & vollständig)
@@ -525,7 +524,6 @@ async def stream_persons_by_filter(
 # -------------------------------------------------------------------------
 # NACHFASS
 # -------------------------------------------------------------------------
-
 async def _build_nf_master_final(
     nf_batch_ids: List[str],
     batch_id: str,
@@ -533,17 +531,15 @@ async def _build_nf_master_final(
     job_obj=None
 ) -> pd.DataFrame:
     """
-    Schneller, stabiler Nachfass-Aufbau:
-    - nutzt Filter 3024 (Nachfass)
-    - prüft Batch-ID-Feld robust (auch Dicts)
-    - ignoriert Aktivitätsdaten der letzten 3 Monate / Zukunft
-    - schreibt in nf_master_final
+    Schneller Nachfass-Aufbau (parallelisiert, robust):
+    - lädt Personen asynchron über /persons/search
+    - prüft Batch-ID-Feld und Aktivitätsdaten
+    - speichert Ergebnis in nf_master_final
     """
     person_fields = await get_person_fields()
     hint_to_key: Dict[str, str] = {}
     gender_map: Dict[str, str] = {}
 
-    # Feld-Mapping vorbereiten
     for f in person_fields:
         nm = (f.get("name") or "").lower()
         for hint in PERSON_FIELD_HINTS_TO_EXPORT.keys():
@@ -570,7 +566,6 @@ async def _build_nf_master_final(
             return gender_map.get(sv, sv)
         return sv
 
-    # Schlüssel für Aktivität & Batch-ID
     last_key = await get_last_activity_key()
     next_key = await get_next_activity_key()
     batch_key = await get_batch_field_key()
@@ -578,45 +573,36 @@ async def _build_nf_master_final(
         raise RuntimeError("Personenfeld 'Batch ID' wurde nicht gefunden.")
 
     if job_obj:
-        job_obj.phase = "Lade Nachfass-Personen (Filter 3024) …"
+        job_obj.phase = "Lade Nachfass-Daten aus Pipedrive …"
         job_obj.percent = 10
 
-    selected: List[dict] = []
-    async for chunk in stream_persons_by_filter(FILTER_NACHFASS):
-        for p in chunk:
-            # Aktivität prüfen
-            av = extract_field_date(p, last_key) or extract_field_date(p, next_key)
-            if is_forbidden_activity_date(av):
-                continue
-
-            # Batch-Feld robust prüfen
-            val = p.get(batch_key)
-            if isinstance(val, dict):
-                val = val.get("value") or val.get("label") or ""
-            if not _contains_any_text(val, nf_batch_ids):
-                continue
-
-            selected.append(p)
-
-    if not selected:
+    persons = await stream_persons_by_batch_id(batch_key, nf_batch_ids, page_limit=100, job_obj=job_obj)
+    if not persons:
         raise RuntimeError("Keine Daten für Batch-ID(s) gefunden.")
+
+    selected = []
+    for p in persons:
+        val = p.get(batch_key)
+        if isinstance(val, dict):
+            val = val.get("value") or val.get("label") or ""
+        if not _contains_any_text(val, nf_batch_ids):
+            continue
+        av = extract_field_date(p, last_key) or extract_field_date(p, next_key)
+        if is_forbidden_activity_date(av):
+            continue
+        selected.append(p)
+
+    if job_obj:
+        job_obj.phase = f"{len(selected)} Nachfass-Personen nach Filter"
+        job_obj.percent = 40
 
     rows = []
     for p in selected:
         pid = p.get("id")
         vor, nach = split_name(p.get("first_name"), p.get("last_name"), p.get("name"))
-
-        # Organisation
-        org_name, org_id = "-", ""
         org = p.get("org_id") or {}
-        if isinstance(org, dict):
-            org_name = org.get("name") or p.get("org_name") or "-"
-            org_id = str(org.get("id") or org.get("value") or "")
-        elif isinstance(org, (int, str)) and str(org).strip():
-            org_id = str(org)
-            org_name = (p.get("org_name") or org_name)
-
-        # E-Mail
+        org_name = org.get("name") or p.get("org_name") or "-"
+        org_id = str(org.get("id") or org.get("value") or "")
         emails = _as_list_email(p.get("email"))
         email = emails[0] if emails else ""
 
@@ -640,12 +626,7 @@ async def _build_nf_master_final(
 
     df = pd.DataFrame(rows, columns=TEMPLATE_COLUMNS)
     await save_df_text(df, tables("nf")["final"])
-    print(f"[Nachfass] Export abgeschlossen ({len(df)} Zeilen).")
-
-    if job_obj:
-        job_obj.phase = f"Daten gespeichert ({len(df)} Zeilen)"
-        job_obj.percent = 60
-
+    print(f"[Nachfass] Export abgeschlossen ({len(df)} Zeilen)")
     return df
 
 
