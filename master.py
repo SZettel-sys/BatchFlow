@@ -505,47 +505,47 @@ def field_options_id_to_label_map(field: dict) -> Dict[str, str]:
 # -----------------------------------------------------------------------------
 # STREAMING-FUNKTION
 # -----------------------------------------------------------------------------
-async def stream_persons_by_filter(filter_id: int, page_limit: int = NF_PAGE_LIMIT) -> list[dict]:
+from typing import AsyncGenerator, List
+
+# =============================================================================
+# Personen aus Pipedrive-Filter streamen (komplett, asynchron & paginiert)
+# =============================================================================
+async def stream_persons_by_filter(
+    filter_id: int,
+    page_limit: int = PAGE_LIMIT
+) -> AsyncGenerator[List[dict], None]:
     """
-    Holt alle Personen aus einem Filter mit asynchronem Paging (parallelisiert).
-    Bis zu 20 Seiten (~10.000 Datensätze) werden parallel geladen.
+    Streamt alle Personen aus einem Pipedrive-Filter mit Pagination.
+    Nutzt async generator (yield) – funktioniert mit async for.
     """
-    import asyncio
-    sem = asyncio.Semaphore(8)  # Anzahl gleichzeitiger Requests
-    all_persons = []
+    start = 0
+    total = 0
 
-    async def fetch_page(start: int):
-        async with sem:
-            url = append_token(
-                f"{PIPEDRIVE_API}/persons?filter_id={filter_id}&start={start}&limit={page_limit}&sort=id"
-            )
-            r = await http_client().get(url)
-            if r.status_code != 200:
-                print(f"[WARN] Pipedrive Fehler bei Start={start}: {r.text[:120]}")
-                return []
-            data = (r.json() or {}).get("data") or []
-            return data
+    while True:
+        url = append_token(
+            f"{PIPEDRIVE_API}/persons?filter_id={filter_id}&start={start}&limit={page_limit}&sort=id"
+        )
+        r = await http_client().get(url, headers=get_headers())
 
-    # Erstes Paket holen (um Gesamtmenge zu kennen)
-    url0 = append_token(f"{PIPEDRIVE_API}/persons?filter_id={filter_id}&start=0&limit={page_limit}&sort=id")
-    r0 = await http_client().get(url0)
-    if r0.status_code != 200:
-        raise Exception(f"Pipedrive Fehler: {r0.text}")
-    data0 = (r0.json() or {}).get("data") or []
-    all_persons.extend(data0)
+        if r.status_code != 200:
+            raise Exception(f"Pipedrive API Fehler: {r.text}")
 
-    if len(data0) == page_limit:
-        starts = list(range(page_limit, page_limit * 20, page_limit))
-        results = await asyncio.gather(*[fetch_page(s) for s in starts])
-        for chunk in results:
-            if not chunk:
-                continue
-            all_persons.extend(chunk)
-            if len(chunk) < page_limit:
-                break
+        data = r.json().get("data") or []
+        if not data:
+            break
 
-    print(f"[INFO] Filter {filter_id}: {len(all_persons)} Personen geladen.")
-    return all_persons
+        total += len(data)
+        print(f"[DEBUG] Filter {filter_id}: {len(data)} Personen (Start={start}, Gesamt={total})")
+
+        # Ergebnis an den Aufrufer streamen
+        yield data
+
+        # Wenn weniger als eine volle Seite zurückkam → Ende
+        if len(data) < page_limit:
+            break
+
+        # Nächste Seite
+        start += page_limit
 
 
 # =============================================================================
