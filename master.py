@@ -528,11 +528,11 @@ async def stream_persons_by_filter(
     # -------------------------------------------------------------------------
 
     async def _build_nf_master_final(
-    nf_batch_ids: List[str],
-    batch_id: str,
-    campaign: str,
-    job_obj=None
-) -> pd.DataFrame:
+        nf_batch_ids: List[str],
+        batch_id: str,
+        campaign: str,
+        job_obj=None
+    ) -> pd.DataFrame:
     """
     Schneller Nachfass-Aufbau:
     - pro Batch-ID via /persons/search paginieren
@@ -541,134 +541,134 @@ async def stream_persons_by_filter(
     - Ergebnis in nf_master_final sichern
     """
     # 1) Feld-Mapping vorbereiten
-    person_fields = await get_person_fields()
-    hint_to_key: Dict[str, str] = {}
-    gender_map: Dict[str, str] = {}
-
-    for f in person_fields:
-        nm = (f.get("name") or "").lower()
-        for hint in PERSON_FIELD_HINTS_TO_EXPORT.keys():
-            if hint in nm and hint not in hint_to_key:
-                hint_to_key[hint] = f.get("key")
-        if any(x in nm for x in ("gender", "geschlecht")):
-            gender_map = field_options_id_to_label_map(f)
-
-    def get_field(p: dict, hint: str) -> str:
-        key = hint_to_key.get(hint)
-        if not key:
-            return ""
-        v = p.get(key)
-        if isinstance(v, dict) and "label" in v:
-            return str(v.get("label") or "")
-        if isinstance(v, list):
-            if v and isinstance(v[0], dict) and "value" in v[0]:
-                return str(v[0].get("value") or "")
-            return ", ".join([str(x) for x in v if x])
-        if v is None or (isinstance(v, float) and pd.isna(v)):
-            return ""
-        sv = str(v)
-        if hint in ("gender", "geschlecht") and gender_map:
-            return gender_map.get(sv, sv)
-        return sv
-
-    # 2) Schlüssel für Aktivität + Batch-Feld holen
-    last_key  = await get_last_activity_key()
-    next_key  = await get_next_activity_key()
-    batch_key = await get_batch_field_key()
-    if not batch_key:
-        raise RuntimeError("Personenfeld 'Batch ID' wurde nicht gefunden.")
-
-    # 3) Personen gezielt pro Batch-ID laden (Search)
-    if job_obj:
-        job_obj.phase   = "Lade Nachfass-Daten aus Pipedrive …"
-        job_obj.percent = 10
-
-    selected: List[dict] = []
-    seen: set[str] = set()
-
-    async for page in stream_persons_by_batch_id(batch_key, nf_batch_ids, page_limit=100, job_obj=job_obj):
-        for p in page:
-            pid = str(p.get("id") or "")
-            if not pid or pid in seen:
-                continue
-            # Sicherstellen, dass das Batch-Feld wirklich zur gesuchten ID passt
-            if not _contains_any_text(p.get(batch_key), nf_batch_ids):
-                continue
-            # Aktivitätsfenster (keine Zukunft, nichts in den letzten 3 Monaten)
-            av = extract_field_date(p, last_key) or extract_field_date(p, next_key)
-            if is_forbidden_activity_date(av):
-                continue
-            seen.add(pid)
-            selected.append(p)
-
-    if job_obj:
-        job_obj.phase   = f"{len(selected)} Nachfass-Personen gefunden"
-        job_obj.percent = 40
-
-    # 4) Zeilen fürs Excel aufbauen
-    rows: List[dict] = []
-    for p in selected:
-        pid = p.get("id")
-        vor, nach = split_name(p.get("first_name"), p.get("last_name"), p.get("name"))
-
-        # Organisation
-        org_name, org_id = "-", ""
-        org = p.get("org_id")
-        if isinstance(org, dict):
-            org_name = org.get("name") or p.get("org_name") or "-"
-            oid = org.get("id") if org.get("id") is not None else org.get("value")
-            if oid is not None and str(oid).strip():
-                org_id = str(oid)
-        elif isinstance(org, (int, str)) and str(org).strip():
-            org_id = str(org).strip()
-            org_name = (p.get("org_name") or org_name)
-        else:
-            org_name = (p.get("org_name") or org_name)
-
-        # E-Mail (erste vorhandene)
-        def _list_email(v):
+        person_fields = await get_person_fields()
+        hint_to_key: Dict[str, str] = {}
+        gender_map: Dict[str, str] = {}
+    
+        for f in person_fields:
+            nm = (f.get("name") or "").lower()
+            for hint in PERSON_FIELD_HINTS_TO_EXPORT.keys():
+                if hint in nm and hint not in hint_to_key:
+                    hint_to_key[hint] = f.get("key")
+            if any(x in nm for x in ("gender", "geschlecht")):
+                gender_map = field_options_id_to_label_map(f)
+    
+        def get_field(p: dict, hint: str) -> str:
+            key = hint_to_key.get(hint)
+            if not key:
+                return ""
+            v = p.get(key)
+            if isinstance(v, dict) and "label" in v:
+                return str(v.get("label") or "")
+            if isinstance(v, list):
+                if v and isinstance(v[0], dict) and "value" in v[0]:
+                    return str(v[0].get("value") or "")
+                return ", ".join([str(x) for x in v if x])
             if v is None or (isinstance(v, float) and pd.isna(v)):
-                return []
-            if isinstance(v, dict):
-                v = v.get("value")
-                return [v] if v else []
-            if isinstance(v, (list, tuple, np.ndarray)):
-                out = []
-                for x in v:
-                    if isinstance(x, dict):
-                        x = x.get("value")
-                    if x:
-                        out.append(str(x))
-                return out
-            return [str(v)]
-
-        emails = _list_email(p.get("email"))
-        email  = emails[0] if emails else ""
-
-        rows.append({
-            "Batch ID": batch_id or "",
-            "Channel": DEFAULT_CHANNEL,
-            "Cold-Mailing Import": campaign or "",
-            "Prospect ID": get_field(p, "prospect"),
-            "Organisation ID": org_id,
-            "Organisation Name": org_name,
-            "Person ID": str(pid or ""),
-            "Person Vorname": vor,
-            "Person Nachname": nach,
-            "Person Titel": get_field(p, "titel") or get_field(p, "title") or get_field(p, "anrede"),
-            "Person Geschlecht": get_field(p, "gender") or get_field(p, "geschlecht"),
-            "Person Position": get_field(p, "position"),
-            "Person E-Mail": email,
-            "XING Profil": get_field(p, "xing") or get_field(p, "xing url") or get_field(p, "xing profil"),
-            "LinkedIn URL": get_field(p, "linkedin"),
-        })
-
-    df = pd.DataFrame(rows, columns=TEMPLATE_COLUMNS)
-    await save_df_text(df, tables("nf")["final"])  # <-- Einheitliche Tabellennamen
-    if job_obj:
-        job_obj.phase   = f"Daten gespeichert ({len(df)} Zeilen)"
-        job_obj.percent = 60
-    print(f"[Nachfass] Export abgeschlossen ({len(df)} Zeilen).")
+                return ""
+            sv = str(v)
+            if hint in ("gender", "geschlecht") and gender_map:
+                return gender_map.get(sv, sv)
+            return sv
+    
+        # 2) Schlüssel für Aktivität + Batch-Feld holen
+        last_key  = await get_last_activity_key()
+        next_key  = await get_next_activity_key()
+        batch_key = await get_batch_field_key()
+        if not batch_key:
+            raise RuntimeError("Personenfeld 'Batch ID' wurde nicht gefunden.")
+    
+        # 3) Personen gezielt pro Batch-ID laden (Search)
+        if job_obj:
+            job_obj.phase   = "Lade Nachfass-Daten aus Pipedrive …"
+            job_obj.percent = 10
+    
+        selected: List[dict] = []
+        seen: set[str] = set()
+    
+        async for page in stream_persons_by_batch_id(batch_key, nf_batch_ids, page_limit=100, job_obj=job_obj):
+            for p in page:
+                pid = str(p.get("id") or "")
+                if not pid or pid in seen:
+                    continue
+                # Sicherstellen, dass das Batch-Feld wirklich zur gesuchten ID passt
+                if not _contains_any_text(p.get(batch_key), nf_batch_ids):
+                    continue
+                # Aktivitätsfenster (keine Zukunft, nichts in den letzten 3 Monaten)
+                av = extract_field_date(p, last_key) or extract_field_date(p, next_key)
+                if is_forbidden_activity_date(av):
+                    continue
+                seen.add(pid)
+                selected.append(p)
+    
+        if job_obj:
+            job_obj.phase   = f"{len(selected)} Nachfass-Personen gefunden"
+            job_obj.percent = 40
+    
+        # 4) Zeilen fürs Excel aufbauen
+        rows: List[dict] = []
+        for p in selected:
+            pid = p.get("id")
+            vor, nach = split_name(p.get("first_name"), p.get("last_name"), p.get("name"))
+    
+            # Organisation
+            org_name, org_id = "-", ""
+            org = p.get("org_id")
+            if isinstance(org, dict):
+                org_name = org.get("name") or p.get("org_name") or "-"
+                oid = org.get("id") if org.get("id") is not None else org.get("value")
+                if oid is not None and str(oid).strip():
+                    org_id = str(oid)
+            elif isinstance(org, (int, str)) and str(org).strip():
+                org_id = str(org).strip()
+                org_name = (p.get("org_name") or org_name)
+            else:
+                org_name = (p.get("org_name") or org_name)
+    
+            # E-Mail (erste vorhandene)
+            def _list_email(v):
+                if v is None or (isinstance(v, float) and pd.isna(v)):
+                    return []
+                if isinstance(v, dict):
+                    v = v.get("value")
+                    return [v] if v else []
+                if isinstance(v, (list, tuple, np.ndarray)):
+                    out = []
+                    for x in v:
+                        if isinstance(x, dict):
+                            x = x.get("value")
+                        if x:
+                            out.append(str(x))
+                    return out
+                return [str(v)]
+    
+            emails = _list_email(p.get("email"))
+            email  = emails[0] if emails else ""
+    
+            rows.append({
+                "Batch ID": batch_id or "",
+                "Channel": DEFAULT_CHANNEL,
+                "Cold-Mailing Import": campaign or "",
+                "Prospect ID": get_field(p, "prospect"),
+                "Organisation ID": org_id,
+                "Organisation Name": org_name,
+                "Person ID": str(pid or ""),
+                "Person Vorname": vor,
+                "Person Nachname": nach,
+                "Person Titel": get_field(p, "titel") or get_field(p, "title") or get_field(p, "anrede"),
+                "Person Geschlecht": get_field(p, "gender") or get_field(p, "geschlecht"),
+                "Person Position": get_field(p, "position"),
+                "Person E-Mail": email,
+                "XING Profil": get_field(p, "xing") or get_field(p, "xing url") or get_field(p, "xing profil"),
+                "LinkedIn URL": get_field(p, "linkedin"),
+            })
+    
+        df = pd.DataFrame(rows, columns=TEMPLATE_COLUMNS)
+        await save_df_text(df, tables("nf")["final"])  # <-- Einheitliche Tabellennamen
+        if job_obj:
+            job_obj.phase   = f"Daten gespeichert ({len(df)} Zeilen)"
+            job_obj.percent = 60
+        print(f"[Nachfass] Export abgeschlossen ({len(df)} Zeilen).")
     return df
 
 
