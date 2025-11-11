@@ -181,6 +181,21 @@ async def save_df_text(df: pd.DataFrame, table: str):
                     await conn.executemany(sql, batch); batch=[]
             if batch: await conn.executemany(sql, batch)
 
+# =============================================================================
+# Tabellen-Namenszuordnung (einheitlich für Nachfass / Neukontakte)
+# =============================================================================
+def tables(prefix: str) -> dict:
+    """
+    Liefert standardisierte Tabellennamen für master_final / ready / log.
+    Beispiel: tables("nf") → {"final": "nf_master_final", "ready": "nf_master_ready", "log": "nf_delete_log"}
+    """
+    prefix = prefix.lower().strip()
+    return {
+        "final": f"{prefix}_master_final",
+        "ready": f"{prefix}_master_ready",
+        "log": f"{prefix}_delete_log",
+    }
+
 async def load_df_text(table:str)->pd.DataFrame:
     async with get_pool().acquire() as conn:
         rows = await conn.fetch(f'SELECT * FROM "{SCHEMA}"."{table}"')
