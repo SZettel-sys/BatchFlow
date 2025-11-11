@@ -449,6 +449,23 @@ async def get_last_activity_key() -> Optional[str]:
         pass
     return _LAST_ACTIVITY_KEY
 
+_BATCH_FIELD_KEY: Optional[str] = None
+
+async def get_batch_field_key() -> Optional[str]:
+    """Sucht das Personenfeld in Pipedrive, das die Batch-ID enthält."""
+    global _BATCH_FIELD_KEY
+    if _BATCH_FIELD_KEY is not None:
+        return _BATCH_FIELD_KEY
+
+    fields = await get_person_fields()
+    candidates = ["batch id", "batch-id", "batch_id", "batch"]
+    for f in fields:
+        nm = (f.get("name") or "").lower()
+        if any(c in nm for c in candidates):
+            _BATCH_FIELD_KEY = f.get("key")
+            break
+
+    return _BATCH_FIELD_KEY
 
 # =============================================================================
 # Nachfass – Aufbau Master (funktionierend & performant, wie in der alten Version)
