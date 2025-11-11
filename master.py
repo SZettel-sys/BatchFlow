@@ -533,17 +533,17 @@ async def _build_nf_master_final(
     job_obj=None
 ) -> pd.DataFrame:
     """
-    Schneller Nachfass-Aufbau:
-    - pro Batch-ID via /persons/search paginieren
-    - Aktivitätsfenster filtern
-    - Felder robust mappen
-    - Ergebnis in nf_master_final sichern
+    Schneller, stabiler Nachfass-Aufbau:
+    - nutzt Filter 3024 (Nachfass)
+    - prüft Batch-ID-Feld robust (auch Dicts)
+    - ignoriert Aktivitätsdaten der letzten 3 Monate / Zukunft
+    - schreibt in nf_master_final
     """
-    # 1) Feld-Mapping vorbereiten
     person_fields = await get_person_fields()
     hint_to_key: Dict[str, str] = {}
     gender_map: Dict[str, str] = {}
 
+    # Feld-Mapping vorbereiten
     for f in person_fields:
         nm = (f.get("name") or "").lower()
         for hint in PERSON_FIELD_HINTS_TO_EXPORT.keys():
@@ -570,97 +570,55 @@ async def _build_nf_master_final(
             return gender_map.get(sv, sv)
         return sv
 
-    # 2) Schlüssel für Aktivität + Batch-Feld holen
-    last_key  = await get_last_activity_key()
-    next_key  = await get_next_activity_key()
+    # Schlüssel für Aktivität & Batch-ID
+    last_key = await get_last_activity_key()
+    next_key = await get_next_activity_key()
     batch_key = await get_batch_field_key()
     if not batch_key:
         raise RuntimeError("Personenfeld 'Batch ID' wurde nicht gefunden.")
 
-    # 3) Personen gezielt pro Batch-ID laden (Search)
     if job_obj:
-        job_obj.phase   = "Lade Nachfass-Daten aus Pipedrive …"
+        job_obj.phase = "Lade Nachfass-Personen (Filter 3024) …"
         job_obj.percent = 10
 
     selected: List[dict] = []
-    seen: set[str] = set()
-
-    async for page in stream_persons_by_batch_id(batch_key, nf_batch_ids, page_limit=100, job_obj=job_obj):
-        for p in page:
-            pid = str(p.get("id") or "")
-            if not pid or pid in seen:
-                continue
-            val = p.get(batch_key)
-            # Batch-Feld prüfen (string, dict oder liste möglich)
-            val = p.get(batch_key)
-            if isinstance(val, dict):
-                val = val.get("value") or val.get("label") or ""
-            elif isinstance(val, (list, tuple)):
-                vals = []
-                for x in val:
-                    if isinstance(x, dict):
-                        x = x.get("value") or x.get("label")
-                    if x:
-                        vals.append(str(x))
-                val = " | ".join(vals)
-            else:
-                val = str(val or "")
-
-        # Falls keine Übereinstimmung mit gesuchten Batch-IDs → überspringen
-        if not any(bid.lower() in val.lower() for bid in nf_batch_ids if bid):
-            continue
-
-            
-
+    async for chunk in stream_persons_by_filter(FILTER_NACHFASS):
+        for p in chunk:
+            # Aktivität prüfen
             av = extract_field_date(p, last_key) or extract_field_date(p, next_key)
             if is_forbidden_activity_date(av):
                 continue
-            seen.add(pid)
+
+            # Batch-Feld robust prüfen
+            val = p.get(batch_key)
+            if isinstance(val, dict):
+                val = val.get("value") or val.get("label") or ""
+            if not _contains_any_text(val, nf_batch_ids):
+                continue
+
             selected.append(p)
 
-    if job_obj:
-        job_obj.phase   = f"{len(selected)} Nachfass-Personen gefunden"
-        job_obj.percent = 40
+    if not selected:
+        raise RuntimeError("Keine Daten für Batch-ID(s) gefunden.")
 
-    # 4) Zeilen fürs Excel aufbauen
-    rows: List[dict] = []
+    rows = []
     for p in selected:
         pid = p.get("id")
         vor, nach = split_name(p.get("first_name"), p.get("last_name"), p.get("name"))
 
         # Organisation
         org_name, org_id = "-", ""
-        org = p.get("org_id")
+        org = p.get("org_id") or {}
         if isinstance(org, dict):
             org_name = org.get("name") or p.get("org_name") or "-"
-            oid = org.get("id") if org.get("id") is not None else org.get("value")
-            if oid is not None and str(oid).strip():
-                org_id = str(oid)
+            org_id = str(org.get("id") or org.get("value") or "")
         elif isinstance(org, (int, str)) and str(org).strip():
-            org_id = str(org).strip()
-            org_name = (p.get("org_name") or org_name)
-        else:
+            org_id = str(org)
             org_name = (p.get("org_name") or org_name)
 
-        # E-Mail (erste vorhandene)
-        def _list_email(v):
-            if v is None or (isinstance(v, float) and pd.isna(v)):
-                return []
-            if isinstance(v, dict):
-                v = v.get("value")
-                return [v] if v else []
-            if isinstance(v, (list, tuple, np.ndarray)):
-                out = []
-                for x in v:
-                    if isinstance(x, dict):
-                        x = x.get("value")
-                    if x:
-                        out.append(str(x))
-                return out
-            return [str(v)]
-
-        emails = _list_email(p.get("email"))
-        email  = emails[0] if emails else ""
+        # E-Mail
+        emails = _as_list_email(p.get("email"))
+        email = emails[0] if emails else ""
 
         rows.append({
             "Batch ID": batch_id or "",
@@ -682,12 +640,13 @@ async def _build_nf_master_final(
 
     df = pd.DataFrame(rows, columns=TEMPLATE_COLUMNS)
     await save_df_text(df, tables("nf")["final"])
-    if job_obj:
-        job_obj.phase   = f"Daten gespeichert ({len(df)} Zeilen)"
-        job_obj.percent = 60
     print(f"[Nachfass] Export abgeschlossen ({len(df)} Zeilen).")
-    return df
 
+    if job_obj:
+        job_obj.phase = f"Daten gespeichert ({len(df)} Zeilen)"
+        job_obj.percent = 60
+
+    return df
 
 
     # -------------------------------------------------------------------------
