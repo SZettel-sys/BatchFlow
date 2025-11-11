@@ -193,8 +193,9 @@ def tables(prefix: str) -> dict:
     return {
         "final": f"{prefix}_master_final",
         "ready": f"{prefix}_master_ready",
-        "log": f"{prefix}_delete_log",
+        "log":   f"{prefix}_delete_log",
     }
+
 
 async def load_df_text(table:str)->pd.DataFrame:
     async with get_pool().acquire() as conn:
@@ -491,61 +492,36 @@ def split_name(first: Optional[str], last: Optional[str], full: Optional[str]) -
     return " ".join(parts[:-1]), parts[-1]
 
 
-def field_options_id_to_label_map(field: dict) -> Dict[str, str]:
-    """Erstellt ein Mapping von ID → Label für Dropdown-Optionen."""
-    opts = field.get("options") or []
-    mp: Dict[str, str] = {}
-    for o in opts:
-        oid = str(o.get("id"))
-        lab = str(o.get("label") or o.get("name") or oid)
-        mp[oid] = lab
-    return mp
-
+from typing import AsyncGenerator  # oben bereits importiert; sonst hinzufügen
 
 # -----------------------------------------------------------------------------
 # STREAMING-FUNKTION
 # -----------------------------------------------------------------------------
-from typing import AsyncGenerator, List
-
-# =============================================================================
-# Personen aus Pipedrive-Filter streamen (komplett, asynchron & paginiert)
-# =============================================================================
 async def stream_persons_by_filter(
     filter_id: int,
-    page_limit: int = PAGE_LIMIT
+    page_limit: int = NF_PAGE_LIMIT
 ) -> AsyncGenerator[List[dict], None]:
     """
-    Streamt alle Personen aus einem Pipedrive-Filter mit Pagination.
-    Nutzt async generator (yield) – funktioniert mit async for.
+    Liefert Personen seitenweise (Paging) aus einem Pipedrive-Filter.
+    Verwendung: async for chunk in stream_persons_by_filter(...): ...
     """
     start = 0
-    total = 0
-
     while True:
         url = append_token(
             f"{PIPEDRIVE_API}/persons?filter_id={filter_id}&start={start}&limit={page_limit}&sort=id"
         )
         r = await http_client().get(url, headers=get_headers())
-
         if r.status_code != 200:
-            raise Exception(f"Pipedrive API Fehler: {r.text}")
-
-        data = r.json().get("data") or []
+            raise Exception(f"Pipedrive Fehler: {r.text}")
+        data = (r.json() or {}).get("data") or []
         if not data:
             break
-
-        total += len(data)
-        print(f"[DEBUG] Filter {filter_id}: {len(data)} Personen (Start={start}, Gesamt={total})")
-
-        # Ergebnis an den Aufrufer streamen
         yield data
-
-        # Wenn weniger als eine volle Seite zurückkam → Ende
         if len(data) < page_limit:
             break
+        start += len(data)
 
-        # Nächste Seite
-        start += page_limit
+
 
     # -------------------------------------------------------------------------
     # NACHFASS
