@@ -521,11 +521,10 @@ async def stream_persons_by_filter(
         if len(data) < page_limit:
             break
         start += len(data)
-
 # -------------------------------------------------------------------------
-# NACHFASS – Final & performant nach Batch-ID
+# NACHFASS – Final & vollständig mit Fehler-Tabelle
 # -------------------------------------------------------------------------
-import json  # fix für "name 'json' is not defined"
+import json
 
 async def _build_nf_master_final(
     nf_batch_ids: List[str],
@@ -536,16 +535,15 @@ async def _build_nf_master_final(
     """
     Baut Nachfass-Daten performant & vollständig:
     - Lädt nur Personen, deren Batch-ID eines der übergebenen nf_batch_ids enthält
-    - Vermeidet komplettes Laden des Filters 3024
-    - Füllt alle relevanten Felder korrekt (inkl. Gender, LinkedIn, XING usw.)
+    - Füllt alle relevanten Felder (inkl. Prospect, Gender, Position, LinkedIn, XING)
+    - Erstellt zusätzlich eine Tabelle mit verworfenen Datensätzen (fehlende Felder)
     """
 
     # ---------------------------------------------------------------------
-    # 1) Feld-Mapping vorbereiten
+    # Feld-Mapping vorbereiten
     # ---------------------------------------------------------------------
     person_fields = await get_person_fields()
-    hint_to_key: Dict[str, str] = {}
-    gender_map: Dict[str, str] = {}
+    hint_to_key, gender_map = {}, {}
 
     for f in person_fields:
         nm = (f.get("name") or "").lower()
@@ -556,7 +554,6 @@ async def _build_nf_master_final(
             gender_map = field_options_id_to_label_map(f)
 
     def get_field(p: dict, hint: str) -> str:
-        """Hilfsfunktion: liest Feldinhalt anhand von Hint."""
         key = hint_to_key.get(hint)
         if not key:
             return ""
@@ -564,9 +561,13 @@ async def _build_nf_master_final(
         if isinstance(v, dict) and "label" in v:
             return str(v.get("label") or "")
         if isinstance(v, list):
-            if v and isinstance(v[0], dict) and "value" in v[0]:
-                return str(v[0].get("value") or "")
-            return ", ".join([str(x) for x in v if x])
+            vals = []
+            for x in v:
+                if isinstance(x, dict):
+                    vals.append(x.get("value") or x.get("label") or "")
+                elif isinstance(x, str):
+                    vals.append(x)
+            return ", ".join([v for v in vals if v])
         if v is None or (isinstance(v, float) and pd.isna(v)):
             return ""
         sv = str(v)
@@ -575,110 +576,87 @@ async def _build_nf_master_final(
         return sv
 
     # ---------------------------------------------------------------------
-    # 2) Schlüssel für Aktivitäten + Batch-Feld
+    # Batch-Key + Aktivitätsfelder
     # ---------------------------------------------------------------------
-    last_key  = await get_last_activity_key()
-    next_key  = await get_next_activity_key()
-    batch_key = await get_batch_field_key()
-
-    # Fallback, falls Batch-Feld nicht exakt "Batch ID" heißt
+    last_key, next_key, batch_key = await get_last_activity_key(), await get_next_activity_key(), await get_batch_field_key()
     if not batch_key:
-        print("[WARN] Batch-Feldschlüssel nicht gefunden – Fallback aktiv.")
         for f in person_fields:
-            nm = (f.get("name") or "").lower()
-            if "batch" in nm:
+            if "batch" in (f.get("name") or "").lower():
                 batch_key = f.get("key")
-                print(f"[INFO] Fallback Batch-Key erkannt: {batch_key}")
                 break
     if not batch_key:
         raise RuntimeError("Personenfeld 'Batch ID' wurde nicht gefunden.")
 
     # ---------------------------------------------------------------------
-    # 3) Personen gezielt per Batch-ID laden
+    # Personen per Batch-ID laden
     # ---------------------------------------------------------------------
-    if job_obj:
-        job_obj.phase   = "Lade Nachfass-Personen aus Pipedrive …"
-        job_obj.percent = 10
-
     persons = await stream_persons_by_batch_id(batch_key, nf_batch_ids, page_limit=100, job_obj=job_obj)
     if not persons:
         raise RuntimeError("Keine Personen für die angegebenen Batch-IDs gefunden.")
-
-    print(f"[INFO] {len(persons)} Personen aus Pipedrive geladen.")
-    print("[DEBUG] Beispielperson:")
-    print(json.dumps(persons[0], indent=2)[:1000])
+    print(f"[INFO] {len(persons)} Personen aus Pipedrive geladen")
 
     # ---------------------------------------------------------------------
-    # 4) Filterung nach Aktivitäten & Batch-ID
+    # Filter + Logging nicht berücksichtigter Datensätze
     # ---------------------------------------------------------------------
-    selected = []
-    seen_ids = set()
+    selected, excluded = [], []
+    seen = set()
 
     for p in persons:
         pid = str(p.get("id") or "")
-        if not pid or pid in seen_ids:
+        if not pid or pid in seen:
             continue
+        seen.add(pid)
 
-        # --- Batch-Feld robust prüfen ---
         val = p.get(batch_key)
-        if not val:
-            cf = p.get("custom_fields", [])
-            if isinstance(cf, list):
-                for x in cf:
-                    if isinstance(x, str) and any(bid.lower() in x.lower() for bid in nf_batch_ids):
-                        val = x
-                        break
-        # Strings, Listen oder Dicts vereinheitlichen
         if isinstance(val, dict):
             val = val.get("value") or val.get("label") or ""
         elif isinstance(val, list):
-            vals = [str(x.get("value") if isinstance(x, dict) else x) for x in val]
-            val = " ".join([v for v in vals if v])
+            val = " ".join(str(x.get("value") if isinstance(x, dict) else x) for x in val)
         else:
             val = str(val or "")
 
         if not _contains_any_text(val, nf_batch_ids):
+            excluded.append({"id": pid, "name": p.get("name"), "grund": "Batch-ID passt nicht"})
             continue
 
-        # --- Aktivitätsprüfung ---
         av = extract_field_date(p, last_key) or extract_field_date(p, next_key)
         if is_forbidden_activity_date(av):
+            excluded.append({"id": pid, "name": p.get("name"), "grund": "Aktivität innerhalb 3 Monate"})
             continue
 
-        seen_ids.add(pid)
         selected.append(p)
 
-    print(f"[INFO] Nach Aktivitäts- & Batch-Filter: {len(selected)} Personen übrig.")
+    print(f"[INFO] Nach Filter: {len(selected)} übrig, {len(excluded)} ausgeschlossen")
 
     if not selected:
-        print("[WARN] Keine Personen nach Filterung übrig.")
-        return pd.DataFrame(columns=TEMPLATE_COLUMNS)
+        await save_df_text(pd.DataFrame(columns=TEMPLATE_COLUMNS), tables("nf")["final"])
+        await save_df_text(pd.DataFrame(excluded), "nf_excluded")
+        job.excluded_count = len(await load_df_text("nf_excluded"))
+        return pd.DataFrame()
 
     # ---------------------------------------------------------------------
-    # 5) DataFrame aufbauen
+    # DataFrame aufbauen (alle Felder)
     # ---------------------------------------------------------------------
-    rows = []
+    rows, missing = [], []
+
     for p in selected:
         pid = str(p.get("id") or "")
         name = p.get("name") or ""
         org = p.get("organization") or {}
-        org_name = org.get("name") or "-"
-        org_id = str(org.get("id") or "")
-
+        org_name, org_id = org.get("name") or "-", str(org.get("id") or "")
         emails = p.get("emails") or p.get("email") or []
         email = ""
         if isinstance(emails, list) and emails:
-            first = emails[0]
-            email = first.get("value") if isinstance(first, dict) else str(first)
+            email = emails[0].get("value") if isinstance(emails[0], dict) else str(emails[0])
         elif isinstance(emails, str):
             email = emails
 
         vor, nach = split_name(p.get("first_name"), p.get("last_name"), name)
 
-        rows.append({
-            "Batch ID": batch_id or "",
+        row = {
+            "Batch ID": batch_id,
             "Channel": DEFAULT_CHANNEL,
-            "Cold-Mailing Import": campaign or "",
+            "Cold-Mailing Import": campaign,
             "Prospect ID": get_field(p, "prospect"),
             "Organisation ID": org_id,
             "Organisation Name": org_name,
@@ -691,15 +669,24 @@ async def _build_nf_master_final(
             "Person E-Mail": email,
             "XING Profil": get_field(p, "xing") or get_field(p, "xing url") or get_field(p, "xing profil"),
             "LinkedIn URL": get_field(p, "linkedin"),
-        })
+        }
+        rows.append(row)
+
+        # Sammle unvollständige Zeilen für Log
+        if not all([row["Prospect ID"], row["Person Titel"], row["Person Geschlecht"],
+                    row["Person Position"], row["XING Profil"], row["LinkedIn URL"]]):
+            missing.append({
+                "id": pid,
+                "name": name,
+                "org": org_name,
+                "grund": "Unvollständige Felder"
+            })
 
     df = pd.DataFrame(rows, columns=TEMPLATE_COLUMNS)
     print(f"[Nachfass] Export abgeschlossen ({len(df)} Zeilen).")
 
     await save_df_text(df, tables("nf")["final"])
-    if job_obj:
-        job_obj.phase = f"Daten gespeichert ({len(df)} Zeilen)"
-        job_obj.percent = 60
+    await save_df_text(pd.DataFrame(excluded + missing), "nf_excluded")
 
     return df
 
@@ -1325,6 +1312,7 @@ loadOptions();
 async def nachfass_page(request: Request):
     authed = bool(user_tokens.get("default") or PD_API_TOKEN)
     auth_info = "<span class='muted'>angemeldet</span>" if authed else "<a href='/login'>Anmelden</a>"
+
     return HTMLResponse(f"""<!doctype html><html lang="de">
 <head>
 <meta charset="utf-8"/>
@@ -1347,11 +1335,22 @@ async def nachfass_page(request: Request):
             backdrop-filter:blur(2px);z-index:9999;align-items:center;justify-content:center;flex-direction:column;gap:10px}}
   .barwrap{{width:min(520px,90vw);height:10px;border-radius:999px;background:#e2e8f0;overflow:hidden}}
   .bar{{height:100%;width:0%;background:#0ea5e9;transition:width .25s linear}}
+  table{{width:100%;border-collapse:collapse;margin-top:20px;
+         border:1px solid #e2e8f0;border-radius:10px;box-shadow:0 2px 8px rgba(2,8,23,.04);background:#fff}}
+  th,td{{padding:8px 10px;border-bottom:1px solid #e2e8f0;text-align:left}}
+  th{{background:#f8fafc;font-weight:600}}
+  tr:hover{{background:#f1f5f9}}
 </style>
 </head>
 <body>
-<header><div class="hwrap"><div><a href='/campaign' style='color:#0a66c2;text-decoration:none'>← Kampagne wählen</a></div>
-<div><b>Nachfass</b></div><div>{auth_info}</div></div></header>
+<header>
+  <div class="hwrap">
+    <div><a href='/campaign' style='color:#0a66c2;text-decoration:none'>← Kampagne wählen</a></div>
+    <div><b>Nachfass</b></div>
+    <div>{auth_info}</div>
+  </div>
+</header>
+
 <main>
   <section class="card">
     <label>Batch IDs (1–2 Werte)</label>
@@ -1365,85 +1364,93 @@ async def nachfass_page(request: Request):
       <button class="btn" id="btnExportNf">Abgleich & Download</button>
     </div>
   </section>
+
+  <section id="excludedSection" style="margin-top:30px;display:none">
+    <h3>Nicht berücksichtigte Datensätze</h3>
+    <div id="excludedTable"></div>
+  </section>
 </main>
 
-<div id="overlay"><div id="phase" style="color:#0f172a;font-weight:500"></div>
-<div class="barwrap"><div class="bar" id="bar"></div></div></div>
+<div id="overlay">
+  <div id="phase" style="color:#0f172a;font-weight:500"></div>
+  <div class="barwrap"><div class="bar" id="bar"></div></div>
+</div>
 
 <script>
 const el = id => document.getElementById(id);
 
-// Overlay Steuerung
-function showOverlay(msg) {{ el('phase').textContent = msg || ''; el('overlay').style.display = 'flex'; }}
-function hideOverlay() {{ el('overlay').style.display = 'none'; }}
-function setProgress(p) {{ el('bar').style.width = Math.max(0, Math.min(100, p)) + '%'; }}
+function showOverlay(msg){{el('phase').textContent=msg||'';el('overlay').style.display='flex';}}
+function hideOverlay(){{el('overlay').style.display='none';}}
+function setProgress(p){{el('bar').style.width=Math.max(0,Math.min(100,p))+'%';}}
 
-// Batch IDs parsen (max. 2)
 function _parseIDs(raw) {{
-  return raw.split(/[\\n,;]/).map(s => s.trim()).filter(Boolean).slice(0, 2);
+  return raw.split(/[\\n,;]/).map(s=>s.trim()).filter(Boolean).slice(0,2);
 }}
 
-// Export starten
 async function startExportNf() {{
-  const ids = _parseIDs(el('nf_batch_ids').value);
-  if (ids.length === 0) return alert('Bitte mindestens eine Batch ID angeben.');
-  const bid = el('batch_id').value || '';
-  const camp = el('campaign').value || '';
+  const ids=_parseIDs(el('nf_batch_ids').value);
+  if(ids.length===0)return alert('Bitte mindestens eine Batch ID angeben.');
+  const bid=el('batch_id').value||'';
+  const camp=el('campaign').value||'';
 
   showOverlay('Starte Abgleich …');
   setProgress(5);
 
   try {{
-    const r = await fetch('/nachfass/export_start', {{
-      method: 'POST',
-      headers: {{ 'Content-Type': 'application/json' }},
-      body: JSON.stringify({{ nf_batch_ids: ids, batch_id: bid, campaign: camp }})
+    const r=await fetch('/nachfass/export_start',{{
+      method:'POST',
+      headers:{{'Content-Type':'application/json'}},
+      body:JSON.stringify({{nf_batch_ids:ids,batch_id:bid,campaign:camp}})
     }});
-    if (!r.ok) throw new Error('Start fehlgeschlagen.');
-    const {{ job_id }} = await r.json();
+    if(!r.ok)throw new Error('Start fehlgeschlagen.');
+    const {{job_id}}=await r.json();
     await poll(job_id);
-  }} catch (err) {{
-    alert(err.message || 'Fehler beim Starten.');
+  }} catch(err) {{
+    alert(err.message||'Fehler beim Starten.');
     hideOverlay();
   }}
 }}
 
-// Fortschritt regelmäßig abfragen
-async function poll(job_id) {{
-  let done = false;
-  let lastPhase = '';
-  while (!done) {{
-    await new Promise(r => setTimeout(r, 600));
-    const r = await fetch('/nachfass/export_progress?job_id=' + encodeURIComponent(job_id));
-    if (!r.ok) break;
-    const s = await r.json();
-
-    if (s.phase && s.phase !== lastPhase) {{
-      el('phase').textContent = s.phase + ' (' + (s.percent || 0) + '%)';
-      lastPhase = s.phase;
-    }}
-
-    setProgress(s.percent || 0);
-
-    if (s.error) {{
-      alert(s.error);
-      hideOverlay();
-      return;
-    }}
-
-    done = s.done;
+async function poll(job_id){{
+  let done=false;
+  while(!done){{
+    await new Promise(r=>setTimeout(r,600));
+    const r=await fetch('/nachfass/export_progress?job_id='+encodeURIComponent(job_id));
+    if(!r.ok)break;
+    const s=await r.json();
+    if(s.phase)el('phase').textContent=s.phase+' ('+ (s.percent||0)+'%)';
+    setProgress(s.percent||0);
+    if(s.error){{alert(s.error);hideOverlay();return;}}
+    done=s.done;
   }}
-
-  el('phase').textContent = 'Download startet …';
+  // Export abgeschlossen
+  el('phase').textContent='Download startet …';
   setProgress(100);
-  window.location.href = '/nachfass/export_download?job_id=' + encodeURIComponent(job_id);
-  setTimeout(() => window.location.href = '/nachfass/summary?job_id=' + job_id, 1500);
+  window.location.href='/nachfass/export_download?job_id='+encodeURIComponent(job_id);
+  await loadExcludedTable();
+  hideOverlay();
 }}
 
-el('btnExportNf').addEventListener('click', startExportNf);
+async function loadExcludedTable(){{
+  const r=await fetch('/nachfass/excluded/json');
+  if(!r.ok)return;
+  const data=await r.json();
+  if(data.total===0)return;
+  const htmlRows=data.rows.map(r=>`
+    <tr>
+      <td>${{r.id||''}}</td>
+      <td>${{r.name||''}}</td>
+      <td>${{r.org||''}}</td>
+      <td>${{r.grund||''}}</td>
+    </tr>`).join('');
+  const table=`<table><tr><th>ID</th><th>Name</th><th>Organisation</th><th>Grund</th></tr>${{htmlRows}}</table>`;
+  el('excludedTable').innerHTML=table;
+  el('excludedSection').style.display='block';
+}}
+
+el('btnExportNf').addEventListener('click',startExportNf);
 </script>
 </body></html>""")
-
 
 # =============================================================================
 # Summary-Seiten
@@ -1496,6 +1503,15 @@ async def nachfass_summary(job_id: str = Query(...)):
     <section>{table_html}</section>
     <a href='/campaign'>Zur Übersicht</a></main></body></html>"""
     return HTMLResponse(html)
+    
+  
+@app.get("/nachfass/excluded/json")
+async def nachfass_excluded_json():
+    df = await load_df_text("nf_excluded")
+    if df.empty:
+        return JSONResponse({"total": 0, "rows": []})
+    rows = df.tail(100).to_dict(orient="records")
+    return JSONResponse({"total": len(df), "rows": rows})
 
 # =============================================================================
 # Redirects & Fallbacks (fix für /overview & ungültige Pfade)
