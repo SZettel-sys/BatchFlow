@@ -1448,6 +1448,82 @@ async def nachfass_excluded_json():
     rows = df.tail(100).to_dict(orient="records")
     return JSONResponse({"total": len(df), "rows": rows})
 
+# -------------------------------------------------------------------------
+# Startet den Nachfass-Export (BatchFlow)
+# -------------------------------------------------------------------------
+@app.post("/nachfass/export_start")
+async def export_start_nf(request: Request):
+    """
+    Startet den asynchronen Nachfass-Export:
+    - Erstellt Job-Objekt (für Fortschritt & Status)
+    - Ruft _build_nf_master_final asynchron auf
+    - Liefert Job-ID für Fortschrittsabfragen zurück
+    """
+    try:
+        data = await request.json()
+        nf_batch_ids = data.get("nf_batch_ids") or []
+        batch_id = data.get("batch_id") or ""
+        campaign = data.get("campaign") or ""
+
+        if not nf_batch_ids:
+            return JSONResponse({"error": "Keine Batch-IDs übergeben."}, status_code=400)
+
+        # ---------------------------------------------------------------
+        # Job erstellen (ohne id-Parameter im Konstruktor!)
+        # ---------------------------------------------------------------
+        job_id = str(uuid.uuid4())
+        job_obj = Job(
+            name=f"Nachfass Export ({batch_id})",
+            phase="Starte Nachfass-Export …",
+            percent=0,
+            done=False,
+        )
+        job_obj.id = job_id
+        JOBS[job_id] = job_obj
+
+        # ---------------------------------------------------------------
+        # Asynchronen Export starten
+        # ---------------------------------------------------------------
+        async def run_export():
+            try:
+                job_obj.phase = "Lade Nachfass-Daten aus Pipedrive …"
+                job_obj.percent = 5
+
+                df = await _build_nf_master_final(
+                    nf_batch_ids=nf_batch_ids,
+                    batch_id=batch_id,
+                    campaign=campaign,
+                    job_obj=job_obj
+                )
+
+                await save_df_text(df, tables("nf")["final"])
+
+                # Zusatz: Anzahl ausgeschlossener Datensätze
+                try:
+                    excluded_df = await load_df_text("nf_excluded")
+                    job_obj.excluded_count = len(excluded_df)
+                except Exception:
+                    job_obj.excluded_count = 0
+
+                job_obj.phase = f"Export abgeschlossen ({len(df)} Zeilen)"
+                job_obj.percent = 100
+                job_obj.done = True
+
+                print(f"[Nachfass] Export fertig ({len(df)} Zeilen, {job_obj.excluded_count} ausgeschlossen)")
+            except Exception as e:
+                job_obj.phase = "Fehler beim Nachfass-Export"
+                job_obj.error = str(e)
+                job_obj.done = True
+                print(f"[ERROR] Nachfass-Export fehlgeschlagen: {e}")
+
+        asyncio.create_task(run_export())
+        return JSONResponse({"job_id": job_id})
+
+    except Exception as e:
+        print(f"[ERROR] /nachfass/export_start: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
 # =============================================================================
 # Redirects & Fallbacks (fix für /overview & ungültige Pfade)
 # =============================================================================
