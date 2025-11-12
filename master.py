@@ -578,7 +578,12 @@ async def _build_nf_master_final(
     # ---------------------------------------------------------------------
     # Batch-Key + Aktivitätsfelder
     # ---------------------------------------------------------------------
-    last_key, next_key, batch_key = await get_last_activity_key(), await get_next_activity_key(), await get_batch_field_key()
+    last_key, next_key, batch_key = (
+        await get_last_activity_key(),
+        await get_next_activity_key(),
+        await get_batch_field_key()
+    )
+
     if not batch_key:
         for f in person_fields:
             if "batch" in (f.get("name") or "").lower():
@@ -592,7 +597,10 @@ async def _build_nf_master_final(
     # ---------------------------------------------------------------------
     persons = await stream_persons_by_batch_id(batch_key, nf_batch_ids, page_limit=100, job_obj=job_obj)
     if not persons:
-        raise RuntimeError("Keine Personen für die angegebenen Batch-IDs gefunden.")
+        print("[WARN] Keine Personen für die angegebenen Batch-IDs gefunden.")
+        await save_df_text(pd.DataFrame(columns=TEMPLATE_COLUMNS), tables("nf")["final"])
+        return pd.DataFrame(columns=TEMPLATE_COLUMNS)
+
     print(f"[INFO] {len(persons)} Personen aus Pipedrive geladen")
 
     # ---------------------------------------------------------------------
@@ -628,11 +636,16 @@ async def _build_nf_master_final(
 
     print(f"[INFO] Nach Filter: {len(selected)} übrig, {len(excluded)} ausgeschlossen")
 
+    # ---------------------------------------------------------------------
+    # Wenn keine passenden Personen -> leere Datei trotzdem speichern
+    # ---------------------------------------------------------------------
     if not selected:
-        await save_df_text(pd.DataFrame(columns=TEMPLATE_COLUMNS), tables("nf")["final"])
+        empty_df = pd.DataFrame(columns=TEMPLATE_COLUMNS)
+        await save_df_text(empty_df, tables("nf")["final"])
         await save_df_text(pd.DataFrame(excluded), "nf_excluded")
-        job_obj.excluded_count = len(await load_df_text("nf_excluded"))
-        return pd.DataFrame()
+        job_obj.excluded_count = len(excluded)
+        print("[Nachfass] Keine gültigen Datensätze – leere Exportdatei erzeugt.")
+        return empty_df
 
     # ---------------------------------------------------------------------
     # DataFrame aufbauen (alle Felder)
@@ -672,7 +685,6 @@ async def _build_nf_master_final(
         }
         rows.append(row)
 
-        # Sammle unvollständige Zeilen für Log
         if not all([row["Prospect ID"], row["Person Titel"], row["Person Geschlecht"],
                     row["Person Position"], row["XING Profil"], row["LinkedIn URL"]]):
             missing.append({
@@ -683,10 +695,15 @@ async def _build_nf_master_final(
             })
 
     df = pd.DataFrame(rows, columns=TEMPLATE_COLUMNS)
-    print(f"[Nachfass] Export abgeschlossen ({len(df)} Zeilen).")
 
+    print(f"[Nachfass] Export abgeschlossen ({len(df)} Zeilen, {len(missing)} unvollständig).")
+
+    # ---------------------------------------------------------------------
+    # Ergebnis speichern
+    # ---------------------------------------------------------------------
     await save_df_text(df, tables("nf")["final"])
     await save_df_text(pd.DataFrame(excluded + missing), "nf_excluded")
+    job_obj.excluded_count = len(excluded) + len(missing)
 
     return df
 
