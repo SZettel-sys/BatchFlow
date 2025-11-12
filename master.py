@@ -1088,31 +1088,38 @@ async def neukontakte_export_download(job_id: str = Query(...)):
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
+# -------------------------------------------------------------------------
+# Download des erzeugten Nachfass-Exports
+# -------------------------------------------------------------------------
 @app.get("/nachfass/export_download")
-async def nachfass_export_download(job_id: str = Query(...)):
-    job = JOBS.get(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job nicht gefunden")
+async def nachfass_export_download(job_id: str):
+    """
+    Liefert die exportierte Nachfass-Datei als Download zurück.
+    """
+    try:
+        # DataFrame laden
+        df = await load_df_text(tables("nf")["final"])
 
-    if job.excel_bytes:
-        return StreamingResponse(
-            io.BytesIO(job.excel_bytes),
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={"Content-Disposition": f"attachment; filename={job.filename_base}.xlsx"},
-        )
+        if df is None or df.empty:
+            raise FileNotFoundError("Keine Exportdaten gefunden")
 
-    if job.path and os.path.exists(job.path):
+        # Temporäre Excel-Datei erzeugen
+        file_path = f"/tmp/nachfass_{job_id}.xlsx"
+        df.to_excel(file_path, index=False)
+
+        # Datei als Download zurückgeben
         return FileResponse(
-            job.path,
-            filename=f"{job.filename_base}.xlsx",
+            file_path,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            filename=f"nachfass_{job_id}.xlsx"
         )
 
-    raise HTTPException(status_code=404, detail="Datei nicht gefunden")
-# master_fixed_v2_part5.py — Teil 5/5
-# UI (HTML), Summarys und Kampagnenübersicht
+    except FileNotFoundError:
+        return JSONResponse({"detail": "Datei nicht gefunden"}, status_code=404)
 
-from fastapi.responses import HTMLResponse
+    except Exception as e:
+        print(f"[ERROR] /nachfass/export_download: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 # =============================================================================
 # Kampagnenübersicht (Home)
