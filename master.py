@@ -654,62 +654,135 @@ async def _build_nf_master_final(
         job_obj.phase = f"{len(selected)} Nachfass-Personen nach Filter"
         job_obj.percent = 40
   
+    # ---------------------------------------------------------------------
+    # 3️⃣ Personen gezielt pro Batch-ID laden (Search oder Filter)
+    # ---------------------------------------------------------------------
+    if job_obj:
+        job_obj.phase = "Lade Nachfass-Daten aus Pipedrive …"
+        job_obj.percent = 10
 
-    rows = []
+    selected: list[dict] = []
+    seen: set[str] = set()
+
+    # 🔹 Alle Personen laden (du hast Filter 3024 mit bis zu 100k Einträgen)
+    persons_all: list[dict] = []
+    start = 0
+    http = http_client()
+    while True:
+        url = append_token(
+            f"{PIPEDRIVE_API}/persons?filter_id={FILTER_NACHFASS}&start={start}&limit=500&sort=id"
+        )
+        r = await http.get(url, headers=get_headers())
+        if r.status_code != 200:
+            print(f"[WARN] Pipedrive Fehler (Seite {start}): {r.text[:120]}")
+            break
+        data = (r.json() or {}).get("data") or []
+        if not data:
+            break
+        persons_all.extend(data)
+        print(f"[DEBUG] Seite {start}: {len(data)} Personen")
+        if len(data) < 500:
+            break
+        start += 500
+
+    print(f"[INFO] Insgesamt {len(persons_all)} Personen aus Filter {FILTER_NACHFASS} geladen")
+
+    # ---------------------------------------------------------------------
+    # 4️⃣ Filterung nach Batch-ID (z. B. B443)
+    # ---------------------------------------------------------------------
+    for p in persons_all:
+        pid = str(p.get("id") or "")
+        if not pid or pid in seen:
+            continue
+
+        # Prüfe Batch-ID in custom_fields, name, title, oder beliebigen Feldern
+        found = False
+        search_space = []
+
+        # Sammle alles, was durchsucht werden kann
+        for key, val in p.items():
+            if isinstance(val, str):
+                search_space.append(val)
+            elif isinstance(val, dict):
+                search_space.extend([str(v) for v in val.values() if isinstance(v, str)])
+            elif isinstance(val, list):
+                search_space.extend([str(x) for x in val if isinstance(x, str)])
+
+        text = " ".join(search_space).lower()
+        for bid in nf_batch_ids:
+            if bid.lower() in text:
+                found = True
+                break
+
+        if not found:
+            continue
+
+        # Aktivität prüfen (keine Zukunft / letzte 3 Monate)
+        av = extract_field_date(p, await get_last_activity_key()) or extract_field_date(
+            p, await get_next_activity_key()
+        )
+        if is_forbidden_activity_date(av):
+            continue
+
+        seen.add(pid)
+        selected.append(p)
+
+    print(f"[INFO] {len(selected)} Nachfass-Personen nach Batch-Filter")
+
+    if job_obj:
+        job_obj.phase = f"{len(selected)} Nachfass-Personen gefunden"
+        job_obj.percent = 40
+
+    # ---------------------------------------------------------------------
+    # 5️⃣ Aufbau DataFrame
+    # ---------------------------------------------------------------------
+    rows: list[dict] = []
     for p in selected:
-        pid = p.get("id")
-        vor, nach = split_name(p.get("first_name"), p.get("last_name"), p.get("name"))
-        org = p.get("org_id") or {}
-        org_name = org.get("name") or p.get("org_name") or "-"
-        org_id = str(org.get("id") or org.get("value") or "")
-        emails = _as_list_email(p.get("email"))
-        email = emails[0] if emails else ""
-
-        # -----------------------------------------------------------------
-        # Zeilenaufbau – robust für Search-Ergebnisse (wie in deinem JSON)
-        # -----------------------------------------------------------------
-        pid = p.get("id")
+        pid = str(p.get("id") or "")
         name = p.get("name") or ""
-        org_data = p.get("organization") or {}
-        org_name = org_data.get("name") or "-"
-        org_id = str(org_data.get("id") or "")
-        emails = p.get("emails") or []
+        org = p.get("org_id") or p.get("organization") or {}
+        org_name = org.get("name") if isinstance(org, dict) else "-"
+        org_id = str(org.get("id") or org.get("value") or "") if isinstance(org, dict) else ""
+
+        # Email
+        emails = p.get("email") or p.get("emails") or []
         email = ""
         if isinstance(emails, list) and emails:
-            email = str(emails[0])
+            first_email = emails[0]
+            if isinstance(first_email, dict):
+                email = first_email.get("value") or ""
+            else:
+                email = str(first_email)
         elif isinstance(emails, str):
             email = emails
 
-        # LinkedIn / Xing Profil aus custom_fields extrahieren
+        # Custom Fields (LinkedIn, Xing, Position, Batch)
         cf = p.get("custom_fields") or []
         linkedin_url = ""
         xing_url = ""
         position = ""
-        batch_val = ""
         for item in cf:
             if isinstance(item, str):
                 if "linkedin.com" in item.lower():
                     linkedin_url = item
                 elif "xing.com" in item.lower():
                     xing_url = item
-                elif "projektleiter" in item.lower() or "leiter" in item.lower():
+                elif any(k in item.lower() for k in ["leiter", "head", "manager", "director"]):
                     position = item
-                elif any(bid.lower() in item.lower() for bid in nf_batch_ids):
-                    batch_val = item
 
-        # Vor- und Nachname (falls nur "name" gegeben ist)
+        # Vorname / Nachname
         name_parts = name.split(" ", 1)
         vor = name_parts[0] if len(name_parts) > 0 else ""
         nach = name_parts[1] if len(name_parts) > 1 else ""
 
         rows.append({
-            "Batch ID": batch_id or batch_val or "",
+            "Batch ID": batch_id or "",
             "Channel": DEFAULT_CHANNEL,
             "Cold-Mailing Import": campaign or "",
-            "Prospect ID": "",  # nicht in Search-Daten enthalten
+            "Prospect ID": "",
             "Organisation ID": org_id,
-            "Organisation Name": org_name,
-            "Person ID": str(pid or ""),
+            "Organisation Name": org_name or "-",
+            "Person ID": pid,
             "Person Vorname": vor,
             "Person Nachname": nach,
             "Person Titel": "",
@@ -720,12 +793,16 @@ async def _build_nf_master_final(
             "LinkedIn URL": linkedin_url,
         })
 
-        
-
     df = pd.DataFrame(rows, columns=TEMPLATE_COLUMNS)
-    await save_df_text(df, tables("nf")["final"])
     print(f"[Nachfass] Export abgeschlossen ({len(df)} Zeilen)")
+
+    await save_df_text(df, tables("nf")["final"])
+    if job_obj:
+        job_obj.phase = f"Daten gespeichert ({len(df)} Zeilen)"
+        job_obj.percent = 60
     return df
+
+
 
 
     # -------------------------------------------------------------------------
