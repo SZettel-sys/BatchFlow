@@ -521,11 +521,9 @@ async def stream_persons_by_filter(
         if len(data) < page_limit:
             break
         start += len(data)
+
 # -------------------------------------------------------------------------
-# NACHFASS – Final & vollständig mit Fehler-Tabelle
-# -------------------------------------------------------------------------
-# -------------------------------------------------------------------------
-# NACHFASS – Performant & korrekt nach Batch-ID
+# NACHFASS – stabile, funktionierende Version mit verbessertem Feld-Mapping
 # -------------------------------------------------------------------------
 async def _build_nf_master_final(
     nf_batch_ids: List[str],
@@ -536,7 +534,6 @@ async def _build_nf_master_final(
     """
     Baut Nachfass-Daten performant & vollständig:
     - Lädt nur Personen, deren Batch-ID eines der übergebenen nf_batch_ids enthält
-    - Vermeidet komplettes Laden des Filters 3024
     - Füllt alle relevanten Felder korrekt (inkl. Gender, LinkedIn, XING usw.)
     """
 
@@ -555,21 +552,23 @@ async def _build_nf_master_final(
         if any(x in nm for x in ("gender", "geschlecht")):
             gender_map = field_options_id_to_label_map(f)
 
+    # verbessertes Feld-Mapping
     def get_field(p: dict, hint: str) -> str:
         key = hint_to_key.get(hint)
         if not key:
             return ""
         v = p.get(key)
-        if isinstance(v, dict) and "label" in v:
-            return str(v.get("label") or "")
+        if isinstance(v, dict):
+            # handle Pipedrive option fields
+            return v.get("label") or v.get("value") or ""
         if isinstance(v, list):
             vals = []
             for x in v:
-                if isinstance(x, dict) and "value" in x:
-                    vals.append(str(x["value"]))
+                if isinstance(x, dict):
+                    vals.append(x.get("label") or x.get("value") or "")
                 elif isinstance(x, str):
                     vals.append(x)
-            return ", ".join(vals)
+            return ", ".join([str(x) for x in vals if x])
         if hint in ("gender", "geschlecht") and gender_map:
             return gender_map.get(str(v), str(v))
         return str(v or "")
@@ -634,11 +633,9 @@ async def _build_nf_master_final(
         pid = str(p.get("id") or "")
         if not pid or pid in seen_ids:
             continue
-        # Aktivitätsprüfung
         av = extract_field_date(p, last_key) or extract_field_date(p, next_key)
         if is_forbidden_activity_date(av):
             continue
-        # Batch-Abgleich
         custom_fields = p.get("custom_fields") or []
         if not any(str(bid).lower() in str(x).lower() for bid in nf_batch_ids for x in custom_fields):
             continue
@@ -648,7 +645,7 @@ async def _build_nf_master_final(
     print(f"[INFO] Nach Aktivitäts- & Batch-Filter: {len(selected)} Personen übrig")
 
     # ---------------------------------------------------------------------
-    # 5) DataFrame aufbauen
+    # 5) DataFrame aufbauen (alle wichtigen Felder)
     # ---------------------------------------------------------------------
     rows = []
     for p in selected:
@@ -660,8 +657,16 @@ async def _build_nf_master_final(
         org_name = org.get("name") or "-"
         org_id = str(org.get("id") or "")
 
-        emails = p.get("emails") or []
-        email = emails[0] if emails else ""
+        emails = p.get("emails") or p.get("email") or []
+        email = ""
+        if isinstance(emails, list):
+            if emails:
+                if isinstance(emails[0], dict):
+                    email = emails[0].get("value") or ""
+                else:
+                    email = str(emails[0])
+        elif isinstance(emails, str):
+            email = emails
 
         rows.append({
             "Batch ID": batch_id or "",
