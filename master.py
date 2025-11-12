@@ -522,8 +522,9 @@ async def stream_persons_by_filter(
             break
         start += len(data)
 
+
 # -------------------------------------------------------------------------
-# NACHFASS
+# NACHFASS – Performant & korrekt nach Batch-ID
 # -------------------------------------------------------------------------
 async def _build_nf_master_final(
     nf_batch_ids: List[str],
@@ -532,11 +533,15 @@ async def _build_nf_master_final(
     job_obj=None
 ) -> pd.DataFrame:
     """
-    Schneller Nachfass-Aufbau (parallelisiert, robust):
-    - lädt Personen asynchron über /persons/search
-    - prüft Batch-ID-Feld und Aktivitätsdaten
-    - speichert Ergebnis in nf_master_final
+    Baut Nachfass-Daten performant & vollständig:
+    - Lädt nur Personen, deren Batch-ID eines der übergebenen nf_batch_ids enthält
+    - Vermeidet komplettes Laden des Filters 3024
+    - Füllt alle relevanten Felder korrekt (inkl. Gender, LinkedIn, XING usw.)
     """
+
+    # ---------------------------------------------------------------------
+    # 1) Feld-Mapping vorbereiten
+    # ---------------------------------------------------------------------
     person_fields = await get_person_fields()
     hint_to_key: Dict[str, str] = {}
     gender_map: Dict[str, str] = {}
@@ -557,249 +562,132 @@ async def _build_nf_master_final(
         if isinstance(v, dict) and "label" in v:
             return str(v.get("label") or "")
         if isinstance(v, list):
-            if v and isinstance(v[0], dict) and "value" in v[0]:
-                return str(v[0].get("value") or "")
-            return ", ".join([str(x) for x in v if x])
-        if v is None or (isinstance(v, float) and pd.isna(v)):
-            return ""
-        sv = str(v)
+            vals = []
+            for x in v:
+                if isinstance(x, dict) and "value" in x:
+                    vals.append(str(x["value"]))
+                elif isinstance(x, str):
+                    vals.append(x)
+            return ", ".join(vals)
         if hint in ("gender", "geschlecht") and gender_map:
-            return gender_map.get(sv, sv)
-        return sv
+            return gender_map.get(str(v), str(v))
+        return str(v or "")
 
-    last_key = await get_last_activity_key()
-    next_key = await get_next_activity_key()
+    # ---------------------------------------------------------------------
+    # 2) Schlüssel für Aktivitäten + Batch-Feld
+    # ---------------------------------------------------------------------
+    last_key  = await get_last_activity_key()
+    next_key  = await get_next_activity_key()
     batch_key = await get_batch_field_key()
-    if not batch_key:
-        print("[WARN] Batch-Feldschlüssel nicht gefunden – Fallback aktiv.")
-        # 🔍 Fallback: suche in allen Person-Feldern manuell nach 'batch'
-        person_fields = await get_person_fields()
-        for f in person_fields:
-            name = (f.get("name") or "").lower()
-            key = f.get("key")
-            if "batch" in name and key:
-                batch_key = key
-                print(f"[INFO] Fallback Batch-Key erkannt: {batch_key}")
-                break
-
-    if not batch_key:
-        raise RuntimeError("Kein passendes Batch-Feld in Pipedrive gefunden.")
     if not batch_key:
         raise RuntimeError("Personenfeld 'Batch ID' wurde nicht gefunden.")
 
+    # ---------------------------------------------------------------------
+    # 3) Personen gezielt per Batch-ID laden
+    # ---------------------------------------------------------------------
     if job_obj:
-        job_obj.phase = "Lade Nachfass-Daten aus Pipedrive …"
+        job_obj.phase   = "Lade Nachfass-Personen aus Pipedrive …"
         job_obj.percent = 10
 
-    persons = await stream_persons_by_batch_id(batch_key, nf_batch_ids, page_limit=100, job_obj=job_obj)
+    persons: List[dict] = []
+    for bid in nf_batch_ids:
+        start = 0
+        total = 0
+        while True:
+            url = append_token(
+                f"{PIPEDRIVE_API}/persons/search?term={bid}&fields=custom_fields&start={start}&limit=100"
+            )
+            r = await http_client().get(url, headers=get_headers())
+            if r.status_code != 200:
+                print(f"[WARN] Batch {bid} Fehler: {r.text[:100]}")
+                break
+            data = r.json().get("data", {}).get("items", [])
+            if not data:
+                break
+
+            items = [d.get("item") for d in data if d.get("item")]
+            persons.extend(items)
+            total += len(items)
+            start += len(items)
+            if len(data) < 100:
+                break
+
+        print(f"[INFO] Batch {bid}: {total} Personen geladen")
+
+    if job_obj:
+        job_obj.phase   = f"Alle Batch-IDs geladen ({len(persons)} Personen)"
+        job_obj.percent = 35
+
     if not persons:
-        raise RuntimeError("Keine Daten für Batch-ID(s) gefunden.")
+        print("[WARN] Keine Personen gefunden.")
+        return pd.DataFrame(columns=TEMPLATE_COLUMNS)
 
+    print(f"[DEBUG] Beispielperson – erster Datensatz:\n{json.dumps(persons[0], indent=2)}")
+
+    # ---------------------------------------------------------------------
+    # 4) Filterung nach Aktivitäten & Duplikaten
+    # ---------------------------------------------------------------------
     selected = []
+    seen_ids = set()
     for p in persons:
-        if len(persons) > 0:
-            import json
-            print("[DEBUG] Beispielperson – erster Datensatz:")
-            print(json.dumps(persons[0], indent=2)[:1500])
-        # nach 1. Lauf wieder auskommentieren!
-            break
-        # --- Batch-Feld robust prüfen ---
-  
-                # --- Batch-Feld robust prüfen ---
-        val = p.get(batch_key)
-
-        # 🔹 1) Falls None: auch in custom_fields nachsehen
-        if not val:
-            cf = p.get("custom_fields", [])
-            if isinstance(cf, list):
-                for x in cf:
-                    if isinstance(x, str) and any(bid.lower() in x.lower() for bid in nf_batch_ids):
-                        val = x
-                        break
-
-        # 🔹 2) Standardbehandlung (dict, list, str)
-        if isinstance(val, dict):
-            val = val.get("value") or val.get("label") or ""
-        elif isinstance(val, list):
-            values = []
-            for x in val:
-                if isinstance(x, dict):
-                    values.append(x.get("value") or x.get("label") or "")
-                else:
-                    values.append(str(x))
-            val = " ".join(values)
-        else:
-            val = str(val or "")
-
-        # Debug zur Kontrolle
-        print(f"[DEBUG] Person {p.get('id')} Batch-Wert: {val}")
-
-        if not _contains_any_text(val, nf_batch_ids):
+        pid = str(p.get("id") or "")
+        if not pid or pid in seen_ids:
             continue
-
-        # Debug-Check (kannst du nachher wieder entfernen)
-        # print(f"[DEBUG] Person {p.get('id')}: Batch-Feld = {val}")
-
-        if not _contains_any_text(val, nf_batch_ids):
-            continue
-
-        # --- Aktivitätsfilter prüfen ---
+        # Aktivitätsprüfung
         av = extract_field_date(p, last_key) or extract_field_date(p, next_key)
         if is_forbidden_activity_date(av):
             continue
-
+        # Batch-Abgleich
+        custom_fields = p.get("custom_fields") or []
+        if not any(str(bid).lower() in str(x).lower() for bid in nf_batch_ids for x in custom_fields):
+            continue
+        seen_ids.add(pid)
         selected.append(p)
 
-    if job_obj:
-        job_obj.phase = f"{len(selected)} Nachfass-Personen nach Filter"
-        job_obj.percent = 40
-  
-    # ---------------------------------------------------------------------
-    # 3️⃣ Personen gezielt pro Batch-ID laden (Search oder Filter)
-    # ---------------------------------------------------------------------
-    if job_obj:
-        job_obj.phase = "Lade Nachfass-Daten aus Pipedrive …"
-        job_obj.percent = 10
-
-    selected: list[dict] = []
-    seen: set[str] = set()
-
-    # 🔹 Alle Personen laden (du hast Filter 3024 mit bis zu 100k Einträgen)
-    persons_all: list[dict] = []
-    start = 0
-    http = http_client()
-    while True:
-        url = append_token(
-            f"{PIPEDRIVE_API}/persons?filter_id={FILTER_NACHFASS}&start={start}&limit=500&sort=id"
-        )
-        r = await http.get(url, headers=get_headers())
-        if r.status_code != 200:
-            print(f"[WARN] Pipedrive Fehler (Seite {start}): {r.text[:120]}")
-            break
-        data = (r.json() or {}).get("data") or []
-        if not data:
-            break
-        persons_all.extend(data)
-        print(f"[DEBUG] Seite {start}: {len(data)} Personen")
-        if len(data) < 500:
-            break
-        start += 500
-
-    print(f"[INFO] Insgesamt {len(persons_all)} Personen aus Filter {FILTER_NACHFASS} geladen")
+    print(f"[INFO] Nach Aktivitäts- & Batch-Filter: {len(selected)} Personen übrig")
 
     # ---------------------------------------------------------------------
-    # 4️⃣ Filterung nach Batch-ID (z. B. B443)
+    # 5) DataFrame aufbauen
     # ---------------------------------------------------------------------
-    for p in persons_all:
-        pid = str(p.get("id") or "")
-        if not pid or pid in seen:
-            continue
-
-        # Prüfe Batch-ID in custom_fields, name, title, oder beliebigen Feldern
-        found = False
-        search_space = []
-
-        # Sammle alles, was durchsucht werden kann
-        for key, val in p.items():
-            if isinstance(val, str):
-                search_space.append(val)
-            elif isinstance(val, dict):
-                search_space.extend([str(v) for v in val.values() if isinstance(v, str)])
-            elif isinstance(val, list):
-                search_space.extend([str(x) for x in val if isinstance(x, str)])
-
-        text = " ".join(search_space).lower()
-        for bid in nf_batch_ids:
-            if bid.lower() in text:
-                found = True
-                break
-
-        if not found:
-            continue
-
-        # Aktivität prüfen (keine Zukunft / letzte 3 Monate)
-        av = extract_field_date(p, await get_last_activity_key()) or extract_field_date(
-            p, await get_next_activity_key()
-        )
-        if is_forbidden_activity_date(av):
-            continue
-
-        seen.add(pid)
-        selected.append(p)
-
-    print(f"[INFO] {len(selected)} Nachfass-Personen nach Batch-Filter")
-
-    if job_obj:
-        job_obj.phase = f"{len(selected)} Nachfass-Personen gefunden"
-        job_obj.percent = 40
-
-    # ---------------------------------------------------------------------
-    # 5️⃣ Aufbau DataFrame
-    # ---------------------------------------------------------------------
-    rows: list[dict] = []
+    rows = []
     for p in selected:
-        pid = str(p.get("id") or "")
+        pid = p.get("id")
         name = p.get("name") or ""
-        org = p.get("org_id") or p.get("organization") or {}
-        org_name = org.get("name") if isinstance(org, dict) else "-"
-        org_id = str(org.get("id") or org.get("value") or "") if isinstance(org, dict) else ""
+        vor, nach = split_name(p.get("first_name"), p.get("last_name"), name)
 
-        # Email
-        emails = p.get("email") or p.get("emails") or []
-        email = ""
-        if isinstance(emails, list) and emails:
-            first_email = emails[0]
-            if isinstance(first_email, dict):
-                email = first_email.get("value") or ""
-            else:
-                email = str(first_email)
-        elif isinstance(emails, str):
-            email = emails
+        org = p.get("organization") or {}
+        org_name = org.get("name") or "-"
+        org_id = str(org.get("id") or "")
 
-        # Custom Fields (LinkedIn, Xing, Position, Batch)
-        cf = p.get("custom_fields") or []
-        linkedin_url = ""
-        xing_url = ""
-        position = ""
-        for item in cf:
-            if isinstance(item, str):
-                if "linkedin.com" in item.lower():
-                    linkedin_url = item
-                elif "xing.com" in item.lower():
-                    xing_url = item
-                elif any(k in item.lower() for k in ["leiter", "head", "manager", "director"]):
-                    position = item
-
-        # Vorname / Nachname
-        name_parts = name.split(" ", 1)
-        vor = name_parts[0] if len(name_parts) > 0 else ""
-        nach = name_parts[1] if len(name_parts) > 1 else ""
+        emails = p.get("emails") or []
+        email = emails[0] if emails else ""
 
         rows.append({
             "Batch ID": batch_id or "",
             "Channel": DEFAULT_CHANNEL,
             "Cold-Mailing Import": campaign or "",
-            "Prospect ID": "",
+            "Prospect ID": get_field(p, "prospect"),
             "Organisation ID": org_id,
-            "Organisation Name": org_name or "-",
-            "Person ID": pid,
+            "Organisation Name": org_name,
+            "Person ID": str(pid or ""),
             "Person Vorname": vor,
             "Person Nachname": nach,
-            "Person Titel": "",
-            "Person Geschlecht": "",
-            "Person Position": position,
+            "Person Titel": get_field(p, "titel") or get_field(p, "title") or get_field(p, "anrede"),
+            "Person Geschlecht": get_field(p, "gender") or get_field(p, "geschlecht"),
+            "Person Position": get_field(p, "position"),
             "Person E-Mail": email,
-            "XING Profil": xing_url,
-            "LinkedIn URL": linkedin_url,
+            "XING Profil": get_field(p, "xing") or get_field(p, "xing url") or get_field(p, "xing profil"),
+            "LinkedIn URL": get_field(p, "linkedin"),
         })
 
     df = pd.DataFrame(rows, columns=TEMPLATE_COLUMNS)
-    print(f"[Nachfass] Export abgeschlossen ({len(df)} Zeilen)")
-
     await save_df_text(df, tables("nf")["final"])
+
     if job_obj:
-        job_obj.phase = f"Daten gespeichert ({len(df)} Zeilen)"
+        job_obj.phase   = f"Daten gespeichert ({len(df)} Zeilen)"
         job_obj.percent = 60
+
+    print(f"[Nachfass] Export abgeschlossen ({len(df)} Zeilen)")
     return df
 
 
