@@ -631,7 +631,7 @@ async def _build_nf_master_final(
     if not selected:
         await save_df_text(pd.DataFrame(columns=TEMPLATE_COLUMNS), tables("nf")["final"])
         await save_df_text(pd.DataFrame(excluded), "nf_excluded")
-        job.excluded_count = len(await load_df_text("nf_excluded"))
+        job_obj.excluded_count = len(await load_df_text("nf_excluded"))
         return pd.DataFrame()
 
     # ---------------------------------------------------------------------
@@ -1052,72 +1052,86 @@ async def export_start_nk(
     asyncio.create_task(_run())
     return JSONResponse({"job_id": job_id})
 
-# =============================================================================
-# EXPORT-START – NACHFASS
-# =============================================================================
+# -------------------------------------------------------------------------
+# Startet den Nachfass-Export (BatchFlow)
+# -------------------------------------------------------------------------
 @app.post("/nachfass/export_start")
-async def export_start_nf(
-    nf_batch_ids: List[str] = Body(..., embed=True),
-    batch_id: str = Body(...),
-    campaign: str = Body(...),
-):
-    job_id = str(uuid.uuid4())
-    job = Job()
-    JOBS[job_id] = job
-    job.phase = "Initialisiere Nachfass …"
-    job.percent = 1
-    job.filename_base = slugify_filename(campaign or "BatchFlow_Export")
+async def export_start_nf(request: Request):
+    """
+    Startet den asynchronen Nachfass-Export:
+    - Erstellt Job-Objekt (für Fortschritt & Status)
+    - Ruft _build_nf_master_final asynchron auf
+    - Liefert Job-ID für Fortschrittsabfragen zurück
+    """
+    try:
+        data = await request.json()
+        nf_batch_ids = data.get("nf_batch_ids") or []
+        batch_id = data.get("batch_id") or ""
+        campaign = data.get("campaign") or ""
 
-    import asyncio
+        if not nf_batch_ids:
+            return JSONResponse({"error": "Keine Batch-IDs übergeben."}, status_code=400)
 
-    async def update_progress(msg: str, pct: int):
-        job.phase = msg
-        job.percent = min(100, max(0, pct))
-        await asyncio.sleep(0.05)
+        # ---------------------------------------------------------------
+        # Job erstellen
+        # ---------------------------------------------------------------
+        job_id = str(uuid.uuid4())
+        job_obj = Job(
+            id=job_id,
+            name=f"Nachfass Export ({batch_id})",
+            phase="Starte Nachfass-Export …",
+            percent=0,
+            done=False,
+        )
+        JOBS[job_id] = job_obj
 
-    async def _run():
-        try:
-            # 1️⃣ Lade Personen
-            await update_progress("Lade Nachfass-Daten aus Pipedrive …", 5)
-            df = await _build_nf_master_final(nf_batch_ids, batch_id, campaign, job_obj=job)
+        # ---------------------------------------------------------------
+        # Asynchronen Export starten
+        # ---------------------------------------------------------------
+        async def run_export():
+            try:
+                job_obj.phase = "Lade Nachfass-Daten aus Pipedrive …"
+                job_obj.percent = 5
 
-            if df.empty:
-                job.error = "Keine Daten für Batch-ID(s) gefunden."
-                job.phase = "Keine Daten"
-                job.percent = 100
-                job.done = True
-                return
+                df = await _build_nf_master_final(
+                    nf_batch_ids=nf_batch_ids,
+                    batch_id=batch_id,
+                    campaign=campaign,
+                    job_obj=job_obj
+                )
 
-            total = len(df)
-            if total > 8000:
-                await update_progress(f"Reduziere Vergleichsdaten (nur 8000 von {total}) …", 40)
-                df = df.sample(8000, random_state=42)
+                # Ergebnis speichern
+                await save_df_text(df, tables("nf")["final"])
 
-            # 2️⃣ Abgleich / Dublettenprüfung
-            await update_progress("Starte Abgleich (Organisationen & IDs) …", 55)
-            await reconcile_with_progress(job, "nf")
+                # Zusatz: Anzahl ausgeschlossener Datensätze
+                try:
+                    excluded_df = await load_df_text("nf_excluded")
+                    job_obj.excluded_count = len(excluded_df)
+                except Exception:
+                    job_obj.excluded_count = 0
 
-            # 3️⃣ Excel erzeugen
-            await update_progress("Erzeuge Excel-Datei …", 85)
-            ready = await load_df_text("nf_master_ready")
-            export_df = build_export_from_ready(ready)
-            job.excel_bytes = _df_to_excel_bytes(export_df)
+                job_obj.phase = f"Export abgeschlossen ({len(df)} Zeilen)"
+                job_obj.percent = 100
+                job_obj.done = True
 
-            # 4️⃣ Abschluss
-            await update_progress(f"Fertig – {len(export_df)} Zeilen exportiert", 100)
-            job.total_rows = len(export_df)
-            job.done = True
-            print(f"[Nachfass] Export abgeschlossen ({len(export_df)} Zeilen)")
+                print(f"[Nachfass] Export erfolgreich beendet ({len(df)} Zeilen, {job_obj.excluded_count} ausgeschlossen)")
 
-        except Exception as e:
-            job.error = f"Fehler: {e}"
-            job.phase = "Fehler"
-            job.percent = 100
-            job.done = True
+            except Exception as e:
+                job_obj.phase = "Fehler beim Nachfass-Export"
+                job_obj.error = str(e)
+                job_obj.done = True
+                print(f"[ERROR] Nachfass-Export fehlgeschlagen: {e}")
 
-    asyncio.create_task(_run())
-    return JSONResponse({"job_id": job_id})
+        asyncio.create_task(run_export())
 
+        # ---------------------------------------------------------------
+        # Job-ID für Frontend zurückgeben
+        # ---------------------------------------------------------------
+        return JSONResponse({"job_id": job_id})
+
+    except Exception as e:
+        print(f"[ERROR] /nachfass/export_start: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 # =============================================================================
 # EXPORT-FORTSCHRITT & DOWNLOAD-ENDPUNKTE
