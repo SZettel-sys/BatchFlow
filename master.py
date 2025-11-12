@@ -1460,6 +1460,9 @@ async def export_start_nf(request: Request):
     - Liefert Job-ID für Fortschrittsabfragen zurück
     """
     try:
+        # ---------------------------------------------------------------
+        # 1) Request-Daten einlesen
+        # ---------------------------------------------------------------
         data = await request.json()
         nf_batch_ids = data.get("nf_batch_ids") or []
         batch_id = data.get("batch_id") or ""
@@ -1469,20 +1472,22 @@ async def export_start_nf(request: Request):
             return JSONResponse({"error": "Keine Batch-IDs übergeben."}, status_code=400)
 
         # ---------------------------------------------------------------
-        # Job erstellen (ohne id-Parameter im Konstruktor!)
+        # 2) Job anlegen (ohne Parameter im Konstruktor!)
         # ---------------------------------------------------------------
         job_id = str(uuid.uuid4())
-        job_obj = Job(
-            name=f"Nachfass Export ({batch_id})",
-            phase="Starte Nachfass-Export …",
-            percent=0,
-            done=False,
-        )
+        job_obj = Job()  # <- deine Klasse hat keinen __init__ mit Parametern
         job_obj.id = job_id
+        job_obj.name = f"Nachfass Export ({batch_id})"
+        job_obj.phase = "Starte Nachfass-Export …"
+        job_obj.percent = 0
+        job_obj.done = False
+        job_obj.error = None
+
+        # Globale Job-Registry aktualisieren
         JOBS[job_id] = job_obj
 
         # ---------------------------------------------------------------
-        # Asynchronen Export starten
+        # 3) Asynchronen Export starten
         # ---------------------------------------------------------------
         async def run_export():
             try:
@@ -1496,9 +1501,10 @@ async def export_start_nf(request: Request):
                     job_obj=job_obj
                 )
 
+                # DataFrame speichern
                 await save_df_text(df, tables("nf")["final"])
 
-                # Zusatz: Anzahl ausgeschlossener Datensätze
+                # Anzahl ausgeschlossener Datensätze bestimmen
                 try:
                     excluded_df = await load_df_text("nf_excluded")
                     job_obj.excluded_count = len(excluded_df)
@@ -1509,20 +1515,26 @@ async def export_start_nf(request: Request):
                 job_obj.percent = 100
                 job_obj.done = True
 
-                print(f"[Nachfass] Export fertig ({len(df)} Zeilen, {job_obj.excluded_count} ausgeschlossen)")
+                print(f"[Nachfass] Export erfolgreich beendet "
+                      f"({len(df)} Zeilen, {job_obj.excluded_count} ausgeschlossen)")
+
             except Exception as e:
                 job_obj.phase = "Fehler beim Nachfass-Export"
                 job_obj.error = str(e)
                 job_obj.done = True
                 print(f"[ERROR] Nachfass-Export fehlgeschlagen: {e}")
 
+        # Task im Hintergrund starten
         asyncio.create_task(run_export())
+
+        # ---------------------------------------------------------------
+        # 4) Job-ID an Frontend zurückgeben
+        # ---------------------------------------------------------------
         return JSONResponse({"job_id": job_id})
 
     except Exception as e:
         print(f"[ERROR] /nachfass/export_start: {e}")
         return JSONResponse({"error": str(e)}, status_code=500)
-
 
 # =============================================================================
 # Redirects & Fallbacks (fix für /overview & ungültige Pfade)
