@@ -523,7 +523,7 @@ async def stream_persons_by_filter(
         start += len(data)
 
 # -------------------------------------------------------------------------
-# FINALE VERSION: _build_nf_master_final (mit vollständigen Feldern + erweiterten Ergebnis-Spalten)
+# FINALE VERSION – _build_nf_master_final (vollständig, robust & frontend-kompatibel)
 # -------------------------------------------------------------------------
 import json
 import datetime as dt
@@ -531,6 +531,9 @@ from collections import defaultdict
 import pandas as pd
 import numpy as np
 
+# -------------------------------------------------------------------------
+# Hauptfunktion
+# -------------------------------------------------------------------------
 async def _build_nf_master_final(
     nf_batch_ids: List[str],
     batch_id: str,
@@ -538,11 +541,13 @@ async def _build_nf_master_final(
     job_obj=None
 ) -> pd.DataFrame:
 
+    # ---------------------------------------------------------------------
+    # 1. Feld-Mapping vorbereiten
+    # ---------------------------------------------------------------------
     person_fields = await get_person_fields()
     hint_to_key, gender_map = {}, {}
     next_activity_key = None
 
-    # Feld-Mapping vorbereiten
     for f in person_fields:
         nm = (f.get("name") or "").lower()
         for hint in PERSON_FIELD_HINTS_TO_EXPORT.keys():
@@ -572,7 +577,9 @@ async def _build_nf_master_final(
             return gender_map.get(str(v), str(v))
         return str(v or "")
 
-    # Personen laden (z. B. per Filter-ID oder Batch)
+    # ---------------------------------------------------------------------
+    # 2. Personen laden (Batch oder Filter)
+    # ---------------------------------------------------------------------
     persons = await stream_persons_by_batch_id(
         await get_batch_field_key(),
         nf_batch_ids,
@@ -585,22 +592,15 @@ async def _build_nf_master_final(
     org_counter = defaultdict(int)
     now = dt.datetime.now()
 
-    # ---------------------------
-    # FILTERLOGIK
-    # ---------------------------
+    # ---------------------------------------------------------------------
+    # 3. Vorabfilter: (a) Datum nächste Aktivität, (b) max. 2 Kontakte pro Org
+    # ---------------------------------------------------------------------
     for p in persons:
         pid = str(p.get("id") or "")
         name = p.get("name") or ""
         org = p.get("organization") or {}
         org_id = str(org.get("id") or "")
         org_name = org.get("name") or "-"
-
-        # Fallbacks (wenn Organisation nicht direkt in p enthalten)
-        if not org_id or org_name == "-":
-            if "organization" in p.get("metadata", {}):
-                org_meta = p["metadata"]["organization"]
-                org_id = org_meta.get("id") or org_id
-                org_name = org_meta.get("name") or org_name
 
         # Regel 1: Datum nächste Aktivität
         if next_activity_key:
@@ -638,9 +638,9 @@ async def _build_nf_master_final(
 
     print(f"[INFO] Nach Vorabfilter: {len(selected)} übrig, {len(excluded)} ausgeschlossen")
 
-    # ---------------------------
-    # DataFrame mit allen Feldern
-    # ---------------------------
+    # ---------------------------------------------------------------------
+    # 4. DataFrame mit allen relevanten Feldern aufbauen
+    # ---------------------------------------------------------------------
     rows = []
     for p in selected:
         pid = str(p.get("id") or "")
@@ -658,7 +658,7 @@ async def _build_nf_master_final(
         elif isinstance(emails, str):
             email = emails
 
-        # XING-Feld robust finden (beliebige Feldnamen)
+        # XING-Profil robust extrahieren
         xing_value = ""
         for k, v in p.items():
             if isinstance(k, str) and "xing" in k.lower():
@@ -666,7 +666,9 @@ async def _build_nf_master_final(
                     xing_value = v
                     break
                 if isinstance(v, list):
-                    xing_value = ", ".join([x.get("value") for x in v if isinstance(x, dict)])
+                    xing_value = ", ".join([
+                        x.get("value") for x in v if isinstance(x, dict) and x.get("value")
+                    ])
                     break
 
         rows.append({
@@ -682,19 +684,22 @@ async def _build_nf_master_final(
             "Person - Nachname": nach,
             "Person - Position": get_field(p, "position"),
             "Person - ID": pid,
-            "Person ID": pid,  # Alias für Reconcile
+            "Person ID": pid,
             "Person - XING-Profil": xing_value,
             "Person - LinkedIn Profil-URL": get_field(p, "linkedin"),
             "Person - E-Mail-Adresse - Büro": email,
         })
 
     df = pd.DataFrame(rows)
-    excluded_df = pd.DataFrame(excluded).replace({np.nan: None})
 
+    # ---------------------------------------------------------------------
+    # 5. Speichern + Ausschlüsse behandeln
+    # ---------------------------------------------------------------------
+    excluded_df = pd.DataFrame(excluded).replace({np.nan: None})
     await save_df_text(df, "nf_master_final")
     await save_df_text(excluded_df, "nf_excluded")
 
-    # Wenn keine Ausschlüsse → leere Meldung einfügen
+    # Wenn keine Ausschlüsse → Dummy-Zeile speichern (Frontend-Hinweis)
     if excluded_df.empty:
         excluded_df = pd.DataFrame([{
             "Kontakt ID": "-",
