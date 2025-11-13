@@ -670,16 +670,23 @@ async def _build_nf_master_final(
                 except Exception as e:
                     print(f"[WARN] Konnte Aktivitätsdatum für {name} nicht interpretieren: {e}")
 
-        # 2️⃣ Regel: max. 2 Personen pro Organisation
-        org_counter[org_name] += 1
-        if org_counter[org_name] > 2:
-            excluded.append({
-                "id": pid,
-                "name": name,
-                "org": org_name,
-                "grund": "Mehr als 2 Kontakte pro Organisation"
-            })
-            continue
+        # 2️⃣ Regel: max. 2 Personen pro Organisation (nach Organisation-ID)
+            org_id = str(org.get("id") or "")
+            org_name = org.get("name") or "-"
+            
+            if org_id:  # nur zählen, wenn ID vorhanden ist
+                org_counter[org_id] += 1
+                if org_counter[org_id] > 2:
+                    excluded.append({
+                        "id": pid,
+                        "name": name,
+                        "org": org_name,
+                        "grund": "Mehr als 2 Kontakte pro Organisation"
+                    })
+                    continue
+            else:
+                # Falls es doch eine Person ohne Organisation gäbe → einfach behalten
+                org_counter[f"no_org_{pid}"] += 1
 
         selected.append(p)
 
