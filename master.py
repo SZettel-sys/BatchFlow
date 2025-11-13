@@ -694,6 +694,7 @@ async def _build_nf_master_final(
             "Person - Nachname": nach,
             "Person - Position": get_field(p, "position"),
             "Person - ID": str(pid),
+            "Person ID": pid,
             "Person - XING-Profil": get_field(p, "xing") or get_field(p, "xing profil"),
             "Person - LinkedIn Profil-URL": get_field(p, "linkedin"),
             "Person - E-Mail-Adresse - Büro": email
