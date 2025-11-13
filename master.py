@@ -521,10 +521,14 @@ async def stream_persons_by_filter(
         if len(data) < page_limit:
             break
         start += len(data)
+
 # -------------------------------------------------------------------------
-# NACHFASS – stabile Version mit verbessertem Batch-ID-Abgleich
+# NACHFASS – stabile Version mit klar definierten Vorab-Regeln
 # -------------------------------------------------------------------------
 import json
+import datetime as dt
+from collections import defaultdict
+import pandas as pd
 
 async def _build_nf_master_final(
     nf_batch_ids: List[str],
@@ -534,9 +538,11 @@ async def _build_nf_master_final(
 ) -> pd.DataFrame:
     """
     Baut Nachfass-Daten performant & vollständig:
-    - Lädt nur Personen, deren Batch-ID eines der übergebenen nf_batch_ids enthält
-    - Füllt alle relevanten Felder (inkl. Gender, LinkedIn, XING usw.)
-    - Erkennt Batch-ID auch in custom_fields (z. B. "B443")
+    - Lädt Personen anhand der Batch-IDs aus Pipedrive
+    - Wendet NUR folgende Vorab-Regeln an:
+        1. Nur 2 Personen pro Organisation
+        2. Wenn "Datum nächste Aktivität" vorhanden UND
+           innerhalb der letzten 3 Monate liegt oder in der Zukunft ist → ausschließen
     """
 
     # ---------------------------------------------------------------------
@@ -544,49 +550,34 @@ async def _build_nf_master_final(
     # ---------------------------------------------------------------------
     person_fields = await get_person_fields()
     hint_to_key: Dict[str, str] = {}
-    gender_map: Dict[str, str] = {}
+    next_activity_key = None
 
     for f in person_fields:
         nm = (f.get("name") or "").lower()
         for hint in PERSON_FIELD_HINTS_TO_EXPORT.keys():
             if hint in nm and hint not in hint_to_key:
                 hint_to_key[hint] = f.get("key")
-        if any(x in nm for x in ("gender", "geschlecht")):
-            gender_map = field_options_id_to_label_map(f)
+
+        # Schlüssel für "Datum nächste Aktivität" merken
+        if "datum nächste aktivität" in nm or "next activity" in nm:
+            next_activity_key = f.get("key")
 
     def get_field(p: dict, hint: str) -> str:
         key = hint_to_key.get(hint)
         if not key:
             return ""
         v = p.get(key)
-        if isinstance(v, dict):
-            return v.get("label") or v.get("value") or ""
+        if isinstance(v, dict) and "label" in v:
+            return v["label"]
         if isinstance(v, list):
-            vals = []
-            for x in v:
-                if isinstance(x, dict):
-                    vals.append(x.get("label") or x.get("value") or "")
-                elif isinstance(x, str):
-                    vals.append(x)
-            return ", ".join([str(x) for x in vals if x])
-        if hint in ("gender", "geschlecht") and gender_map:
-            return gender_map.get(str(v), str(v))
+            return ", ".join(str(x.get("value", "")) if isinstance(x, dict) else str(x) for x in v)
         return str(v or "")
 
     # ---------------------------------------------------------------------
-    # 2) Schlüssel für Aktivitäten + Batch-Feld
-    # ---------------------------------------------------------------------
-    last_key  = await get_last_activity_key()
-    next_key  = await get_next_activity_key()
-    batch_key = await get_batch_field_key()
-    if not batch_key:
-        raise RuntimeError("Personenfeld 'Batch ID' wurde nicht gefunden.")
-
-    # ---------------------------------------------------------------------
-    # 3) Personen gezielt per Batch-ID laden
+    # 2) Personen per Batch-ID laden
     # ---------------------------------------------------------------------
     if job_obj:
-        job_obj.phase   = "Lade Nachfass-Personen aus Pipedrive …"
+        job_obj.phase = "Lade Nachfass-Personen aus Pipedrive …"
         job_obj.percent = 10
 
     persons: List[dict] = []
@@ -612,116 +603,90 @@ async def _build_nf_master_final(
                 break
         print(f"[INFO] Batch {bid}: {total} Personen geladen")
 
-    if job_obj:
-        job_obj.phase   = f"Alle Batch-IDs geladen ({len(persons)} Personen)"
-        job_obj.percent = 35
-
-    if not persons:
-        print("[WARN] Keine Personen gefunden.")
-        return pd.DataFrame(columns=TEMPLATE_COLUMNS)
-
-    print(f"[DEBUG] Beispielperson – erster Datensatz:\n{json.dumps(persons[0], indent=2)}")
+    print(f"[INFO] Insgesamt {len(persons)} Personen aus Pipedrive geladen")
 
     # ---------------------------------------------------------------------
-    # 4) Filterung nach Aktivitäten & Duplikaten
+    # 3) Vorabfilterung nach definierten Regeln
     # ---------------------------------------------------------------------
     selected = []
-    seen_ids = set()
     excluded = []
+    org_counter = defaultdict(int)
+    now = dt.datetime.now()
 
     for p in persons:
         pid = str(p.get("id") or "")
-        if not pid or pid in seen_ids:
+        name = p.get("name") or ""
+        org = p.get("organization") or {}
+        org_name = org.get("name") or "-"
+
+        # 1️⃣ Regel: Aktivitätsprüfung
+        if next_activity_key:
+            raw_date = p.get(next_activity_key)
+            if raw_date:
+                try:
+                    next_act_val = dt.datetime.fromisoformat(str(raw_date).split(" ")[0])
+                    delta_days = (now - next_act_val).days
+                    # Innerhalb der letzten 3 Monate (0–90 Tage) oder in der Zukunft (<0) -> ausschließen
+                    if 0 <= delta_days <= 90 or delta_days < 0:
+                        excluded.append({
+                            "id": pid,
+                            "name": name,
+                            "org": org_name,
+                            "grund": "Datum nächste Aktivität < 3 Monate oder in der Zukunft"
+                        })
+                        continue
+                except Exception as e:
+                    print(f"[WARN] Konnte Aktivitätsdatum für {name} nicht interpretieren: {e}")
+
+        # 2️⃣ Regel: max. 2 Personen pro Organisation
+        org_counter[org_name] += 1
+        if org_counter[org_name] > 2:
+            excluded.append({
+                "id": pid,
+                "name": name,
+                "org": org_name,
+                "grund": "Mehr als 2 Kontakte pro Organisation"
+            })
             continue
-        seen_ids.add(pid)
 
-        # Aktivitätsprüfung
-        av = extract_field_date(p, last_key) or extract_field_date(p, next_key)
-        if is_forbidden_activity_date(av):
-            excluded.append({"id": pid, "name": p.get("name"), "grund": "Aktivität innerhalb 3 Monate"})
-            continue
-
-        # -----------------------------
-        # NEUER ROBUSTER BATCH-ID-ABGLEICH
-        # -----------------------------
-        val = p.get(batch_key)
-        match_found = False
-
-        # Prüfe direkt im Batch-Feld
-        if isinstance(val, (str, int)):
-            match_found = any(str(bid).lower() in str(val).lower() for bid in nf_batch_ids)
-        elif isinstance(val, list):
-            match_found = any(str(bid).lower() in str(x).lower() for bid in nf_batch_ids for x in val)
-        elif isinstance(val, dict):
-            match_found = any(str(bid).lower() in str(v).lower() for bid in nf_batch_ids for v in val.values())
-
-        # Fallback: Suche in allen custom_fields
-        if not match_found:
-            cf = p.get("custom_fields") or []
-            match_found = any(str(bid).lower() in str(x).lower() for bid in nf_batch_ids for x in cf)
-
-        if not match_found:
-            excluded.append({"id": pid, "name": p.get("name"), "grund": "Batch-ID passt nicht"})
-            continue
-
-        # Wenn alles passt → hinzufügen
         selected.append(p)
 
-    print(f"[INFO] Nach Aktivitäts- & Batch-Filter: {len(selected)} übrig, {len(excluded)} ausgeschlossen")
+    print(f"[INFO] Nach Vorabfilter: {len(selected)} übrig, {len(excluded)} ausgeschlossen")
 
     # ---------------------------------------------------------------------
-    # 5) DataFrame aufbauen (alle Felder)
+    # 4) DataFrame aufbauen
     # ---------------------------------------------------------------------
     rows = []
     for p in selected:
         pid = p.get("id")
         name = p.get("name") or ""
-        vor, nach = split_name(p.get("first_name"), p.get("last_name"), name)
         org = p.get("organization") or {}
         org_name = org.get("name") or "-"
         org_id = str(org.get("id") or "")
-
-        emails = p.get("emails") or p.get("email") or []
-        email = ""
-        if isinstance(emails, list) and emails:
-            if isinstance(emails[0], dict):
-                email = emails[0].get("value") or ""
-            else:
-                email = str(emails[0])
-        elif isinstance(emails, str):
-            email = emails
+        emails = p.get("emails") or []
+        email = emails[0] if emails else ""
 
         rows.append({
-            "Batch ID": batch_id or "",
+            "Batch ID": batch_id,
             "Channel": DEFAULT_CHANNEL,
-            "Cold-Mailing Import": campaign or "",
-            "Prospect ID": get_field(p, "prospect"),
+            "Cold-Mailing Import": campaign,
             "Organisation ID": org_id,
             "Organisation Name": org_name,
-            "Person ID": str(pid or ""),
-            "Person Vorname": vor,
-            "Person Nachname": nach,
-            "Person Titel": get_field(p, "titel") or get_field(p, "title") or get_field(p, "anrede"),
-            "Person Geschlecht": get_field(p, "gender") or get_field(p, "geschlecht"),
-            "Person Position": get_field(p, "position"),
+            "Person ID": pid,
+            "Person Name": name,
             "Person E-Mail": email,
-            "XING Profil": get_field(p, "xing") or get_field(p, "xing url") or get_field(p, "xing profil"),
-            "LinkedIn URL": get_field(p, "linkedin"),
         })
 
-    df = pd.DataFrame(rows, columns=TEMPLATE_COLUMNS)
-    await save_df_text(df, tables("nf")["final"])
-
-    # Excluded separat speichern (nur für Info-Tabelle)
+    df = pd.DataFrame(rows)
+    await save_df_text(df, "nf_master_final")
     await save_df_text(pd.DataFrame(excluded), "nf_excluded")
 
     if job_obj:
-        job_obj.phase   = f"Daten gespeichert ({len(df)} Zeilen)"
+        job_obj.phase = f"Daten gespeichert ({len(df)} Zeilen)"
         job_obj.percent = 60
 
     print(f"[Nachfass] Export abgeschlossen ({len(df)} Zeilen, {len(excluded)} ausgeschlossen)")
     return df
-
 
 # =============================================================================
 # NEUKONTAKTE – MASTER FINAL
