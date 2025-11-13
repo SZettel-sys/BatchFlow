@@ -523,12 +523,13 @@ async def stream_persons_by_filter(
         start += len(data)
 
 # -------------------------------------------------------------------------
-# NACHFASS – intelligente Version mit Filter-API-Integration & klaren Regeln
+# NACHFASS – finale Version mit vollständigen Spalten & korrekter Filterlogik
 # -------------------------------------------------------------------------
 import json
 import datetime as dt
 from collections import defaultdict
 import pandas as pd
+import numpy as np
 
 async def _build_nf_master_final(
     nf_batch_ids: List[str],
@@ -538,12 +539,11 @@ async def _build_nf_master_final(
 ) -> pd.DataFrame:
     """
     Baut Nachfass-Daten performant & vollständig:
-    - Wenn nur eine Batch-ID übergeben wird → nutzt echten Pipedrive-Filter (z. B. 3024)
-    - Sonst Search-API (Fallback)
-    - Vorab-Regeln:
-        1. Nur 2 Personen pro Organisation
-        2. Wenn 'Datum nächste Aktivität' vorhanden UND
-           innerhalb der letzten 3 Monate liegt oder in der Zukunft ist → ausschließen
+    - nutzt echten Filter (z. B. 3024)
+    - filtert nach:
+        1. max. 2 Personen pro Organisation (nach ID)
+        2. "Datum nächste Aktivität" < 3 Monate oder in der Zukunft
+    - exportiert vollständige Spalten
     """
 
     # ---------------------------------------------------------------------
@@ -551,6 +551,7 @@ async def _build_nf_master_final(
     # ---------------------------------------------------------------------
     person_fields = await get_person_fields()
     hint_to_key: Dict[str, str] = {}
+    gender_map: Dict[str, str] = {}
     next_activity_key = None
 
     for f in person_fields:
@@ -559,86 +560,65 @@ async def _build_nf_master_final(
             if hint in nm and hint not in hint_to_key:
                 hint_to_key[hint] = f.get("key")
 
-        # Schlüssel für "Datum nächste Aktivität" merken
+        if any(x in nm for x in ("gender", "geschlecht")):
+            gender_map = field_options_id_to_label_map(f)
+
         if "datum nächste aktivität" in nm or "next activity" in nm:
             next_activity_key = f.get("key")
 
     def get_field(p: dict, hint: str) -> str:
+        """Hilfsfunktion: extrahiert benutzerdefinierte Felder robust"""
         key = hint_to_key.get(hint)
         if not key:
             return ""
         v = p.get(key)
         if isinstance(v, dict) and "label" in v:
-            return v["label"]
+            return str(v.get("label"))
         if isinstance(v, list):
-            return ", ".join(
-                str(x.get("value", "")) if isinstance(x, dict) else str(x)
-                for x in v
-            )
+            vals = []
+            for x in v:
+                if isinstance(x, dict):
+                    vals.append(str(x.get("value") or x.get("label") or ""))
+                else:
+                    vals.append(str(x))
+            return ", ".join([x for x in vals if x])
+        if hint in ("gender", "geschlecht") and gender_map:
+            return gender_map.get(str(v), str(v))
         return str(v or "")
 
     # ---------------------------------------------------------------------
-    # 2) Personen laden – intelligent: Filter-ID bevorzugt
+    # 2) Personen per Filter laden (statt search)
     # ---------------------------------------------------------------------
-    persons: List[dict] = []
-    total = 0
-
     if job_obj:
         job_obj.phase = "Lade Nachfass-Personen aus Pipedrive …"
         job_obj.percent = 10
 
-    try:
-        if len(nf_batch_ids) == 1:
-            # ECHTER FILTER-AUFRUF (exakt wie in der UI)
-            filter_id = 3024  # ggf. anpassen
-            start = 0
-            while True:
-                url = append_token(
-                    f"{PIPEDRIVE_API}/persons?filter_id={filter_id}&start={start}&limit=100"
-                )
-                r = await http_client().get(url, headers=get_headers())
-                if r.status_code != 200:
-                    print(f"[WARN] Filter {filter_id} Fehler: {r.text[:100]}")
-                    break
-                data = r.json().get("data", [])
-                if not data:
-                    break
-                persons.extend(data)
-                total += len(data)
-                start += len(data)
-                if len(data) < 100:
-                    break
-            print(f"[INFO] Filter {filter_id}: {total} Personen geladen")
-        else:
-            # FALLBACK: SEARCH über alle Batch-IDs
-            for bid in nf_batch_ids:
-                start = 0
-                while True:
-                    url = append_token(
-                        f"{PIPEDRIVE_API}/persons/search?term={bid}&fields=custom_fields&start={start}&limit=100"
-                    )
-                    r = await http_client().get(url, headers=get_headers())
-                    if r.status_code != 200:
-                        print(f"[WARN] Batch {bid} Fehler: {r.text[:100]}")
-                        break
-                    data = r.json().get("data", {}).get("items", [])
-                    if not data:
-                        break
-                    items = [d.get("item") for d in data if d.get("item")]
-                    persons.extend(items)
-                    total += len(items)
-                    start += len(items)
-                    if len(data) < 100:
-                        break
-                print(f"[INFO] Batch {bid}: {total} Personen geladen")
+    persons: List[dict] = []
+    filter_id = 3024  # dein Nachfass-Filter
+    start = 0
+    total = 0
 
-    except Exception as e:
-        print(f"[ERROR] Fehler beim Laden der Personen: {e}")
+    while True:
+        url = append_token(
+            f"{PIPEDRIVE_API}/persons?filter_id={filter_id}&start={start}&limit=100"
+        )
+        r = await http_client().get(url, headers=get_headers())
+        if r.status_code != 200:
+            print(f"[WARN] Filter {filter_id} Fehler: {r.text[:100]}")
+            break
+        data = r.json().get("data", [])
+        if not data:
+            break
+        persons.extend(data)
+        total += len(data)
+        start += len(data)
+        if len(data) < 100:
+            break
 
-    print(f"[INFO] Insgesamt {len(persons)} Personen aus Pipedrive geladen")
+    print(f"[INFO] Filter {filter_id}: {total} Personen geladen")
 
     # ---------------------------------------------------------------------
-    # 3) Vorabfilterung nach deinen Regeln
+    # 3) Vorabfilterung
     # ---------------------------------------------------------------------
     selected = []
     excluded = []
@@ -650,15 +630,15 @@ async def _build_nf_master_final(
         name = p.get("name") or ""
         org = p.get("organization") or {}
         org_name = org.get("name") or "-"
+        org_id = str(org.get("id") or "")
 
-        # 1️⃣ Regel: Aktivitätsprüfung
+        # 1️⃣ Aktivitätsprüfung
         if next_activity_key:
             raw_date = p.get(next_activity_key)
             if raw_date:
                 try:
                     next_act_val = dt.datetime.fromisoformat(str(raw_date).split(" ")[0])
                     delta_days = (now - next_act_val).days
-                    # Innerhalb der letzten 3 Monate (0–90 Tage) oder in der Zukunft (< 0) → ausschließen
                     if 0 <= delta_days <= 90 or delta_days < 0:
                         excluded.append({
                             "id": pid,
@@ -670,64 +650,86 @@ async def _build_nf_master_final(
                 except Exception as e:
                     print(f"[WARN] Konnte Aktivitätsdatum für {name} nicht interpretieren: {e}")
 
-        # 2️⃣ Regel: max. 2 Personen pro Organisation (nach Organisation-ID)
-            org_id = str(org.get("id") or "")
-            org_name = org.get("name") or "-"
-            
-            if org_id:  # nur zählen, wenn ID vorhanden ist
-                org_counter[org_id] += 1
-                if org_counter[org_id] > 2:
-                    excluded.append({
-                        "id": pid,
-                        "name": name,
-                        "org": org_name,
-                        "grund": "Mehr als 2 Kontakte pro Organisation"
-                    })
-                    continue
-            else:
-                # Falls es doch eine Person ohne Organisation gäbe → einfach behalten
-                org_counter[f"no_org_{pid}"] += 1
+        # 2️⃣ max. 2 Kontakte pro Organisation-ID
+        if org_id:
+            org_counter[org_id] += 1
+            if org_counter[org_id] > 2:
+                excluded.append({
+                    "id": pid,
+                    "name": name,
+                    "org": org_name,
+                    "grund": "Mehr als 2 Kontakte pro Organisation"
+                })
+                continue
 
         selected.append(p)
 
     print(f"[INFO] Nach Vorabfilter: {len(selected)} übrig, {len(excluded)} ausgeschlossen")
 
     # ---------------------------------------------------------------------
-    # 4) DataFrame aufbauen
+    # 4) DataFrame aufbauen mit allen geforderten Spalten
     # ---------------------------------------------------------------------
     rows = []
     for p in selected:
         pid = p.get("id")
-        name = p.get("name") or ""
         org = p.get("organization") or {}
-        org_name = org.get("name") or "-"
         org_id = str(org.get("id") or "")
+        org_name = org.get("name") or "-"
+        name = p.get("name") or ""
         emails = p.get("emails") or []
         email = emails[0] if emails else ""
 
+        vor, nach = split_name(p.get("first_name"), p.get("last_name"), name)
+
         rows.append({
-            "Batch ID": batch_id,
-            "Channel": DEFAULT_CHANNEL,
+            "Person - Batch ID": batch_id,
+            "Person - Channel": DEFAULT_CHANNEL,
             "Cold-Mailing Import": campaign,
-            "Organisation ID": org_id,
-            "Organisation Name": org_name,
-            "Person ID": pid,
-            "Person Name": name,
-            "Person E-Mail": email,
+            "Person - Prospect ID": get_field(p, "prospect"),
+            "Person - Organisation": org_name,
+            "Organisation - ID": org_id,
+            "Person - Geschlecht": get_field(p, "geschlecht") or get_field(p, "gender"),
+            "Person - Titel": get_field(p, "titel") or get_field(p, "anrede"),
+            "Person - Vorname": vor,
+            "Person - Nachname": nach,
+            "Person - Position": get_field(p, "position"),
+            "Person - ID": str(pid),
+            "Person - XING-Profil": get_field(p, "xing") or get_field(p, "xing profil"),
+            "Person - LinkedIn Profil-URL": get_field(p, "linkedin"),
+            "Person - E-Mail-Adresse - Büro": email
         })
 
     df = pd.DataFrame(rows)
-    excluded_df = pd.DataFrame(excluded).replace({pd.NA: None})
+    df = df.replace({np.nan: None})
+
+    # ---------------------------------------------------------------------
+    # 5) Speichern & Ergebnisanzeige
+    # ---------------------------------------------------------------------
+    excluded_df = pd.DataFrame(excluded).replace({np.nan: None})
+
     await save_df_text(df, "nf_master_final")
     await save_df_text(excluded_df, "nf_excluded")
 
     if job_obj:
-        job_obj.phase = f"Daten gespeichert ({len(df)} Zeilen)"
+        if len(excluded_df) == 0:
+            job_obj.phase = "Keine Datensätze ausgeschlossen"
+        else:
+            job_obj.phase = f"{len(excluded_df)} Datensätze ausgeschlossen"
         job_obj.percent = 60
 
     print(f"[Nachfass] Export abgeschlossen ({len(df)} Zeilen, {len(excluded)} ausgeschlossen)")
-    return df
 
+    # Wenn keine Ausschlüsse → Dummy-Eintrag zur Anzeige im Frontend
+    if excluded_df.empty:
+        excluded_df = pd.DataFrame([{
+            "id": "-",
+            "name": "-",
+            "org": "-",
+            "grund": "Keine Datensätze ausgeschlossen"
+        }])
+        await save_df_text(excluded_df, "nf_excluded")
+
+    return df
 
 # =============================================================================
 # BASIS-ABGLEICH (Organisationen & IDs)
