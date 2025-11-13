@@ -523,7 +523,7 @@ async def stream_persons_by_filter(
         start += len(data)
 
 # -------------------------------------------------------------------------
-# NACHFASS – stabile Version mit klar definierten Vorab-Regeln
+# NACHFASS – intelligente Version mit Filter-API-Integration & klaren Regeln
 # -------------------------------------------------------------------------
 import json
 import datetime as dt
@@ -538,10 +538,11 @@ async def _build_nf_master_final(
 ) -> pd.DataFrame:
     """
     Baut Nachfass-Daten performant & vollständig:
-    - Lädt Personen anhand der Batch-IDs aus Pipedrive
-    - Wendet NUR folgende Vorab-Regeln an:
+    - Wenn nur eine Batch-ID übergeben wird → nutzt echten Pipedrive-Filter (z. B. 3024)
+    - Sonst Search-API (Fallback)
+    - Vorab-Regeln:
         1. Nur 2 Personen pro Organisation
-        2. Wenn "Datum nächste Aktivität" vorhanden UND
+        2. Wenn 'Datum nächste Aktivität' vorhanden UND
            innerhalb der letzten 3 Monate liegt oder in der Zukunft ist → ausschließen
     """
 
@@ -570,43 +571,74 @@ async def _build_nf_master_final(
         if isinstance(v, dict) and "label" in v:
             return v["label"]
         if isinstance(v, list):
-            return ", ".join(str(x.get("value", "")) if isinstance(x, dict) else str(x) for x in v)
+            return ", ".join(
+                str(x.get("value", "")) if isinstance(x, dict) else str(x)
+                for x in v
+            )
         return str(v or "")
 
     # ---------------------------------------------------------------------
-    # 2) Personen per Batch-ID laden
+    # 2) Personen laden – intelligent: Filter-ID bevorzugt
     # ---------------------------------------------------------------------
+    persons: List[dict] = []
+    total = 0
+
     if job_obj:
         job_obj.phase = "Lade Nachfass-Personen aus Pipedrive …"
         job_obj.percent = 10
 
-    persons: List[dict] = []
-    for bid in nf_batch_ids:
-        start = 0
-        total = 0
-        while True:
-            url = append_token(
-                f"{PIPEDRIVE_API}/persons/search?term={bid}&fields=custom_fields&start={start}&limit=100"
-            )
-            r = await http_client().get(url, headers=get_headers())
-            if r.status_code != 200:
-                print(f"[WARN] Batch {bid} Fehler: {r.text[:100]}")
-                break
-            data = r.json().get("data", {}).get("items", [])
-            if not data:
-                break
-            items = [d.get("item") for d in data if d.get("item")]
-            persons.extend(items)
-            total += len(items)
-            start += len(items)
-            if len(data) < 100:
-                break
-        print(f"[INFO] Batch {bid}: {total} Personen geladen")
+    try:
+        if len(nf_batch_ids) == 1:
+            # ECHTER FILTER-AUFRUF (exakt wie in der UI)
+            filter_id = 3024  # ggf. anpassen
+            start = 0
+            while True:
+                url = append_token(
+                    f"{PIPEDRIVE_API}/persons?filter_id={filter_id}&start={start}&limit=100"
+                )
+                r = await http_client().get(url, headers=get_headers())
+                if r.status_code != 200:
+                    print(f"[WARN] Filter {filter_id} Fehler: {r.text[:100]}")
+                    break
+                data = r.json().get("data", [])
+                if not data:
+                    break
+                persons.extend(data)
+                total += len(data)
+                start += len(data)
+                if len(data) < 100:
+                    break
+            print(f"[INFO] Filter {filter_id}: {total} Personen geladen")
+        else:
+            # FALLBACK: SEARCH über alle Batch-IDs
+            for bid in nf_batch_ids:
+                start = 0
+                while True:
+                    url = append_token(
+                        f"{PIPEDRIVE_API}/persons/search?term={bid}&fields=custom_fields&start={start}&limit=100"
+                    )
+                    r = await http_client().get(url, headers=get_headers())
+                    if r.status_code != 200:
+                        print(f"[WARN] Batch {bid} Fehler: {r.text[:100]}")
+                        break
+                    data = r.json().get("data", {}).get("items", [])
+                    if not data:
+                        break
+                    items = [d.get("item") for d in data if d.get("item")]
+                    persons.extend(items)
+                    total += len(items)
+                    start += len(items)
+                    if len(data) < 100:
+                        break
+                print(f"[INFO] Batch {bid}: {total} Personen geladen")
+
+    except Exception as e:
+        print(f"[ERROR] Fehler beim Laden der Personen: {e}")
 
     print(f"[INFO] Insgesamt {len(persons)} Personen aus Pipedrive geladen")
 
     # ---------------------------------------------------------------------
-    # 3) Vorabfilterung nach definierten Regeln
+    # 3) Vorabfilterung nach deinen Regeln
     # ---------------------------------------------------------------------
     selected = []
     excluded = []
@@ -626,7 +658,7 @@ async def _build_nf_master_final(
                 try:
                     next_act_val = dt.datetime.fromisoformat(str(raw_date).split(" ")[0])
                     delta_days = (now - next_act_val).days
-                    # Innerhalb der letzten 3 Monate (0–90 Tage) oder in der Zukunft (<0) -> ausschließen
+                    # Innerhalb der letzten 3 Monate (0–90 Tage) oder in der Zukunft (< 0) → ausschließen
                     if 0 <= delta_days <= 90 or delta_days < 0:
                         excluded.append({
                             "id": pid,
@@ -678,8 +710,9 @@ async def _build_nf_master_final(
         })
 
     df = pd.DataFrame(rows)
+    excluded_df = pd.DataFrame(excluded).replace({pd.NA: None})
     await save_df_text(df, "nf_master_final")
-    await save_df_text(pd.DataFrame(excluded), "nf_excluded")
+    await save_df_text(excluded_df, "nf_excluded")
 
     if job_obj:
         job_obj.phase = f"Daten gespeichert ({len(df)} Zeilen)"
@@ -688,114 +721,6 @@ async def _build_nf_master_final(
     print(f"[Nachfass] Export abgeschlossen ({len(df)} Zeilen, {len(excluded)} ausgeschlossen)")
     return df
 
-# =============================================================================
-# NEUKONTAKTE – MASTER FINAL
-# =============================================================================
-async def _build_nk_master_final(
-    fachbereich: str,
-    take_count: Optional[int],
-    batch_id: Optional[str],
-    campaign: Optional[str],
-    per_org_limit: int,
-    job_obj=None,
-) -> pd.DataFrame:
-    """Erstellt den Master für Neukontakte nach Fachbereich und Limit."""
-    fb_field = await get_person_field_by_hint(FIELD_FACHBEREICH_HINT)
-    if not fb_field:
-        raise RuntimeError("'Fachbereich'-Feld nicht gefunden.")
-    fb_key = fb_field.get("key")
-
-    person_fields = await get_person_fields()
-    hint_to_key: Dict[str, str] = {}
-    gender_map: Dict[str, str] = {}
-
-    # Feldzuordnung vorbereiten
-    for f in person_fields:
-        nm = (f.get("name") or "").lower()
-        for hint in [
-            "prospect", "gender", "geschlecht", "titel", "title", "anrede",
-            "position", "xing", "xing url", "xing profil", "linkedin",
-            "email büro", "email buero", "office email"
-        ]:
-            if hint in nm and hint not in hint_to_key:
-                hint_to_key[hint] = f.get("key")
-        if any(x in nm for x in ("gender", "geschlecht")) and "options" in f:
-            gender_map = {str(o["id"]): o["label"] for o in f.get("options", [])}
-
-    def get_field(p: dict, hint: str) -> str:
-        key = hint_to_key.get(hint)
-        if not key:
-            return ""
-        v = p.get(key)
-        if isinstance(v, dict) and "label" in v:
-            return str(v["label"])
-        if isinstance(v, list):
-            if v and isinstance(v[0], dict) and "value" in v[0]:
-                return str(v[0]["value"])
-            return ", ".join([str(x) for x in v if x])
-        if v is None:
-            return ""
-        sv = str(v)
-        if hint in ("gender", "geschlecht") and gender_map:
-            return gender_map.get(sv, sv)
-        return sv
-
-    selected: List[dict] = []
-    org_used: Dict[str, int] = {}
-
-    if job_obj:
-        job_obj.phase = "Lade Neukontakte aus Pipedrive …"
-        job_obj.percent = 10
-
-    async for chunk in stream_persons_by_filter(FILTER_NEUKONTAKTE):
-        for p in chunk:
-            if str(p.get(fb_key)) != str(fachbereich):
-                continue
-            org = p.get("org_id") or {}
-            org_key = f"id:{org.get('id')}" if org.get("id") else f"name:{normalize_name(org.get('name') or '')}"
-            used = org_used.get(org_key, 0)
-            if used >= per_org_limit:
-                continue
-            org_used[org_key] = used + 1
-            selected.append(p)
-            if take_count and len(selected) >= take_count:
-               break
-        if take_count and len(selected) >= take_count:
-            break
-   
-
-    if job_obj:
-        job_obj.phase = f"Neukontakte gesammelt: {len(selected)}"
-        job_obj.percent = 40
-
-    rows = []
-    for p in selected:
-        org = p.get("org_id") or {}
-        org_id = str(org.get("id") or org.get("value") or "")
-        org_name = org.get("name") or p.get("org_name") or "-"
-        emails = _as_list_email(p.get("email"))
-        email = emails[0] if emails else ""
-        rows.append({
-            "Batch ID": batch_id or "",
-            "Channel": DEFAULT_CHANNEL,
-            "Cold-Mailing Import": campaign or "",
-            "Prospect ID": get_field(p, "prospect"),
-            "Organisation ID": org_id,
-            "Organisation Name": org_name,
-            "Person ID": str(p.get("id") or ""),
-            "Person Vorname": p.get("first_name") or "",
-            "Person Nachname": p.get("last_name") or "",
-            "Person Titel": get_field(p, "titel") or get_field(p, "title") or get_field(p, "anrede"),
-            "Person Geschlecht": get_field(p, "gender") or get_field(p, "geschlecht"),
-            "Person Position": get_field(p, "position"),
-            "Person E-Mail": email,
-            "XING Profil": get_field(p, "xing") or get_field(p, "xing url") or get_field(p, "xing profil"),
-            "LinkedIn URL": get_field(p, "linkedin"),
-        })
-
-    df = pd.DataFrame(rows, columns=TEMPLATE_COLUMNS)
-    await save_df_text(df, "nk_master_final")
-    return df
 
 # =============================================================================
 # BASIS-ABGLEICH (Organisationen & IDs)
