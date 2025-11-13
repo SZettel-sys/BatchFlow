@@ -5,7 +5,7 @@
 import os, re, io, uuid, time, asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, List, AsyncGenerator
-import numpy as np, pandas as pd, httpx, asyncpg
+import numpy as np, pandas as pd, json, httpx, asyncpg
 from rapidfuzz import fuzz, process
 from fastapi import FastAPI, Request, Body, Query, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, StreamingResponse, RedirectResponse
