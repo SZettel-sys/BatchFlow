@@ -523,7 +523,7 @@ async def stream_persons_by_filter(
         start += len(data)
 
 # -------------------------------------------------------------------------
-# NACHFASS – finale Version mit vollständigen Spalten & korrekter Filterlogik
+# FINALE VERSION: _build_nf_master_final (mit vollständigen Feldern + erweiterten Ergebnis-Spalten)
 # -------------------------------------------------------------------------
 import json
 import datetime as dt
@@ -537,102 +537,72 @@ async def _build_nf_master_final(
     campaign: str,
     job_obj=None
 ) -> pd.DataFrame:
-    """
-    Baut Nachfass-Daten performant & vollständig:
-    - nutzt echten Filter (z. B. 3024)
-    - filtert nach:
-        1. max. 2 Personen pro Organisation (nach ID)
-        2. "Datum nächste Aktivität" < 3 Monate oder in der Zukunft
-    - exportiert vollständige Spalten
-    """
 
-    # ---------------------------------------------------------------------
-    # 1) Feld-Mapping vorbereiten
-    # ---------------------------------------------------------------------
     person_fields = await get_person_fields()
-    hint_to_key: Dict[str, str] = {}
-    gender_map: Dict[str, str] = {}
+    hint_to_key, gender_map = {}, {}
     next_activity_key = None
 
+    # Feld-Mapping vorbereiten
     for f in person_fields:
         nm = (f.get("name") or "").lower()
         for hint in PERSON_FIELD_HINTS_TO_EXPORT.keys():
             if hint in nm and hint not in hint_to_key:
                 hint_to_key[hint] = f.get("key")
-
         if any(x in nm for x in ("gender", "geschlecht")):
             gender_map = field_options_id_to_label_map(f)
-
         if "datum nächste aktivität" in nm or "next activity" in nm:
             next_activity_key = f.get("key")
 
     def get_field(p: dict, hint: str) -> str:
-        """Hilfsfunktion: extrahiert benutzerdefinierte Felder robust"""
         key = hint_to_key.get(hint)
         if not key:
             return ""
         v = p.get(key)
-        if isinstance(v, dict) and "label" in v:
-            return str(v.get("label"))
+        if isinstance(v, dict):
+            return v.get("label") or v.get("value") or ""
         if isinstance(v, list):
             vals = []
             for x in v:
                 if isinstance(x, dict):
-                    vals.append(str(x.get("value") or x.get("label") or ""))
-                else:
-                    vals.append(str(x))
-            return ", ".join([x for x in vals if x])
+                    vals.append(x.get("value") or x.get("label") or "")
+                elif isinstance(x, str):
+                    vals.append(x)
+            return ", ".join([v for v in vals if v])
         if hint in ("gender", "geschlecht") and gender_map:
             return gender_map.get(str(v), str(v))
         return str(v or "")
 
-    # ---------------------------------------------------------------------
-    # 2) Personen per Filter laden (statt search)
-    # ---------------------------------------------------------------------
-    if job_obj:
-        job_obj.phase = "Lade Nachfass-Personen aus Pipedrive …"
-        job_obj.percent = 10
+    # Personen laden (z. B. per Filter-ID oder Batch)
+    persons = await stream_persons_by_batch_id(
+        await get_batch_field_key(),
+        nf_batch_ids,
+        page_limit=100,
+        job_obj=job_obj
+    )
+    print(f"[INFO] {len(persons)} Personen geladen")
 
-    persons: List[dict] = []
-    filter_id = 3024  # dein Nachfass-Filter
-    start = 0
-    total = 0
-
-    while True:
-        url = append_token(
-            f"{PIPEDRIVE_API}/persons?filter_id={filter_id}&start={start}&limit=100"
-        )
-        r = await http_client().get(url, headers=get_headers())
-        if r.status_code != 200:
-            print(f"[WARN] Filter {filter_id} Fehler: {r.text[:100]}")
-            break
-        data = r.json().get("data", [])
-        if not data:
-            break
-        persons.extend(data)
-        total += len(data)
-        start += len(data)
-        if len(data) < 100:
-            break
-
-    print(f"[INFO] Filter {filter_id}: {total} Personen geladen")
-
-    # ---------------------------------------------------------------------
-    # 3) Vorabfilterung
-    # ---------------------------------------------------------------------
-    selected = []
-    excluded = []
+    selected, excluded = [], []
     org_counter = defaultdict(int)
     now = dt.datetime.now()
 
+    # ---------------------------
+    # FILTERLOGIK
+    # ---------------------------
     for p in persons:
         pid = str(p.get("id") or "")
         name = p.get("name") or ""
         org = p.get("organization") or {}
-        org_name = org.get("name") or "-"
         org_id = str(org.get("id") or "")
+        org_name = org.get("name") or "-"
 
-        # 1️⃣ Aktivitätsprüfung
+        # Fallbacks (wenn Organisation nicht direkt in p enthalten)
+        if not org_id or org_name == "-":
+            if "organization" in p.get("metadata", {}):
+                org_meta = p["metadata"]["organization"]
+                org_id = org_meta.get("id") or org_id
+                org_name = org_meta.get("name") or org_name
+
+        # Regel 1: Datum nächste Aktivität
         if next_activity_key:
             raw_date = p.get(next_activity_key)
             if raw_date:
@@ -641,24 +611,26 @@ async def _build_nf_master_final(
                     delta_days = (now - next_act_val).days
                     if 0 <= delta_days <= 90 or delta_days < 0:
                         excluded.append({
-                            "id": pid,
-                            "name": name,
-                            "org": org_name,
-                            "grund": "Datum nächste Aktivität < 3 Monate oder in der Zukunft"
+                            "Kontakt ID": pid,
+                            "Name": name,
+                            "Organisation ID": org_id,
+                            "Organisationsname": org_name,
+                            "Grund": "Datum nächste Aktivität < 3 Monate oder in der Zukunft"
                         })
                         continue
-                except Exception as e:
-                    print(f"[WARN] Konnte Aktivitätsdatum für {name} nicht interpretieren: {e}")
+                except Exception:
+                    pass
 
-        # 2️⃣ max. 2 Kontakte pro Organisation-ID
+        # Regel 2: max. 2 Kontakte pro Organisation
         if org_id:
             org_counter[org_id] += 1
             if org_counter[org_id] > 2:
                 excluded.append({
-                    "id": pid,
-                    "name": name,
-                    "org": org_name,
-                    "grund": "Mehr als 2 Kontakte pro Organisation"
+                    "Kontakt ID": pid,
+                    "Name": name,
+                    "Organisation ID": org_id,
+                    "Organisationsname": org_name,
+                    "Grund": "Mehr als 2 Kontakte pro Organisation"
                 })
                 continue
 
@@ -666,20 +638,36 @@ async def _build_nf_master_final(
 
     print(f"[INFO] Nach Vorabfilter: {len(selected)} übrig, {len(excluded)} ausgeschlossen")
 
-    # ---------------------------------------------------------------------
-    # 4) DataFrame aufbauen mit allen geforderten Spalten
-    # ---------------------------------------------------------------------
+    # ---------------------------
+    # DataFrame mit allen Feldern
+    # ---------------------------
     rows = []
     for p in selected:
-        pid = p.get("id")
+        pid = str(p.get("id") or "")
         org = p.get("organization") or {}
-        org_id = str(org.get("id") or "")
         org_name = org.get("name") or "-"
+        org_id = str(org.get("id") or "")
+        if not org_name or org_name == "-":
+            org_name = p.get("org_name") or "-"
         name = p.get("name") or ""
-        emails = p.get("emails") or []
-        email = emails[0] if emails else ""
-
         vor, nach = split_name(p.get("first_name"), p.get("last_name"), name)
+        emails = p.get("emails") or []
+        email = ""
+        if isinstance(emails, list) and emails:
+            email = emails[0].get("value") if isinstance(emails[0], dict) else str(emails[0])
+        elif isinstance(emails, str):
+            email = emails
+
+        # XING-Feld robust finden (beliebige Feldnamen)
+        xing_value = ""
+        for k, v in p.items():
+            if isinstance(k, str) and "xing" in k.lower():
+                if isinstance(v, str) and v.startswith("http"):
+                    xing_value = v
+                    break
+                if isinstance(v, list):
+                    xing_value = ", ".join([x.get("value") for x in v if isinstance(x, dict)])
+                    break
 
         rows.append({
             "Person - Batch ID": batch_id,
@@ -688,48 +676,36 @@ async def _build_nf_master_final(
             "Person - Prospect ID": get_field(p, "prospect"),
             "Person - Organisation": org_name,
             "Organisation - ID": org_id,
-            "Person - Geschlecht": get_field(p, "geschlecht") or get_field(p, "gender"),
-            "Person - Titel": get_field(p, "titel") or get_field(p, "anrede"),
+            "Person - Geschlecht": get_field(p, "gender") or get_field(p, "geschlecht"),
+            "Person - Titel": get_field(p, "titel") or get_field(p, "title") or get_field(p, "anrede"),
             "Person - Vorname": vor,
             "Person - Nachname": nach,
             "Person - Position": get_field(p, "position"),
-            "Person - ID": str(pid),
-            "Person ID": pid,
-            "Person - XING-Profil": get_field(p, "xing") or get_field(p, "xing profil"),
+            "Person - ID": pid,
+            "Person ID": pid,  # Alias für Reconcile
+            "Person - XING-Profil": xing_value,
             "Person - LinkedIn Profil-URL": get_field(p, "linkedin"),
-            "Person - E-Mail-Adresse - Büro": email
+            "Person - E-Mail-Adresse - Büro": email,
         })
 
     df = pd.DataFrame(rows)
-    df = df.replace({np.nan: None})
-
-    # ---------------------------------------------------------------------
-    # 5) Speichern & Ergebnisanzeige
-    # ---------------------------------------------------------------------
     excluded_df = pd.DataFrame(excluded).replace({np.nan: None})
 
     await save_df_text(df, "nf_master_final")
     await save_df_text(excluded_df, "nf_excluded")
 
-    if job_obj:
-        if len(excluded_df) == 0:
-            job_obj.phase = "Keine Datensätze ausgeschlossen"
-        else:
-            job_obj.phase = f"{len(excluded_df)} Datensätze ausgeschlossen"
-        job_obj.percent = 60
-
-    print(f"[Nachfass] Export abgeschlossen ({len(df)} Zeilen, {len(excluded)} ausgeschlossen)")
-
-    # Wenn keine Ausschlüsse → Dummy-Eintrag zur Anzeige im Frontend
+    # Wenn keine Ausschlüsse → leere Meldung einfügen
     if excluded_df.empty:
         excluded_df = pd.DataFrame([{
-            "id": "-",
-            "name": "-",
-            "org": "-",
-            "grund": "Keine Datensätze ausgeschlossen"
+            "Kontakt ID": "-",
+            "Name": "-",
+            "Organisation ID": "-",
+            "Organisationsname": "-",
+            "Grund": "Keine Datensätze ausgeschlossen"
         }])
         await save_df_text(excluded_df, "nf_excluded")
 
+    print(f"[Nachfass] Export abgeschlossen ({len(df)} Zeilen, {len(excluded)} ausgeschlossen)")
     return df
 
 # =============================================================================
