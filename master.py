@@ -1496,12 +1496,10 @@ async def export_start_nf(request: Request):
     Startet den asynchronen Nachfass-Export:
     - Erstellt Job-Objekt (für Fortschritt & Status)
     - Ruft _build_nf_master_final asynchron auf
+    - Führt anschließend den Abgleich (_reconcile) aus
     - Liefert Job-ID für Fortschrittsabfragen zurück
     """
     try:
-        # ---------------------------------------------------------------
-        # 1) Request-Daten einlesen
-        # ---------------------------------------------------------------
         data = await request.json()
         nf_batch_ids = data.get("nf_batch_ids") or []
         batch_id = data.get("batch_id") or ""
@@ -1511,10 +1509,10 @@ async def export_start_nf(request: Request):
             return JSONResponse({"error": "Keine Batch-IDs übergeben."}, status_code=400)
 
         # ---------------------------------------------------------------
-        # 2) Job anlegen (ohne Parameter im Konstruktor!)
+        # Job erstellen (ohne Parameter im Konstruktor!)
         # ---------------------------------------------------------------
         job_id = str(uuid.uuid4())
-        job_obj = Job()  # <- deine Klasse hat keinen __init__ mit Parametern
+        job_obj = Job()
         job_obj.id = job_id
         job_obj.name = f"Nachfass Export ({batch_id})"
         job_obj.phase = "Starte Nachfass-Export …"
@@ -1522,14 +1520,14 @@ async def export_start_nf(request: Request):
         job_obj.done = False
         job_obj.error = None
 
-        # Globale Job-Registry aktualisieren
         JOBS[job_id] = job_obj
 
         # ---------------------------------------------------------------
-        # 3) Asynchronen Export starten
+        # Asynchronen Export starten
         # ---------------------------------------------------------------
         async def run_export():
             try:
+                # 1️⃣ Nachfass-Daten aufbauen
                 job_obj.phase = "Lade Nachfass-Daten aus Pipedrive …"
                 job_obj.percent = 5
 
@@ -1540,22 +1538,32 @@ async def export_start_nf(request: Request):
                     job_obj=job_obj
                 )
 
-                # DataFrame speichern
                 await save_df_text(df, tables("nf")["final"])
+                job_obj.phase = f"Daten geladen ({len(df)} Zeilen)"
+                job_obj.percent = 60
 
-                # Anzahl ausgeschlossener Datensätze bestimmen
+                # 2️⃣ Abgleichslogik anwenden (Organisation + Personen)
+                try:
+                    job_obj.phase = "Führe Abgleichslogik aus …"
+                    job_obj.percent = 80
+                    await reconcile_with_progress(job_obj, "nf")
+                except Exception as e:
+                    print(f"[WARN] Abgleich fehlgeschlagen: {e}")
+                    job_obj.phase = f"Abgleich fehlgeschlagen: {e}"
+
+                # 3️⃣ Abschlussstatus
+                job_obj.phase = "Export und Abgleich abgeschlossen"
+                job_obj.percent = 100
+                job_obj.done = True
+
+                # optional: Anzahl ausgeschlossener Datensätze (nf_excluded)
                 try:
                     excluded_df = await load_df_text("nf_excluded")
                     job_obj.excluded_count = len(excluded_df)
                 except Exception:
                     job_obj.excluded_count = 0
 
-                job_obj.phase = f"Export abgeschlossen ({len(df)} Zeilen)"
-                job_obj.percent = 100
-                job_obj.done = True
-
-                print(f"[Nachfass] Export erfolgreich beendet "
-                      f"({len(df)} Zeilen, {job_obj.excluded_count} ausgeschlossen)")
+                print(f"[Nachfass] Export + Abgleich fertig ({len(df)} Zeilen, {job_obj.excluded_count} ausgeschlossen)")
 
             except Exception as e:
                 job_obj.phase = "Fehler beim Nachfass-Export"
@@ -1563,11 +1571,10 @@ async def export_start_nf(request: Request):
                 job_obj.done = True
                 print(f"[ERROR] Nachfass-Export fehlgeschlagen: {e}")
 
-        # Task im Hintergrund starten
         asyncio.create_task(run_export())
 
         # ---------------------------------------------------------------
-        # 4) Job-ID an Frontend zurückgeben
+        # Job-ID für Frontend zurückgeben
         # ---------------------------------------------------------------
         return JSONResponse({"job_id": job_id})
 
