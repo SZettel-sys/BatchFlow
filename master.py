@@ -521,10 +521,11 @@ async def stream_persons_by_filter(
         if len(data) < page_limit:
             break
         start += len(data)
+# -------------------------------------------------------------------------
+# NACHFASS – stabile Version mit verbessertem Batch-ID-Abgleich
+# -------------------------------------------------------------------------
+import json
 
-# -------------------------------------------------------------------------
-# NACHFASS – stabile, funktionierende Version mit verbessertem Feld-Mapping
-# -------------------------------------------------------------------------
 async def _build_nf_master_final(
     nf_batch_ids: List[str],
     batch_id: str,
@@ -534,7 +535,8 @@ async def _build_nf_master_final(
     """
     Baut Nachfass-Daten performant & vollständig:
     - Lädt nur Personen, deren Batch-ID eines der übergebenen nf_batch_ids enthält
-    - Füllt alle relevanten Felder korrekt (inkl. Gender, LinkedIn, XING usw.)
+    - Füllt alle relevanten Felder (inkl. Gender, LinkedIn, XING usw.)
+    - Erkennt Batch-ID auch in custom_fields (z. B. "B443")
     """
 
     # ---------------------------------------------------------------------
@@ -552,14 +554,12 @@ async def _build_nf_master_final(
         if any(x in nm for x in ("gender", "geschlecht")):
             gender_map = field_options_id_to_label_map(f)
 
-    # verbessertes Feld-Mapping
     def get_field(p: dict, hint: str) -> str:
         key = hint_to_key.get(hint)
         if not key:
             return ""
         v = p.get(key)
         if isinstance(v, dict):
-            # handle Pipedrive option fields
             return v.get("label") or v.get("value") or ""
         if isinstance(v, list):
             vals = []
@@ -604,14 +604,12 @@ async def _build_nf_master_final(
             data = r.json().get("data", {}).get("items", [])
             if not data:
                 break
-
             items = [d.get("item") for d in data if d.get("item")]
             persons.extend(items)
             total += len(items)
             start += len(items)
             if len(data) < 100:
                 break
-
         print(f"[INFO] Batch {bid}: {total} Personen geladen")
 
     if job_obj:
@@ -629,42 +627,67 @@ async def _build_nf_master_final(
     # ---------------------------------------------------------------------
     selected = []
     seen_ids = set()
+    excluded = []
+
     for p in persons:
         pid = str(p.get("id") or "")
         if not pid or pid in seen_ids:
             continue
+        seen_ids.add(pid)
+
+        # Aktivitätsprüfung
         av = extract_field_date(p, last_key) or extract_field_date(p, next_key)
         if is_forbidden_activity_date(av):
+            excluded.append({"id": pid, "name": p.get("name"), "grund": "Aktivität innerhalb 3 Monate"})
             continue
-        custom_fields = p.get("custom_fields") or []
-        if not any(str(bid).lower() in str(x).lower() for bid in nf_batch_ids for x in custom_fields):
+
+        # -----------------------------
+        # NEUER ROBUSTER BATCH-ID-ABGLEICH
+        # -----------------------------
+        val = p.get(batch_key)
+        match_found = False
+
+        # Prüfe direkt im Batch-Feld
+        if isinstance(val, (str, int)):
+            match_found = any(str(bid).lower() in str(val).lower() for bid in nf_batch_ids)
+        elif isinstance(val, list):
+            match_found = any(str(bid).lower() in str(x).lower() for bid in nf_batch_ids for x in val)
+        elif isinstance(val, dict):
+            match_found = any(str(bid).lower() in str(v).lower() for bid in nf_batch_ids for v in val.values())
+
+        # Fallback: Suche in allen custom_fields
+        if not match_found:
+            cf = p.get("custom_fields") or []
+            match_found = any(str(bid).lower() in str(x).lower() for bid in nf_batch_ids for x in cf)
+
+        if not match_found:
+            excluded.append({"id": pid, "name": p.get("name"), "grund": "Batch-ID passt nicht"})
             continue
-        seen_ids.add(pid)
+
+        # Wenn alles passt → hinzufügen
         selected.append(p)
 
-    print(f"[INFO] Nach Aktivitäts- & Batch-Filter: {len(selected)} Personen übrig")
+    print(f"[INFO] Nach Aktivitäts- & Batch-Filter: {len(selected)} übrig, {len(excluded)} ausgeschlossen")
 
     # ---------------------------------------------------------------------
-    # 5) DataFrame aufbauen (alle wichtigen Felder)
+    # 5) DataFrame aufbauen (alle Felder)
     # ---------------------------------------------------------------------
     rows = []
     for p in selected:
         pid = p.get("id")
         name = p.get("name") or ""
         vor, nach = split_name(p.get("first_name"), p.get("last_name"), name)
-
         org = p.get("organization") or {}
         org_name = org.get("name") or "-"
         org_id = str(org.get("id") or "")
 
         emails = p.get("emails") or p.get("email") or []
         email = ""
-        if isinstance(emails, list):
-            if emails:
-                if isinstance(emails[0], dict):
-                    email = emails[0].get("value") or ""
-                else:
-                    email = str(emails[0])
+        if isinstance(emails, list) and emails:
+            if isinstance(emails[0], dict):
+                email = emails[0].get("value") or ""
+            else:
+                email = str(emails[0])
         elif isinstance(emails, str):
             email = emails
 
@@ -689,13 +712,15 @@ async def _build_nf_master_final(
     df = pd.DataFrame(rows, columns=TEMPLATE_COLUMNS)
     await save_df_text(df, tables("nf")["final"])
 
+    # Excluded separat speichern (nur für Info-Tabelle)
+    await save_df_text(pd.DataFrame(excluded), "nf_excluded")
+
     if job_obj:
         job_obj.phase   = f"Daten gespeichert ({len(df)} Zeilen)"
         job_obj.percent = 60
 
-    print(f"[Nachfass] Export abgeschlossen ({len(df)} Zeilen)")
+    print(f"[Nachfass] Export abgeschlossen ({len(df)} Zeilen, {len(excluded)} ausgeschlossen)")
     return df
-
 
 
 # =============================================================================
