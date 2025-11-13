@@ -959,6 +959,11 @@ async def _reconcile(prefix: str) -> None:
     await save_df_text(master, t["ready"])
     log_df = pd.DataFrame(delete_rows, columns=["reason","id","name","org_id","org_name","extra"])
     await save_df_text(log_df, t["log"])
+    try:
+        df_del = await load_df_text("nf_delete_log")
+        print(f"[Reconcile] {len(df_del)} Zeilen im Delete-Log gespeichert.")
+    except Exception as e:
+        print(f"[Reconcile] Delete-Log konnte nicht geladen werden: {e}")
 
 
 # =============================================================================
@@ -1479,13 +1484,48 @@ async def nachfass_summary(job_id: str = Query(...)):
     return HTMLResponse(html)
     
   
+# -------------------------------------------------------------------------
+# Kombinierter Ausschluss-Endpunkt: zeigt nf_excluded + nf_delete_log
+# -------------------------------------------------------------------------
 @app.get("/nachfass/excluded/json")
 async def nachfass_excluded_json():
-    df = await load_df_text("nf_excluded")
-    if df.empty:
+    """
+    Liefert alle ausgeschlossenen Nachfass-Datensätze als JSON:
+    - kombiniert nf_excluded (Batch/Fehler)
+    - und nf_delete_log (aus Fuzzy-/Kontakt-Abgleich)
+    """
+    import pandas as pd
+
+    excluded_df = pd.DataFrame()
+    deleted_df = pd.DataFrame()
+
+    try:
+        excluded_df = await load_df_text("nf_excluded")
+    except Exception as e:
+        print(f"[WARN] Konnte nf_excluded nicht laden: {e}")
+
+    try:
+        deleted_df = await load_df_text("nf_delete_log")
+    except Exception as e:
+        print(f"[WARN] Konnte nf_delete_log nicht laden: {e}")
+
+    if not excluded_df.empty:
+        excluded_df["Quelle"] = "Batch-/Filter-Ausschluss"
+    if not deleted_df.empty:
+        deleted_df["Quelle"] = "Abgleich (Fuzzy/Kontaktfilter)"
+
+    df_all = pd.concat([excluded_df, deleted_df], ignore_index=True)
+
+    if df_all.empty:
         return JSONResponse({"total": 0, "rows": []})
-    rows = df.tail(100).to_dict(orient="records")
-    return JSONResponse({"total": len(df), "rows": rows})
+
+    # auf 200 letzte Datensätze begrenzen, damit UI schnell lädt
+    rows = df_all.tail(200).to_dict(orient="records")
+    return JSONResponse({
+        "total": len(df_all),
+        "rows": rows
+    })
+
 
 # -------------------------------------------------------------------------
 # Startet den Nachfass-Export (BatchFlow)
