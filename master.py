@@ -1314,7 +1314,7 @@ async function poll(job_id){{
 }}
 
 async function loadExcludedTable(){{
-  const r=await fetch('/json');
+  const r = await fetch('/nachfass/excluded/json');
   if(!r.ok)return;
   const data=await r.json();
   if(data.total===0)return;
