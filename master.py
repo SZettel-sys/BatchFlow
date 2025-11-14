@@ -1388,16 +1388,18 @@ async def nachfass_summary(job_id: str = Query(...)):
     
   
 # -------------------------------------------------------------------------
-# Kombinierter Ausschluss-Endpunkt: zeigt nf_excluded + nf_delete_log
+# JSON-ENDPOINT: /nachfass/excluded/json
 # -------------------------------------------------------------------------
 @app.get("/nachfass/excluded/json")
 async def nachfass_excluded_json():
     """
     Liefert alle ausgeschlossenen Nachfass-Datensätze als JSON:
-    - kombiniert nf_excluded (Batch/Fehler)
-    - und nf_delete_log (aus Fuzzy-/Kontakt-Abgleich)
+    - kombiniert nf_excluded (Batch-/Filter-Ausschluss)
+    - und nf_delete_log (Abgleich/Fuzzy)
+    mit Spalten: Kontakt ID, Name, Organisation ID, Organisationsname, Grund, Quelle
     """
     import pandas as pd
+    import numpy as np
 
     excluded_df = pd.DataFrame()
     deleted_df = pd.DataFrame()
@@ -1412,18 +1414,52 @@ async def nachfass_excluded_json():
     except Exception as e:
         print(f"[WARN] Konnte nf_delete_log nicht laden: {e}")
 
-    if not excluded_df.empty:
-        excluded_df["Quelle"] = "Batch-/Filter-Ausschluss"
-    if not deleted_df.empty:
-        deleted_df["Quelle"] = "Abgleich (Fuzzy/Kontaktfilter)"
+    expected_cols = ["Kontakt ID", "Name", "Organisation ID", "Organisationsname", "Grund", "Quelle"]
 
+    def normalize_df(df, quelle_label):
+        if df is None or df.empty:
+            return pd.DataFrame(columns=expected_cols)
+        df = df.copy().replace({np.nan: None})
+        rename_map = {
+            "id": "Kontakt ID",
+            "person id": "Kontakt ID",
+            "name": "Name",
+            "org": "Organisationsname",
+            "organisation": "Organisationsname",
+            "organisation name": "Organisationsname",
+            "organisation id": "Organisation ID",
+            "org id": "Organisation ID",
+            "grund": "Grund",
+        }
+        for old, new in rename_map.items():
+            for col in df.columns:
+                if col.lower() == old and new not in df.columns:
+                    df.rename(columns={col: new}, inplace=True)
+        for col in expected_cols:
+            if col not in df.columns:
+                df[col] = ""
+        df["Quelle"] = quelle_label
+        return df[expected_cols]
+
+    excluded_df = normalize_df(excluded_df, "Batch-/Filter-Ausschluss")
+    deleted_df = normalize_df(deleted_df, "Abgleich (Fuzzy/Kontaktfilter)")
     df_all = pd.concat([excluded_df, deleted_df], ignore_index=True)
 
     if df_all.empty:
-        return JSONResponse({"total": 0, "rows": []})
+        df_all = pd.DataFrame([{
+            "Kontakt ID": "-",
+            "Name": "-",
+            "Organisation ID": "-",
+            "Organisationsname": "-",
+            "Grund": "Keine Datensätze ausgeschlossen",
+            "Quelle": "-"
+        }])
 
-    # auf 200 letzte Datensätze begrenzen, damit UI schnell lädt
+    # JSON-kompatibel machen
+    df_all = df_all.replace({np.nan: None, np.inf: None, -np.inf: None})
+    df_all = df_all.astype(str)
     rows = df_all.tail(200).to_dict(orient="records")
+
     return JSONResponse({
         "total": len(df_all),
         "rows": rows
