@@ -1188,41 +1188,40 @@ loadOptions();
 </body></html>""")
 
 # =============================================================================
-# Frontend – Nachfass
+# Frontend – Nachfass (stabil, ohne f-string/.format())
 # =============================================================================
 @app.get("/nachfass", response_class=HTMLResponse)
 async def nachfass_page(request: Request):
     authed = bool(user_tokens.get("default") or PD_API_TOKEN)
     auth_info = "<span class='muted'>angemeldet</span>" if authed else "<a href='/login'>Anmelden</a>"
 
-    # Alle geschweiften Klammern doppeln – außer {auth_info}
     html = """<!doctype html><html lang="de">
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>Nachfass – BatchFlow</title>
 <style>
-  body{{margin:0;background:#f6f8fb;color:#0f172a;font:16px/1.6 Inter,sans-serif}}
-  header{{background:#fff;border-bottom:1px solid #e2e8f0}}
-  .hwrap{{max-width:1120px;margin:0 auto;padding:14px 20px;display:flex;
-          align-items:center;justify-content:space-between}}
-  main{{max-width:1120px;margin:28px auto;padding:0 20px}}
-  .card{{background:#fff;border:1px solid #e2e8f0;border-radius:14px;padding:20px;
-         box-shadow:0 2px 8px rgba(2,8,23,.04)}}
-  label{{display:block;font-weight:600;margin:8px 0 6px}}
-  textarea,input{{width:100%;padding:10px 12px;border:1px solid #cbd5e1;border-radius:10px}}
-  .btn{{background:#0ea5e9;border:none;color:#fff;border-radius:10px;
-        padding:12px 16px;cursor:pointer;font-weight:600}}
-  .btn:hover{{background:#0284c7}}
-  #overlay{{display:none;position:fixed;inset:0;background:rgba(255,255,255,.7);
-            backdrop-filter:blur(2px);z-index:9999;align-items:center;justify-content:center;flex-direction:column;gap:10px}}
-  .barwrap{{width:min(520px,90vw);height:10px;border-radius:999px;background:#e2e8f0;overflow:hidden}}
-  .bar{{height:100%;width:0%;background:#0ea5e9;transition:width .25s linear}}
-  table{{width:100%;border-collapse:collapse;margin-top:20px;
-         border:1px solid #e2e8f0;border-radius:10px;box-shadow:0 2px 8px rgba(2,8,23,.04);background:#fff}}
-  th,td{{padding:8px 10px;border-bottom:1px solid #e2e8f0;text-align:left}}
-  th{{background:#f8fafc;font-weight:600}}
-  tr:hover{{background:#f1f5f9}}
+  body{margin:0;background:#f6f8fb;color:#0f172a;font:16px/1.6 Inter,sans-serif}
+  header{background:#fff;border-bottom:1px solid #e2e8f0}
+  .hwrap{max-width:1120px;margin:0 auto;padding:14px 20px;display:flex;
+          align-items:center;justify-content:space-between}
+  main{max-width:1120px;margin:28px auto;padding:0 20px}
+  .card{background:#fff;border:1px solid #e2e8f0;border-radius:14px;padding:20px;
+         box-shadow:0 2px 8px rgba(2,8,23,.04)}
+  label{display:block;font-weight:600;margin:8px 0 6px}
+  textarea,input{width:100%;padding:10px 12px;border:1px solid #cbd5e1;border-radius:10px}
+  .btn{background:#0ea5e9;border:none;color:#fff;border-radius:10px;
+        padding:12px 16px;cursor:pointer;font-weight:600}
+  .btn:hover{background:#0284c7}
+  #overlay{display:none;position:fixed;inset:0;background:rgba(255,255,255,.7);
+            backdrop-filter:blur(2px);z-index:9999;align-items:center;justify-content:center;flex-direction:column;gap:10px}
+  .barwrap{width:min(520px,90vw);height:10px;border-radius:999px;background:#e2e8f0;overflow:hidden}
+  .bar{height:100%;width:0%;background:#0ea5e9;transition:width .25s linear}
+  table{width:100%;border-collapse:collapse;margin-top:20px;
+         border:1px solid #e2e8f0;border-radius:10px;box-shadow:0 2px 8px rgba(2,8,23,.04);background:#fff}
+  th,td{padding:8px 10px;border-bottom:1px solid #e2e8f0;text-align:left}
+  th{background:#f8fafc;font-weight:600}
+  tr:hover{background:#f1f5f9}
 </style>
 </head>
 <body>
@@ -1230,7 +1229,7 @@ async def nachfass_page(request: Request):
   <div class="hwrap">
     <div><a href='/campaign' style='color:#0a66c2;text-decoration:none'>← Kampagne wählen</a></div>
     <div><b>Nachfass</b></div>
-    <div>{auth_info}</div>
+    <div>""" + auth_info + """</div>
   </div>
 </header>
 
@@ -1248,7 +1247,7 @@ async def nachfass_page(request: Request):
     </div>
   </section>
 
-  <section id="excludedSection" style="margin-top:30px;display:none">
+  <section id="excludedSection" style="margin-top:30px;">
     <h3>Nicht berücksichtigte Datensätze</h3>
     <div id="excludedTable">
       <table style="width:100%">
@@ -1278,15 +1277,15 @@ async def nachfass_page(request: Request):
 <script>
 const el = id => document.getElementById(id);
 
-function showOverlay(msg){{el('phase').textContent=msg||'';el('overlay').style.display='flex';}}
-function hideOverlay(){{el('overlay').style.display='none';}}
-function setProgress(p){{el('bar').style.width=Math.max(0,Math.min(100,p))+'%';}}
+function showOverlay(msg){el('phase').textContent=msg||'';el('overlay').style.display='flex';}
+function hideOverlay(){el('overlay').style.display='none';}
+function setProgress(p){el('bar').style.width=Math.max(0,Math.min(100,p))+'%';}
 
-function _parseIDs(raw) {{
+function _parseIDs(raw){
   return raw.split(/[\\n,;]/).map(s=>s.trim()).filter(Boolean).slice(0,2);
-}}
+}
 
-async function startExportNf() {{
+async function startExportNf(){
   const ids=_parseIDs(el('nf_batch_ids').value);
   if(ids.length===0)return alert('Bitte mindestens eine Batch ID angeben.');
   const bid=el('batch_id').value||'';
@@ -1295,25 +1294,25 @@ async function startExportNf() {{
   showOverlay('Starte Abgleich …');
   setProgress(5);
 
-  try {{
-    const r=await fetch('/nachfass/export_start',{{
+  try{
+    const r=await fetch('/nachfass/export_start',{
       method:'POST',
-      headers:{{'Content-Type':'application/json'}},
-      body:JSON.stringify({{nf_batch_ids:ids,batch_id:bid,campaign:camp}})
-    }});
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({nf_batch_ids:ids,batch_id:bid,campaign:camp})
+    });
     if(!r.ok)throw new Error('Start fehlgeschlagen.');
-    const {{job_id}}=await r.json();
+    const {job_id}=await r.json();
     await poll(job_id);
-  }} catch(err) {{
+  }catch(err){
     alert(err.message||'Fehler beim Starten.');
     hideOverlay();
-  }}
-}}
+  }
+}
 
-async function loadExcludedTable() {{
-  try {{
+async function loadExcludedTable(){
+  try{
     const r = await fetch('/nachfass/excluded/json');
-    if (!r.ok) throw new Error(`Serverfehler: ${'{'}r.status{'}'}`);
+    if (!r.ok) throw new Error(`Serverfehler: ${r.status}`);
     const data = await r.json();
 
     const table = document.querySelector('#excluded-table-body');
@@ -1321,63 +1320,63 @@ async function loadExcludedTable() {{
 
     table.innerHTML = '';
 
-    if (!data || !data.rows || data.rows.length === 0) {{
+    if (!data || !data.rows || data.rows.length === 0) {
       table.innerHTML = `
         <tr><td colspan="6" style="text-align:center;color:#888">
           Keine Datensätze ausgeschlossen
         </td></tr>`;
       return;
-    }}
+    }
 
-    for (const r of data.rows) {{
+    for (const r of data.rows) {
       const tr = document.createElement('tr');
       tr.innerHTML = `
-        <td>${'{'}r['Kontakt ID'] || r.id || ''{'}'}</td>
-        <td>${'{'}r['Name'] || ''{'}'}</td>
-        <td>${'{'}r['Organisation ID'] || ''{'}'}</td>
-        <td>${'{'}r['Organisationsname'] || r['org'] || ''{'}'}</td>
-        <td>${'{'}r['Grund'] || ''{'}'}</td>
-        <td>${'{'}r['Quelle'] || ''{'}'}</td>
+        <td>${r['Kontakt ID'] || r.id || ''}</td>
+        <td>${r['Name'] || ''}</td>
+        <td>${r['Organisation ID'] || ''}</td>
+        <td>${r['Organisationsname'] || r['org'] || ''}</td>
+        <td>${r['Grund'] || ''}</td>
+        <td>${r['Quelle'] || ''}</td>
       `;
       table.appendChild(tr);
-    }}
-  }} catch (err) {{
+    }
+
+  } catch (err) {
     console.error('Fehler beim Laden der ausgeschlossenen Datensätze:', err);
     const table = document.querySelector('#excluded-table-body');
-    if (table) {{
+    if (table) {
       table.innerHTML = `
         <tr><td colspan="6" style="text-align:center;color:red">
-          Fehler beim Laden der Daten (${{'{'}err.message{'}'}})
+          Fehler beim Laden der Daten (${err.message})
         </td></tr>`;
-    }}
-  }}
-}}
+    }
+  }
+}
 
-async function poll(job_id) {{
+async function poll(job_id){
   let done=false;
-  while(!done) {{
+  while(!done){
     await new Promise(r=>setTimeout(r,600));
     const r=await fetch('/nachfass/export_progress?job_id='+encodeURIComponent(job_id));
     if(!r.ok)break;
     const s=await r.json();
     if(s.phase)el('phase').textContent=s.phase+' ('+ (s.percent||0)+'%)';
     setProgress(s.percent||0);
-    if(s.error){{alert(s.error);hideOverlay();return;}}
+    if(s.error){alert(s.error);hideOverlay();return;}
     done=s.done;
-  }}
+  }
   el('phase').textContent='Download startet …';
   setProgress(100);
   window.location.href='/nachfass/export_download?job_id='+encodeURIComponent(job_id);
   await loadExcludedTable();
   hideOverlay();
-}}
+}
 
 el('btnExportNf').addEventListener('click',startExportNf);
 </script>
-</body></html>""".format(auth_info=auth_info)
+</body></html>"""
 
     return HTMLResponse(html)
-
 
 # =============================================================================
 # Summary-Seiten
