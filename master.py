@@ -1314,7 +1314,7 @@ async function poll(job_id){{
 }}
 
 async function loadExcludedTable(){{
-  const r=await fetch('/nachfass/excluded/json');
+  const r=await fetch('/json');
   if(!r.ok)return;
   const data=await r.json();
   if(data.total===0)return;
@@ -1465,6 +1465,157 @@ async def nachfass_excluded_json():
         "rows": rows
     })
 
+# -------------------------------------------------------------------------
+# HTML-ENDPOINT: /nachfass/excluded
+# -------------------------------------------------------------------------
+from fastapi.responses import HTMLResponse
+import pandas as pd
+import numpy as np
+
+@app.get("/nachfass/excluded", response_class=HTMLResponse)
+async def nachfass_excluded():
+    """
+    HTML-Ansicht aller ausgeschlossenen Nachfass-Datensätze:
+    kombiniert nf_excluded (Batch-/Filter-Ausschluss) und nf_delete_log (Fuzzy-Abgleich)
+    Spalten:
+      Kontakt ID, Name, Organisation ID, Organisationsname, Grund, Quelle
+    """
+
+    try:
+        excluded_df = await load_df_text("nf_excluded")
+    except Exception as e:
+        print(f"[WARN] Konnte nf_excluded nicht laden: {e}")
+        excluded_df = pd.DataFrame()
+
+    try:
+        deleted_df = await load_df_text("nf_delete_log")
+    except Exception as e:
+        print(f"[WARN] Konnte nf_delete_log nicht laden: {e}")
+        deleted_df = pd.DataFrame()
+
+    expected_cols = ["Kontakt ID", "Name", "Organisation ID", "Organisationsname", "Grund", "Quelle"]
+
+    def normalize_df(df, quelle_label):
+        if df is None or df.empty:
+            return pd.DataFrame(columns=expected_cols)
+        df = df.copy().replace({np.nan: None})
+        rename_map = {
+            "id": "Kontakt ID",
+            "person id": "Kontakt ID",
+            "name": "Name",
+            "org": "Organisationsname",
+            "organisation": "Organisationsname",
+            "organisation name": "Organisationsname",
+            "organisation id": "Organisation ID",
+            "org id": "Organisation ID",
+            "grund": "Grund",
+        }
+        for old, new in rename_map.items():
+            for col in df.columns:
+                if col.lower() == old and new not in df.columns:
+                    df.rename(columns={col: new}, inplace=True)
+        for col in expected_cols:
+            if col not in df.columns:
+                df[col] = ""
+        df["Quelle"] = quelle_label
+        return df[expected_cols]
+
+    excluded_df = normalize_df(excluded_df, "Batch-/Filter-Ausschluss")
+    deleted_df = normalize_df(deleted_df, "Abgleich (Fuzzy/Kontaktfilter)")
+    df_all = pd.concat([excluded_df, deleted_df], ignore_index=True)
+
+    if df_all.empty:
+        df_all = pd.DataFrame([{
+            "Kontakt ID": "-",
+            "Name": "-",
+            "Organisation ID": "-",
+            "Organisationsname": "-",
+            "Grund": "Keine Datensätze ausgeschlossen",
+            "Quelle": "-"
+        }])
+
+    df_all = df_all.replace({np.nan: None, np.inf: None, -np.inf: None})
+
+    # HTML-Tabelle rendern
+    html_rows = "".join(
+        f"""
+        <tr>
+            <td>{r.get('Kontakt ID','')}</td>
+            <td>{r.get('Name','')}</td>
+            <td>{r.get('Organisation ID','')}</td>
+            <td>{r.get('Organisationsname','')}</td>
+            <td>{r.get('Grund','')}</td>
+            <td>{r.get('Quelle','')}</td>
+        </tr>
+        """ for _, r in df_all.iterrows()
+    )
+
+    html = f"""
+    <!doctype html>
+    <html lang="de">
+    <head>
+        <meta charset="utf-8"/>
+        <meta name="viewport" content="width=device-width,initial-scale=1"/>
+        <title>Nachfass – Nicht berücksichtigte Datensätze</title>
+        <style>
+            body {{
+                font-family: Inter, Arial, sans-serif;
+                margin: 40px auto;
+                max-width: 1200px;
+                background: #f9fafb;
+                color: #222;
+                line-height: 1.4;
+            }}
+            h2 {{
+                margin-bottom: 20px;
+                color: #1f2937;
+            }}
+            table {{
+                width: 100%;
+                border-collapse: collapse;
+                background: white;
+                border-radius: 8px;
+                box-shadow: 0 1px 4px rgba(0,0,0,0.05);
+            }}
+            th, td {{
+                padding: 10px 14px;
+                text-align: left;
+                border-bottom: 1px solid #eee;
+            }}
+            th {{
+                background: #f3f4f6;
+                font-weight: 600;
+            }}
+            tr:hover td {{
+                background: #f9f9f9;
+            }}
+            a {{
+                display: inline-block;
+                margin-top: 20px;
+                color: #2563eb;
+                text-decoration: none;
+            }}
+        </style>
+    </head>
+    <body>
+        <h2>Nicht berücksichtigte Datensätze ({len(df_all)})</h2>
+        <table>
+            <tr>
+                <th>Kontakt ID</th>
+                <th>Name</th>
+                <th>Organisation ID</th>
+                <th>Organisationsname</th>
+                <th>Grund</th>
+                <th>Quelle</th>
+            </tr>
+            {html_rows}
+        </table>
+        <a href="/campaign">← Zur Kampagnenübersicht</a>
+    </body>
+    </html>
+    """
+
+    return HTMLResponse(html)
 
 # -------------------------------------------------------------------------
 # Startet den Nachfass-Export (BatchFlow)
