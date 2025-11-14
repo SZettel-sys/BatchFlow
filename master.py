@@ -1195,7 +1195,7 @@ async def nachfass_page(request: Request):
     authed = bool(user_tokens.get("default") or PD_API_TOKEN)
     auth_info = "<span class='muted'>angemeldet</span>" if authed else "<a href='/login'>Anmelden</a>"
 
-    return HTMLResponse(f"""<!doctype html><html lang="de">
+    html = r"""<!doctype html><html lang="de">
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
@@ -1249,7 +1249,23 @@ async def nachfass_page(request: Request):
 
   <section id="excludedSection" style="margin-top:30px;display:none">
     <h3>Nicht berücksichtigte Datensätze</h3>
-    <div id="excludedTable"></div>
+    <div id="excludedTable">
+      <table style="width:100%">
+        <thead>
+          <tr>
+            <th>Kontakt ID</th>
+            <th>Name</th>
+            <th>Organisation ID</th>
+            <th>Organisationsname</th>
+            <th>Grund</th>
+            <th>Quelle</th>
+          </tr>
+        </thead>
+        <tbody id="excluded-table-body">
+          <tr><td colspan="6" style="text-align:center;color:#888">Noch keine Daten geladen</td></tr>
+        </tbody>
+      </table>
+    </div>
   </section>
 </main>
 
@@ -1293,8 +1309,8 @@ async function startExportNf() {{
   }}
 }}
 
-async function loadExcludedTable() {
-  try {
+async function loadExcludedTable() {{
+  try {{
     const r = await fetch('/nachfass/excluded/json');
     if (!r.ok) throw new Error(`Serverfehler: ${r.status}`);
     const data = await r.json();
@@ -1305,44 +1321,42 @@ async function loadExcludedTable() {
     // Alte Zeilen löschen
     table.innerHTML = '';
 
-    if (!data || !data.rows || data.rows.length === 0) {
+    if (!data || !data.rows || data.rows.length === 0) {{
       table.innerHTML = `
         <tr><td colspan="6" style="text-align:center;color:#888">
           Keine Datensätze ausgeschlossen
         </td></tr>`;
       return;
-    }
+    }}
 
     // Dynamisch Zeilen einfügen
-    for (const r of data.rows) {
+    for (const r of data.rows) {{
       const tr = document.createElement('tr');
       tr.innerHTML = `
-        <td>${r['Kontakt ID'] || r.id || ''}</td>
-        <td>${r['Name'] || ''}</td>
-        <td>${r['Organisation ID'] || ''}</td>
-        <td>${r['Organisationsname'] || r['org'] || ''}</td>
-        <td>${r['Grund'] || ''}</td>
-        <td>${r['Quelle'] || ''}</td>
+        <td>${{r['Kontakt ID'] || r.id || ''}}</td>
+        <td>${{r['Name'] || ''}}</td>
+        <td>${{r['Organisation ID'] || ''}}</td>
+        <td>${{r['Organisationsname'] || r['org'] || ''}}</td>
+        <td>${{r['Grund'] || ''}}</td>
+        <td>${{r['Quelle'] || ''}}</td>
       `;
       table.appendChild(tr);
-    }
-
-  } catch (err) {
+    }}
+  }} catch (err) {{
     console.error('Fehler beim Laden der ausgeschlossenen Datensätze:', err);
     const table = document.querySelector('#excluded-table-body');
-    if (table) {
+    if (table) {{
       table.innerHTML = `
         <tr><td colspan="6" style="text-align:center;color:red">
-          Fehler beim Laden der Daten (${err.message})
+          Fehler beim Laden der Daten (${{err.message}})
         </td></tr>`;
-    }
-  }
-}
+    }}
+  }}
+}}
 
-
-async function poll(job_id){{
+async function poll(job_id) {{
   let done=false;
-  while(!done){{
+  while(!done) {{
     await new Promise(r=>setTimeout(r,600));
     const r=await fetch('/nachfass/export_progress?job_id='+encodeURIComponent(job_id));
     if(!r.ok)break;
@@ -1362,7 +1376,9 @@ async function poll(job_id){{
 
 el('btnExportNf').addEventListener('click',startExportNf);
 </script>
-</body></html>""")
+</body></html>""".format(auth_info=auth_info)
+
+    return HTMLResponse(html)
 
 # =============================================================================
 # Summary-Seiten
