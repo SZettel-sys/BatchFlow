@@ -1195,7 +1195,8 @@ async def nachfass_page(request: Request):
     authed = bool(user_tokens.get("default") or PD_API_TOKEN)
     auth_info = "<span class='muted'>angemeldet</span>" if authed else "<a href='/login'>Anmelden</a>"
 
-    html = r"""<!doctype html><html lang="de">
+    # Alle geschweiften Klammern doppeln – außer {auth_info}
+    html = """<!doctype html><html lang="de">
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
@@ -1312,13 +1313,12 @@ async function startExportNf() {{
 async function loadExcludedTable() {{
   try {{
     const r = await fetch('/nachfass/excluded/json');
-    if (!r.ok) throw new Error(`Serverfehler: ${r.status}`);
+    if (!r.ok) throw new Error(`Serverfehler: ${'{'}r.status{'}'}`);
     const data = await r.json();
 
     const table = document.querySelector('#excluded-table-body');
     if (!table) return;
 
-    // Alte Zeilen löschen
     table.innerHTML = '';
 
     if (!data || !data.rows || data.rows.length === 0) {{
@@ -1329,16 +1329,15 @@ async function loadExcludedTable() {{
       return;
     }}
 
-    // Dynamisch Zeilen einfügen
     for (const r of data.rows) {{
       const tr = document.createElement('tr');
       tr.innerHTML = `
-        <td>${{r['Kontakt ID'] || r.id || ''}}</td>
-        <td>${{r['Name'] || ''}}</td>
-        <td>${{r['Organisation ID'] || ''}}</td>
-        <td>${{r['Organisationsname'] || r['org'] || ''}}</td>
-        <td>${{r['Grund'] || ''}}</td>
-        <td>${{r['Quelle'] || ''}}</td>
+        <td>${'{'}r['Kontakt ID'] || r.id || ''{'}'}</td>
+        <td>${'{'}r['Name'] || ''{'}'}</td>
+        <td>${'{'}r['Organisation ID'] || ''{'}'}</td>
+        <td>${'{'}r['Organisationsname'] || r['org'] || ''{'}'}</td>
+        <td>${'{'}r['Grund'] || ''{'}'}</td>
+        <td>${'{'}r['Quelle'] || ''{'}'}</td>
       `;
       table.appendChild(tr);
     }}
@@ -1348,7 +1347,7 @@ async function loadExcludedTable() {{
     if (table) {{
       table.innerHTML = `
         <tr><td colspan="6" style="text-align:center;color:red">
-          Fehler beim Laden der Daten (${{err.message}})
+          Fehler beim Laden der Daten (${{'{'}err.message{'}'}})
         </td></tr>`;
     }}
   }}
@@ -1366,7 +1365,6 @@ async function poll(job_id) {{
     if(s.error){{alert(s.error);hideOverlay();return;}}
     done=s.done;
   }}
-  // Export abgeschlossen
   el('phase').textContent='Download startet …';
   setProgress(100);
   window.location.href='/nachfass/export_download?job_id='+encodeURIComponent(job_id);
@@ -1379,6 +1377,7 @@ el('btnExportNf').addEventListener('click',startExportNf);
 </body></html>""".format(auth_info=auth_info)
 
     return HTMLResponse(html)
+
 
 # =============================================================================
 # Summary-Seiten
