@@ -1416,20 +1416,18 @@ async def nachfass_summary(job_id: str = Query(...)):
     <a href='/campaign'>Zur Übersicht</a></main></body></html>"""
     return HTMLResponse(html)
     
-  
 # -------------------------------------------------------------------------
-# JSON-ENDPOINT: /nachfass/excluded/json
+# 1️⃣ JSON-Endpunkt: liefert alle ausgeschlossenen Datensätze
 # -------------------------------------------------------------------------
 @app.get("/nachfass/excluded/json")
 async def nachfass_excluded_json():
     """
     Liefert alle ausgeschlossenen Nachfass-Datensätze als JSON:
     - kombiniert nf_excluded (Batch-/Filter-Ausschluss)
-    - und nf_delete_log (Abgleich/Fuzzy)
-    mit Spalten: Kontakt ID, Name, Organisation ID, Organisationsname, Grund, Quelle
+    - und nf_delete_log (Abgleich auf Kontakt-/Organisationsebene)
     """
     import pandas as pd
-    import numpy as np
+    from fastapi.responses import JSONResponse
 
     excluded_df = pd.DataFrame()
     deleted_df = pd.DataFrame()
@@ -1444,69 +1442,33 @@ async def nachfass_excluded_json():
     except Exception as e:
         print(f"[WARN] Konnte nf_delete_log nicht laden: {e}")
 
-    expected_cols = ["Kontakt ID", "Name", "Organisation ID", "Organisationsname", "Grund", "Quelle"]
+    if not excluded_df.empty:
+        excluded_df["Quelle"] = "Batch-/Filter-Ausschluss"
+    if not deleted_df.empty:
+        deleted_df["Quelle"] = "Abgleich (Fuzzy/Kontaktfilter)"
 
-    def normalize_df(df, quelle_label):
-        if df is None or df.empty:
-            return pd.DataFrame(columns=expected_cols)
-        df = df.copy().replace({np.nan: None})
-        rename_map = {
-            "id": "Kontakt ID",
-            "person id": "Kontakt ID",
-            "name": "Name",
-            "org": "Organisationsname",
-            "organisation": "Organisationsname",
-            "organisation name": "Organisationsname",
-            "organisation id": "Organisation ID",
-            "org id": "Organisation ID",
-            "grund": "Grund",
-        }
-        for old, new in rename_map.items():
-            for col in df.columns:
-                if col.lower() == old and new not in df.columns:
-                    df.rename(columns={col: new}, inplace=True)
-        for col in expected_cols:
-            if col not in df.columns:
-                df[col] = ""
-        df["Quelle"] = quelle_label
-        return df[expected_cols]
-
-    excluded_df = normalize_df(excluded_df, "Batch-/Filter-Ausschluss")
-    deleted_df = normalize_df(deleted_df, "Abgleich (Fuzzy/Kontaktfilter)")
     df_all = pd.concat([excluded_df, deleted_df], ignore_index=True)
 
     if df_all.empty:
-        df_all = pd.DataFrame([{
-            "Kontakt ID": "-",
-            "Name": "-",
-            "Organisation ID": "-",
-            "Organisationsname": "-",
-            "Grund": "Keine Datensätze ausgeschlossen",
-            "Quelle": "-"
-        }])
+        return JSONResponse({"total": 0, "rows": []})
 
-    # JSON-kompatibel machen
-    df_all = df_all.replace({np.nan: None, np.inf: None, -np.inf: None})
-    df_all = df_all.astype(str)
+    # Begrenze Ausgabe auf die letzten 200 Datensätze für Performance
     rows = df_all.tail(200).to_dict(orient="records")
-
     return JSONResponse({
         "total": len(df_all),
         "rows": rows
     })
 
-# -------------------------------------------------------------------------
-# HTML-Version für manuelles Anzeigen der ausgeschlossenen Datensätze
-# -------------------------------------------------------------------------
-from fastapi.responses import HTMLResponse
 
+# -------------------------------------------------------------------------
+# 2️⃣ HTML-Endpunkt: Rendert Seite mit Tabelle + JS zum Nachladen
+# -------------------------------------------------------------------------
 @app.get("/nachfass/excluded", response_class=HTMLResponse)
 async def nachfass_excluded():
     """
-    Zeigt eine HTML-Tabelle mit den ausgeschlossenen Datensätzen
-    (aus nf_excluded und nf_delete_log), lädt sie automatisch aus /nachfass/excluded/json.
+    Rendert die HTML-Seite mit Tabelle und dynamischem JS-Nachladen
     """
-    html = """
+    html = r"""
     <!DOCTYPE html>
     <html lang="de">
     <head>
@@ -1514,109 +1476,104 @@ async def nachfass_excluded():
       <title>Nachfass – Nicht berücksichtigte Datensätze</title>
       <style>
         body {
-          font-family: Inter, Arial, sans-serif;
+          font-family: Inter, sans-serif;
           margin: 30px auto;
           max-width: 1100px;
           padding: 0 20px;
-          background-color: #f9fafb;
-          color: #222;
         }
         h2 {
-          margin-top: 0;
-          color: #111;
+          margin-bottom: 16px;
         }
         table {
-          border-collapse: collapse;
           width: 100%;
-          margin-top: 20px;
-          background: white;
-          border-radius: 8px;
-          overflow: hidden;
-          box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+          border-collapse: collapse;
         }
         th, td {
           border-bottom: 1px solid #eee;
-          padding: 8px 12px;
+          padding: 8px;
           text-align: left;
         }
         th {
-          background-color: #f3f4f6;
-          font-weight: 600;
+          background: #f9f9f9;
         }
         tr:hover td {
-          background-color: #f9f9ff;
+          background: #fafafa;
         }
-        #status {
-          margin-top: 12px;
-          font-size: 0.9em;
-          color: #666;
+        .center {
+          text-align: center;
+          color: #888;
         }
       </style>
     </head>
     <body>
       <h2>Nicht berücksichtigte Datensätze</h2>
-      <div id="status">Lade Daten …</div>
       <table>
         <thead>
           <tr>
             <th>Kontakt ID</th>
             <th>Name</th>
             <th>Organisation ID</th>
-            <th>Organisation</th>
+            <th>Organisationsname</th>
             <th>Grund</th>
             <th>Quelle</th>
           </tr>
         </thead>
         <tbody id="excluded-table-body">
-          <tr><td colspan="6" style="text-align:center;color:#777;">Bitte warten …</td></tr>
+          <tr><td colspan="6" class="center">Lade Daten...</td></tr>
         </tbody>
       </table>
 
       <script>
-        async function loadExcludedTable() {
-          const status = document.getElementById('status');
-          const tbody = document.getElementById('excluded-table-body');
-          try {
-            const r = await fetch('/nachfass/excluded/json');
-            if (!r.ok) throw new Error('Fehler ' + r.status);
-            const data = await r.json();
-            tbody.innerHTML = '';
+      async function loadExcludedTable() {
+        try {
+          const r = await fetch('/nachfass/excluded/json');
+          if (!r.ok) throw new Error(`Serverfehler: ${r.status}`);
+          const data = await r.json();
 
-            if (!data.rows || data.rows.length === 0) {
-              tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:#777;">Keine Datensätze ausgeschlossen</td></tr>';
-              status.textContent = 'Keine ausgeschlossenen Datensätze gefunden.';
-              return;
-            }
+          const table = document.querySelector('#excluded-table-body');
+          if (!table) return;
+          table.innerHTML = '';
 
-            for (const row of data.rows) {
-              const tr = document.createElement('tr');
-              tr.innerHTML = `
-                <td>${row['Kontakt ID'] || row.id || ''}</td>
-                <td>${row['Name'] || ''}</td>
-                <td>${row['Organisation ID'] || ''}</td>
-                <td>${row['Organisation'] || row.org || ''}</td>
-                <td>${row['Grund'] || ''}</td>
-                <td>${row['Quelle'] || ''}</td>
-              `;
-              tbody.appendChild(tr);
-            }
+          if (!data || !data.rows || data.rows.length === 0) {
+            table.innerHTML = `
+              <tr><td colspan="6" class="center">
+                Keine Datensätze ausgeschlossen
+              </td></tr>`;
+            return;
+          }
 
-            status.textContent = `Insgesamt ${data.total} ausgeschlossene Datensätze geladen.`;
-
-          } catch (err) {
-            console.error(err);
-            tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:red;">Fehler beim Laden der Daten</td></tr>';
-            status.textContent = 'Fehler beim Laden der ausgeschlossenen Datensätze.';
+          for (const r of data.rows) {
+            const tr = document.createElement('tr');
+            tr.innerHTML = `
+              <td>${r['Kontakt ID'] || r['id'] || ''}</td>
+              <td>${r['Name'] || r['name'] || ''}</td>
+              <td>${r['Organisation ID'] || ''}</td>
+              <td>${r['Organisationsname'] || r['org'] || ''}</td>
+              <td>${r['Grund'] || r['grund'] || ''}</td>
+              <td>${r['Quelle'] || ''}</td>
+            `;
+            table.appendChild(tr);
+          }
+        } catch (err) {
+          console.error('Fehler beim Laden der ausgeschlossenen Datensätze:', err);
+          const table = document.querySelector('#excluded-table-body');
+          if (table) {
+            table.innerHTML = `
+              <tr><td colspan="6" class="center" style="color:red">
+                Fehler beim Laden der Daten (${err.message})
+              </td></tr>`;
           }
         }
+      }
 
-        loadExcludedTable();
+      // Initial laden
+      loadExcludedTable();
       </script>
     </body>
     </html>
     """
     return HTMLResponse(content=html)
-
+  
 
 # -------------------------------------------------------------------------
 # Startet den Nachfass-Export (BatchFlow)
