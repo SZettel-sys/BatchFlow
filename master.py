@@ -523,7 +523,7 @@ async def stream_persons_by_filter(
         start += len(data)
 
 # =============================================================================
-# STABILE VERSION: _build_nf_master_final
+# ROBUSTE VERSION: _build_nf_master_final (mit Hybrid-Batch-Erkennung)
 # =============================================================================
 import json
 import datetime as dt
@@ -538,14 +538,6 @@ async def _build_nf_master_final(
     campaign: str,
     job_obj=None
 ) -> pd.DataFrame:
-    """
-    Robuste Nachfass-Logik:
-    - erkennt Batch-ID zuverlässig
-    - filtert korrekt nach 'Datum nächste Aktivität'
-    - max. 2 Personen pro Organisation
-    - erzeugt IMMER eine Exportdatei (auch bei 0 Zeilen)
-    """
-
     print(f"[INFO] Starte Nachfass-Build für Batch {batch_id} mit {nf_batch_ids}")
 
     # -------------------------------------------------------------------------
@@ -557,17 +549,13 @@ async def _build_nf_master_final(
 
     for f in person_fields:
         nm = (f.get("name") or "").lower()
-        # Feldzuordnungen erkennen
         for hint in PERSON_FIELD_HINTS_TO_EXPORT.keys():
             if hint in nm and hint not in hint_to_key:
                 hint_to_key[hint] = f.get("key")
-        # Geschlecht
         if any(x in nm for x in ("gender", "geschlecht")):
             gender_map = field_options_id_to_label_map(f)
-        # Datum nächste Aktivität
         if "datum nächste aktivität" in nm or "next activity" in nm:
             next_activity_key = f.get("key")
-        # Batch-Feld
         if "batch" in nm and not batch_key:
             batch_key = f.get("key")
 
@@ -577,9 +565,6 @@ async def _build_nf_master_final(
 
     print(f"[DEBUG] Batch-Feld-Key: {batch_key}, Next-Activity-Key: {next_activity_key}")
 
-    # -------------------------------------------------------------------------
-    # Hilfsfunktion zum Lesen von Custom-Feldern
-    # -------------------------------------------------------------------------
     def get_field(p: dict, hint: str) -> str:
         key = hint_to_key.get(hint)
         if not key:
@@ -600,7 +585,7 @@ async def _build_nf_master_final(
         return str(v or "")
 
     # -------------------------------------------------------------------------
-    # Personen aus Pipedrive laden
+    # Personen laden
     # -------------------------------------------------------------------------
     persons = await stream_persons_by_batch_id(batch_key, nf_batch_ids, page_limit=100, job_obj=job_obj)
     total = len(persons)
@@ -610,7 +595,7 @@ async def _build_nf_master_final(
     now = dt.datetime.now()
 
     # -------------------------------------------------------------------------
-    # Filterlogik – Batch-ID + Aktivität
+    # Filterlogik – Hybrid-Batch + Aktivität
     # -------------------------------------------------------------------------
     for p in persons:
         pid = str(p.get("id") or "")
@@ -619,25 +604,33 @@ async def _build_nf_master_final(
         org_id = str(org.get("id") or "")
         org_name = org.get("name") or "-"
 
-        # Batch-Feld lesen
-        val = p.get(batch_key)
-        batch_val = ""
-        if isinstance(val, dict):
-            batch_val = val.get("value") or val.get("label") or ""
-        elif isinstance(val, list):
-            parts = []
-            for x in val:
-                if isinstance(x, dict):
-                    parts.append(x.get("value") or x.get("label") or "")
-                elif isinstance(x, str):
-                    parts.append(x)
-            batch_val = ", ".join(parts)
-        elif isinstance(val, str):
-            batch_val = val
-        else:
-            batch_val = str(val or "")
+        # -----------------------------------------------------------------
+        # Hybrid-Batch-Erkennung (robust gegen Mappingfehler)
+        # -----------------------------------------------------------------
+        match_found = False
 
-        match_found = any(bid.lower() in (batch_val or "").lower() for bid in nf_batch_ids)
+        # 1️⃣ Alte Logik – Suche in Custom Fields
+        for cf in p.get("custom_fields", []):
+            if isinstance(cf, str) and any(bid.lower() in cf.lower() for bid in nf_batch_ids):
+                match_found = True
+                break
+
+        # 2️⃣ Neue Logik – über batch_key (sofern vorhanden)
+        if not match_found:
+            val = p.get(batch_key)
+            if isinstance(val, (str, list, dict)):
+                text_val = ""
+                if isinstance(val, str):
+                    text_val = val
+                elif isinstance(val, dict):
+                    text_val = val.get("value") or val.get("label") or ""
+                elif isinstance(val, list):
+                    text_val = ", ".join(
+                        [x.get("value") or x.get("label") or "" for x in val if isinstance(x, dict)]
+                    )
+                if any(bid.lower() in text_val.lower() for bid in nf_batch_ids):
+                    match_found = True
+
         if not match_found:
             excluded.append({
                 "Kontakt ID": pid,
@@ -649,7 +642,9 @@ async def _build_nf_master_final(
             })
             continue
 
-        # Datum nächste Aktivität prüfen
+        # -----------------------------------------------------------------
+        # Regel 1: Datum nächste Aktivität
+        # -----------------------------------------------------------------
         if next_activity_key:
             raw_date = p.get(next_activity_key)
             if raw_date:
@@ -674,7 +669,7 @@ async def _build_nf_master_final(
     print(f"[INFO] Nach Batch/Aktivitätsfilter: {len(selected)} übrig, {len(excluded)} ausgeschlossen")
 
     # -------------------------------------------------------------------------
-    # max. 2 Kontakte pro Organisation
+    # Regel 2: max. 2 Kontakte pro Organisation
     # -------------------------------------------------------------------------
     org_map = defaultdict(list)
     for p in selected:
@@ -705,7 +700,7 @@ async def _build_nf_master_final(
     print(f"[INFO] Nach max.2-Regel: {len(selected_final)} übrig, {len(excluded)} ausgeschlossen")
 
     # -------------------------------------------------------------------------
-    # DataFrame zusammenbauen
+    # DataFrame aufbauen
     # -------------------------------------------------------------------------
     rows = []
     for p in selected_final:
@@ -753,7 +748,6 @@ async def _build_nf_master_final(
     except Exception as e:
         print(f"[ERROR] Speichern fehlgeschlagen: {e}")
 
-    # Wenn kein Ergebnis → leere Datei trotzdem erzeugen
     if df.empty:
         print("[WARN] Keine gültigen Datensätze – leere Exportdatei wird erzeugt.")
         empty_df = pd.DataFrame(columns=[
@@ -766,7 +760,6 @@ async def _build_nf_master_final(
         ])
         await save_df_text(empty_df, "nf_master_final")
 
-    # Wenn keine Ausschlüsse vorhanden → Dummy-Eintrag
     if excluded_df.empty:
         excluded_df = pd.DataFrame([{
             "Kontakt ID": "-",
