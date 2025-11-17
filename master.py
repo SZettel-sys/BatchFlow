@@ -1073,28 +1073,38 @@ async def nachfass_excluded_page():
 # ============================================================
 # Redirects & Fallbacks (für Pipedrive /overview usw.)
 # ============================================================
+# ============================================================
+# Redirects & Fallbacks (für Pipedrive /overview usw.)
+# ============================================================
+
 @app.get("/overview", response_class=HTMLResponse)
 async def overview_redirect():
-    """
-    Fängt alte oder externe Aufrufe von Pipedrive ab,
-    z. B. /overview?resource=person&view=list…
-    Leitet automatisch zur Kampagnenauswahl weiter.
-    """
     return RedirectResponse("/campaign", status_code=302)
 
 
+# WICHTIG: Diese Route muss ÜBER dem Catch-All stehen!
+@app.get("/campaign", response_class=HTMLResponse)
+async def campaign_home():
+    return HTMLResponse("""
+    <!doctype html>
+    <html lang='de'>
+    <head><meta charset='utf-8'><title>BatchFlow – Kampagnen</title></head>
+    <body>
+      <h1>BatchFlow – Kampagnen</h1>
+      <ul>
+        <li><a href='/neukontakte'>Neukontakte</a></li>
+        <li><a href='/nachfass'>Nachfass</a></li>
+      </ul>
+    </body>
+    </html>
+    """)
+
+
+# Catch-All MUSS als LETZTES kommen und OHNE Bedingungen!
 @app.get("/{full_path:path}", include_in_schema=False)
-async def catch_all(full_path: str, request: Request):
-    """
-    Sauberer Fallback für alle unbekannten URLs:
-    - /overview    → wird separat abgefangen
-    - /irgendwas   → leitet automatisch auf /campaign
-    """
-    if full_path in ("campaign", "", "/"):
-        return RedirectResponse("/campaign", status_code=302)
+async def catch_all(full_path: str):
     return RedirectResponse("/campaign", status_code=302)
 
 
 
-################################## Ende Teil 5 ##################################
 
