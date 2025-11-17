@@ -1073,31 +1073,12 @@ async def nachfass_excluded_page():
 # ============================================================
 # Redirects & Fallbacks (für Pipedrive /overview usw.)
 # ============================================================
+@app.get("/", include_in_schema=False)
+async def root():
+    return RedirectResponse("/campaign", status_code=302)
 
 @app.get("/{full_path:path}", include_in_schema=False)
-async def catch_all(full_path: str, request: Request):
-
-    # Wenn die URL existiert → NICHT abfangen
-    known_paths = [
-        "campaign",
-        "neukontakte",
-        "nachfass",
-        "neukontakte/export_start",
-        "neukontakte/export_progress",
-        "neukontakte/export_download",
-        "nachfass/export_start",
-        "nachfass/export_progress",
-        "nachfass/export_download",
-        "nachfass/excluded",
-        "nachfass/excluded/json",
-        ""
-    ]
-    
-    if full_path in known_paths:
-        # Weiterreichen → sorgt dafür, dass die echte Route antwortet
-        raise HTTPException(status_code=404)
-
-    # Alles andere wird korrekt auf /campaign gelenkt
+async def catch_all(full_path: str):
     return RedirectResponse("/campaign", status_code=302)
 
 
