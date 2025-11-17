@@ -339,46 +339,41 @@ def _pretty_reason(reason: str, extra: str = "") -> str:
 # =============================================================================
 async def stream_persons_by_batch_field(batch_field_key: str, batch_ids: list[str]) -> list[dict]:
     """
-    Liefert exakt die Personen zurück, deren Batch-ID-Feld einen der übergebenen Werte enthält.
-    Keine Volltextsuche, keine falschen Treffer.
+    Holt Personen extrem schnell durch Exact Match im Custom-Field.
+    Kein Volltextscan, kein globales Paging, keine falschen Treffer.
     """
     results = []
-    start = 0
-    limit = 500
 
-    while True:
-        url = append_token(
-            f"{PIPEDRIVE_API}/persons?start={start}&limit={limit}&sort=id"
-        )
+    for bid in batch_ids:
+        start = 0
+        while True:
+            url = append_token(
+                f"{PIPEDRIVE_API}/persons/search?"
+                f"field_key={batch_field_key}&exact_match=true&term={bid}"
+                f"&start={start}&limit=500"
+            )
 
-        r = await http_client().get(url, headers=get_headers())
-        if r.status_code != 200:
-            raise Exception(f"Pipedrive Fehler beim Personenladen: {r.text}")
+            r = await http_client().get(url, headers=get_headers())
+            if r.status_code != 200:
+                raise Exception(f"Pipedrive Fehler (Batch-Feld-Suche): {r.text}")
 
-        data = r.json().get("data") or []
-        if not data:
-            break
+            items = r.json().get("data", {}).get("items", [])
+            if not items:
+                break
 
-        for p in data:
-            val = p.get(batch_field_key)
+            for it in items:
+                p = it.get("item")
+                if p:
+                    results.append(p)
 
-            # Pipedrive-Feld kann sein: None, String, Dict, List
-            if isinstance(val, dict):
-                val = val.get("value")
-            if isinstance(val, list) and val:
-                # falls Mehrfachwerte möglich
-                val = val[0].get("value") if isinstance(val[0], dict) else val[0]
+            if len(items) < 500:
+                break
 
-            if val and str(val).strip() in batch_ids:
-                results.append(p)
-
-        if len(data) < limit:
-            break
-
-        start += len(data)
+            start += len(items)
 
     print(f"[Nachfass] Echte Batch-Feld-Treffer geladen: {len(results)} Personen")
     return results
+
 
 # =============================================================================
 # Nachfass – Aufbau Master (robust, progressiv & vollständig)
