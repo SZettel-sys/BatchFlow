@@ -333,55 +333,52 @@ def _pretty_reason(reason: str, extra: str = "") -> str:
         "person_id_match": "Person bereits kontaktiert (Filter 1216 / 1708)"
     }.get(reason, "Entfernt")
     return f"{base}{(' – ' + extra) if extra else ''}"
+
 # =============================================================================
-# Nachfass – Personen laden nach Batch-ID (mit Paging & Fortschritt)
+# Nachfass – Batch ID
 # =============================================================================
-async def stream_persons_by_batch_id(
-    batch_key: str,
-    batch_ids: List[str],
-    page_limit: int = 100,
-    job_obj=None
-) -> List[dict]:
-    results: List[dict] = []
-    sem = asyncio.Semaphore(6)  # gedrosselt, um 429 zu vermeiden
+async def stream_persons_by_batch_field(batch_field_key: str, batch_ids: list[str]) -> list[dict]:
+    """
+    Liefert exakt die Personen zurück, deren Batch-ID-Feld einen der übergebenen Werte enthält.
+    Keine Volltextsuche, keine falschen Treffer.
+    """
+    results = []
+    start = 0
+    limit = 500
 
-    async def fetch_one(bid: str):
-        start = 0
-        total = 0
-        local = []
-        async with sem:
-            while True:
-                url = append_token(
-                    f"{PIPEDRIVE_API}/persons/search?term={bid}&fields=custom_fields&start={start}&limit={page_limit}"
-                )
-                r = await http_client().get(url, headers=get_headers())
-                if r.status_code == 429:
-                    print(f"[WARN] Rate limit erreicht, warte 2 Sekunden ...")
-                    await asyncio.sleep(2)
-                    continue
-                if r.status_code != 200:
-                    print(f"[WARN] Batch {bid} Fehler: {r.text}")
-                    break
-                data = r.json().get("data", {}).get("items", [])
-                if not data:
-                    break
+    while True:
+        url = append_token(
+            f"{PIPEDRIVE_API}/persons?start={start}&limit={limit}&sort=id"
+        )
 
-                persons = [it.get("item") for it in data if it.get("item")]
-                local.extend(persons)
-                total += len(persons)
-                start += len(persons)
+        r = await http_client().get(url, headers=get_headers())
+        if r.status_code != 200:
+            raise Exception(f"Pipedrive Fehler beim Personenladen: {r.text}")
 
-                if len(persons) < page_limit:
-                    break
-                await asyncio.sleep(0.1)  # minimale Pause zwischen Seiten
+        data = r.json().get("data") or []
+        if not data:
+            break
 
-        print(f"[DEBUG] Batch {bid}: {total} Personen geladen")
-        results.extend(local)
+        for p in data:
+            val = p.get(batch_field_key)
 
-    await asyncio.gather(*[fetch_one(bid) for bid in batch_ids])
-    print(f"[INFO] Alle Batch-IDs geladen: {len(results)} Personen gesamt")
+            # Pipedrive-Feld kann sein: None, String, Dict, List
+            if isinstance(val, dict):
+                val = val.get("value")
+            if isinstance(val, list) and val:
+                # falls Mehrfachwerte möglich
+                val = val[0].get("value") if isinstance(val[0], dict) else val[0]
+
+            if val and str(val).strip() in batch_ids:
+                results.append(p)
+
+        if len(data) < limit:
+            break
+
+        start += len(data)
+
+    print(f"[Nachfass] Echte Batch-Feld-Treffer geladen: {len(results)} Personen")
     return results
-
 
 # =============================================================================
 # Nachfass – Aufbau Master (robust, progressiv & vollständig)
@@ -590,20 +587,18 @@ async def _build_nf_master_final(
             return gender_map.get(str(v), str(v))
         return str(v or "")
 
-    # ---------------------------------------------------------------------
-    # Personen laden
-    # ---------------------------------------------------------------------
-    persons = await stream_persons_by_batch_id(
-        await get_batch_field_key(),
-        nf_batch_ids,
-        page_limit=100,
-        job_obj=job_obj
+# ---------------------------------------------------------------------
+# Personen laden (NEU: echte Batch-Feld-Abfrage, keine Volltextsuche)
+# ---------------------------------------------------------------------
+    batch_field_key = await get_batch_field_key()
+    
+    persons = await stream_persons_by_batch_field(
+        batch_field_key=batch_field_key,
+        batch_ids=nf_batch_ids
     )
-    print(f"[INFO] {len(persons)} Personen geladen")
+    
+    print(f"[INFO] {len(persons)} Personen geladen (Batch-Feld exakt matchend)")
 
-    selected, excluded = [], []
-    org_counter = defaultdict(int)
-    now = dt.datetime.now()
 
     # ---------------------------------------------------------------------
     # FILTERLOGIK
