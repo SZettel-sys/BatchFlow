@@ -1073,17 +1073,24 @@ async def nachfass_excluded_page():
 # ============================================================
 # Redirects & Fallbacks (für Pipedrive /overview usw.)
 # ============================================================
-
-@app.get("/overview", response_class=HTMLResponse)
-async def overview_redirect():
-    return RedirectResponse("/campaign", status_code=302)
-
-
 @app.get("/{full_path:path}", include_in_schema=False)
 async def catch_all(full_path: str, request: Request):
-    if full_path in ("campaign", "", "/"):
-        return RedirectResponse("/campaign", status_code=302)
+
+    # 1. Gültige Seiten explizit zulassen
+    allowed_paths = {
+        "", "/", "campaign", "neukontakte", "nachfass",
+        "neukontakte/export_start", "neukontakte/export_progress",
+        "neukontakte/export_download", "nachfass/export_start",
+        "nachfass/export_progress", "nachfass/export_download",
+        "nachfass/excluded", "nachfass/excluded/json"
+    }
+
+    if full_path in allowed_paths:
+        raise HTTPException(status_code=404, detail="Not found")
+
+    # 2. Alles andere auf die Kampagnenstartseite lenken
     return RedirectResponse("/campaign", status_code=302)
+
 
 
 ################################## Ende Teil 5 ##################################
