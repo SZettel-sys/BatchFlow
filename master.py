@@ -375,6 +375,36 @@ async def stream_persons_by_batch_field(batch_field_key: str, batch_ids: list[st
     return results
 
 
+async def get_persons_by_batch_ids(batch_field_key: str, batch_values: list[str]) -> list[dict]:
+    """Holt Personen anhand des Batch-Feldes über /persons/search (stabil)."""
+    results = []
+    seen_ids = set()
+    for batch in batch_values:
+        start = 0
+        limit = 100
+        while True:
+            url = append_token(
+                f"{PIPEDRIVE_API}/persons/search?field_key={batch_field_key}&term={batch}&exact_match=true&start={start}&limit={limit}"
+            )
+            r = await http_client().get(url, headers=get_headers())
+            r.raise_for_status()
+            data = r.json().get("data") or {}
+            items = data.get("items") or []
+            if not items:
+                break
+            for it in items:
+                pid = it.get("item", {}).get("id")
+                if pid:
+                    seen_ids.add(str(pid))
+            if len(items) < limit:
+                break
+            start += limit
+    # load full details
+    full = await fetch_person_details(list(seen_ids))
+    return full
+
+
+
 # =============================================================================
 # Nachfass – Aufbau Master (robust, progressiv & vollständig)
 # =============================================================================
@@ -587,10 +617,7 @@ async def _build_nf_master_final(
 # ---------------------------------------------------------------------
     batch_field_key = await get_batch_field_key()
     
-    persons = await stream_persons_by_batch_field(
-        batch_field_key=batch_field_key,
-        batch_ids=nf_batch_ids
-    )
+    persons = await get_persons_by_batch_ids(batch_field_key=batch_field_key, batch_values=nf_batch_ids)
     
     print(f"[INFO] {len(persons)} Personen geladen (Batch-Feld exakt matchend)")
 
