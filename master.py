@@ -226,24 +226,32 @@ async def stream_person_ids_by_filter(filter_id: int) -> AsyncGenerator[List[str
 
 async def get_person_ids_by_batch_value(batch_field_key: str, batch_value: str) -> list[str]:
     """
-    Baut einen temporären Pipedrive-Filter:
+    Baut einen temporären Pipedrive-Filter (gültiges Format!):
         Personen, deren Batch-Feld == batch_value
-    Holt ALLE IDs, komplett & stabil paginiert.
+    Holt ALLE IDs, komplett paginiert.
     """
 
-    # Filter anlegen
     payload = {
         "name": f"tmp_batch_{batch_value}",
-        "conditions": [
-            {
-                "field_id": batch_field_key,
-                "operator": "=",
-                "value": batch_value
-            }
-        ],
-        "type": "people"
+        "type": "people",
+        "conditions": {
+            "glue": "and",
+            "conditions": [
+                {
+                    "glue": "and",
+                    "conditions": [
+                        {
+                            "field_id": batch_field_key,
+                            "operator": "=",
+                            "value": batch_value
+                        }
+                    ]
+                }
+            ]
+        }
     }
 
+    # Filter anlegen
     create_url = append_token(f"{PIPEDRIVE_API}/filters")
     r = await http_client().post(create_url, headers=get_headers(), json=payload)
     r.raise_for_status()
@@ -254,7 +262,7 @@ async def get_person_ids_by_batch_value(batch_field_key: str, batch_value: str) 
     async for chunk in stream_person_ids_by_filter(filter_id):
         all_ids.extend(chunk)
 
-    # Filter wieder löschen (Clean-Up)
+    # Filter wieder löschen
     try:
         del_url = append_token(f"{PIPEDRIVE_API}/filters/{filter_id}")
         await http_client().delete(del_url, headers=get_headers())
@@ -262,7 +270,6 @@ async def get_person_ids_by_batch_value(batch_field_key: str, batch_value: str) 
         pass
 
     return all_ids
-
 
 # ------------------------------------------------------------
 # Vollständige Personendetails holen
