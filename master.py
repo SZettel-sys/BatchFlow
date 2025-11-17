@@ -1099,6 +1099,168 @@ async def campaign_home():
     </html>
     """)
 
+@app.get("/neukontakte", response_class=HTMLResponse)
+async def neukontakte_home():
+    return HTMLResponse("""
+    <!doctype html>
+    <html lang='de'>
+    <head>
+        <meta charset='utf-8'>
+        <title>BatchFlow – Neukontakte</title>
+        <style>
+            body { font-family: Arial; margin: 40px; }
+            input, select { padding: 6px; font-size: 15px; }
+            button {
+                padding: 10px 20px; font-size: 16px;
+                background: #007bff; color: white; border: none;
+                cursor: pointer; border-radius: 4px;
+            }
+            button:disabled { background: grey; }
+            .progress { margin-top: 20px; width: 350px; background: #eee; border-radius: 6px; }
+            .bar { height: 20px; width: 0%; background: #28a745; border-radius: 6px; transition: width 0.3s; }
+        </style>
+    </head>
+    <body>
+
+        <h1>Neukontakte</h1>
+
+        <label>Batch ID:</label>
+        <input id='batch' placeholder='z. B. B443'><br><br>
+
+        <label>Kampagne:</label>
+        <input id='campaign' placeholder='Name der Kampagne'><br><br>
+
+        <button onclick='startExport()'>Export starten</button>
+
+        <div class='progress'><div class='bar' id='bar'></div></div>
+
+        <p id='status'></p>
+
+        <script>
+        async function startExport(){
+            const batch = document.getElementById('batch').value.trim();
+            const campaign = document.getElementById('campaign').value.trim();
+
+            if(!batch){ alert("Bitte Batch ID eingeben!"); return; }
+
+            const r = await fetch('/neukontakte/export_start', {
+                method:'POST',
+                headers:{'Content-Type':'application/json'},
+                body: JSON.stringify({batch_id: batch, campaign: campaign})
+            });
+            const j = await r.json();
+            if(!j.job_id){ alert("Fehler!"); return; }
+
+            poll(j.job_id);
+        }
+
+        async function poll(id){
+            const r = await fetch('/neukontakte/export_progress?job_id='+id);
+            const j = await r.json();
+
+            document.getElementById('status').innerText = j.phase;
+            document.getElementById('bar').style.width = j.percent + '%';
+
+            if(j.done){
+                if(j.error){
+                    document.getElementById('status').innerText = "Fehler: "+j.error;
+                } else {
+                    window.location = '/neukontakte/export_download?job_id='+id;
+                }
+                return;
+            }
+
+            setTimeout(() => poll(id), 700);
+        }
+        </script>
+
+    </body>
+    </html>
+    """)
+@app.get("/nachfass", response_class=HTMLResponse)
+async def nachfass_home():
+    return HTMLResponse("""
+    <!doctype html>
+    <html lang='de'>
+    <head>
+        <meta charset='utf-8'>
+        <title>BatchFlow – Nachfass</title>
+        <style>
+            body { font-family: Arial; margin: 40px; }
+            input { padding: 6px; font-size: 15px; }
+            button {
+                padding: 10px 20px; font-size: 16px;
+                background: #007bff; color: white; border: none;
+                cursor: pointer; border-radius: 4px;
+            }
+            button:disabled { background: grey; }
+            .progress { margin-top: 20px; width: 350px; background: #eee; border-radius: 6px; }
+            .bar { height: 20px; width: 0%; background: #28a745; border-radius: 6px; transition: width 0.3s; }
+        </style>
+    </head>
+    <body>
+
+        <h1>Nachfass</h1>
+
+        <label>Batch-ID(s):</label><br>
+        <input id='nf_batches' placeholder='B443,B442'><br><br>
+
+        <label>Export-Batch ID:</label><br>
+        <input id='batch_id' placeholder='B443'><br><br>
+
+        <label>Kampagne:</label><br>
+        <input id='campaign' placeholder='Kampagnenname'><br><br>
+
+        <button onclick='startNF()'>Nachfass starten</button>
+
+        <div class='progress'><div class='bar' id='bar'></div></div>
+
+        <p id='status'></p>
+
+        <script>
+        async function startNF(){
+            const nf = document.getElementById('nf_batches').value.split(',').map(x => x.trim()).filter(Boolean);
+            const batch_id = document.getElementById('batch_id').value.trim();
+            const campaign = document.getElementById('campaign').value.trim();
+
+            if(nf.length === 0){ alert("Bitte Batch-IDs eingeben!"); return; }
+
+            const r = await fetch('/nachfass/export_start', {
+                method:'POST',
+                headers:{'Content-Type':'application/json'},
+                body: JSON.stringify({ nf_batch_ids: nf, batch_id: batch_id, campaign: campaign })
+            });
+            const j = await r.json();
+
+            if(!j.job_id){ alert("Fehler beim Starten!"); return; }
+
+            poll(j.job_id);
+        }
+
+        async function poll(id){
+            const r = await fetch('/nachfass/export_progress?job_id='+id);
+            const j = await r.json();
+
+            document.getElementById('status').innerText = j.phase;
+            document.getElementById('bar').style.width = j.percent + '%';
+
+            if(j.done){
+                if(j.error){
+                    document.getElementById('status').innerText = "Fehler: "+j.error;
+                } else {
+                    window.location = '/nachfass/export_download?job_id='+id;
+                }
+                return;
+            }
+            setTimeout(() => poll(id), 700);
+        }
+        </script>
+
+    </body>
+    </html>
+    """)
+
+
 
 # Catch-All MUSS als LETZTES kommen und OHNE Bedingungen!
 @app.get("/{full_path:path}", include_in_schema=False)
