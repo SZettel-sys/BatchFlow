@@ -523,7 +523,7 @@ async def stream_persons_by_filter(
         start += len(data)
 
 # =============================================================================
-# FINALE VERSION: _build_nf_master_final
+# STABILE VERSION: _build_nf_master_final
 # =============================================================================
 import json
 import datetime as dt
@@ -539,32 +539,48 @@ async def _build_nf_master_final(
     job_obj=None
 ) -> pd.DataFrame:
     """
-    Baut Nachfass-Daten vollständig auf:
-    - Filtert Personen anhand Batch-ID & Aktivitätsdatum
-    - Entfernt >2 Kontakte pro Organisation
-    - Füllt alle Felder inkl. Prospect, Titel, Geschlecht, Position, XING, LinkedIn
-    - Schreibt Export + Ausschlussliste in DB
+    Robuste Nachfass-Logik:
+    - erkennt Batch-ID zuverlässig
+    - filtert korrekt nach 'Datum nächste Aktivität'
+    - max. 2 Personen pro Organisation
+    - erzeugt IMMER eine Exportdatei (auch bei 0 Zeilen)
     """
 
-    # ---------------------------------------------------------------
-    # 1️⃣ Felder und Mapping vorbereiten
-    # ---------------------------------------------------------------
+    print(f"[INFO] Starte Nachfass-Build für Batch {batch_id} mit {nf_batch_ids}")
+
+    # -------------------------------------------------------------------------
+    # Feld-Mapping vorbereiten
+    # -------------------------------------------------------------------------
     person_fields = await get_person_fields()
     hint_to_key, gender_map = {}, {}
-    next_activity_key = None
+    next_activity_key, batch_key = None, None
 
     for f in person_fields:
         nm = (f.get("name") or "").lower()
+        # Feldzuordnungen erkennen
         for hint in PERSON_FIELD_HINTS_TO_EXPORT.keys():
             if hint in nm and hint not in hint_to_key:
                 hint_to_key[hint] = f.get("key")
+        # Geschlecht
         if any(x in nm for x in ("gender", "geschlecht")):
             gender_map = field_options_id_to_label_map(f)
+        # Datum nächste Aktivität
         if "datum nächste aktivität" in nm or "next activity" in nm:
             next_activity_key = f.get("key")
+        # Batch-Feld
+        if "batch" in nm and not batch_key:
+            batch_key = f.get("key")
 
+    if not batch_key:
+        batch_key = await get_batch_field_key()
+        print("[WARN] Kein direktes Batch-Feld erkannt – nutze Fallback-Key.")
+
+    print(f"[DEBUG] Batch-Feld-Key: {batch_key}, Next-Activity-Key: {next_activity_key}")
+
+    # -------------------------------------------------------------------------
+    # Hilfsfunktion zum Lesen von Custom-Feldern
+    # -------------------------------------------------------------------------
     def get_field(p: dict, hint: str) -> str:
-        """Sicheres Lesen eines Custom-Feldes anhand des Namens-Hints"""
         key = hint_to_key.get(hint)
         if not key:
             return ""
@@ -583,19 +599,19 @@ async def _build_nf_master_final(
             return gender_map.get(str(v), str(v))
         return str(v or "")
 
-    # ---------------------------------------------------------------
-    # 2️⃣ Personen laden
-    # ---------------------------------------------------------------
-    batch_key = await get_batch_field_key()
+    # -------------------------------------------------------------------------
+    # Personen aus Pipedrive laden
+    # -------------------------------------------------------------------------
     persons = await stream_persons_by_batch_id(batch_key, nf_batch_ids, page_limit=100, job_obj=job_obj)
-    print(f"[INFO] {len(persons)} Personen aus Pipedrive geladen")
+    total = len(persons)
+    print(f"[INFO] {total} Personen aus Pipedrive geladen")
 
     selected, excluded = [], []
     now = dt.datetime.now()
 
-    # ---------------------------------------------------------------
-    # 3️⃣ Filter: Batch-ID prüfen
-    # ---------------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # Filterlogik – Batch-ID + Aktivität
+    # -------------------------------------------------------------------------
     for p in persons:
         pid = str(p.get("id") or "")
         name = p.get("name") or ""
@@ -603,9 +619,9 @@ async def _build_nf_master_final(
         org_id = str(org.get("id") or "")
         org_name = org.get("name") or "-"
 
-        # Batch-ID robust prüfen
-        batch_val = ""
+        # Batch-Feld lesen
         val = p.get(batch_key)
+        batch_val = ""
         if isinstance(val, dict):
             batch_val = val.get("value") or val.get("label") or ""
         elif isinstance(val, list):
@@ -621,9 +637,7 @@ async def _build_nf_master_final(
         else:
             batch_val = str(val or "")
 
-        # Prüfen, ob eine gewünschte Batch-ID vorkommt
-        match_found = any(bid.lower() in batch_val.lower() for bid in nf_batch_ids if batch_val)
-
+        match_found = any(bid.lower() in (batch_val or "").lower() for bid in nf_batch_ids)
         if not match_found:
             excluded.append({
                 "Kontakt ID": pid,
@@ -635,9 +649,7 @@ async def _build_nf_master_final(
             })
             continue
 
-        # -----------------------------------------------------------
-        # 4️⃣ Regel: Datum nächste Aktivität prüfen
-        # -----------------------------------------------------------
+        # Datum nächste Aktivität prüfen
         if next_activity_key:
             raw_date = p.get(next_activity_key)
             if raw_date:
@@ -661,48 +673,47 @@ async def _build_nf_master_final(
 
     print(f"[INFO] Nach Batch/Aktivitätsfilter: {len(selected)} übrig, {len(excluded)} ausgeschlossen")
 
-    # ---------------------------------------------------------------
-    # 5️⃣ Regel: max. 2 Kontakte pro Organisation
-    # ---------------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # max. 2 Kontakte pro Organisation
+    # -------------------------------------------------------------------------
     org_map = defaultdict(list)
     for p in selected:
         org = p.get("organization") or {}
-        org_id = str(org.get("id") or "")
-        org_name = org.get("name") or "-"
-        if not org_id:
-            continue
-        org_map[(org_id, org_name)].append(p)
+        oid = str(org.get("id") or "")
+        oname = org.get("name") or "-"
+        if oid:
+            org_map[(oid, oname)].append(p)
 
     selected_final = []
-    for (org_id, org_name), plist in org_map.items():
+    for (oid, oname), plist in org_map.items():
         if len(plist) <= 2:
             selected_final.extend(plist)
         else:
             keep = plist[:2]
             drop = plist[2:]
             selected_final.extend(keep)
-            for p in drop:
+            for d in drop:
                 excluded.append({
-                    "Kontakt ID": str(p.get("id") or ""),
-                    "Name": p.get("name") or "",
-                    "Organisation ID": org_id,
-                    "Organisationsname": org_name,
+                    "Kontakt ID": str(d.get("id") or ""),
+                    "Name": d.get("name") or "",
+                    "Organisation ID": oid,
+                    "Organisationsname": oname,
                     "Grund": "Mehr als 2 Kontakte pro Organisation",
                     "Quelle": "Batch-/Filter-Ausschluss"
                 })
 
     print(f"[INFO] Nach max.2-Regel: {len(selected_final)} übrig, {len(excluded)} ausgeschlossen")
 
-    # ---------------------------------------------------------------
-    # 6️⃣ Export-DataFrame aufbauen
-    # ---------------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # DataFrame zusammenbauen
+    # -------------------------------------------------------------------------
     rows = []
     for p in selected_final:
         pid = str(p.get("id") or "")
-        name = p.get("name") or ""
         org = p.get("organization") or {}
         org_name = org.get("name") or "-"
         org_id = str(org.get("id") or "")
+        name = p.get("name") or ""
         vor, nach = split_name(p.get("first_name"), p.get("last_name"), name)
 
         emails = p.get("emails") or []
@@ -711,15 +722,6 @@ async def _build_nf_master_final(
             email = emails[0].get("value") if isinstance(emails[0], dict) else str(emails[0])
         elif isinstance(emails, str):
             email = emails
-
-        xing_val = ""
-        for k, v in p.items():
-            if isinstance(k, str) and "xing" in k.lower():
-                if isinstance(v, str) and v.startswith("http"):
-                    xing_val = v
-                elif isinstance(v, list):
-                    xing_val = ", ".join([x.get("value") for x in v if isinstance(x, dict)])
-                break
 
         rows.append({
             "Person - Batch ID": batch_id,
@@ -734,19 +736,37 @@ async def _build_nf_master_final(
             "Person - Nachname": nach,
             "Person - Position": get_field(p, "position"),
             "Person - ID": pid,
-            "Person - XING-Profil": xing_val,
+            "Person - XING-Profil": get_field(p, "xing"),
             "Person - LinkedIn Profil-URL": get_field(p, "linkedin"),
             "Person - E-Mail-Adresse - Büro": email
         })
 
     df = pd.DataFrame(rows)
-    excluded_df = pd.DataFrame(excluded)
+    excluded_df = pd.DataFrame(excluded).replace({np.nan: None})
 
-    # ---------------------------------------------------------------
-    # 7️⃣ Ergebnisse speichern
-    # ---------------------------------------------------------------
-    await save_df_text(df, "nf_master_final")
+    # -------------------------------------------------------------------------
+    # Immer Dateien speichern – auch wenn leer
+    # -------------------------------------------------------------------------
+    try:
+        await save_df_text(df, "nf_master_final")
+        await save_df_text(excluded_df, "nf_excluded")
+    except Exception as e:
+        print(f"[ERROR] Speichern fehlgeschlagen: {e}")
 
+    # Wenn kein Ergebnis → leere Datei trotzdem erzeugen
+    if df.empty:
+        print("[WARN] Keine gültigen Datensätze – leere Exportdatei wird erzeugt.")
+        empty_df = pd.DataFrame(columns=[
+            "Person - Batch ID", "Person - Channel", "Cold-Mailing Import",
+            "Person - Prospect ID", "Person - Organisation", "Organisation - ID",
+            "Person - Geschlecht", "Person - Titel", "Person - Vorname",
+            "Person - Nachname", "Person - Position", "Person - ID",
+            "Person - XING-Profil", "Person - LinkedIn Profil-URL",
+            "Person - E-Mail-Adresse - Büro"
+        ])
+        await save_df_text(empty_df, "nf_master_final")
+
+    # Wenn keine Ausschlüsse vorhanden → Dummy-Eintrag
     if excluded_df.empty:
         excluded_df = pd.DataFrame([{
             "Kontakt ID": "-",
@@ -756,8 +776,7 @@ async def _build_nf_master_final(
             "Grund": "Keine Datensätze ausgeschlossen",
             "Quelle": "-"
         }])
-
-    await save_df_text(excluded_df, "nf_excluded")
+        await save_df_text(excluded_df, "nf_excluded")
 
     print(f"[Nachfass] Export abgeschlossen ({len(df)} Zeilen, {len(excluded)} ausgeschlossen)")
     return df
