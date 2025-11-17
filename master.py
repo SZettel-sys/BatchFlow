@@ -620,6 +620,12 @@ async def _build_nf_master_final(
     persons = await get_persons_by_batch_ids(batch_field_key=batch_field_key, batch_values=nf_batch_ids)
     
     print(f"[INFO] {len(persons)} Personen geladen (Batch-Feld exakt matchend)")
+   
+    # Initialisierung (FEHLTE – führt zu NameError!)
+    selected = []
+    excluded = []
+    org_counter = defaultdict(int)
+    now = dt.datetime.now()
 
 
     # ---------------------------------------------------------------------
