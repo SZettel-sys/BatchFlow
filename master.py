@@ -236,38 +236,51 @@ async def fetch_person_chunk(start: int) -> list[dict]:
     data = r.json().get("data") or []
     return data
 
-
-
-async def get_all_persons_list() -> list[dict]:
+async def get_persons_from_filter(filter_id: str) -> list[dict]:
     """
-    Lädt ALLE Personen aus Pipedrive.
-    total_count existiert bei dir nicht → dynamisches Paging.
+    Holt ALLE Personen, die im gewählten Pipedrive-Filter stehen.
+    Vorteil:
+    - nur echte Personen
+    - keine gelöschten IDs
+    - keine Ghost-Objekte
+    - Detail-Endpoint funktioniert für 100 % der IDs
     """
 
     all_data = []
     start = 0
 
-    print("[BatchEngine V6] Starte LIST-Scan...")
+    print(f"[BatchEngine V6] Starte FILTER-Scan (Filter {filter_id})")
 
     while True:
-        chunk = await fetch_person_chunk(start)
+        url = append_token(
+            f"{PIPEDRIVE_API}/persons?filter_id={filter_id}&start={start}&limit={LIST_LIMIT}&fields=id,name"
+        )
+
+        r = await http_client().get(url, headers=get_headers())
+
+        if r.status_code != 200:
+            print("[V6] FILTER-ERROR:", r.status_code, r.text)
+            return all_data
+
+        chunk = r.json().get("data") or []
         cnt = len(chunk)
 
-        print(f"[V6] Chunk start={start}, count={cnt}")
+        print(f"[V6] Filter-Chunk start={start}, count={cnt}")
 
         if cnt == 0:
             break
 
         all_data.extend(chunk)
 
-        # keine weiteren Seiten
         if cnt < LIST_LIMIT:
             break
 
         start += LIST_LIMIT
 
-    print(f"[BatchEngine V6] LIST: {len(all_data)} Personen geladen")
+    print(f"[BatchEngine V6] Filter gesamt: {len(all_data)} Personen")
     return all_data
+
+
 
 
 
@@ -307,7 +320,8 @@ async def get_persons_by_batch_ids_v6(batch_field_key: str, batch_values: list[s
     # -----------------------------
     # 1: Liste laden
     # -----------------------------
-    persons_list = await get_all_persons_list()
+    persons_list = await get_persons_from_filter("3024")
+
 
     ids = [
         str(p.get("id"))
