@@ -88,6 +88,49 @@ def http_client() -> httpx.AsyncClient:
 def get_pool():
     return app.state.pool
 
+def extract_custom_field(person: dict, field_key: str):
+    """
+    Holt ein Custom-Feld zuverlässig aus einem Pipedrive-Personenobjekt.
+    Unterstützt alle Rückgabevarianten (root, custom_fields, nested, dict, list).
+    """
+
+    # 1. Direktes Feld
+    if field_key in person:
+        val = person[field_key]
+        if isinstance(val, dict):
+            return val.get("value") or val.get("label")
+        if isinstance(val, list):
+            if val and isinstance(val[0], dict):
+                return val[0].get("value") or val[0].get("label")
+            return val[0] if val else None
+        return val
+
+    # 2. custom_fields
+    cf = person.get("custom_fields") or {}
+    if field_key in cf:
+        val = cf[field_key]
+        if isinstance(val, dict):
+            return val.get("value") or val.get("label")
+        if isinstance(val, list):
+            if val and isinstance(val[0], dict):
+                return val[0].get("value") or val[0].get("label")
+            return val[0] if val else None
+        return val
+
+    # 3. nested: data.custom_fields
+    data = person.get("data") or {}
+    cf2 = data.get("custom_fields") or {}
+    if field_key in cf2:
+        val = cf2[field_key]
+        if isinstance(val, dict):
+            return val.get("value") or val.get("label")
+        if isinstance(val, list):
+            if val and isinstance(val[0], dict):
+                return val[0].get("value") or val[0].get("label")
+            return val[0] if val else None
+        return val
+
+    return None
 
 # ============================================================
 # =========  NEUE 108K Batch-ID Engine (ultrastabil) =========
@@ -140,8 +183,8 @@ async def get_person_ids_for_batch(batch_field_key: str, batch_values: list[str]
     ids = []
 
     for p in all_people:
-        val = p.get(batch_field_key)
-
+        val = extract_custom_field(p, batch_field_key)
+       
         # Pipedrive liefert Custom-Felder in verschiedenen Formaten
         if isinstance(val, dict):
             val = val.get("value")
@@ -864,24 +907,6 @@ async def nachfass_home():
     </html>
     """)
 
-
-@app.get("/debug/person_fields")
-async def debug_person_fields():
-    """
-    Debug: Liste aller Personenfelder + Keys.
-    """
-    url = append_token(f"{PIPEDRIVE_API}/personFields")
-    r = await http_client().get(url, headers=get_headers())
-    data = r.json().get("data", [])
-    
-    fields = []
-    for f in data:
-        fields.append({
-            "name": f.get("name"),
-            "key": f.get("key"),
-            "type": f.get("field_type"),
-        })
-    return fields
 
 # ============================================================
 # ===============   CATCH-ALL (Keine Loops!)   ================
