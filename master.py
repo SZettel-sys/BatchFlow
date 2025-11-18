@@ -865,6 +865,23 @@ async def nachfass_home():
     """)
 
 
+@app.get("/debug/person_fields")
+async def debug_person_fields():
+    """
+    Debug: Liste aller Personenfelder + Keys.
+    """
+    url = append_token(f"{PIPEDRIVE_API}/personFields")
+    r = await http_client().get(url, headers=get_headers())
+    data = r.json().get("data", [])
+    
+    fields = []
+    for f in data:
+        fields.append({
+            "name": f.get("name"),
+            "key": f.get("key"),
+            "type": f.get("field_type"),
+        })
+    return fields
 
 # ============================================================
 # ===============   CATCH-ALL (Keine Loops!)   ================
