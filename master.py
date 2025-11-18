@@ -686,10 +686,10 @@ async def build_nf_export(nf_batch_ids: list[str], batch_id: str, campaign: str,
 
 @app.post("/nachfass/export_start")
 async def nf_export_start(data=Body(...)):
-
-    nf_batch_ids = data.get("nf_batch_ids") or []
-    batch_id = data.get("batch_id", "").trim()
-    campaign = data.get("campaign", "").trim()
+   
+    nf_batch_ids = [str(x).strip() for x in (data.get("nf_batch_ids") or [])]
+    batch_id = (data.get("batch_id") or "").strip()
+    campaign = (data.get("campaign") or "").strip()
 
     job_id = create_job()
     update_job(job_id, phase="Init")
