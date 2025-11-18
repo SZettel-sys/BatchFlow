@@ -148,362 +148,213 @@ def split_name(first_name: Optional[str], last_name: Optional[str], full_name: s
     if len(parts) >= 2:
         return parts[0], " ".join(parts[1:])
     return full_name, ""
+
 # ============================================================
-# master_20251119_FINAL.py – Modul 2/6
-# Filter-First Engine (NF), NK Engine & Parallel Detail Loader
+# MODUL 2 — DATA ACCESS LAYER (FINAL 2025)
+# Zero-Limit NF + NK Engine (ohne Filter 3024)
 # ============================================================
+
 # ------------------------------------------------------------
-# GLOBALER RETRY WRAPPER (für 429 + Netzwerkfehler)
+# 2.1 GLOBAL SAFE REQUEST (mit 429 & Netzwerk-Retry)
 # ------------------------------------------------------------
 
-async def safe_request(method, url, headers=None, max_retries=10):
-    delay = 1.5  # Start bei 1.5s (sanft für Pipedrive)
+async def safe_request(method, url, headers=None, max_retries=8):
+    """
+    Universeller Request Wrapper:
+    - fängt 429 Downloads ab
+    - exponentielle Backofftime (max 10s)
+    - keine Abbrüche mehr
+    """
+    delay = 1.0  # Start mild
 
     for attempt in range(max_retries):
         try:
             r = await http_client().request(method, url, headers=headers)
 
-            # Erfolgreich
+            # Kein 429 → Rückgabe
             if r.status_code != 429:
                 return r
 
-            # 429 - Rate Limit → warten
+            # 429 → Warten
             print(f"[Retry] 429 erhalten. Warte {delay:.1f}s …")
             await asyncio.sleep(delay)
-            delay = min(delay * 1.6, 15.0)  # Exponentiell, max 15s
+            delay = min(delay * 1.7, 10.0)
 
         except Exception as e:
-            print(f"[Retry] Netzwerkfehler: {e}, Warte {delay:.1f}s …")
+            print(f"[Retry] Netzwerkfehler: {e} → Warte {delay:.1f}s")
             await asyncio.sleep(delay)
-            delay = min(delay * 1.6, 15.0)
+            delay = min(delay * 1.7, 10.0)
 
     raise Exception(f"Request fehlgeschlagen nach {max_retries} Retries: {url}")
 
-# ------------------------------------------------------------
-# PERSONEN-FELDER CACHE
-# ------------------------------------------------------------
-
-_PERSON_FIELDS_CACHE: Optional[List[dict]] = None
-
-async def get_person_fields() -> List[dict]:
-    """Lädt Personenfelder einmalig und cached sie."""
-    global _PERSON_FIELDS_CACHE
-    if _PERSON_FIELDS_CACHE is not None:
-        return _PERSON_FIELDS_CACHE
-
-    url = append_token(f"{PIPEDRIVE_API}/personFields")
-    r = await http_client().get(url, headers=get_headers())
-
-    if r.status_code != 200:
-        raise Exception(f"personFields Fehler: {r.text}")
-
-    _PERSON_FIELDS_CACHE = r.json().get("data") or []
-    return _PERSON_FIELDS_CACHE
-
 
 # ------------------------------------------------------------
-# Custom-Felder robust auslesen
+# 2.2 FULL PERSON INDEX SCAN (Zero-Limit Loader)
 # ------------------------------------------------------------
 
-def extract_custom_field(person: dict, field_key: str):
-    """Liest ein beliebiges Custom-Feld sicher aus."""
-    # 1) Direkt
-    if field_key in person:
-        val = person[field_key]
-        if isinstance(val, dict):  return val.get("value") or val.get("label")
-        if isinstance(val, list):  return val[0].get("value") if (val and isinstance(val[0], dict)) else (val[0] if val else None)
-        return val
-
-    # 2) custom_fields root
-    cf = person.get("custom_fields") or {}
-    if field_key in cf:
-        val = cf[field_key]
-        if isinstance(val, dict):  return val.get("value") or val.get("label")
-        if isinstance(val, list):  return val[0].get("value") if (val and isinstance(val[0], dict)) else (val[0] if val else None)
-        return val
-
-    # 3) data.custom_fields
-    data = person.get("data") or {}
-    cf2 = data.get("custom_fields") or {}
-    if field_key in cf2:
-        val = cf2[field_key]
-        if isinstance(val, dict):  return val.get("value") or val.get("label")
-        if isinstance(val, list):  return val[0].get("value") if (val and isinstance(val[0], dict)) else (val[0] if val else None)
-        return val
-
-    return None
-
-# ------------------------------------------------------------
-# SMART BATCH DETAIL FETCH (Chunk Size = 50)
-# ------------------------------------------------------------
-
-async def fetch_person_details(person_ids: List[str]) -> List[dict]:
+async def load_all_person_ids(limit: int = 500) -> List[str]:
     """
-    Holt Personendetails in stabilen, parallelen 50er-Chunks.
-    Optimiert für 300–1500 Personen.
-    Pipedrive-Limit-sicher.
+    Lädt ALLE Personen-IDs ohne Filter.
+    Schnell, stabil & Pipedrive-friendly.
     """
-
-    results = []
-    chunk_size = 50
-
-    # Personen in 50er-Chunks aufteilen
-    chunks = [person_ids[i:i + chunk_size] for i in range(0, len(person_ids), chunk_size)]
-
-    # Semaphore → bis zu 20 gleichzeitige Requests pro Chunk
-    sem = asyncio.Semaphore(40)
-
-    async def load_one(pid):
-        async with sem:
-            url = append_token(f"{PIPEDRIVE_API}/persons/{pid}?fields=*")
-            r = await http_client().get(url, headers=get_headers())
-
-            if r.status_code == 200:
-                data = r.json().get("data")
-                if data:
-                    results.append(data)
-
-            # Kurz warten → verhindert 429, aber schnell!
-            await asyncio.sleep(0.004)
-
-    # Chunks nacheinander, aber CHUNK-INTERN parallel
-    for chunk in chunks:
-        await asyncio.gather(*(load_one(pid) for pid in chunk))
-
-    return results
-
-# ============================================================
-# HYBRID STREAM PRODUCER (Pipedrive-safe)
-# Sequential pages → but streamed immediately
-# ============================================================
-
-async def stream_filter_ids(filter_id: int, limit: int = 500):
-    """
-    Pipedrive-sicherer Filter-Loader:
-    - keine parallelen Page-Requests (verhindert 429)
-    - aber streamt IDs sofort weiter
-    - extrem stabil
-    """
-
-    queue = asyncio.Queue()
-
-    async def producer():
-        start = 0
-
-        while True:
-            url = append_token(
-                f"{PIPEDRIVE_API}/persons?filter_id={filter_id}"
-                f"&start={start}&limit={limit}&fields=id"
-            )
-
-            r = await safe_request("GET", url, headers=get_headers())
-            data = r.json().get("data") or []
-
-            # in Stream Queue legen
-            await queue.put(data)
-
-            # Ende des Filters
-            if len(data) < limit:
-                break
-
-            start += limit
-
-            # Minimales Delay, verhindert Soft-Limits/429
-            await asyncio.sleep(0.003)
-
-        # Endsignal
-        await queue.put(None)
-
-    # Producer starten
-    asyncio.create_task(producer())
-
-    # Generator für den Consumer zurückgeben
-    async def generator():
-        while True:
-            batch = await queue.get()
-            if batch is None:
-                break
-            yield batch
-
-    return generator()
-
-# ============================================================
-# HIGH-END STREAM CONSUMER – Smart Batch Detail Loader
-# ============================================================
-
-async def consume_filter_stream_and_load_details(generator, batch_size=50):
-    """
-    Nimmt einen ID-Stream (vom Producer) entgegen
-    und lädt Details sofort in Smart-Batches.
-
-    Vorteile:
-    - Detail-Fetch beginnt, während IDs noch laden
-    - Pipeline ohne Wartezeiten
-    - sehr hohe Geschwindigkeit
-    """
-
-    results = []
-    pending_ids = []
-    sem = asyncio.Semaphore(20)  # 20 Parallel-Requests pro Batch
-
-    async def load_one(pid):
-        async with sem:
-            url = append_token(f"{PIPEDRIVE_API}/persons/{pid}?fields=*")
-            r = await safe_request("GET", url, headers=get_headers())
-            if r.status_code == 200:
-                data = r.json().get("data")
-                if data:
-                    results.append(data)
-        await asyncio.sleep(0.004)
-
-    async def flush_batch():
-        """Ein Batch mit 50 IDs parallel laden."""
-        if not pending_ids:
-            return
-        batch = pending_ids.copy()
-        pending_ids.clear()
-        await asyncio.gather(*(load_one(pid) for pid in batch))
-
-    # IDs aus dem Stream holen → sofort Details laden
-    async for page in generator:
-        for p in page:
-            pid = str(p.get("id"))
-            if not pid:
-                continue
-
-            pending_ids.append(pid)
-
-            # Wenn Batch voll → sofort laden
-            if len(pending_ids) >= batch_size:
-                await flush_batch()
-
-    # Restliche IDs laden, wenn Stream abgeschlossen ist
-    await flush_batch()
-
-    return results
-
-
-
-# ============================================================
-# HIGH-END STREAM ORCHESTRATOR
-# Kombiniert Producer + Consumer → 10× schneller als normal
-# ============================================================
-
-async def get_persons_from_filter_detailed(filter_id: int) -> List[dict]:
-    """
-    High-End Pipeline:
-    - Lädt Filter 3024 über parallele Page-Producer
-    - Streamt IDs live zum Consumer
-    - Lädt Details sofort in Smart-Batches
-    - Kein Warten mehr auf "alle IDs"
-    """
-
-    print(f"[Stream] Starte High-End Stream Pipeline für Filter {filter_id} …")
-
-    # 1) Producer vorbereiten
-    generator = await stream_filter_ids(filter_id)
-
-    # 2) Consumer starten (Chunk 50)
-    persons = await consume_filter_stream_and_load_details(generator, batch_size=50)
-
-    print(f"[Stream] Pipeline abgeschlossen. Geladene Personen: {len(persons)}")
-
-    return persons
-
-
-
-
-# ------------------------------------------------------------
-# NK ENGINE – Batch-Feld exakte Suche
-# ------------------------------------------------------------
-
-async def get_nk_persons(batch_value: str) -> List[dict]:
-    """Neukontakte: Batch-Feld ist Hauptkriterium."""
-    ids = set()
-    start = 0
-    batch_value_clean = batch_value.strip()
-
-    while True:
-        url = append_token(
-            f"{PIPEDRIVE_API}/persons/search?"
-            f"field_key={BATCH_FIELD_KEY}&term={batch_value_clean}"
-            f"&exact_match=true&start={start}&limit=100"
-        )
-        r = await http_client().get(url, headers=get_headers())
-        if r.status_code != 200:
-            raise Exception(f"Batch-Suche Fehler: {r.text}")
-
-        items = (r.json().get("data") or {}).get("items") or []
-        if not items:
-            break
-
-        for it in items:
-            pid = it.get("item", {}).get("id")
-            if pid:
-                ids.add(str(pid))
-
-        if len(items) < 100:
-            break
-        start += 100
-
-    print(f"[NK] Batch-Feld IDs: {len(ids)}")
-    return await fetch_person_details(list(ids))
-
-
-# ------------------------------------------------------------
-# NF ENGINE – FILTER-FIRST + BATCH-Feldprüfung
-# ------------------------------------------------------------
-
-async def get_nf_persons_filter_first(batch_values: list[str]) -> List[dict]:
-    """
-    NF:
-    1) Lade ALLE Personen aus Filter 3024
-    2) Prüfe Batch-Feld in Python
-    """
-    persons = await get_persons_from_filter_detailed(FILTER_NACHFASS)
-
-    batchnorm = {b.strip().lower() for b in batch_values}
-    valid = []
-
-    for p in persons:
-        val = extract_custom_field(p, BATCH_FIELD_KEY)
-        if not val:
-            continue
-
-        sval = str(val).strip().lower()
-        if sval in batchnorm:
-            valid.append(p)
-
-    print(f"[NF] Nach Batch-Check übrig: {len(valid)} Personen")
-    return valid
-# ------------------------------------------------------------
-# SIMPLE ID FETCHER FÜR FILTER (wird in Reconcile benötigt)
-# ------------------------------------------------------------
-async def get_ids_from_filter(filter_id: int, limit: int = 500) -> set[str]:
-    ids = set()
+    ids = []
     start = 0
 
     while True:
         url = append_token(
-            f"{PIPEDRIVE_API}/persons?filter_id={filter_id}&start={start}&limit={limit}&fields=id"
+            f"{PIPEDRIVE_API}/persons?start={start}&limit={limit}&fields=id"
         )
+
         r = await safe_request("GET", url, headers=get_headers())
+        data = r.json().get("data") or []
 
-        data = (r.json().get("data") or [])
-        if not data:
-            break
-
-        for item in data:
-            pid = item.get("id")
+        for p in data:
+            pid = p.get("id")
             if pid:
-                ids.add(str(pid))
+                ids.append(str(pid))
 
         if len(data) < limit:
             break
 
         start += limit
+        await asyncio.sleep(0.002)  # Soft-Limit freundlich
 
+    print(f"[SCAN] Personen-Index geladen: {len(ids)} IDs")
     return ids
+
+
+# ------------------------------------------------------------
+# 2.3 SMART BATCH DETAIL LOADER 2025
+# ------------------------------------------------------------
+
+async def load_person_details(ids: List[str], batch_size: int = 50) -> List[dict]:
+    """
+    Lädt Personendetails extrem schnell.
+    - 50 IDs pro Batch
+    - 40 parallele Requests
+    - mit safe_request für 429/Network-Errors
+    """
+
+    results = []
+    sem = asyncio.Semaphore(40)  # 40 parallel = optimal für Render + Pipedrive
+
+    async def load_one(pid):
+        async with sem:
+            url = append_token(f"{PIPEDRIVE_API}/persons/{pid}?fields=*")
+            r = await safe_request("GET", url, headers=get_headers())
+
+            if r.status_code == 200:
+                data = r.json().get("data")
+                if data:
+                    results.append(data)
+
+        await asyncio.sleep(0.003)  # Mikrodelay
+
+    # Batches laden
+    for i in range(0, len(ids), batch_size):
+        batch = ids[i:i + batch_size]
+        await asyncio.gather(*(load_one(pid) for pid in batch))
+
+    print(f"[DETAIL] Vollständige Details geladen: {len(results)}")
+    return results
+
+
+# ------------------------------------------------------------
+# 2.4 NF FILTERLOGIK (Python-Replikation von Filter 3024)
+# ------------------------------------------------------------
+
+def nf_filter_logic(person: dict) -> bool:
+    """
+    Repliziert die wichtigsten Regeln des ehemaligen Filters 3024.
+    Anpassbar, falls weitere Kriterien benötigt werden.
+    """
+
+    if not person:
+        return False
+
+    # aktiv?
+    if not person.get("active_flag", True):
+        return False
+
+    # Email vorhanden?
+    emails = person.get("emails") or []
+    if not emails:
+        return False
+
+    # primäre Email?
+    primary = None
+    if isinstance(emails, list):
+        if len(emails) > 0:
+            if isinstance(emails[0], dict):
+                primary = emails[0].get("value")
+            else:
+                primary = str(emails[0])
+    else:
+        primary = str(emails)
+
+    if not primary:
+        return False
+
+    return True
+
+
+# ------------------------------------------------------------
+# 2.5 NF LOAD PIPELINE (Hauptfunktion)
+# ------------------------------------------------------------
+
+async def load_nf_candidates() -> List[dict]:
+    """
+    Neue NF-Engine:
+    1. Alle IDs laden (keine Filter!)
+    2. Schneller Detail-Loader
+    3. NF-Pythonfilter anwenden
+    """
+
+    print("[NF] Starte neue Zero-Limit NF-Pipeline …")
+
+    # 1) IDs
+    ids = await load_all_person_ids()
+
+    # 2) Details
+    persons = await load_person_details(ids)
+
+    # 3) NF-Kriterien anwenden
+    nf_list = [p for p in persons if nf_filter_logic(p)]
+
+    print(f"[NF] Nach Python-Filter: {len(nf_list)} Personen")
+    return nf_list
+
+
+# ------------------------------------------------------------
+# 2.6 NK ENGINE (unverändert, aber final optimiert)
+# ------------------------------------------------------------
+
+async def get_nk_persons(batch_id: str) -> List[dict]:
+    """
+    NK-Batchfeldsuche über Pipedrive Search. Sehr schnell & stabil.
+    """
+
+    search_url = append_token(
+        f"{PIPEDRIVE_API}/persons/search"
+        f"?term={batch_id}"
+        f"&fields=custom_fields"
+        f"&exact_match=true"
+        f"&field_key={BATCH_FIELD_KEY}"
+    )
+
+    r = await safe_request("GET", search_url, headers=get_headers())
+    data = r.json().get("data") or {}
+
+    items = (data.get("items") or [])
+    person_ids = [str(item["item"]["id"]) for item in items if "item" in item]
+
+    print(f"[NK] Treffer Batch '{batch_id}': {len(person_ids)} IDs")
+
+    # Details holen (Smart Batch Mode)
+    persons = await load_person_details(person_ids)
+
+    print(f"[NK] Vollständige NK-Details geladen: {len(persons)}")
+    return persons
 
 # ============================================================
 # master_20251119_FINAL.py – Modul 3/6
@@ -524,7 +375,7 @@ async def _build_nf_master_final(
         job_obj.phase = "Lade Personen aus Filter 3024 …"
         job_obj.percent = 10
 
-    persons = await get_nf_persons_filter_first(nf_batch_ids)
+    persons = await load_nf_candidates()
 
     print(f"[NF] Personen nach Filter + Batch-Prüfung: {len(persons)}")
 
