@@ -65,8 +65,8 @@ def append_token(url: str) -> str:
     if "api_token=" in url:
         return url
     if "?" in url:
-        return url + f"&api_token={PD_API_TOKEN}"
-    return url + f"?api_token={PD_API_TOKEN}"
+        return url + f"&api_token={PIPEDRIVE_TOKEN}"
+    return url + f"?api_token={PIPEDRIVE_TOKEN}"
 
 
 def get_headers():
