@@ -224,7 +224,8 @@ async def fetch_person_chunk(start: int) -> list[dict]:
     Kompatibel zu deiner Pipedrive-Version.
     """
     url = append_token(
-        f"{PIPEDRIVE_API}/persons?start={start}&limit={LIST_LIMIT}"
+        f"{PIPEDRIVE_API}/persons?start={start}&limit={LIST_LIMIT}&fields=id"
+
     )
 
     r = await http_client().get(url, headers=get_headers())
