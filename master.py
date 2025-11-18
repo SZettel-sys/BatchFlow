@@ -35,6 +35,8 @@ PIPEDRIVE_API = "https://api.pipedrive.com/v1"
 PIPEDRIVE_TOKEN = os.getenv("PD_API_TOKEN", "")
 BATCH_FIELD_KEY = "5ac34dad3ea917fdef4087caebf77ba275f87eec"   # korrektes Batch-ID Feld
 DEFAULT_CHANNEL = "E-Mail"
+FILTER_NEUKONTAKTE = int(os.getenv("FILTER_NEUKONTAKTE", "2998"))
+FILTER_NACHFASS = int(os.getenv("FILTER_NACHFASS", "3024"))
 
 SCHEMA = "public"   # verwendetes DB-Schema
 
@@ -207,6 +209,39 @@ def df_to_file_response(df: pd.DataFrame, filename: str) -> FileResponse:
     df.to_csv(path, index=False)
     return FileResponse(path, filename=filename, media_type="text/csv")
 
+async def get_persons_from_filter(filter_id: int) -> list[dict]:
+    all_data = []
+    start = 0
+
+    print(f"[BatchEngine V6] Starte FILTER-Scan (Filter {filter_id})")
+
+    while True:
+        url = append_token(
+            f"{PIPEDRIVE_API}/persons?filter_id={filter_id}&start={start}&limit={LIST_LIMIT}&fields=id,name"
+        )
+
+        r = await http_client().get(url, headers=get_headers())
+        if r.status_code != 200:
+            print("[V6] FILTER-ERROR:", r.status_code, r.text)
+            return all_data
+
+        chunk = r.json().get("data") or []
+        cnt = len(chunk)
+
+        print(f"[V6] Filter-Chunk start={start}, count={cnt}")
+
+        if cnt == 0:
+            break
+
+        all_data.extend(chunk)
+
+        if cnt < LIST_LIMIT:
+            break
+
+        start += LIST_LIMIT
+
+    print(f"[BatchEngine V6] Filter gesamt: {len(all_data)} Personen")
+    return all_data
 
 # ============================================================
 # =============  BatchEngine V6 – UNIVERSAL SCAN  ============
@@ -320,7 +355,7 @@ async def get_persons_by_batch_ids_v6(batch_field_key: str, batch_values: list[s
     # -----------------------------
     # 1: Liste laden
     # -----------------------------
-    persons_list = await get_persons_from_filter("3024")
+    persons_list = await get_persons_from_filter(FILTER_NACHFASS)
 
 
     ids = [
