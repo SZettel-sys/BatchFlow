@@ -133,107 +133,75 @@ def extract_custom_field(person: dict, field_key: str):
     return None
 
 # ============================================================
-# =========  NEUE 108K Batch-ID Engine (ultrastabil) =========
+# ===========  Neue Batch-Engine (Blockweise, schnell) ========
 # ============================================================
 
-async def get_all_person_ids() -> list[str]:
+async def get_persons_by_batch_ids(batch_field_key: str, batch_values: list[str]) -> list[dict]:
     """
-    Lädt nur Person-IDs – minimaler Speicherverbrauch.
+    Neue, extrem schnelle und RAM-sichere Batch-Engine.
+    
+    1) Blockweise Personen laden (je 500)
+    2) Batch-Feld direkt im Block filtern
+    3) Nur gefilterte Personen vollständig nachladen
     """
-    out = []
-    start = 0
-    limit = 500
 
+    batch_values = [v.strip() for v in batch_values if v.strip()]
+    block_size = 500
+    start = 0
+    matched_ids = []
+
+    # 1) PERSONEN BLOCKWEISE LADEN
     while True:
         url = append_token(
-            f"{PIPEDRIVE_API}/persons?start={start}&limit={limit}&fields=id"
+            f"{PIPEDRIVE_API}/persons?"
+            f"start={start}&limit={block_size}&"
+            f"fields=id,name,organization,first_name,last_name,emails,{batch_field_key}"
         )
         r = await http_client().get(url, headers=get_headers())
         r.raise_for_status()
 
         data = r.json().get("data") or []
         if not data:
-            break
+            break  # fertig
 
+        # → Batch-Feld extrahieren und filtern
         for p in data:
-            out.append(str(p["id"]))
+            val = extract_custom_field(p, batch_field_key)
+            if val in batch_values:
+                matched_ids.append(str(p["id"]))
 
-        if len(data) < limit:
-            break
+        if len(data) < block_size:
+            break  # Ende
+        start += block_size
 
-        start += limit
+    print(f"[INFO] Batch-Feld Treffer IDs: {len(matched_ids)}")
 
-    return out
+    # 2) DETAILS NACHLADEN – aber nur für die gefilterten IDs
+    details = []
+    sem = asyncio.Semaphore(6)
 
-async def get_batch_value(pid: str, field_key: str):
-    """
-    Holt nur EIN Custom-Feld für EINE Person.
-    Extrem leichtgewichtig und zuverlässig.
-    """
-    url = append_token(f"{PIPEDRIVE_API}/persons/{pid}?fields={field_key}")
-    r = await http_client().get(url, headers=get_headers())
-    if r.status_code != 200:
-        return None
-
-    d = r.json().get("data") or {}
-    return extract_custom_field(d, field_key)
-
-async def get_person_ids_for_batch(batch_field_key: str, batch_values: list[str]) -> list[str]:
-    """
-    RAM-stabil: filtert Personen-ID für ID über mini API-Calls.
-    """
-    all_ids = await get_all_person_ids()
-    batch_values = [v.strip() for v in batch_values if v.strip()]
-    out = []
-
-    sem = asyncio.Semaphore(5)  # Parallelität für Geschwindigkeit
-
-    async def check(pid):
+    async def load(pid):
         async with sem:
-            val = await get_batch_value(pid, batch_field_key)
-            if str(val) in batch_values:
-                out.append(pid)
-
-    await asyncio.gather(*[check(pid) for pid in all_ids])
-    return out
-
-
-async def fetch_person_details(person_ids: List[str]) -> List[dict]:
-    """
-    Schritt 3:
-    Vollständige Personendetails nachladen.
-    Parallelisiert und gedrosselt (Render-sicher).
-    """
-    out = []
-    sem = asyncio.Semaphore(10)
-
-    async def fetch_one(pid):
-        async with sem:
-            url = append_token(f"{PIPEDRIVE_API}/persons/{pid}")
+            url = append_token(
+                f"{PIPEDRIVE_API}/persons/{pid}?"
+                f"fields=id,name,first_name,last_name,emails,organization,"
+                f"{batch_field_key}"
+            )
             r = await http_client().get(url, headers=get_headers())
             if r.status_code == 200:
                 d = r.json().get("data")
                 if d:
-                    out.append(d)
-            await asyncio.sleep(0.1)
+                    details.append(d)
+            await asyncio.sleep(0.05)
 
-    await asyncio.gather(*[fetch_one(pid) for pid in person_ids])
-    return out
+    await asyncio.gather(*[load(pid) for pid in matched_ids])
 
-
-async def get_persons_by_batch_ids(batch_field_key: str, batch_values: list[str]) -> list[dict]:
-    """
-    Hauptfunktion:
-    - ID-Liste anhand Batch-Feld (100 % exakt)
-    - danach vollständige Personendetails
-    """
-    ids = await get_person_ids_for_batch(batch_field_key, batch_values)
-    print(f"[INFO] Batch-Feld Treffer IDs: {len(ids)}")
-
-    details = await fetch_person_details(ids)
     print(f"[INFO] Vollständige Personen geladen: {len(details)}")
 
     return details
+
+
+
 # ============================================================
 # =============   DATABASE + EXPORT UTILITIES   ==============
 # ============================================================
