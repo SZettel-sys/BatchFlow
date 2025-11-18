@@ -186,91 +186,46 @@ def split_name(first: Optional[str], last: Optional[str], full: Optional[str]) -
         return parts[0], ""
     return " ".join(parts[:-1]), parts[-1]
 # ============================================================
-# master_20251119_FINAL.py – Modul 2/6
-# PIPEDRIVE SCAN ENGINE: Filter, Batch-Feld-Suche, Details
+# master_20251119_FINAL.py – Modul 2/6 (NEU – FILTER FIRST)
+# Nachfass lädt Personen zuerst aus Filter 3024, dann Batch-Check
 # ============================================================
 
-# ------------------------------------------------------------
-# PERSONEN-FELDER (Cache)
-# ------------------------------------------------------------
-
-_PERSON_FIELDS_CACHE: Optional[List[dict]] = None
+_PERSON_FIELDS_CACHE = None
 
 async def get_person_fields() -> List[dict]:
-    """Lädt Personenfelder 1× und cached sie."""
     global _PERSON_FIELDS_CACHE
     if _PERSON_FIELDS_CACHE is not None:
         return _PERSON_FIELDS_CACHE
 
     url = append_token(f"{PIPEDRIVE_API}/personFields")
     r = await http_client().get(url, headers=get_headers())
+
     if r.status_code != 200:
-        raise Exception(f"Pipedrive personFields Fehler: {r.text}")
+        raise Exception(f"personFields Fehler: {r.text}")
 
     _PERSON_FIELDS_CACHE = r.json().get("data") or []
     return _PERSON_FIELDS_CACHE
 
 
-def extract_custom_field(person: dict, field_key: str):
-    """
-    Holt stabile Werte aus Custom-Feldern:
-    - direkte Zuordnung
-    - custom_fields
-    - data.custom_fields
-    """
-    # 1) direct
-    if field_key in person:
-        val = person[field_key]
-        if isinstance(val, dict): return val.get("value") or val.get("label")
-        if isinstance(val, list):
-            return (val[0].get("value")
-                    if val and isinstance(val[0], dict)
-                    else (val[0] if val else None))
-        return val
-
-    # 2) person["custom_fields"]
-    cf = person.get("custom_fields") or {}
-    if field_key in cf:
-        val = cf[field_key]
-        if isinstance(val, dict): return val.get("value") or val.get("label")
-        if isinstance(val, list):
-            return (val[0].get("value")
-                    if val and isinstance(val[0], dict)
-                    else (val[0] if val else None))
-        return val
-
-    # 3) person["data"]["custom_fields"]
-    data = person.get("data") or {}
-    cf2 = data.get("custom_fields") or {}
-    if field_key in cf2:
-        val = cf2[field_key]
-        if isinstance(val, dict): return val.get("value") or val.get("label")
-        if isinstance(val, list):
-            return (val[0].get("value")
-                    if val and isinstance(val[0], dict)
-                    else (val[0] if val else None))
-        return val
-
-    return None
-
-
 # ------------------------------------------------------------
-# FILTER-SCANS (2998 / 3024)
+# Filter 3024 – Personen laden (mit Details)
 # ------------------------------------------------------------
 
-async def stream_persons_by_filter(filter_id: int, limit: int = 500) -> AsyncGenerator[List[dict], None]:
-    """
-    Lädt Personen aus einem Pipedrive-Filter (paging), garantiert:
-    - keine Ghost-IDs
-    - keine Archivleichen
-    - 100 % echte Personen
-    """
+async def get_persons_from_filter_detailed(filter_id: int) -> List[dict]:
+    """Lädt Personen vollständig aus einem Pipedrive-Filter."""
+    ids = set()
+    persons = []
+
     start = 0
+    limit = 500
+
+    # 1) IDs sammeln
     while True:
         url = append_token(
-            f"{PIPEDRIVE_API}/persons?filter_id={filter_id}&start={start}&limit={limit}&sort=id"
+            f"{PIPEDRIVE_API}/persons?filter_id={filter_id}&start={start}&limit={limit}&fields=id"
         )
         r = await http_client().get(url, headers=get_headers())
+
         if r.status_code != 200:
             raise Exception(f"Pipedrive Filter Fehler: {r.text}")
 
@@ -278,74 +233,102 @@ async def stream_persons_by_filter(filter_id: int, limit: int = 500) -> AsyncGen
         if not chunk:
             break
 
-        yield chunk
+        for p in chunk:
+            pid = str(p.get("id"))
+            if pid:
+                ids.add(pid)
 
         if len(chunk) < limit:
             break
-
         start += limit
 
+    print(f"[Filter] Filter {filter_id} hat {len(ids)} IDs")
 
-async def get_persons_from_filter(filter_id: int) -> List[dict]:
-    """Aggregiert alle Personen aus /persons?filter_id=…"""
-    out = []
-    async for chunk in stream_persons_by_filter(filter_id):
-        out.extend(chunk)
-    print(f"[Filter] Personen geladen aus Filter {filter_id}: {len(out)}")
-    return out
+    # 2) Details laden (parallel)
+    persons = await fetch_person_details(list(ids))
+    print(f"[Filter] {len(persons)} vollständige Personen geladen")
+
+    return persons
 
 
 # ------------------------------------------------------------
-# BATCH-FELD-PERSONEN (perfekt & schnell)
+# NK-Personen (nur Batch)
+# unverändert! NK bleibt Batch-Feld basiert
 # ------------------------------------------------------------
 
-async def get_persons_by_batch_ids(batch_values: list[str]) -> List[dict]:
+async def get_nk_persons(batch_value: str) -> List[dict]:
+    """Für NK bleibt das Batch-Feld die Hauptquelle."""
+    out = set()
+    start = 0
+
+    while True:
+        url = append_token(
+            f"{PIPEDRIVE_API}/persons/search?"
+            f"field_key={BATCH_FIELD_KEY}&term={batch_value}&exact_match=true"
+            f"&start={start}&limit=100"
+        )
+        r = await http_client().get(url, headers=get_headers())
+        if r.status_code != 200:
+            raise Exception(f"Batch-Suche Fehler: {r.text}")
+
+        items = (r.json().get("data") or {}).get("items") or []
+        if not items:
+            break
+
+        for it in items:
+            pid = it.get("item", {}).get("id")
+            if pid:
+                out.add(str(pid))
+
+        if len(items) < 100:
+            break
+        start += 100
+
+    return await fetch_person_details(list(out))
+
+
+# ------------------------------------------------------------
+# NF-Personen = Filter 3024 Personen + Batch-Feld-Prüfung
+# ------------------------------------------------------------
+
+async def get_nf_persons_filter_first(batch_values: list[str]) -> List[dict]:
     """
-    Holt Personen über persons/search mit field_key=BATCH_FIELD_KEY.
-    Exakt-matchend, keine Vollscans, keine Ghost-IDs.
+    Hauptlogik für NF:
+    - Lade alle Personen aus Filter 3024 (Details)
+    - Prüfe Batch-Feld im Python
     """
-    found_ids = set()
 
-    for batch in batch_values:
-        start = 0
-        limit = 100
-        while True:
-            url = append_token(
-                f"{PIPEDRIVE_API}/persons/search?"
-                f"field_key={BATCH_FIELD_KEY}&term={batch}&exact_match=true"
-                f"&start={start}&limit={limit}"
-            )
+    # 1) hole alle Personen aus Filter 3024
+   persons = await get_nf_persons_filter_first(nf_batch_ids)
 
-            r = await http_client().get(url, headers=get_headers())
-            if r.status_code != 200:
-                raise Exception(f"Pipedrive Batch-Feld-Suche Fehler: {r.text}")
 
-            items = (r.json().get("data") or {}).get("items") or []
-            if not items:
+    valid = []
+
+    # 2) prüfe Batch-Feld
+    for p in persons:
+        val = extract_custom_field(p, BATCH_FIELD_KEY)
+        if not val:
+            continue
+
+        # val kann ein einzelwert oder liste sein → string normalize
+        sval = str(val).strip().lower()
+
+        for b in batch_values:
+            if sval == b.lower().strip():
+                valid.append(p)
                 break
 
-            for it in items:
-                pid = it.get("item", {}).get("id")
-                if pid:
-                    found_ids.add(str(pid))
-
-            if len(items) < limit:
-                break
-
-            start += limit
-
-    print(f"[Batch-Feld] Treffer Gesamt: {len(found_ids)} IDs")
-    return await fetch_person_details(list(found_ids))
+    print(f"[NF] Nach Batch-Check übrig: {len(valid)} Personen")
+    return valid
 
 
 # ------------------------------------------------------------
-# DETAIL-FETCH (100 % stabil)
+# Optimierter Detail-Fetch (alle Module nutzen denselben)
 # ------------------------------------------------------------
 
 async def fetch_person_details(person_ids: List[str]) -> List[dict]:
-    """Lädt vollständige Datensätze parallel (max 15 Requests gleichzeitig)."""
     results = []
-    sem = asyncio.Semaphore(15)
+    sem = asyncio.Semaphore(20)  # stabil & limitfreundlich
 
     async def load_one(pid):
         async with sem:
@@ -355,12 +338,12 @@ async def fetch_person_details(person_ids: List[str]) -> List[dict]:
                 data = r.json().get("data")
                 if data:
                     results.append(data)
-
-            await asyncio.sleep(0.05)  # Eventloop entlasten
+        await asyncio.sleep(0.03)
 
     await asyncio.gather(*[load_one(pid) for pid in person_ids])
-    print(f"[Details] Vollständige Personen geladen: {len(results)}")
+
     return results
+
 # ============================================================
 # master_20251119_FINAL.py – Modul 3/6
 # Nachfass: Master-Datenaufbau (NF-Master)
@@ -372,6 +355,19 @@ async def _build_nf_master_final(
     campaign: str,
     job_obj=None
 ) -> pd.DataFrame:
+    
+    if job_obj:
+        job_obj.phase = "Filter 3024 laden …"
+        job_obj.percent = 10
+
+    # 🔥 Filter-First:
+    persons = await get_nf_persons_filter_first(nf_batch_ids)
+
+    print(f"[NF] NF-Personen nach Filter+Batch: {len(persons)}")
+
+    if job_obj:
+        job_obj.phase = "Verarbeite Nachfass-Daten …"
+        job_obj.percent = 30
 
     # --------------------------------------------------------
     # 1) Personenfelder für Mapping laden
@@ -1157,6 +1153,68 @@ async def debug_batch(batch_id: str):
     persons = await get_persons_by_batch_ids([batch_id])
     return {"batch_id": batch_id, "count": len(persons)}
 
+# ============================================================
+# NF Diagnose Tool
+# ============================================================
+
+@app.get("/debug/nf_inspect", response_class=JSONResponse)
+async def debug_nf_inspect(batch: str):
+
+    batch = batch.strip().lower()
+    if not batch:
+        return {"error": "Bitte ?batch=B443 angeben"}
+
+    # 1) Lade Personen aus Filter 3024 (DETAILS!)
+    filter_persons = await get_persons_from_filter_detailed(FILTER_NACHFASS)
+    count_filter = len(filter_persons)
+
+    # 2) Prüfe Batch-Feld direkt
+    matched = []
+    no_batch_field = []
+    wrong_batch = []
+
+    for p in filter_persons:
+        pid = str(p.get("id"))
+        name = p.get("name")
+        org = (p.get("organization") or {}).get("name", "-")
+
+        val = extract_custom_field(p, BATCH_FIELD_KEY)
+
+        if not val:
+            no_batch_field.append({
+                "id": pid, "name": name, "org": org,
+                "reason": "Kein Batch-Feld gesetzt"
+            })
+            continue
+
+        sval = str(val).strip().lower()
+
+        if sval == batch:
+            matched.append({
+                "id": pid, "name": name, "org": org,
+                "batch_value": sval
+            })
+        else:
+            wrong_batch.append({
+                "id": pid, "name": name, "org": org,
+                "batch_value": sval
+            })
+
+    # 3) Zusammenfassung
+    return {
+        "batch_requested": batch,
+        "filter_3024_total": count_filter,
+
+        "matched_batch": len(matched),
+        "without_batch_field": len(no_batch_field),
+        "batch_mismatch": len(wrong_batch),
+
+        "details": {
+            "matched": matched,
+            "no_batch_field": no_batch_field,
+            "wrong_batch": wrong_batch,
+        }
+    }
 
 # ------------------------------------------------------------
 # Fallback → Kampagnenseite
