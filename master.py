@@ -32,8 +32,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 # ============================================================
 
 PIPEDRIVE_API = "https://api.pipedrive.com/v1"
-# PIPEDRIVE_TOKEN = os.getenv("PIPEDRIVE_TOKEN", "")
-PIPEDRIVE_TOKEN = "9a4b406edd6fa501a48e4832906866643950edbe"
+PIPEDRIVE_TOKEN = os.getenv("PD_API_TOKEN", "")
 BATCH_FIELD_KEY = "5ac34dad3ea917fdef4087caebf77ba275f87eec"   # korrektes Batch-ID Feld
 DEFAULT_CHANNEL = "E-Mail"
 
@@ -66,8 +65,8 @@ def append_token(url: str) -> str:
     if "api_token=" in url:
         return url
     if "?" in url:
-        return url + f"&api_token={PIPEDRIVE_TOKEN}"
-    return url + f"?api_token={PIPEDRIVE_TOKEN}"
+        return url + f"&api_token={PD_API_TOKEN}"
+    return url + f"?api_token={PD_API_TOKEN}"
 
 
 def get_headers():
