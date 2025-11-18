@@ -273,57 +273,60 @@ async def fetch_person_details(person_ids: List[str]) -> List[dict]:
     return results
 
 # ============================================================
-# HIGH-END STREAM PRODUCER – Parallel Filter Loader
+# HYBRID STREAM PRODUCER (Pipedrive-safe)
+# Sequential pages → but streamed immediately
 # ============================================================
 
-async def stream_filter_ids(filter_id: int, max_workers: int = 6):
+async def stream_filter_ids(filter_id: int, limit: int = 500):
     """
-    Lädt Personen-IDs aus Filter 3024 extrem schnell:
-    - mehrere Pages gleichzeitig
-    - adaptive Retry
-    - Streaming Queue
+    Pipedrive-sicherer Filter-Loader:
+    - keine parallelen Page-Requests (verhindert 429)
+    - aber streamt IDs sofort weiter
+    - extrem stabil
     """
 
-    limit = 500
     queue = asyncio.Queue()
-    done_flag = False
 
-    async def page_worker(start_index):
-        nonlocal done_flag
-        while not done_flag:
+    async def producer():
+        start = 0
 
+        while True:
             url = append_token(
-                f"{PIPEDRIVE_API}/persons?filter_id={filter_id}&start={start_index}&limit={limit}&fields=id"
+                f"{PIPEDRIVE_API}/persons?filter_id={filter_id}"
+                f"&start={start}&limit={limit}&fields=id"
             )
 
             r = await safe_request("GET", url, headers=get_headers())
             data = r.json().get("data") or []
 
-            # In Queue legen
+            # in Stream Queue legen
             await queue.put(data)
 
+            # Ende des Filters
             if len(data) < limit:
-                done_flag = True
-                return
-
-            start_index += limit
-
-    # Worker starten (6 gleichzeitig)
-    tasks = [asyncio.create_task(page_worker(i * limit)) for i in range(max_workers)]
-
-    async def generator():
-        # So lange Worker laufen: streamen
-        while True:
-            if all(t.done() for t in tasks) and queue.empty():
                 break
 
-            try:
-                items = await asyncio.wait_for(queue.get(), timeout=1)
-                yield items
-            except asyncio.TimeoutError:
-                continue
+            start += limit
+
+            # Minimales Delay, verhindert Soft-Limits/429
+            await asyncio.sleep(0.003)
+
+        # Endsignal
+        await queue.put(None)
+
+    # Producer starten
+    asyncio.create_task(producer())
+
+    # Generator für den Consumer zurückgeben
+    async def generator():
+        while True:
+            batch = await queue.get()
+            if batch is None:
+                break
+            yield batch
 
     return generator()
+
 # ============================================================
 # HIGH-END STREAM CONSUMER – Smart Batch Detail Loader
 # ============================================================
