@@ -32,7 +32,8 @@ from fastapi.middleware.gzip import GZipMiddleware
 # ============================================================
 
 PIPEDRIVE_API = "https://api.pipedrive.com/v1"
-PIPEDRIVE_TOKEN = os.getenv("PIPEDRIVE_TOKEN", "")
+# PIPEDRIVE_TOKEN = os.getenv("PIPEDRIVE_TOKEN", "")
+PIPEDRIVE_TOKEN = "9a4b406edd6fa501a48e4832906866643950edbe"
 BATCH_FIELD_KEY = "5ac34dad3ea917fdef4087caebf77ba275f87eec"   # korrektes Batch-ID Feld
 DEFAULT_CHANNEL = "E-Mail"
 
