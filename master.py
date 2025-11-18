@@ -185,14 +185,20 @@ def split_name(first: Optional[str], last: Optional[str], full: Optional[str]) -
     if len(parts) == 1:
         return parts[0], ""
     return " ".join(parts[:-1]), parts[-1]
+
 # ============================================================
-# master_20251119_FINAL.py – Modul 2/6 (NEU – FILTER FIRST)
-# Nachfass lädt Personen zuerst aus Filter 3024, dann Batch-Check
+# master_20251119_FINAL.py – Modul 2/6 (FINAL)
+# Filter-First Nachfass Engine + Batch-Feld Matching
 # ============================================================
 
-_PERSON_FIELDS_CACHE = None
+# ------------------------------------------------------------
+# PERSONEN-FELDER (Cache)
+# ------------------------------------------------------------
+
+_PERSON_FIELDS_CACHE: Optional[List[dict]] = None
 
 async def get_person_fields() -> List[dict]:
+    """Lädt Personenfelder 1× und cached sie."""
     global _PERSON_FIELDS_CACHE
     if _PERSON_FIELDS_CACHE is not None:
         return _PERSON_FIELDS_CACHE
@@ -207,22 +213,64 @@ async def get_person_fields() -> List[dict]:
     return _PERSON_FIELDS_CACHE
 
 
+def extract_custom_field(person: dict, field_key: str):
+    """Liest ein Custom-Feld robust aus mehreren möglichen Stellen."""
+    # 1) Direkt im Person-Objekt
+    if field_key in person:
+        val = person[field_key]
+        if isinstance(val, dict):
+            return val.get("value") or val.get("label")
+        if isinstance(val, list):
+            return (
+                val[0].get("value") if val and isinstance(val[0], dict)
+                else (val[0] if val else None)
+            )
+        return val
+
+    # 2) person["custom_fields"]
+    cf = person.get("custom_fields") or {}
+    if field_key in cf:
+        val = cf[field_key]
+        if isinstance(val, dict):
+            return val.get("value") or val.get("label")
+        if isinstance(val, list):
+            return (
+                val[0].get("value") if val and isinstance(val[0], dict)
+                else (val[0] if val else None)
+            )
+        return val
+
+    # 3) person["data"]["custom_fields"]
+    data = person.get("data") or {}
+    cf2 = data.get("custom_fields") or {}
+    if field_key in cf2:
+        val = cf2[field_key]
+        if isinstance(val, dict):
+            return val.get("value") or val.get("label")
+        if isinstance(val, list):
+            return (
+                val[0].get("value") if val and isinstance(val[0], dict)
+                else (val[0] if val else None)
+            )
+        return val
+
+    return None
+
+
 # ------------------------------------------------------------
-# Filter 3024 – Personen laden (mit Details)
+# FILTER 3024 – ID-LISTE laden
 # ------------------------------------------------------------
 
-async def get_persons_from_filter_detailed(filter_id: int) -> List[dict]:
-    """Lädt Personen vollständig aus einem Pipedrive-Filter."""
+async def get_ids_from_filter(filter_id: int) -> set[str]:
+    """Lädt nur IDs (ohne Details) aus einem Pipedrive-Filter."""
     ids = set()
-    persons = []
-
     start = 0
     limit = 500
 
-    # 1) IDs sammeln
     while True:
         url = append_token(
-            f"{PIPEDRIVE_API}/persons?filter_id={filter_id}&start={start}&limit={limit}&fields=id"
+            f"{PIPEDRIVE_API}/persons?filter_id={filter_id}"
+            f"&start={start}&limit={limit}&fields=id"
         )
         r = await http_client().get(url, headers=get_headers())
 
@@ -242,23 +290,30 @@ async def get_persons_from_filter_detailed(filter_id: int) -> List[dict]:
             break
         start += limit
 
-    print(f"[Filter] Filter {filter_id} hat {len(ids)} IDs")
+    print(f"[Filter] IDs aus Filter {filter_id}: {len(ids)}")
+    return ids
 
-    # 2) Details laden (parallel)
+
+# ------------------------------------------------------------
+# FILTER 3024 – Komplett laden (mit Details!)
+# ------------------------------------------------------------
+
+async def get_persons_from_filter_detailed(filter_id: int) -> List[dict]:
+    """Lädt vollständige Personendetails der IDs aus einem Filter."""
+    ids = await get_ids_from_filter(filter_id)
     persons = await fetch_person_details(list(ids))
-    print(f"[Filter] {len(persons)} vollständige Personen geladen")
-
+    print(f"[Filter] Vollständige Details geladen: {len(persons)} Personen")
     return persons
 
 
 # ------------------------------------------------------------
-# NK-Personen (nur Batch)
-# unverändert! NK bleibt Batch-Feld basiert
+# NEUKONTAKTE (NK) – Batch-Feld Suche (exakt)
 # ------------------------------------------------------------
 
 async def get_nk_persons(batch_value: str) -> List[dict]:
-    """Für NK bleibt das Batch-Feld die Hauptquelle."""
-    out = set()
+    """Neukontakte: Batch-Feld ist Hauptfilter."""
+    batch_value_clean = batch_value.strip().lower()
+    ids = set()
     start = 0
 
     while True:
@@ -278,57 +333,54 @@ async def get_nk_persons(batch_value: str) -> List[dict]:
         for it in items:
             pid = it.get("item", {}).get("id")
             if pid:
-                out.add(str(pid))
+                ids.add(str(pid))
 
         if len(items) < 100:
             break
         start += 100
 
-    return await fetch_person_details(list(out))
+    print(f"[NK] Batch-Feld IDs: {len(ids)}")
+    return await fetch_person_details(list(ids))
 
 
 # ------------------------------------------------------------
-# NF-Personen = Filter 3024 Personen + Batch-Feld-Prüfung
+# NACHFASS (NF) – Filter 3024 + Batch-Feld Prüfung (Filter-First)
 # ------------------------------------------------------------
 
 async def get_nf_persons_filter_first(batch_values: list[str]) -> List[dict]:
     """
-    Hauptlogik für NF:
-    - Lade alle Personen aus Filter 3024 (Details)
-    - Prüfe Batch-Feld im Python
+    NF-Strategie:
+    - Zuerst ALLE Personen aus Filter 3024 laden
+    - Dann Batch-Feld in Python prüfen
     """
 
-    # 1) hole alle Personen aus Filter 3024
-    persons = await get_nf_persons_filter_first(nf_batch_ids)
-
+    persons = await get_persons_from_filter_detailed(FILTER_NACHFASS)
+    batchnorm = [b.strip().lower() for b in batch_values]
 
     valid = []
 
-    # 2) prüfe Batch-Feld
     for p in persons:
         val = extract_custom_field(p, BATCH_FIELD_KEY)
         if not val:
             continue
 
-        # val kann ein einzelwert oder liste sein → string normalize
         sval = str(val).strip().lower()
 
-        for b in batch_values:
-            if sval == b.lower().strip():
-                valid.append(p)
-                break
+        if sval in batchnorm:
+            valid.append(p)
 
     print(f"[NF] Nach Batch-Check übrig: {len(valid)} Personen")
     return valid
 
 
 # ------------------------------------------------------------
-# Optimierter Detail-Fetch (alle Module nutzen denselben)
+# DETAIL-FETCH (parallel, limitfreundlich)
 # ------------------------------------------------------------
 
 async def fetch_person_details(person_ids: List[str]) -> List[dict]:
+    """Lädt Personendetails parallel mit Limit-Semaphore."""
     results = []
-    sem = asyncio.Semaphore(20)  # stabil & limitfreundlich
+    sem = asyncio.Semaphore(20)
 
     async def load_one(pid):
         async with sem:
@@ -341,7 +393,6 @@ async def fetch_person_details(person_ids: List[str]) -> List[dict]:
         await asyncio.sleep(0.03)
 
     await asyncio.gather(*[load_one(pid) for pid in person_ids])
-
     return results
 
 # ============================================================
