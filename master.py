@@ -207,120 +207,136 @@ def df_to_file_response(df: pd.DataFrame, filename: str) -> FileResponse:
     df.to_csv(path, index=False)
     return FileResponse(path, filename=filename, media_type="text/csv")
 
+
 # ============================================================
-# =============  BatchEngine V5 – DETAIL-MATCH  ===============
+# =============  BatchEngine V6 – UNIVERSAL SCAN  ============
 # ============================================================
 
-BLOCK_SIZE = 500
-PARALLEL_DETAILS = 10      # Anzahl paralleler Detailrequests
-DETAIL_DELAY = 0.025       # 25ms – schützt vor Rate-Limit
+LIST_LIMIT = 5000            # große Pages → schneller
+DETAIL_PARALLEL = 20         # viele Details auf einmal
+DETAIL_RETRY_DELAY = 0.25    # Wartezeit bei Rate-Limit
+DETAIL_MAX_RETRIES = 3       # maximale Wiederholungen
 
 
-async def fetch_id_block(start: int) -> list[str]:
+async def fetch_person_chunk(start: int) -> list[dict]:
     """
-    Holt NUR die IDs der Personen.
-    Pipedrive liefert hierbei schnell & zuverlässig.
+    Holt eine Page Personen – völlig ohne total_count.
+    Kompatibel zu deiner Pipedrive-Version.
     """
     url = append_token(
-        f"{PIPEDRIVE_API}/persons?"
-        f"start={start}&limit={BLOCK_SIZE}&"
-        f"fields=id"
+        f"{PIPEDRIVE_API}/persons?start={start}&limit={LIST_LIMIT}"
     )
+
     r = await http_client().get(url, headers=get_headers())
     if r.status_code != 200:
+        print("[V6] LIST-ERROR:", r.status_code, r.text)
         return []
 
     data = r.json().get("data") or []
-    return [str(p["id"]) for p in data]
+    return data
 
 
-async def get_all_person_ids() -> list[str]:
+
+async def get_all_persons_list() -> list[dict]:
     """
-    Holt ALLE Personen-IDs, blockweise.
-    Schnell, RAM-sicher.
-    """
-
-    # 1) Gesamtzahl bestimmen
-    meta_url = append_token(f"{PIPEDRIVE_API}/persons?start=0&limit=1&fields=id")
-    meta = await http_client().get(meta_url, headers=get_headers())
-    total = meta.json().get("additional_data", {}).get("pagination", {}).get("total_count", 0)
-
-    print(f"[BatchEngine V5] Gesamtpersonen in Pipedrive: {total}")
-
-    starts = list(range(0, total + 1, BLOCK_SIZE))
-
-    ids = []
-    sem = asyncio.Semaphore(6)
-
-    async def load_block(start):
-        async with sem:
-            block_ids = await fetch_id_block(start)
-            ids.extend(block_ids)
-
-    await asyncio.gather(*[load_block(s) for s in starts])
-
-    print(f"[BatchEngine V5] IDs geladen: {len(ids)}")
-
-    return ids
-
-
-
-async def get_person_details_if_batch_match(pid: str, batch_values: list[str]):
-    """
-    Holt Detaildaten einer Person und prüft,
-    ob das Batch-Feld zu unseren Batch-IDs passt.
+    Lädt ALLE Personen aus Pipedrive.
+    total_count existiert bei dir nicht → dynamisches Paging.
     """
 
+    all_data = []
+    start = 0
+
+    print("[BatchEngine V6] Starte LIST-Scan...")
+
+    while True:
+        chunk = await fetch_person_chunk(start)
+        cnt = len(chunk)
+
+        print(f"[V6] Chunk start={start}, count={cnt}")
+
+        if cnt == 0:
+            break
+
+        all_data.extend(chunk)
+
+        # keine weiteren Seiten
+        if cnt < LIST_LIMIT:
+            break
+
+        start += LIST_LIMIT
+
+    print(f"[BatchEngine V6] LIST: {len(all_data)} Personen geladen")
+    return all_data
+
+
+
+async def fetch_person_detail(pid: str) -> dict | None:
+    """
+    Holt Detaildaten (inkl. Custom Felder).
+    Mit 429 Retry-Schutz.
+    """
     url = append_token(f"{PIPEDRIVE_API}/persons/{pid}?fields=*")
-    r = await http_client().get(url, headers=get_headers())
-    if r.status_code != 200:
+
+    for attempt in range(DETAIL_MAX_RETRIES):
+        r = await http_client().get(url, headers=get_headers())
+
+        if r.status_code == 200:
+            return r.json().get("data") or None
+
+        if r.status_code == 429:
+            await asyncio.sleep(DETAIL_RETRY_DELAY)
+            continue
+
+        print("[V6] DETAIL-ERROR:", pid, r.status_code)
         return None
 
-    d = r.json().get("data") or {}
-
-    val = extract_custom_field(d, BATCH_FIELD_KEY)
-
-    # Passt die Batch-ID?
-    if val in batch_values:
-        return d
-
+    print("[V6] DETAIL-FAIL:", pid)
     return None
 
 
 
-async def get_persons_by_batch_ids(batch_field_key: str, batch_values: list[str]) -> list[dict]:
+async def get_persons_by_batch_ids_v6(batch_field_key: str, batch_values: list[str]) -> list[dict]:
     """
-    BatchEngine V5:
-
-    1. Holt alle Personen-IDs (blockweise)
-    2. Lädt die Detaildaten NUR für IDs, bei denen die Batch-ID passt
-    3. Maximal parallelisiert, aber sicher (wegen Pipedrive-Limits)
-
-    → Funktioniert für ALLE Feldtypen
-    → Auch wenn /persons Textfelder NICHT liefert
+    V6 Matching:
+    1. Alle Personen (LIST) → IDs extrahieren
+    2. Detaildaten laden
+    3. Batch-Feld prüfen
     """
 
-    # 1: IDs holen
-    ids = await get_all_person_ids()
+    # -----------------------------
+    # 1: Liste laden
+    # -----------------------------
+    persons_list = await get_all_persons_list()
 
-    print(f"[BatchEngine V5] Starte Detailprüfung...")
+    ids = [
+        str(p.get("id"))
+        for p in persons_list
+        if p.get("id")
+    ]
+    print(f"[BatchEngine V6] IDs extrahiert: {len(ids)}")
 
-    # 2: Detailprüfung
-    details = []
-    sem = asyncio.Semaphore(PARALLEL_DETAILS)
+    # -----------------------------
+    # 2: Detail-Scan
+    # -----------------------------
+    print("[BatchEngine V6] Starte DETAIL-Scan...")
+
+    matched = []
+    sem = asyncio.Semaphore(DETAIL_PARALLEL)
 
     async def process_id(pid):
         async with sem:
-            d = await get_person_details_if_batch_match(pid, batch_values)
-            if d:
-                details.append(d)
-            await asyncio.sleep(DETAIL_DELAY)
+            d = await fetch_person_detail(pid)
+            if not d:
+                return
+            val = extract_custom_field(d, batch_field_key)
+            if val in batch_values:
+                matched.append(d)
 
     await asyncio.gather(*[process_id(pid) for pid in ids])
 
-    print(f"[BatchEngine V5] Batch-Treffer: {len(details)}")
+    print(f"[BatchEngine V6] TREFFER: {len(matched)}")
 
-    return details
+    return matched
 
 # ============================================================
 # =============  NEUKONTAKTE – EXPORT LOGIK  ================
@@ -335,7 +351,7 @@ async def build_nk_export(batch_id: str, campaign: str, job_id: str) -> pd.DataF
     update_job(job_id, phase="Lade Personen (Batch V5)", percent=10)
 
     # Personen anhand EINER Batch-ID holen
-    persons = await get_persons_by_batch_ids(BATCH_FIELD_KEY, [batch_id])
+    persons = await get_persons_by_batch_ids_v6(BATCH_FIELD_KEY, [batch_id])
 
     update_job(job_id, phase="Verarbeite Datensätze", percent=40)
 
@@ -494,7 +510,8 @@ async def build_nf_export(nf_batch_ids: list[str], batch_id: str, campaign: str,
     update_job(job_id, phase="Lade Personen (Batch V5)", percent=10)
 
     # 1) Alle relevanten Personen laden
-    persons = await get_persons_by_batch_ids(BATCH_FIELD_KEY, nf_batch_ids)
+    persons = await get_persons_by_batch_ids_v6(BATCH_FIELD_KEY, nf_batch_ids)
+ 
 
     update_job(job_id, phase="Feld-Mapping vorbereiten", percent=25)
 
