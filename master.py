@@ -224,8 +224,7 @@ async def fetch_person_block(start: int, batch_field_key: str):
     url = append_token(
         f"{PIPEDRIVE_API}/persons?"
         f"start={start}&limit={BLOCK_SIZE}&"
-        f"fields=id,name,organization,"
-        f"first_name,last_name,emails,{batch_field_key}"
+        f"fields=*"
     )
     r = await http_client().get(url, headers=get_headers())
     if r.status_code != 200:
@@ -296,7 +295,7 @@ async def get_persons_by_batch_ids(batch_field_key: str, batch_values: list[str]
         async with sem:
             url = append_token(
                 f"{PIPEDRIVE_API}/persons/{pid}?"
-                f"fields=id,name,first_name,last_name,emails,organization,{batch_field_key}"
+                f"fields=*"
             )
             r = await http_client().get(url, headers=get_headers())
             if r.status_code == 200:
