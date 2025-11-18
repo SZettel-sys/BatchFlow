@@ -136,15 +136,9 @@ def extract_custom_field(person: dict, field_key: str):
 # =========  NEUE 108K Batch-ID Engine (ultrastabil) =========
 # ============================================================
 
-async def get_all_person_ids_with_batch(batch_field_key: str) -> list[dict]:
+async def get_all_person_ids() -> list[str]:
     """
-    Lädt ALLE Personen, aber nur:
-    - id
-    - batch_field_key (z. B. "5ac34dad3ea917...")
-    
-    Vorteil:
-    - extrem geringer Speicherverbrauch
-    - perfekt für >100.000 Personen
+    Lädt nur Person-IDs – minimaler Speicherverbrauch.
     """
     out = []
     start = 0
@@ -152,8 +146,7 @@ async def get_all_person_ids_with_batch(batch_field_key: str) -> list[dict]:
 
     while True:
         url = append_token(
-            f"{PIPEDRIVE_API}/persons?start={start}&limit={limit}"
-            f"&fields=id,{batch_field_key}"
+            f"{PIPEDRIVE_API}/persons?start={start}&limit={limit}&fields=id"
         )
         r = await http_client().get(url, headers=get_headers())
         r.raise_for_status()
@@ -162,7 +155,8 @@ async def get_all_person_ids_with_batch(batch_field_key: str) -> list[dict]:
         if not data:
             break
 
-        out.extend(data)
+        for p in data:
+            out.append(str(p["id"]))
 
         if len(data) < limit:
             break
@@ -171,33 +165,37 @@ async def get_all_person_ids_with_batch(batch_field_key: str) -> list[dict]:
 
     return out
 
+async def get_batch_value(pid: str, field_key: str):
+    """
+    Holt nur EIN Custom-Feld für EINE Person.
+    Extrem leichtgewichtig und zuverlässig.
+    """
+    url = append_token(f"{PIPEDRIVE_API}/persons/{pid}?fields={field_key}")
+    r = await http_client().get(url, headers=get_headers())
+    if r.status_code != 200:
+        return None
+
+    d = r.json().get("data") or {}
+    return extract_custom_field(d, field_key)
 
 async def get_person_ids_for_batch(batch_field_key: str, batch_values: list[str]) -> list[str]:
     """
-    Schritt 2:
-    Filtert durch ALLE Personen anhand des Batch-Feldwertes.
-    100 % exakt, unabhängig von Pipedrive-Indexierung.
+    RAM-stabil: filtert Personen-ID für ID über mini API-Calls.
     """
-    all_people = await get_all_person_ids_with_batch(batch_field_key)
+    all_ids = await get_all_person_ids()
     batch_values = [v.strip() for v in batch_values if v.strip()]
-    ids = []
+    out = []
 
-    for p in all_people:
-        val = extract_custom_field(p, batch_field_key)
-       
-        # Pipedrive liefert Custom-Felder in verschiedenen Formaten
-        if isinstance(val, dict):
-            val = val.get("value")
-        if isinstance(val, list) and val:
-            if isinstance(val[0], dict):
-                val = val[0].get("value")
-            else:
-                val = val[0]
+    sem = asyncio.Semaphore(5)  # Parallelität für Geschwindigkeit
 
-        if str(val) in batch_values:
-            ids.append(str(p["id"]))
+    async def check(pid):
+        async with sem:
+            val = await get_batch_value(pid, batch_field_key)
+            if str(val) in batch_values:
+                out.append(pid)
 
-    return ids
+    await asyncio.gather(*[check(pid) for pid in all_ids])
+    return out
 
 
 async def fetch_person_details(person_ids: List[str]) -> List[dict]:
@@ -217,7 +215,7 @@ async def fetch_person_details(person_ids: List[str]) -> List[dict]:
                 d = r.json().get("data")
                 if d:
                     out.append(d)
-            await asyncio.sleep(0.03)
+            await asyncio.sleep(0.1)
 
     await asyncio.gather(*[fetch_one(pid) for pid in person_ids])
     return out
@@ -907,6 +905,13 @@ async def nachfass_home():
     </html>
     """)
 
+@app.get("/debug/person/{pid}")
+async def debug_person(pid: str):
+    url = append_token(
+    f"{PIPEDRIVE_API}/persons/{pid}?fields=id,name,organization,first_name,last_name,emails,{BATCH_FIELD_KEY}"
+)
+    r = await http_client().get(url, headers=get_headers())
+    return r.json()
 
 # ============================================================
 # ===============   CATCH-ALL (Keine Loops!)   ================
