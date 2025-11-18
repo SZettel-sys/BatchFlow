@@ -294,8 +294,7 @@ async def get_persons_by_batch_ids(batch_field_key: str, batch_values: list[str]
     async def load_details(pid):
         async with sem:
             url = append_token(
-                f"{PIPEDRIVE_API}/persons/{pid}?"
-                f"fields=*"
+                f"{PIPEDRIVE_API}/persons/{pid}?fields=*"
             )
             r = await http_client().get(url, headers=get_headers())
             if r.status_code == 200:
