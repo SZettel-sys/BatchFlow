@@ -251,7 +251,7 @@ async def fetch_person_details(person_ids: List[str]) -> List[dict]:
     chunks = [person_ids[i:i + chunk_size] for i in range(0, len(person_ids), chunk_size)]
 
     # Semaphore → bis zu 20 gleichzeitige Requests pro Chunk
-    sem = asyncio.Semaphore(20)
+    sem = asyncio.Semaphore(40)
 
     async def load_one(pid):
         async with sem:
@@ -271,36 +271,6 @@ async def fetch_person_details(person_ids: List[str]) -> List[dict]:
         await asyncio.gather(*(load_one(pid) for pid in chunk))
 
     return results
-
-
-
-
-# ============================================================
-# HIGH-END STREAM ORCHESTRATOR
-# Kombiniert Producer + Consumer → 10× schneller als normal
-# ============================================================
-
-async def get_persons_from_filter_detailed(filter_id: int) -> List[dict]:
-    """
-    High-End Pipeline:
-    - Lädt Filter 3024 über parallele Page-Producer
-    - Streamt IDs live zum Consumer
-    - Lädt Details sofort in Smart-Batches
-    - Kein Warten mehr auf "alle IDs"
-    """
-
-    print(f"[Stream] Starte High-End Stream Pipeline für Filter {filter_id} …")
-
-    # 1) Producer vorbereiten
-    generator = await stream_filter_ids(filter_id)
-
-    # 2) Consumer starten (Chunk 50)
-    persons = await consume_filter_stream_and_load_details(generator, batch_size=50)
-
-    print(f"[Stream] Pipeline abgeschlossen. Geladene Personen: {len(persons)}")
-
-    return persons
-
 
 # ============================================================
 # HIGH-END STREAM PRODUCER – Parallel Filter Loader
@@ -410,6 +380,36 @@ async def consume_filter_stream_and_load_details(generator, batch_size=50):
     return results
 
 
+
+# ============================================================
+# HIGH-END STREAM ORCHESTRATOR
+# Kombiniert Producer + Consumer → 10× schneller als normal
+# ============================================================
+
+async def get_persons_from_filter_detailed(filter_id: int) -> List[dict]:
+    """
+    High-End Pipeline:
+    - Lädt Filter 3024 über parallele Page-Producer
+    - Streamt IDs live zum Consumer
+    - Lädt Details sofort in Smart-Batches
+    - Kein Warten mehr auf "alle IDs"
+    """
+
+    print(f"[Stream] Starte High-End Stream Pipeline für Filter {filter_id} …")
+
+    # 1) Producer vorbereiten
+    generator = await stream_filter_ids(filter_id)
+
+    # 2) Consumer starten (Chunk 50)
+    persons = await consume_filter_stream_and_load_details(generator, batch_size=50)
+
+    print(f"[Stream] Pipeline abgeschlossen. Geladene Personen: {len(persons)}")
+
+    return persons
+
+
+
+
 # ------------------------------------------------------------
 # NK ENGINE – Batch-Feld exakte Suche
 # ------------------------------------------------------------
@@ -473,6 +473,35 @@ async def get_nf_persons_filter_first(batch_values: list[str]) -> List[dict]:
 
     print(f"[NF] Nach Batch-Check übrig: {len(valid)} Personen")
     return valid
+# ------------------------------------------------------------
+# SIMPLE ID FETCHER FÜR FILTER (wird in Reconcile benötigt)
+# ------------------------------------------------------------
+async def get_ids_from_filter(filter_id: int, limit: int = 500) -> set[str]:
+    ids = set()
+    start = 0
+
+    while True:
+        url = append_token(
+            f"{PIPEDRIVE_API}/persons?filter_id={filter_id}&start={start}&limit={limit}&fields=id"
+        )
+        r = await safe_request("GET", url, headers=get_headers())
+
+        data = (r.json().get("data") or [])
+        if not data:
+            break
+
+        for item in data:
+            pid = item.get("id")
+            if pid:
+                ids.add(str(pid))
+
+        if len(data) < limit:
+            break
+
+        start += limit
+
+    return ids
+
 # ============================================================
 # master_20251119_FINAL.py – Modul 3/6
 # Nachfass: Master-Datenaufbau (Filter-First + Batch-Feld)
