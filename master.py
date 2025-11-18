@@ -299,7 +299,7 @@ async def get_nf_persons_filter_first(batch_values: list[str]) -> List[dict]:
     """
 
     # 1) hole alle Personen aus Filter 3024
-   persons = await get_nf_persons_filter_first(nf_batch_ids)
+    persons = await get_nf_persons_filter_first(nf_batch_ids)
 
 
     valid = []
@@ -345,8 +345,8 @@ async def fetch_person_details(person_ids: List[str]) -> List[dict]:
     return results
 
 # ============================================================
-# master_20251119_FINAL.py – Modul 3/6
-# Nachfass: Master-Datenaufbau (NF-Master)
+# master_20251119_FINAL.py – Modul 3/6 (FINAL)
+# Nachfass: Master-Datenaufbau (Filter-First + Batch-Check)
 # ============================================================
 
 async def _build_nf_master_final(
@@ -355,12 +355,14 @@ async def _build_nf_master_final(
     campaign: str,
     job_obj=None
 ) -> pd.DataFrame:
-    
+
+    # --------------------------------------------------------
+    # 1) Personen laden (Filter 3024 → Batch-ID prüfen)
+    # --------------------------------------------------------
     if job_obj:
-        job_obj.phase = "Filter 3024 laden …"
+        job_obj.phase = "Lade Personen (Filter 3024 …)"
         job_obj.percent = 10
 
-    # 🔥 Filter-First:
     persons = await get_nf_persons_filter_first(nf_batch_ids)
 
     print(f"[NF] NF-Personen nach Filter+Batch: {len(persons)}")
@@ -370,7 +372,7 @@ async def _build_nf_master_final(
         job_obj.percent = 30
 
     # --------------------------------------------------------
-    # 1) Personenfelder für Mapping laden
+    # 2) Personenfelder für Mapping laden
     # --------------------------------------------------------
     person_fields = await get_person_fields()
 
@@ -378,7 +380,6 @@ async def _build_nf_master_final(
     gender_map: Dict[str, str] = {}
     next_activity_key: Optional[str] = None
 
-    # wichtige Hints zur Zuordnung
     PERSON_FIELD_HINTS_TO_EXPORT = {
         "prospect": "prospect",
         "titel": "titel",
@@ -394,29 +395,24 @@ async def _build_nf_master_final(
         "linkedin url": "linkedin url",
     }
 
-    # --------------------------------------------------------
-    # 2) Feld-Mapping vorbereiten
-    # --------------------------------------------------------
     for f in person_fields:
         nm = (f.get("name") or "").lower()
 
-        # Hint → Feld
+        # Feldzuordnung via Hint
         for hint in PERSON_FIELD_HINTS_TO_EXPORT.keys():
             if hint in nm and hint not in hint_to_key:
                 hint_to_key[hint] = f.get("key")
 
-        # Geschlecht
+        # Geschlecht-Mapping
         if "gender" in nm or "geschlecht" in nm:
-            opts = f.get("options") or []
-            for o in opts:
+            for o in (f.get("options") or []):
                 gender_map[str(o["id"])] = o["label"]
 
-        # Datum nächste Aktivität
+        # nächste Aktivität
         if ("next" in nm and "activity" in nm) or ("datum nächste" in nm):
             next_activity_key = f.get("key")
 
     def get_field(p: dict, hint: str) -> str:
-        """Extrahiert ein Feld anhand des Hints."""
         key = hint_to_key.get(hint)
         if not key:
             return ""
@@ -430,32 +426,16 @@ async def _build_nf_master_final(
                     vals.append(x.get("value") or x.get("label") or "")
                 elif isinstance(x, str):
                     vals.append(x)
-            return ", ".join([v for v in vals if v])
+            return ", ".join(v for v in vals if v)
         if hint in ("gender", "geschlecht") and gender_map:
             return gender_map.get(str(val), str(val))
         return str(val or "")
 
     # --------------------------------------------------------
-    # 3) Personen anhand Batch-Feld suchen
-    # --------------------------------------------------------
-    if job_obj:
-        job_obj.phase = "Lade Personen über Batch-Feld …"
-        job_obj.percent = 10
-
-    persons = await get_persons_by_batch_ids(nf_batch_ids)
-
-    print(f"[NF] Personen geladen (Batch-Feld exakt): {len(persons)}")
-
-    if job_obj:
-        job_obj.phase = "Verarbeite Nachfass-Daten …"
-        job_obj.percent = 30
-
-    # --------------------------------------------------------
-    # 4) Vorabfilter – Ausschlüsse
+    # 3) Vorab-Filter / Ausschlüsse
     # --------------------------------------------------------
     selected = []
     excluded = []
-
     org_counter = defaultdict(int)
     now = datetime.now()
 
@@ -467,14 +447,13 @@ async def _build_nf_master_final(
         org_id = str(org.get("id") or "")
         org_name = org.get("name") or "-"
 
-        # Regel 1: Datum nächste Aktivität
+        # Regel 1 – Datum nächste Aktivität (3 Monate)
         if next_activity_key:
             dt_raw = p.get(next_activity_key)
             if dt_raw:
                 try:
                     dt_val = datetime.fromisoformat(str(dt_raw).split(" ")[0])
                     delta_days = (now - dt_val).days
-                    # Ausschluss: Zukunft oder <3 Monate
                     if delta_days < 0 or delta_days <= 90:
                         excluded.append({
                             "Kontakt ID": pid,
@@ -487,7 +466,7 @@ async def _build_nf_master_final(
                 except:
                     pass
 
-        # Regel 2: Max 2 Kontakte pro Organisation
+        # Regel 2 – max 2 Kontakte pro Organisation
         if org_id:
             org_counter[org_id] += 1
             if org_counter[org_id] > 2:
@@ -509,7 +488,7 @@ async def _build_nf_master_final(
         job_obj.percent = 60
 
     # --------------------------------------------------------
-    # 5) DataFrame erzeugen (Hauptdaten)
+    # 4) DataFrame erzeugen
     # --------------------------------------------------------
     rows = []
 
@@ -521,9 +500,13 @@ async def _build_nf_master_final(
         org_id = str(org.get("id") or "")
         org_name = org.get("name") or "-"
 
-        vor, nach = split_name(p.get("first_name"), p.get("last_name"), name)
+        vor, nach = split_name(
+            p.get("first_name"),
+            p.get("last_name"),
+            name
+        )
 
-        # E-Mail
+        # E-Mail-Adresse
         emails = p.get("emails") or []
         email = ""
         if isinstance(emails, list) and emails:
@@ -531,18 +514,18 @@ async def _build_nf_master_final(
         elif isinstance(emails, str):
             email = emails
 
-        # XING
+        # XING-Feld (diverse Varianten)
         xing_val = ""
         for k, v in p.items():
             if isinstance(k, str) and "xing" in k.lower():
                 if isinstance(v, str) and v.startswith("http"):
                     xing_val = v
-                    break
-                if isinstance(v, list):
+                elif isinstance(v, list):
                     xing_val = ", ".join(
-                        [x.get("value") for x in v if isinstance(x, dict) and x.get("value")]
+                        x.get("value") for x in v
+                        if isinstance(x, dict) and x.get("value")
                     )
-                    break
+                break
 
         rows.append({
             "Person - Batch ID": batch_id,
@@ -568,7 +551,7 @@ async def _build_nf_master_final(
     df = pd.DataFrame(rows)
 
     # --------------------------------------------------------
-    # 6) Excluded speichern
+    # 5) Excluded speichern
     # --------------------------------------------------------
     excluded_df = pd.DataFrame(excluded).replace({np.nan: None})
     if excluded_df.empty:
@@ -583,7 +566,7 @@ async def _build_nf_master_final(
     await save_df_text(excluded_df, "nf_excluded")
 
     # --------------------------------------------------------
-    # 7) Master speichern
+    # 6) Master Final speichern
     # --------------------------------------------------------
     await save_df_text(df, "nf_master_final")
 
@@ -592,7 +575,9 @@ async def _build_nf_master_final(
         job_obj.percent = 80
 
     print(f"[NF] Master gespeichert: {len(df)} Zeilen")
+
     return df
+
 # ============================================================
 # master_20251119_FINAL.py – Modul 4/6
 # Nachfass: Reconcile / Abgleich
