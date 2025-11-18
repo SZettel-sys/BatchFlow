@@ -207,32 +207,46 @@ def extract_custom_field(person: dict, field_key: str):
 
     return None
 
-
 # ------------------------------------------------------------
-# GENERISCHER PARALLEL DETAIL FETCH
+# SMART BATCH DETAIL FETCH (Chunk Size = 50)
 # ------------------------------------------------------------
 
 async def fetch_person_details(person_ids: List[str]) -> List[dict]:
     """
-    Holt Personendetails parallel.
-    Perfekt austariert für 300–1500 Datensätze (dein Bereich).
+    Holt Personendetails in stabilen, parallelen 50er-Chunks.
+    Optimiert für 300–1500 Personen.
+    Pipedrive-Limit-sicher.
     """
+
     results = []
-    sem = asyncio.Semaphore(22)  # LIMITSAFE & schnell
+    chunk_size = 50
+
+    # Personen in 50er-Chunks aufteilen
+    chunks = [person_ids[i:i + chunk_size] for i in range(0, len(person_ids), chunk_size)]
+
+    # Semaphore → bis zu 20 gleichzeitige Requests pro Chunk
+    sem = asyncio.Semaphore(20)
 
     async def load_one(pid):
         async with sem:
             url = append_token(f"{PIPEDRIVE_API}/persons/{pid}?fields=*")
             r = await http_client().get(url, headers=get_headers())
+
             if r.status_code == 200:
                 data = r.json().get("data")
                 if data:
                     results.append(data)
-        # kleine Pause → verhindert 429
-        await asyncio.sleep(0.008)
 
-    await asyncio.gather(*(load_one(pid) for pid in person_ids))
+            # Kurz warten → verhindert 429, aber schnell!
+            await asyncio.sleep(0.004)
+
+    # Chunks nacheinander, aber CHUNK-INTERN parallel
+    for chunk in chunks:
+        await asyncio.gather(*(load_one(pid) for pid in chunk))
+
     return results
+
+
 
 
 # ------------------------------------------------------------
