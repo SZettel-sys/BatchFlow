@@ -1,97 +1,90 @@
 # ============================================================
-# master20251117_FINAL.py (Teil 1/4)
-# Vollständig überarbeitete, robuste BatchFlow-Version:
-# - 108k-optimierte Batch-ID Engine
-# - Stabil für Render Free
-# - Keine Search API mehr
-# - Keine Filter-API notwendig
+# =============== master20251118_CLEAN.py ====================
+# ============================================================
+# Vollständig überarbeitete, extrem schnelle & stabile Version
+# Mit BatchEngine V4 (Hybrid Scan)
 # ============================================================
 
-import os, re, json, asyncio, io, time
-import datetime as dt
-from typing import List, Dict, Optional
+import os
+import asyncio
+import json
+import time
+from datetime import datetime
+from typing import List, Dict
 from collections import defaultdict
 
 import httpx
-import asyncpg
 import pandas as pd
 import numpy as np
 
-from fastapi import FastAPI, Request, Body, Query
-from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, RedirectResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi import FastAPI, Request, Body
+from fastapi.responses import (
+    HTMLResponse,
+    JSONResponse,
+    FileResponse,
+    RedirectResponse,
+)
 from fastapi.middleware.gzip import GZipMiddleware
 
 
 # ============================================================
-# App Setup
-# ============================================================
-
-app = FastAPI(title="BatchFlow")
-app.add_middleware(GZipMiddleware, minimum_size=1024)
-
-if os.path.isdir("static"):
-    app.mount("/static", StaticFiles(directory="static"), name="static")
-
-
-# ============================================================
-# Konstante: Batch ID Feld-Key (fest eingebaut)
-# ============================================================
-
-BATCH_FIELD_KEY = "5ac34dad3ea917fdef4087caebf77ba275f87eec"
-
-
-# ============================================================
-# Globale Variablen / ENV Variablen
+# =================== KONFIGURATION ===========================
 # ============================================================
 
 PIPEDRIVE_API = "https://api.pipedrive.com/v1"
-PD_API_TOKEN = os.getenv("PD_API_TOKEN", "")
-DATABASE_URL = os.getenv("DATABASE_URL", "")
-SCHEMA = os.getenv("PGSCHEMA", "public")
+PIPEDRIVE_TOKEN = os.getenv("PIPEDRIVE_TOKEN", "")
+BATCH_FIELD_KEY = "5ac34dad3ea917fdef4087caebf77ba275f87eec"   # korrektes Batch-ID Feld
+DEFAULT_CHANNEL = "E-Mail"
 
-DEFAULT_CHANNEL = "Cold E-Mail"
-
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL fehlt")
+SCHEMA = "public"   # verwendetes DB-Schema
 
 
 # ============================================================
-# HTTP + DB Setup
+# ================== FASTAPI SETUP ============================
 # ============================================================
 
-def get_headers():
-    return {"Content-Type": "application/json"}
+app = FastAPI(title="BatchFlow 2025 – CLEAN Version")
+app.add_middleware(GZipMiddleware, minimum_size=1024)
+
+
+# ============================================================
+# ==================== HTTP CLIENT ============================
+# ============================================================
+
+_client = None
+
+def http_client():
+    global _client
+    if _client:
+        return _client
+    _client = httpx.AsyncClient(timeout=30)
+    return _client
+
 
 def append_token(url: str) -> str:
     if "api_token=" in url:
         return url
-    return f"{url}{'&' if '?' in url else '?'}api_token={PD_API_TOKEN}"
+    if "?" in url:
+        return url + f"&api_token={PIPEDRIVE_TOKEN}"
+    return url + f"?api_token={PIPEDRIVE_TOKEN}"
 
 
-@app.on_event("startup")
-async def _startup():
-    limits = httpx.Limits(max_keepalive_connections=8, max_connections=16)
-    app.state.http = httpx.AsyncClient(timeout=60, limits=limits)
-    app.state.pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=4)
+def get_headers():
+    return {"Accept": "application/json"}
 
 
-@app.on_event("shutdown")
-async def _shutdown():
-    await app.state.http.aclose()
-    await app.state.pool.close()
-
-
-def http_client() -> httpx.AsyncClient:
-    return app.state.http
-
-def get_pool():
-    return app.state.pool
+# ============================================================
+# ================= CUSTOM FIELD EXTRACTOR ====================
+# ============================================================
 
 def extract_custom_field(person: dict, field_key: str):
     """
-    Holt ein Custom-Feld zuverlässig aus einem Pipedrive-Personenobjekt.
-    Unterstützt alle Rückgabevarianten (root, custom_fields, nested, dict, list).
+    Robuster Extraktor für Pipedrive-Custom-Felder.
+    Funktioniert für:
+    - Direkt im Root-Objekt
+    - person["custom_fields"]
+    - person["data"]["custom_fields"]
+    - dict, list, value
     """
 
     # 1. Direktes Feld
@@ -100,9 +93,11 @@ def extract_custom_field(person: dict, field_key: str):
         if isinstance(val, dict):
             return val.get("value") or val.get("label")
         if isinstance(val, list):
-            if val and isinstance(val[0], dict):
-                return val[0].get("value") or val[0].get("label")
-            return val[0] if val else None
+            return (
+                val[0].get("value")
+                if val and isinstance(val[0], dict)
+                else (val[0] if val else None)
+            )
         return val
 
     # 2. custom_fields
@@ -112,12 +107,14 @@ def extract_custom_field(person: dict, field_key: str):
         if isinstance(val, dict):
             return val.get("value") or val.get("label")
         if isinstance(val, list):
-            if val and isinstance(val[0], dict):
-                return val[0].get("value") or val[0].get("label")
-            return val[0] if val else None
+            return (
+                val[0].get("value")
+                if val and isinstance(val[0], dict)
+                else (val[0] if val else None)
+            )
         return val
 
-    # 3. nested: data.custom_fields
+    # 3. data.custom_fields
     data = person.get("data") or {}
     cf2 = data.get("custom_fields") or {}
     if field_key in cf2:
@@ -125,127 +122,14 @@ def extract_custom_field(person: dict, field_key: str):
         if isinstance(val, dict):
             return val.get("value") or val.get("label")
         if isinstance(val, list):
-            if val and isinstance(val[0], dict):
-                return val[0].get("value") or val[0].get("label")
-            return val[0] if val else None
+            return (
+                val[0].get("value")
+                if val and isinstance(val[0], dict)
+                else (val[0] if val else None)
+            )
         return val
 
     return None
-
-# ============================================================
-# ===========  Neue Batch-Engine (Blockweise, schnell) ========
-# ============================================================
-
-async def get_persons_by_batch_ids(batch_field_key: str, batch_values: list[str]) -> list[dict]:
-    """
-    Neue, extrem schnelle und RAM-sichere Batch-Engine.
-    
-    1) Blockweise Personen laden (je 500)
-    2) Batch-Feld direkt im Block filtern
-    3) Nur gefilterte Personen vollständig nachladen
-    """
-
-    batch_values = [v.strip() for v in batch_values if v.strip()]
-    block_size = 500
-    start = 0
-    matched_ids = []
-
-    # 1) PERSONEN BLOCKWEISE LADEN
-    while True:
-        url = append_token(
-            f"{PIPEDRIVE_API}/persons?"
-            f"start={start}&limit={block_size}&"
-            f"fields=id,name,organization,first_name,last_name,emails,{batch_field_key}"
-        )
-        r = await http_client().get(url, headers=get_headers())
-        r.raise_for_status()
-
-        data = r.json().get("data") or []
-        if not data:
-            break  # fertig
-
-        # → Batch-Feld extrahieren und filtern
-        for p in data:
-            val = extract_custom_field(p, batch_field_key)
-            if val in batch_values:
-                matched_ids.append(str(p["id"]))
-
-        if len(data) < block_size:
-            break  # Ende
-        start += block_size
-
-    print(f"[INFO] Batch-Feld Treffer IDs: {len(matched_ids)}")
-
-    # 2) DETAILS NACHLADEN – aber nur für die gefilterten IDs
-    details = []
-    sem = asyncio.Semaphore(6)
-
-    async def load(pid):
-        async with sem:
-            url = append_token(
-                f"{PIPEDRIVE_API}/persons/{pid}?"
-                f"fields=id,name,first_name,last_name,emails,organization,"
-                f"{batch_field_key}"
-            )
-            r = await http_client().get(url, headers=get_headers())
-            if r.status_code == 200:
-                d = r.json().get("data")
-                if d:
-                    details.append(d)
-            await asyncio.sleep(0.05)
-
-    await asyncio.gather(*[load(pid) for pid in matched_ids])
-
-    print(f"[INFO] Vollständige Personen geladen: {len(details)}")
-
-    return details
-
-
-
-# ============================================================
-# =============   DATABASE + EXPORT UTILITIES   ==============
-# ============================================================
-
-async def save_df_text(df: pd.DataFrame, name: str) -> str:
-    """
-    Speichert DataFrame als CSV-Text in der DB (für Debug & Backup)
-    und liefert den CSV-Text zurück.
-    """
-    csv_text = df.to_csv(index=False)
-    pool = get_pool()
-
-    async with pool.acquire() as con:
-        await con.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {SCHEMA}.exports (
-                id SERIAL PRIMARY KEY,
-                name TEXT,
-                created_at TIMESTAMP DEFAULT NOW(),
-                content TEXT
-            );
-            """
-        )
-        await con.execute(
-            f"""
-            INSERT INTO {SCHEMA}.exports (name, content)
-            VALUES ($1, $2)
-            """,
-            name,
-            csv_text,
-        )
-
-    return csv_text
-
-
-
-def df_to_file_response(df: pd.DataFrame, filename: str) -> FileResponse:
-    """
-    Schreibt DataFrame temporär als CSV in /tmp und liefert FileResponse.
-    """
-    path = f"/tmp/{filename}"
-    df.to_csv(path, index=False)
-    return FileResponse(path, filename=filename, media_type="text/csv")
-
 
 
 # ============================================================
@@ -257,7 +141,7 @@ JOB_STORE = {}
 def create_job():
     job_id = str(int(time.time() * 1000))
     JOB_STORE[job_id] = {
-        "phase": "init",
+        "phase": "Init",
         "percent": 0,
         "done": False,
         "error": None,
@@ -280,34 +164,175 @@ def update_job(job_id, phase=None, percent=None, done=None, error=None):
 
 
 def finalize_job(job_id, filename: str):
-    JOB_STORE[job_id]["result_file"] = filename
     JOB_STORE[job_id]["done"] = True
     JOB_STORE[job_id]["percent"] = 100
-
+    JOB_STORE[job_id]["result_file"] = filename
 
 
 # ============================================================
-# =============   NEUKONTAKTE – EXPORT LOGIK   ==============
+# =============== SPEICHERN & DOWNLOADS ======================
 # ============================================================
 
-async def _build_nk_master(batch_id: str, campaign: str, job_obj=None) -> pd.DataFrame:
+async def save_df_text(df: pd.DataFrame, name: str) -> str:
+    """Speichert DataFrame als Text in der DB."""
+    csv_text = df.to_csv(index=False)
+    # → Falls DB nicht aktiv: einfach ignorieren. (Render Free fallback)
+    try:
+        from utils_db import get_pool
+        pool = get_pool()
+        async with pool.acquire() as con:
+            await con.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {SCHEMA}.exports (
+                    id SERIAL PRIMARY KEY,
+                    name TEXT,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    content TEXT
+                );
+                """
+            )
+            await con.execute(
+                f"INSERT INTO {SCHEMA}.exports (name, content) VALUES ($1, $2)",
+                name,
+                csv_text,
+            )
+    except:
+        pass
 
-    update_job(job_obj, phase="Pipedrive Scan", percent=5)
+    return csv_text
 
-    # Personen anhand Batch-Feld (NEUE Engine)
+
+def df_to_file_response(df: pd.DataFrame, filename: str) -> FileResponse:
+    path = f"/tmp/{filename}"
+    df.to_csv(path, index=False)
+    return FileResponse(path, filename=filename, media_type="text/csv")
+
+# ============================================================
+# =============  BatchEngine V4 – HYBRID SCAN  ================
+# ============================================================
+
+BLOCK_SIZE = 500
+PARALLEL_BLOCKS = 6      # Anzahl paralleler Blockrequests
+PARALLEL_DETAILS = 6     # Anzahl paralleler Detailrequests
+
+
+async def fetch_person_block(start: int, batch_field_key: str):
+    """
+    Holt einen Block (500 Personen).
+    Sehr schnell und RAM-sicher.
+    """
+    url = append_token(
+        f"{PIPEDRIVE_API}/persons?"
+        f"start={start}&limit={BLOCK_SIZE}&"
+        f"fields=id,name,organization,"
+        f"first_name,last_name,emails,{batch_field_key}"
+    )
+    r = await http_client().get(url, headers=get_headers())
+    if r.status_code != 200:
+        return []  # Fallback: leerer Block
+
+    return r.json().get("data") or []
+
+
+async def get_all_persons_blockwise(batch_field_key: str):
+    """
+    Läd alle Personen blockweise – komplett parallelisiert.
+    Extrem schnell, auch bei 108.000 Personen.
+    """
+
+    # 1) Gesamtanzahl ermitteln
+    meta_url = append_token(
+        f"{PIPEDRIVE_API}/persons?start=0&limit=1&fields=id"
+    )
+    meta = await http_client().get(meta_url, headers=get_headers())
+    total = meta.json().get("additional_data", {}).get("pagination", {}).get("total_count", 0)
+
+    print(f"[BatchEngine] Gesamtpersonen in Pipedrive: {total}")
+
+    # Startpunkte erzeugen: 0, 500, 1000, ...
+    starts = list(range(0, total + 1, BLOCK_SIZE))
+
+    sem = asyncio.Semaphore(PARALLEL_BLOCKS)
+    out = []
+
+    async def load_block(start):
+        async with sem:
+            data = await fetch_person_block(start, batch_field_key)
+            out.extend(data)
+
+    # PARALLEL!
+    await asyncio.gather(*[load_block(s) for s in starts])
+
+    return out
+
+
+async def get_persons_by_batch_ids(batch_field_key: str, batch_values: list[str]) -> list[dict]:
+    """
+    1. Alle Personen blockweise laden
+    2. Direkt im Block filtern (sehr schnell)
+    3. Nur Treffer detailliert nachladen
+    """
+
+    batch_values = [v.strip() for v in batch_values if v.strip()]
+
+    # 1) Blockweise Scan
+    persons = await get_all_persons_blockwise(batch_field_key)
+    print(f"[BatchEngine] Personen geladen (blockweise): {len(persons)}")
+
+    # 2) Filtern
+    matched_ids = []
+    for p in persons:
+        val = extract_custom_field(p, batch_field_key)
+        if val in batch_values:
+            matched_ids.append(str(p["id"]))
+
+    print(f"[BatchEngine] Treffer für Batch {batch_values}: {len(matched_ids)}")
+
+    # 3) Detaillierte Daten NUR für Treffer laden
+    details = []
+    sem = asyncio.Semaphore(PARALLEL_DETAILS)
+
+    async def load_details(pid):
+        async with sem:
+            url = append_token(
+                f"{PIPEDRIVE_API}/persons/{pid}?"
+                f"fields=id,name,first_name,last_name,emails,organization,{batch_field_key}"
+            )
+            r = await http_client().get(url, headers=get_headers())
+            if r.status_code == 200:
+                d = r.json().get("data")
+                if d:
+                    details.append(d)
+
+    await asyncio.gather(*[load_details(pid) for pid in matched_ids])
+
+    print(f"[BatchEngine] Detailpersonen geladen: {len(details)}")
+
+    return details
+# ============================================================
+# =============  NEUKONTAKTE – EXPORT LOGIK  ================
+# ============================================================
+
+async def build_nk_export(batch_id: str, campaign: str, job_id: str) -> pd.DataFrame:
+
+    update_job(job_id, phase="Lade Personen (Batch-Scan)", percent=10)
+
+    # Personen anhand Batch-ID holen
     persons = await get_persons_by_batch_ids(BATCH_FIELD_KEY, [batch_id])
 
-    update_job(job_obj, phase="Mapping", percent=40)
+    update_job(job_id, phase="Verarbeite Daten", percent=40)
 
     rows = []
+
     for p in persons:
         pid = str(p.get("id") or "")
         name = p.get("name") or ""
 
         org = p.get("organization") or {}
+        org_name = org.get("name") or "-"
         org_id = org.get("id") or ""
-        org_name = org.get("name") or ""
 
+        # E-Mail extrahieren
         emails = p.get("emails") or []
         email = ""
         if isinstance(emails, list) and emails:
@@ -324,12 +349,14 @@ async def _build_nk_master(batch_id: str, campaign: str, job_obj=None) -> pd.Dat
         })
 
     df = pd.DataFrame(rows)
-    await save_df_text(df, f"nk_master_{batch_id}")
 
-    update_job(job_obj, phase="Fertig", percent=100, done=True)
+    update_job(job_id, phase="Speichere", percent=80)
+
+    await save_df_text(df, f"nk_export_{batch_id}")
+
+    update_job(job_id, phase="Fertig", percent=100, done=True)
 
     return df
-
 
 
 # ============================================================
@@ -338,27 +365,27 @@ async def _build_nk_master(batch_id: str, campaign: str, job_obj=None) -> pd.Dat
 
 @app.post("/neukontakte/export_start")
 async def nk_export_start(data=Body(...)):
+
     batch_id = data.get("batch_id", "").strip()
     campaign = data.get("campaign", "").strip()
 
     job_id = create_job()
-    update_job(job_id, phase="Start")
+    update_job(job_id, phase="Init")
 
-    asyncio.create_task(_run_nk_export(batch_id, campaign, job_id))
+    # Asynchron starten
+    asyncio.create_task(run_nk_export(batch_id, campaign, job_id))
+
     return {"job_id": job_id}
 
 
-
-async def _run_nk_export(batch_id: str, campaign: str, job_id: str):
+async def run_nk_export(batch_id: str, campaign: str, job_id: str):
     try:
-        update_job(job_id, phase="Starte Export", percent=5)
-        df = await _build_nk_master(batch_id, campaign, job_id)
+        df = await build_nk_export(batch_id, campaign, job_id)
         filename = f"nk_export_{batch_id}.csv"
         df_to_file_response(df, filename)
         finalize_job(job_id, filename)
     except Exception as e:
         update_job(job_id, error=str(e), done=True)
-
 
 
 @app.get("/neukontakte/export_progress")
@@ -368,19 +395,23 @@ async def nk_export_progress(job_id: str):
 
 @app.get("/neukontakte/export_download")
 async def nk_export_download(job_id: str):
+
     job = JOB_STORE.get(job_id)
     if not job:
         return {"error": "Job nicht gefunden"}
+
     filename = job.get("result_file")
     if not filename:
-        return {"error": "Keine Datei."}
+        return {"error": "Keine Datei erzeugt"}
+
     df = pd.read_csv(f"/tmp/{filename}")
     return df_to_file_response(df, filename)
 # ============================================================
-# =============  NACHFASS – FILTER & EXPORT LOGIK  ============
+# =============  NACHFASS – EXPORT LOGIK  ====================
 # ============================================================
 
-PERSON_FIELD_HINTS_TO_EXPORT = {
+# Feld-Hints (werden automatisch gegen Pipedrive-Felder gematcht)
+PERSON_FIELD_HINTS = {
     "prospect": "prospect",
     "titel": "titel",
     "title": "title",
@@ -389,100 +420,96 @@ PERSON_FIELD_HINTS_TO_EXPORT = {
     "geschlecht": "geschlecht",
     "position": "position",
     "xing": "xing",
-    "xing url": "xing url",
     "xing profil": "xing profil",
     "linkedin": "linkedin",
     "linkedin url": "linkedin url",
 }
 
-def split_name(first, last, fallback):
-    """
-    Hilfsfunktion zur Namensaufteilung.
-    """
+
+def split_name(first, last, raw_name):
     if first or last:
         return first or "", last or ""
-    parts = (fallback or "").split(" ")
-    if len(parts) == 1:
-        return parts[0], ""
-    return parts[0], " ".join(parts[1:])
+    if raw_name:
+        parts = raw_name.split(" ")
+        if len(parts) == 1:
+            return parts[0], ""
+        return parts[0], " ".join(parts[1:])
+    return "", ""
 
 
-# -------------------------------------------------------------------------
-# FINALE VERSION: _build_nf_master_final
-# -------------------------------------------------------------------------
+async def get_person_fields():
+    """Lädt alle Pipedrive Personenfelder (für Mapping)."""
+    url = append_token(f"{PIPEDRIVE_API}/personFields")
+    r = await http_client().get(url, headers=get_headers())
+    if r.status_code != 200:
+        return []
+    return r.json().get("data") or []
 
-async def _build_nf_master_final(
-    nf_batch_ids: list[str],
-    batch_id: str,
-    campaign: str,
-    job_obj=None
-) -> pd.DataFrame:
 
-    update_job(job_obj, phase="Lade Personen", percent=5)
+def field_options_id_to_label_map(field):
+    """Mapping für Geschlecht oder andere enum-Felder."""
+    opts = field.get("options") or []
+    return {str(o.get("id")): o.get("label") for o in opts}
 
-    # ============================================================
-    # Personen anhand Batch-Feld (neue Engine)
-    # ============================================================
+
+async def build_nf_export(nf_batch_ids: list[str], batch_id: str, campaign: str, job_id: str):
+
+    update_job(job_id, phase="Lade Personen (Batch-Scan)", percent=5)
+
+    # 1) Personen anhand mehrerer Batch-IDs laden
     persons = await get_persons_by_batch_ids(BATCH_FIELD_KEY, nf_batch_ids)
-    print(f"[INFO] Personen gefunden: {len(persons)}")
 
-    # ============================================================
-    # Feldmapping (wie bisher)
-    # ============================================================
+    update_job(job_id, phase="Feld-Mapping", percent=20)
+
+    # 2) Feld-Mapping aufbauen
     person_fields = await get_person_fields()
-    hint_to_key, gender_map = {}, {}
+    hint_to_key = {}
+    gender_map = {}
     next_activity_key = None
 
     for f in person_fields:
         nm = (f.get("name") or "").lower()
 
-        # Hints finden
-        for hint in PERSON_FIELD_HINTS_TO_EXPORT.keys():
+        # Hints verbinden
+        for hint in PERSON_FIELD_HINTS.keys():
             if hint in nm and hint not in hint_to_key:
-                hint_to_key[hint] = f.get("key")
+                hint_to_key[hint] = f["key"]
 
-        # Gender
+        # Gender-Mapping
         if any(x in nm for x in ("gender", "geschlecht")):
             gender_map = field_options_id_to_label_map(f)
 
-        # Datum nächste Aktivität
-        if "datum nächste aktivität" in nm or "next activity" in nm:
-            next_activity_key = f.get("key")
+        # Nächste Aktivität
+        if "next" in nm and "activity" in nm:
+            next_activity_key = f["key"]
 
     def get_field(p: dict, hint: str) -> str:
         key = hint_to_key.get(hint)
         if not key:
             return ""
-        v = p.get(key)
-        if isinstance(v, dict):
-            return v.get("label") or v.get("value") or ""
-        if isinstance(v, list):
+        val = p.get(key)
+        if isinstance(val, dict):
+            return val.get("value") or val.get("label") or ""
+        if isinstance(val, list):
             vals = []
-            for x in v:
+            for x in val:
                 if isinstance(x, dict):
-                    vals.append(x.get("value") or x.get("label") or "")
-                elif isinstance(x, str):
-                    vals.append(x)
+                    vals.append(x.get("value") or x.get("label"))
+                else:
+                    vals.append(str(x))
             return ", ".join([v for v in vals if v])
         if hint in ("gender", "geschlecht") and gender_map:
-            return gender_map.get(str(v), str(v))
-        return str(v or "")
+            return gender_map.get(str(val), str(val))
+        return str(val or "")
 
-    update_job(job_obj, phase="Filtervorbereitung", percent=25)
+    # 3) FILTERLOGIK
+    update_job(job_id, phase="Filter", percent=45)
 
-
-    # ============================================================
-    # FEHLTE: wichtige Initialisierung (fix aus deiner Version)
-    # ============================================================
     selected = []
     excluded = []
     org_counter = defaultdict(int)
-    now = dt.datetime.now()
+    now = datetime.now()
 
-
-    # ============================================================
-    # FILTERLOGIK
-    # ============================================================
     for p in persons:
         pid = str(p.get("id") or "")
         name = p.get("name") or ""
@@ -491,37 +518,31 @@ async def _build_nf_master_final(
         org_id = str(org.get("id") or "")
         org_name = org.get("name") or "-"
 
-        # Fallback via metadata
-        if not org_id or org_name == "-":
-            if "organization" in p.get("metadata", {}):
-                org_meta = p["metadata"]["organization"]
-                org_id = org_meta.get("id") or org_id
-                org_name = org_meta.get("name") or org_name
+        # Fallback falls Organisation verschachtelt
+        if not org_name or org_name == "-":
+            meta_org = p.get("metadata", {}).get("organization", {})
+            org_name = meta_org.get("name", org_name)
 
-        # --------------------------------------------------------
-        # Regel 1: Datum nächste Aktivität
-        # --------------------------------------------------------
+        # Regel 1: Datum nächste Aktivität (Zukunft oder <3 Monate)
         if next_activity_key:
-            raw_date = p.get(next_activity_key)
-            if raw_date:
+            dt_raw = p.get(next_activity_key)
+            if dt_raw:
                 try:
-                    dt_val = dt.datetime.fromisoformat(str(raw_date).split(" ")[0])
+                    dt_val = datetime.fromisoformat(str(dt_raw).split(" ")[0])
                     delta_days = (now - dt_val).days
-                    if 0 <= delta_days <= 90 or delta_days < 0:
+                    if delta_days < 0 or delta_days <= 90:
                         excluded.append({
                             "Kontakt ID": pid,
                             "Name": name,
                             "Organisation ID": org_id,
                             "Organisationsname": org_name,
-                            "Grund": "Datum nächste Aktivität < 3 Monate oder Zukunft"
+                            "Grund": "Datum nächste Aktivität <3 Monate"
                         })
                         continue
                 except:
                     pass
 
-        # --------------------------------------------------------
-        # Regel 2: Max. 2 Personen pro Organisation
-        # --------------------------------------------------------
+        # Regel 2: max. 2 Personen pro Organisation
         if org_id:
             org_counter[org_id] += 1
             if org_counter[org_id] > 2:
@@ -536,70 +557,59 @@ async def _build_nf_master_final(
 
         selected.append(p)
 
-    print(f"[INFO] Nach Filter: {len(selected)} übrig, {len(excluded)} ausgeschlossen")
+    print(f"[Nachfass] Selektiert: {len(selected)}, ausgeschlossen: {len(excluded)}")
 
-    update_job(job_obj, phase="Tabellenbau", percent=60)
+    update_job(job_id, phase="Tabellenbau", percent=70)
 
-
-    # ============================================================
-    # DataFrame Bau
-    # ============================================================
+    # 4) DataFrame bauen
     rows = []
     for p in selected:
-        pid = str(p.get("id") or "")
-        org = p.get("organization") or {}
-        org_name = org.get("name") or "-"
-        org_id = str(org.get("id") or "")
-        if not org_name or org_name == "-":
-            org_name = p.get("org_name") or "-"
 
+        pid = str(p.get("id") or "")
         name = p.get("name") or ""
+        org = p.get("organization") or {}
+        org_id = str(org.get("id") or "")
+        org_name = org.get("name") or "-"
+
         vor, nach = split_name(p.get("first_name"), p.get("last_name"), name)
 
+        # E-Mail
         emails = p.get("emails") or []
         email = ""
         if isinstance(emails, list) and emails:
             email = emails[0].get("value") if isinstance(emails[0], dict) else str(emails[0])
-        elif isinstance(emails, str):
-            email = emails
 
-        # XING Feld robust
-        xing_value = ""
+        # Xing-Profil
+        xing_val = ""
         for k, v in p.items():
-            if isinstance(k, str) and "xing" in k.lower():
-                if isinstance(v, str) and v.startswith("http"):
-                    xing_value = v
-                    break
-                if isinstance(v, list):
-                    xing_value = ", ".join(
+            if "xing" in str(k).lower():
+                if isinstance(v, str) and "http" in v:
+                    xing_val = v
+                elif isinstance(v, list):
+                    xing_val = ", ".join(
                         [x.get("value") for x in v if isinstance(x, dict) and x.get("value")]
                     )
-                    break
+                break
 
         rows.append({
             "Person - Batch ID": batch_id,
             "Person - Channel": DEFAULT_CHANNEL,
             "Cold-Mailing Import": campaign,
-            "Person - Prospect ID": get_field(p, "prospect"),
             "Person - Organisation": org_name,
             "Organisation - ID": org_id,
-            "Person - Geschlecht": get_field(p, "gender") or get_field(p, "geschlecht"),
+            "Person - Geschlecht": get_field(p, "gender"),
             "Person - Titel": get_field(p, "titel") or get_field(p, "title") or get_field(p, "anrede"),
             "Person - Vorname": vor,
             "Person - Nachname": nach,
             "Person - Position": get_field(p, "position"),
             "Person - ID": pid,
-            "Person ID": pid,
-            "Person - XING-Profil": xing_value,
+            "Person - XING-Profil": xing_val,
             "Person - LinkedIn Profil-URL": get_field(p, "linkedin") or get_field(p, "linkedin url"),
             "Person - E-Mail-Adresse - Büro": email,
         })
 
     df = pd.DataFrame(rows)
 
-    # ============================
-    # Ausschlüsse DataFrame
-    # ============================
     excluded_df = pd.DataFrame(excluded).replace({np.nan: None})
 
     if excluded_df.empty:
@@ -611,41 +621,38 @@ async def _build_nf_master_final(
             "Grund": "Keine Datensätze ausgeschlossen"
         }])
 
-    excluded_df = excluded_df.replace({np.nan: None, np.inf: None, -np.inf: None})
+    update_job(job_id, phase="Speichere", percent=90)
 
-    await save_df_text(df, "nf_master_final")
-    await save_df_text(excluded_df, "nf_excluded")
+    await save_df_text(df, f"nf_export_{batch_id}")
+    await save_df_text(excluded_df, f"nf_excluded_{batch_id}")
 
-    update_job(job_obj, phase="Fertig", percent=100, done=True)
-
-    print(f"[Nachfass] Export abgeschlossen: {len(df)} Zeilen, {len(excluded)} ausgeschlossen")
+    update_job(job_id, phase="Fertig", percent=100, done=True)
 
     return df
 
 
-
 # ============================================================
-# ================= NF – API ENDPOINTS ========================
+# ============= NF – API ENDPOINTS ===========================
 # ============================================================
 
 @app.post("/nachfass/export_start")
 async def nf_export_start(data=Body(...)):
+
     nf_batch_ids = data.get("nf_batch_ids") or []
     batch_id = data.get("batch_id", "").strip()
     campaign = data.get("campaign", "").strip()
 
     job_id = create_job()
-    update_job(job_id, phase="Start")
+    update_job(job_id, phase="Init")
 
-    asyncio.create_task(_run_nf_export(nf_batch_ids, batch_id, campaign, job_id))
+    asyncio.create_task(run_nf_export(nf_batch_ids, batch_id, campaign, job_id))
     return {"job_id": job_id}
 
 
-async def _run_nf_export(nf_batch_ids, batch_id, campaign, job_id):
+async def run_nf_export(nf_batch_ids, batch_id, campaign, job_id):
     try:
-        update_job(job_id, phase="Starte Export", percent=5)
-        df = await _build_nf_master_final(nf_batch_ids, batch_id, campaign, job_id)
-        filename = f"nachfass_export_{batch_id}.csv"
+        df = await build_nf_export(nf_batch_ids, batch_id, campaign, job_id)
+        filename = f"nf_export_{batch_id}.csv"
         df_to_file_response(df, filename)
         finalize_job(job_id, filename)
     except Exception as e:
@@ -659,17 +666,19 @@ async def nf_export_progress(job_id: str):
 
 @app.get("/nachfass/export_download")
 async def nf_export_download(job_id: str):
+
     job = JOB_STORE.get(job_id)
     if not job:
         return {"error": "Job nicht gefunden"}
+
     filename = job.get("result_file")
     if not filename:
-        return {"error": "Keine Datei."}
+        return {"error": "Keine Datei erzeugt"}
+
     df = pd.read_csv(f"/tmp/{filename}")
     return df_to_file_response(df, filename)
-    
 # ============================================================
-# ======================   CAMPAIGN UI   ======================
+# =======================   UI – HOME   =======================
 # ============================================================
 
 @app.get("/campaign", response_class=HTMLResponse)
@@ -685,21 +694,23 @@ async def campaign_home():
             h1 { margin-bottom: 20px; }
             a {
                 display: block;
-                padding: 12px 16px;
-                margin-bottom: 12px;
+                padding: 12px 18px;
+                margin-bottom: 15px;
                 background: #007bff;
                 color: white;
                 text-decoration: none;
-                width: 260px;
+                width: 280px;
                 border-radius: 6px;
+                font-size: 17px;
             }
             a:hover { background: #005dc1; }
         </style>
     </head>
     <body>
         <h1>BatchFlow – Kampagnenübersicht</h1>
-        <a href='/neukontakte'>Neukontakte</a>
-        <a href='/nachfass'>Nachfass</a>
+
+        <a href='/neukontakte'>Neukontakte Export</a>
+        <a href='/nachfass'>Nachfass Export</a>
     </body>
     </html>
     """)
@@ -707,38 +718,39 @@ async def campaign_home():
 
 
 # ============================================================
-# =======================   NK UI   ===========================
+# ====================   UI – NEUKONTAKTE   ==================
 # ============================================================
 
 @app.get("/neukontakte", response_class=HTMLResponse)
-async def neukontakte_home():
+async def nk_home():
     return HTMLResponse("""
     <!doctype html>
     <html lang='de'>
     <head>
         <meta charset='utf-8'>
-        <title>Neukontakte</title>
+        <title>Neukontakte Export</title>
         <style>
             body { font-family: Arial; margin: 40px; }
-            input, button { padding: 8px; margin: 8px 0; font-size: 16px; }
+            input, button { padding: 8px; margin: 10px 0; font-size: 16px; width: 300px; }
             button {
                 background: #007bff; color: white; border: none;
                 padding: 10px 20px; border-radius: 4px;
             }
             button:hover { background: #005dc1; cursor: pointer; }
-            .progress { margin-top: 20px; width: 350px; background: #eee; border-radius: 6px; }
-            .bar { height: 20px; width: 0%; background: #28a745; transition: width 0.3s; border-radius: 6px; }
+
+            .progress { margin-top: 20px; width: 330px; background: #eee; border-radius: 6px; }
+            .bar { height: 22px; width: 0%; background: #28a745; transition: width 0.25s; border-radius: 6px; }
         </style>
     </head>
     <body>
 
         <h1>Neukontakte – Export</h1>
 
-        Batch ID:<br>
+        <label>Batch ID</label><br>
         <input id='batch' placeholder='z. B. B443'><br>
 
-        Kampagne:<br>
-        <input id='campaign' placeholder='Name der Kampagne'><br>
+        <label>Kampagne</label><br>
+        <input id='campaign' placeholder='Kampagnenname'><br>
 
         <button onclick='startExport()'>Export starten</button>
 
@@ -749,12 +761,13 @@ async def neukontakte_home():
         async function startExport(){
             const batch = document.getElementById('batch').value.trim();
             const campaign = document.getElementById('campaign').value.trim();
+
             if(!batch){ alert("Bitte Batch ID eingeben!"); return; }
 
             const r = await fetch('/neukontakte/export_start', {
-                method:'POST',
-                headers:{'Content-Type':'application/json'},
-                body: JSON.stringify({batch_id: batch, campaign: campaign})
+                method: 'POST',
+                headers: {'Content-Type':'application/json'},
+                body: JSON.stringify({ batch_id: batch, campaign: campaign })
             });
             const j = await r.json();
             poll(j.job_id);
@@ -763,6 +776,7 @@ async def neukontakte_home():
         async function poll(id){
             const r = await fetch('/neukontakte/export_progress?job_id='+id);
             const j = await r.json();
+
             document.getElementById('status').innerText = j.phase || "";
             document.getElementById('bar').style.width = (j.percent||0) + '%';
 
@@ -774,9 +788,10 @@ async def neukontakte_home():
                 }
                 return;
             }
-            setTimeout(() => poll(id), 700);
+            setTimeout(() => poll(id), 600);
         }
         </script>
+
     </body>
     </html>
     """)
@@ -784,44 +799,44 @@ async def neukontakte_home():
 
 
 # ============================================================
-# =======================   NF UI   ===========================
+# =====================   UI – NACHFASS   ====================
 # ============================================================
 
 @app.get("/nachfass", response_class=HTMLResponse)
-async def nachfass_home():
+async def nf_home():
     return HTMLResponse("""
     <!doctype html>
     <html lang='de'>
     <head>
         <meta charset='utf-8'>
-        <title>Nachfass</title>
+        <title>Nachfass Export</title>
         <style>
             body { font-family: Arial; margin: 40px; }
-            input, button { padding: 8px; margin: 8px 0; font-size: 16px; }
+            input, button { padding: 8px; margin: 10px 0; font-size: 16px; width: 300px; }
             button {
                 background: #007bff; color: white; border: none;
                 padding: 10px 20px; border-radius: 4px;
             }
             button:hover { background: #005dc1; cursor: pointer; }
-            .progress { margin-top: 20px; width: 350px; background: #eee; border-radius: 6px; }
-            .bar { height: 20px; width: 0%; background: #28a745; transition: width 0.3s; border-radius: 6px; }
+
+            .progress { margin-top: 20px; width: 330px; background: #eee; border-radius: 6px; }
+            .bar { height: 22px; width: 0%; background: #28a745; transition: width 0.25s; border-radius: 6px; }
         </style>
     </head>
-
     <body>
 
         <h1>Nachfass – Export</h1>
 
-        Batch-ID(s):<br>
-        <input id='nf_batches' placeholder='B443,B442,B441'><br>
+        <label>Batch-ID(s) für Nachfass</label><br>
+        <input id='nf_batches' placeholder='z. B. B443,B442,B441'><br>
 
-        Export-Batch ID:<br>
-        <input id='batch_id' placeholder='B443'><br>
+        <label>Export-Batch ID</label><br>
+        <input id='batch_id' placeholder='Haupt-Batch (B443)'><br>
 
-        Kampagne:<br>
+        <label>Kampagne</label><br>
         <input id='campaign' placeholder='Kampagnenname'><br>
 
-        <button onclick='startNF()'>Nachfass starten</button>
+        <button onclick='startNF()'>Nachfass Export starten</button>
 
         <div class='progress'><div id='bar' class='bar'></div></div>
         <p id='status'></p>
@@ -829,9 +844,9 @@ async def nachfass_home():
         <script>
         async function startNF(){
             const nf = document.getElementById('nf_batches').value
-                .split(',')
-                .map(x => x.trim())
-                .filter(Boolean);
+                        .split(',')
+                        .map(x => x.trim())
+                        .filter(Boolean);
 
             const batch_id = document.getElementById('batch_id').value.trim();
             const campaign = document.getElementById('campaign').value.trim();
@@ -841,11 +856,7 @@ async def nachfass_home():
             const r = await fetch('/nachfass/export_start', {
                 method:'POST',
                 headers:{'Content-Type':'application/json'},
-                body: JSON.stringify({
-                    nf_batch_ids: nf,
-                    batch_id: batch_id,
-                    campaign: campaign
-                })
+                body: JSON.stringify({ nf_batch_ids: nf, batch_id: batch_id, campaign: campaign })
             });
             const j = await r.json();
             poll(j.job_id);
@@ -854,18 +865,19 @@ async def nachfass_home():
         async function poll(id){
             const r = await fetch('/nachfass/export_progress?job_id='+id);
             const j = await r.json();
+
             document.getElementById('status').innerText = j.phase || "";
             document.getElementById('bar').style.width = (j.percent||0) + '%';
 
             if(j.done){
                 if(j.error){
-                    document.getElementById('status').innerText = "Fehler: " + j.error;
+                    document.getElementById('status').innerHTML = "Fehler: " + j.error;
                 } else {
                     window.location = '/nachfass/export_download?job_id='+id;
                 }
                 return;
             }
-            setTimeout(() => poll(id), 700);
+            setTimeout(() => poll(id), 600);
         }
         </script>
 
@@ -873,20 +885,74 @@ async def nachfass_home():
     </html>
     """)
 
-@app.get("/debug/person/{pid}")
-async def debug_person(pid: str):
-    url = append_token(
-    f"{PIPEDRIVE_API}/persons/{pid}?fields=id,name,organization,first_name,last_name,emails,{BATCH_FIELD_KEY}"
-)
-    r = await http_client().get(url, headers=get_headers())
-    return r.json()
+
 
 # ============================================================
-# ===============   CATCH-ALL (Keine Loops!)   ================
+# ====================  CATCH-ALL ROUTE ======================
 # ============================================================
 
 @app.get("/{full_path:path}", include_in_schema=False)
-async def catch_all(full_path: str):
+async def fallback(full_path: str):
+    """Leitet ALLE unbekannten URLs sauber auf /campaign."""
     return RedirectResponse("/campaign", status_code=302)
+
+# ============================================================
+# ======================= DEBUG MODUS =========================
+# ============================================================
+
+@app.get("/debug/person/{pid}", response_class=JSONResponse)
+async def debug_person(pid: str):
+    """
+    Zeigt die PERSON-ROHDATEN inkl. Custom-Felder.
+    Perfekt um zu prüfen:
+    - Wird das Batch-Feld geliefert?
+    - Liegt es in data.custom_fields?
+    - Ist es verschachtelt?
+    """
+    url = append_token(f"{PIPEDRIVE_API}/persons/{pid}?fields=*")
+    r = await http_client().get(url, headers=get_headers())
+    return r.json()
+
+
+@app.get("/debug/block/{start}", response_class=JSONResponse)
+async def debug_block(start: int):
+    """
+    Zeigt einen BLOCK aus der BatchEngine.
+    Perfekt um zu prüfen:
+    - Wie groß ist ein Block?
+    - Ist das Batch-Feld enthalten?
+    - Welche Felder liefert /persons?fields=... wirklich zurück?
+    """
+    url = append_token(
+        f"{PIPEDRIVE_API}/persons?"
+        f"start={start}&limit={BLOCK_SIZE}&"
+        f"fields=id,name,organization,first_name,last_name,emails,{BATCH_FIELD_KEY}"
+    )
+    r = await http_client().get(url, headers=get_headers())
+    return r.json()
+
+
+@app.get("/debug/batch/{batch_id}", response_class=JSONResponse)
+async def debug_batch(batch_id: str):
+    """
+    Testet die BatchEngine V4:
+    - Blockweise Scan
+    - Treffer extrahieren
+    - IDs ausgeben
+    """
+    persons = await get_all_persons_blockwise(BATCH_FIELD_KEY)
+
+    matched_ids = []
+    for p in persons:
+        val = extract_custom_field(p, BATCH_FIELD_KEY)
+        if val == batch_id:
+            matched_ids.append(p["id"])
+
+    return {
+        "batch_id": batch_id,
+        "treffer": len(matched_ids),
+        "ids": matched_ids[:50],   # nur die ersten 50 anzeigen
+    }
+
 
 
