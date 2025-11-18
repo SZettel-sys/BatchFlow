@@ -208,105 +208,120 @@ def df_to_file_response(df: pd.DataFrame, filename: str) -> FileResponse:
     return FileResponse(path, filename=filename, media_type="text/csv")
 
 # ============================================================
-# =============  BatchEngine V4 – HYBRID SCAN  ================
+# =============  BatchEngine V5 – DETAIL-MATCH  ===============
 # ============================================================
 
 BLOCK_SIZE = 500
-PARALLEL_BLOCKS = 6      # Anzahl paralleler Blockrequests
-PARALLEL_DETAILS = 6     # Anzahl paralleler Detailrequests
+PARALLEL_DETAILS = 10      # Anzahl paralleler Detailrequests
+DETAIL_DELAY = 0.025       # 25ms – schützt vor Rate-Limit
 
 
-async def fetch_person_block(start: int, batch_field_key: str):
+async def fetch_id_block(start: int) -> list[str]:
     """
-    Holt einen Block (500 Personen).
-    Sehr schnell und RAM-sicher.
+    Holt NUR die IDs der Personen.
+    Pipedrive liefert hierbei schnell & zuverlässig.
     """
     url = append_token(
         f"{PIPEDRIVE_API}/persons?"
         f"start={start}&limit={BLOCK_SIZE}&"
-        f"fields=*"
+        f"fields=id"
     )
     r = await http_client().get(url, headers=get_headers())
     if r.status_code != 200:
-        return []  # Fallback: leerer Block
+        return []
 
-    return r.json().get("data") or []
+    data = r.json().get("data") or []
+    return [str(p["id"]) for p in data]
 
 
-async def get_all_persons_blockwise(batch_field_key: str):
+async def get_all_person_ids() -> list[str]:
     """
-    Läd alle Personen blockweise – komplett parallelisiert.
-    Extrem schnell, auch bei 108.000 Personen.
+    Holt ALLE Personen-IDs, blockweise.
+    Schnell, RAM-sicher.
     """
 
-    # 1) Gesamtanzahl ermitteln
-    meta_url = append_token(
-        f"{PIPEDRIVE_API}/persons?start=0&limit=1&fields=id"
-    )
+    # 1) Gesamtzahl bestimmen
+    meta_url = append_token(f"{PIPEDRIVE_API}/persons?start=0&limit=1&fields=id")
     meta = await http_client().get(meta_url, headers=get_headers())
     total = meta.json().get("additional_data", {}).get("pagination", {}).get("total_count", 0)
 
-    print(f"[BatchEngine] Gesamtpersonen in Pipedrive: {total}")
+    print(f"[BatchEngine V5] Gesamtpersonen in Pipedrive: {total}")
 
-    # Startpunkte erzeugen: 0, 500, 1000, ...
     starts = list(range(0, total + 1, BLOCK_SIZE))
 
-    sem = asyncio.Semaphore(PARALLEL_BLOCKS)
-    out = []
+    ids = []
+    sem = asyncio.Semaphore(6)
 
     async def load_block(start):
         async with sem:
-            data = await fetch_person_block(start, batch_field_key)
-            out.extend(data)
+            block_ids = await fetch_id_block(start)
+            ids.extend(block_ids)
 
-    # PARALLEL!
     await asyncio.gather(*[load_block(s) for s in starts])
 
-    return out
+    print(f"[BatchEngine V5] IDs geladen: {len(ids)}")
+
+    return ids
+
+
+
+async def get_person_details_if_batch_match(pid: str, batch_values: list[str]):
+    """
+    Holt Detaildaten einer Person und prüft,
+    ob das Batch-Feld zu unseren Batch-IDs passt.
+    """
+
+    url = append_token(f"{PIPEDRIVE_API}/persons/{pid}?fields=*")
+    r = await http_client().get(url, headers=get_headers())
+    if r.status_code != 200:
+        return None
+
+    d = r.json().get("data") or {}
+
+    val = extract_custom_field(d, BATCH_FIELD_KEY)
+
+    # Passt die Batch-ID?
+    if val in batch_values:
+        return d
+
+    return None
+
 
 
 async def get_persons_by_batch_ids(batch_field_key: str, batch_values: list[str]) -> list[dict]:
     """
-    1. Alle Personen blockweise laden
-    2. Direkt im Block filtern (sehr schnell)
-    3. Nur Treffer detailliert nachladen
+    BatchEngine V5:
+
+    1. Holt alle Personen-IDs (blockweise)
+    2. Lädt die Detaildaten NUR für IDs, bei denen die Batch-ID passt
+    3. Maximal parallelisiert, aber sicher (wegen Pipedrive-Limits)
+
+    → Funktioniert für ALLE Feldtypen
+    → Auch wenn /persons Textfelder NICHT liefert
     """
 
-    batch_values = [v.strip() for v in batch_values if v.strip()]
+    # 1: IDs holen
+    ids = await get_all_person_ids()
 
-    # 1) Blockweise Scan
-    persons = await get_all_persons_blockwise(batch_field_key)
-    print(f"[BatchEngine] Personen geladen (blockweise): {len(persons)}")
+    print(f"[BatchEngine V5] Starte Detailprüfung...")
 
-    # 2) Filtern
-    matched_ids = []
-    for p in persons:
-        val = extract_custom_field(p, batch_field_key)
-        if val in batch_values:
-            matched_ids.append(str(p["id"]))
-
-    print(f"[BatchEngine] Treffer für Batch {batch_values}: {len(matched_ids)}")
-
-    # 3) Detaillierte Daten NUR für Treffer laden
+    # 2: Detailprüfung
     details = []
     sem = asyncio.Semaphore(PARALLEL_DETAILS)
 
-    async def load_details(pid):
+    async def process_id(pid):
         async with sem:
-            url = append_token(
-                f"{PIPEDRIVE_API}/persons/{pid}?fields=*"
-            )
-            r = await http_client().get(url, headers=get_headers())
-            if r.status_code == 200:
-                d = r.json().get("data")
-                if d:
-                    details.append(d)
+            d = await get_person_details_if_batch_match(pid, batch_values)
+            if d:
+                details.append(d)
+            await asyncio.sleep(DETAIL_DELAY)
 
-    await asyncio.gather(*[load_details(pid) for pid in matched_ids])
+    await asyncio.gather(*[process_id(pid) for pid in ids])
 
-    print(f"[BatchEngine] Detailpersonen geladen: {len(details)}")
+    print(f"[BatchEngine V5] Batch-Treffer: {len(details)}")
 
     return details
+
 # ============================================================
 # =============  NEUKONTAKTE – EXPORT LOGIK  ================
 # ============================================================
