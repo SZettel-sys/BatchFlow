@@ -152,6 +152,32 @@ def split_name(first_name: Optional[str], last_name: Optional[str], full_name: s
 # master_20251119_FINAL.py – Modul 2/6
 # Filter-First Engine (NF), NK Engine & Parallel Detail Loader
 # ============================================================
+# ------------------------------------------------------------
+# GLOBALER RETRY WRAPPER (für 429 + Netzwerkfehler)
+# ------------------------------------------------------------
+
+async def safe_request(method, url, headers=None, max_retries=10):
+    delay = 1.5  # Start bei 1.5s (sanft für Pipedrive)
+
+    for attempt in range(max_retries):
+        try:
+            r = await http_client().request(method, url, headers=headers)
+
+            # Erfolgreich
+            if r.status_code != 429:
+                return r
+
+            # 429 - Rate Limit → warten
+            print(f"[Retry] 429 erhalten. Warte {delay:.1f}s …")
+            await asyncio.sleep(delay)
+            delay = min(delay * 1.6, 15.0)  # Exponentiell, max 15s
+
+        except Exception as e:
+            print(f"[Retry] Netzwerkfehler: {e}, Warte {delay:.1f}s …")
+            await asyncio.sleep(delay)
+            delay = min(delay * 1.6, 15.0)
+
+    raise Exception(f"Request fehlgeschlagen nach {max_retries} Retries: {url}")
 
 # ------------------------------------------------------------
 # PERSONEN-FELDER CACHE
@@ -247,14 +273,11 @@ async def fetch_person_details(person_ids: List[str]) -> List[dict]:
     return results
 
 
-
-
 # ------------------------------------------------------------
-# FILTER-SCANNER (IDs laden)
+# FILTER-SCANNER (IDs laden) – MIT RETRY
 # ------------------------------------------------------------
 
 async def get_ids_from_filter(filter_id: int) -> set[str]:
-    """Lädt *nur IDs* aus einem Pipedrive-Filter."""
     ids = set()
     start = 0
     limit = 500
@@ -264,35 +287,44 @@ async def get_ids_from_filter(filter_id: int) -> set[str]:
             f"{PIPEDRIVE_API}/persons?filter_id={filter_id}"
             f"&start={start}&limit={limit}&fields=id"
         )
-        r = await http_client().get(url, headers=get_headers())
-        if r.status_code != 200:
-            raise Exception(f"Filter {filter_id} Fehler: {r.text}")
 
-        chunk = r.json().get("data") or []
-        if not chunk:
+        r = await safe_request("GET", url, headers=get_headers())
+
+        data = r.json().get("data") or []
+        if not data:
             break
 
-        for p in chunk:
+        for p in data:
             pid = str(p.get("id"))
             if pid:
                 ids.add(pid)
 
-        if len(chunk) < limit:
+        if len(data) < limit:
             break
+
         start += limit
 
     print(f"[Filter] IDs aus Filter {filter_id}: {len(ids)}")
     return ids
 
 
+
+
 # ------------------------------------------------------------
-# FILTER 3024 – *komplett* laden (Details)
+# FILTER 3024 – komplett laden (IDs → Details)
 # ------------------------------------------------------------
 
 async def get_persons_from_filter_detailed(filter_id: int) -> List[dict]:
-    """NF-Filter vollständig laden (IDs → Details)."""
+    """
+    NF-Filter vollständig laden (IDs → Details).
+    Nutzt Smart-Batch Fetch + Retry-Mechanismus.
+    """
+    # Schritt 1: Alle IDs des Filters holen
     ids = await get_ids_from_filter(filter_id)
+
+    # Schritt 2: Detail-Fetch (Smart Batch Mode)
     persons = await fetch_person_details(list(ids))
+
     print(f"[Filter] Vollständige Details geladen: {len(persons)}")
     return persons
 
@@ -302,7 +334,6 @@ async def get_persons_from_filter_detailed(filter_id: int) -> List[dict]:
 # ------------------------------------------------------------
 
 async def stream_persons_by_filter(filter_id: int):
-    """Ermöglicht iteratives Laden von Filterseiten."""
     start = 0
     limit = 500
 
@@ -311,9 +342,7 @@ async def stream_persons_by_filter(filter_id: int):
             f"{PIPEDRIVE_API}/persons?filter_id={filter_id}"
             f"&start={start}&limit={limit}&fields=id"
         )
-        r = await http_client().get(url, headers=get_headers())
-        if r.status_code != 200:
-            raise Exception(f"Filter-Scan Fehler: {r.text}")
+        r = await safe_request("GET", url, headers=get_headers())
 
         data = r.json().get("data") or []
         if not data:
