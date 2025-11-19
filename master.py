@@ -224,21 +224,18 @@ def split_name(first_name: Optional[str], last_name: Optional[str], full_name: s
     return full_name, ""
 
 # ============================================================
-# MODUL 2 – LIST-Driven NF Engine (FINAL 2025.8)
-# Skalierbar bis 300.000+ Personen
-# Pipedrive Limit-konform, stabil, schnell
+# MODUL 2 – SEARCH-Driven NF Engine (FINAL 2025.9)
+# extrem schnell, 300k-tauglich, filtert nur nach Batch-ID
 # ============================================================
 
 PERSON_BATCH_KEY = "5ac34dad3ea917fdef4087caebf77ba275f87eec"
-PERSON_PROSPECT_KEY = "f9138f9040c44622808a4b8afda2b1b75ee5acd0"
-
 ORG_VERTRIEBSSTOP_KEY = "61d238b86784db69f7300fe8f12f54c601caeff8"
 ORG_LEVEL_KEY = "0ab03885d6792086a0bb007d6302d14b13b0c7d1"
 
 
-# ------------------------------------------------------------
-# Feldzugriff (Custom Fields)
-# ------------------------------------------------------------
+# -----------------------------
+# Hilfsfunktion: CF
+# -----------------------------
 def cf(p: dict, key: str):
     try:
         return (p.get("custom_fields") or {}).get(key)
@@ -247,87 +244,65 @@ def cf(p: dict, key: str):
 
 
 # ------------------------------------------------------------
-# Person LIST LOADER (leichtgewichtige Daten)
+# 1) BATCH-ID PERSONEN SUCHEN (36 Search Requests)
 # ------------------------------------------------------------
-
-async def list_persons_light() -> List[dict]:
+async def search_persons_by_batch_id() -> List[dict]:
     """
-    Lädt ALLE Personen aus Pipedrive über LIST-PAGING.
-    Felder MINIMAL gehalten, um 300k Personen stabil zu verarbeiten.
-    Resultat = leichte Objekte (id, org_id, email, label_ids, custom_fields).
+    Sucht alle Personen mit Batch-ID via Search.
+    Verwendet term >= 2 Zeichen (A–Z, 0–9).
+    Keine Wildcards → Pipedrive-konform.
     """
 
-    print("[NF] Starte LIGHT Personenscan …")
+    print("[NF] Suche Personen mit Batch-ID (Search Engine 2025.9)…")
+
+    terms = []
+
+    # Doppelbuchstaben A–Z
+    letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    for a in letters:
+        for b in letters:
+            terms.append(a + b)
+
+    # Doppelziffern 00–99
+    for i in range(100):
+        terms.append(f"{i:02d}")
 
     persons = []
-    start = 0
-    limit = 500
+    seen_ids = set()
 
-    fields = "id,org_id,email,active_flag,label_ids,name,custom_fields"
+    sem = asyncio.Semaphore(20)
 
-    while True:
-        url = append_token(
-            f"{PIPEDRIVE_API}/persons"
-            f"?start={start}&limit={limit}&fields={fields}"
-        )
+    async def run_term(term):
+        async with sem:
+            url = append_token(
+                f"{PIPEDRIVE_API}/persons/search"
+                f"?term={term}"
+                f"&field_key={PERSON_BATCH_KEY}"
+                f"&start=0&limit=500"
+            )
 
-        r = await safe_request("GET", url, headers=get_headers())
-        data = r.json().get("data")
+            r = await safe_request("GET", url, headers=get_headers())
+            data = r.json().get("data", {}).get("items") or []
 
-        if not data:
-            break
+            for it in data:
+                p = it.get("item") or {}
+                pid = str(p.get("id"))
+                if pid not in seen_ids:
+                    persons.append(p)
+                    seen_ids.add(pid)
 
-        persons.extend(data)
+            await asyncio.sleep(0.01)
 
-        # Break wenn weniger als 500 Personen
-        if len(data) < limit:
-            break
+    # alle Terms parallel schalten
+    await asyncio.gather(*(run_term(t) for t in terms))
 
-        start += limit
-
-        # kleine Pause zur Limit-Schonung
-        await asyncio.sleep(0.01)
-
-    print(f"[NF] LIGHT Personen geladen: {len(persons)}")
+    print(f"[NF] Personen mit Batch-ID (Search): {len(persons)}")
     return persons
 
 
 # ------------------------------------------------------------
-# Replikation von FILTER 3024 (Pre-Check: Personenfilter)
+# 2) PERSON-DETAILS LADEN
 # ------------------------------------------------------------
-
-def nf_precheck_person(p: dict) -> bool:
-    """Leichte Filterung auf Basis der Person-Felder."""
-
-    # Muss aktiv sein
-    if not p.get("active_flag", True):
-        return False
-
-    # Batch-ID ODER Prospect-ID muss existieren
-    if not cf(p, PERSON_BATCH_KEY) and not cf(p, PERSON_PROSPECT_KEY):
-        return False
-
-    # Email vorhanden?
-    emails = p.get("email") or []
-    if not emails or not emails[0].get("value"):
-        return False
-
-    # Person-Labels checken
-    labels = p.get("label_ids") or []
-    if any("BIZFORWARD SPERRE" in str(l) for l in labels):
-        return False
-
-    # Muss eine Organisation besitzen
-    if not p.get("org_id"):
-        return False
-
-    return True
-
-
-# ------------------------------------------------------------
-# Vollständige Personendetails holen
-# ------------------------------------------------------------
-
 async def load_person_details(ids: List[str], batch_size=50) -> List[dict]:
     results = []
     sem = asyncio.Semaphore(40)
@@ -340,7 +315,7 @@ async def load_person_details(ids: List[str], batch_size=50) -> List[dict]:
                 data = r.json().get("data")
                 if data:
                     results.append(data)
-        await asyncio.sleep(0.003)
+        await asyncio.sleep(0.002)
 
     for i in range(0, len(ids), batch_size):
         batch = ids[i:i + batch_size]
@@ -350,9 +325,8 @@ async def load_person_details(ids: List[str], batch_size=50) -> List[dict]:
 
 
 # ------------------------------------------------------------
-# Organisationsdetails laden
+# 3) ORGANISATIONEN LADEN
 # ------------------------------------------------------------
-
 async def load_org_details(org_ids: List[str], batch_size=50) -> Dict[str, dict]:
     results = {}
     sem = asyncio.Semaphore(40)
@@ -365,7 +339,7 @@ async def load_org_details(org_ids: List[str], batch_size=50) -> Dict[str, dict]
                 data = r.json().get("data")
                 if data:
                     results[str(oid)] = data
-        await asyncio.sleep(0.003)
+        await asyncio.sleep(0.002)
 
     for i in range(0, len(org_ids), batch_size):
         batch = org_ids[i:i + batch_size]
@@ -375,12 +349,9 @@ async def load_org_details(org_ids: List[str], batch_size=50) -> Dict[str, dict]
 
 
 # ------------------------------------------------------------
-# Python-Replikation von Filter 3024 (Final)
+# 4) Filter 3024 Python-Replikation
 # ------------------------------------------------------------
-
 def nf_filter_3024(person: dict, org: dict) -> bool:
-
-    # Person-Level-Checks wurden bereits gemacht → org nötig
     if not org:
         return False
 
@@ -395,7 +366,7 @@ def nf_filter_3024(person: dict, org: dict) -> bool:
     if any("VERTRIEBSSTOPP VORÜBERGEHEND" in str(l) for l in org_labels):
         return False
 
-    # ORG-Level leer?
+    # ORG-Level leer
     if cf(org, ORG_LEVEL_KEY) not in (None, "", 0):
         return False
 
@@ -405,7 +376,7 @@ def nf_filter_3024(person: dict, org: dict) -> bool:
     if org.get("won_deals_count", 0) != 0: return False
     if org.get("lost_deals_count", 0) != 0: return False
 
-    # Vertriebsstopp Feld
+    # Vertriebsstop Feld
     vst = cf(org, ORG_VERTRIEBSSTOP_KEY)
     if vst and vst != "keine Freelancer-Anstellung":
         return False
@@ -414,42 +385,35 @@ def nf_filter_3024(person: dict, org: dict) -> bool:
 
 
 # ------------------------------------------------------------
-# NF PIPELINE (LIST → DETAILS → ORGS → FILTER3024)
+# 5) NF Gesamtpipeline
 # ------------------------------------------------------------
-
 async def load_nf_candidates() -> List[dict]:
-    print("[NF] Starte LIST-Driven NF Pipeline …")
+    print("[NF] Starte SEARCH-Driven NF Pipeline …")
 
-    # 1) Leichte Personenliste laden
-    light = await list_persons_light()
+    # 1. Personen mit Batch-ID suchen
+    persons_light = await search_persons_by_batch_id()
 
-    # 2) Personen vorfiltern
-    light_filtered = [p for p in light if nf_precheck_person(p)]
-
-    print(f"[NF] Pre-Filter Personen: {len(light_filtered)}")
-
-    if not light_filtered:
+    if not persons_light:
+        print("[NF] Keine Personen mit Batch-ID gefunden.")
         return []
 
-    # 3) Detail-Ladung nur für Kandidaten
-    ids = [str(p["id"]) for p in light_filtered]
+    # 2. Details laden
+    ids = [str(p["id"]) for p in persons_light]
     persons = await load_person_details(ids)
+    print(f"[NF] Vollständige Details geladen: {len(persons)}")
 
-    print(f"[NF] Vollständige Personendetails: {len(persons)}")
-
-    # 4) relevante Organisationen laden
+    # 3. Organisationen laden
     org_ids = list({str(p.get("org_id")) for p in persons if p.get("org_id")})
     orgs = await load_org_details(org_ids)
 
-    # 5) Finales Filter 3024
+    # 4. Filter 3024 anwenden
     final_list = []
     for p in persons:
-        oid = str(p.get("org_id"))
-        org = orgs.get(oid)
+        org = orgs.get(str(p.get("org_id")))
         if nf_filter_3024(p, org):
             final_list.append(p)
 
-    print(f"[NF] Finale NF-Personen (Filter 3024): {len(final_list)}")
+    print(f"[NF] Finale NF-Personen nach Filter 3024: {len(final_list)}")
     return final_list
 
 # ============================================================
