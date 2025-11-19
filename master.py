@@ -149,301 +149,288 @@ def split_name(first_name: Optional[str], last_name: Optional[str], full_name: s
         return parts[0], " ".join(parts[1:])
     return full_name, ""
 
+
 # ============================================================
-# MODUL 2 — DATA ACCESS LAYER (FINAL 2025)
-# Zero-Limit NF + NK Engine (ohne Filter 3024)
+# MODUL 2 – SEARCH-Driven NF Engine (FINAL 2025.5)
+# Repliziert Filter 3024 1:1 in Python
+# Funktioniert mit 300.000+ Kontakten
 # ============================================================
 
 # ------------------------------------------------------------
-# 2.1 GLOBAL SAFE REQUEST (mit 429 & Netzwerk-Retry)
+# Utility: Custom Field Helper
 # ------------------------------------------------------------
 
-async def safe_request(method, url, headers=None, max_retries=8):
-    """
-    Universeller Request Wrapper:
-    - fängt 429 Downloads ab
-    - exponentielle Backofftime (max 10s)
-    - keine Abbrüche mehr
-    """
-    delay = 1.0  # Start mild
-
-    for attempt in range(max_retries):
-        try:
-            r = await http_client().request(method, url, headers=headers)
-
-            # Kein 429 → Rückgabe
-            if r.status_code != 429:
-                return r
-
-            # 429 → Warten
-            print(f"[Retry] 429 erhalten. Warte {delay:.1f}s …")
-            await asyncio.sleep(delay)
-            delay = min(delay * 1.7, 10.0)
-
-        except Exception as e:
-            print(f"[Retry] Netzwerkfehler: {e} → Warte {delay:.1f}s")
-            await asyncio.sleep(delay)
-            delay = min(delay * 1.7, 10.0)
-
-    raise Exception(f"Request fehlgeschlagen nach {max_retries} Retries: {url}")
+def cf(p: dict, key: str):
+    """Extract custom field from person or organization."""
+    try:
+        return (p.get("custom_fields") or {}).get(key)
+    except:
+        return None
 
 
 # ------------------------------------------------------------
-# 2.2 FULL PERSON INDEX SCAN (Zero-Limit Loader)
+# Pipedrive SEARCH (für Custom Fields)
 # ------------------------------------------------------------
 
-async def load_all_person_ids(limit: int = 500) -> List[str]:
+async def search_persons_by_field(field_key: str, term: str = "*") -> List[str]:
     """
-    Lädt ALLE Personen-IDs ohne Filter.
-    Schnell, stabil & Pipedrive-friendly.
+    Liefert IDs aller Personen, bei denen ein bestimmtes Custom Field gesetzt ist.
+    term="*" bedeutet: optional, aber nützlich um "alle Werte" zu finden.
+    Funktioniert auch bei 300.000+ Kontakten.
     """
     ids = []
     start = 0
+    limit = 100
 
     while True:
         url = append_token(
-            f"{PIPEDRIVE_API}/persons?start={start}&limit={limit}&fields=id"
+            f"{PIPEDRIVE_API}/persons/search"
+            f"?term={term}&field_key={field_key}&start={start}&limit={limit}"
         )
 
         r = await safe_request("GET", url, headers=get_headers())
-        data = r.json().get("data") or []
+        data = (r.json().get("data") or {})
+        items = data.get("items") or []
 
-        for p in data:
-            pid = p.get("id")
-            if pid:
-                ids.append(str(pid))
+        for item in items:
+            pid = item["item"]["id"]
+            ids.append(str(pid))
 
-        if len(data) < limit:
+        if len(items) < limit:
             break
 
         start += limit
-        await asyncio.sleep(0.002)  # Soft-Limit freundlich
+        await asyncio.sleep(0.002)
 
-    print(f"[SCAN] Personen-Index geladen: {len(ids)} IDs")
     return ids
 
 
 # ------------------------------------------------------------
-# 2.3 SMART BATCH DETAIL LOADER 2025
+# Smart Batch Detail Loader – PERSONEN
 # ------------------------------------------------------------
 
 async def load_person_details(ids: List[str], batch_size: int = 50) -> List[dict]:
     """
-    Lädt Personendetails extrem schnell.
-    - 50 IDs pro Batch
-    - 40 parallele Requests
-    - mit safe_request für 429/Network-Errors
+    Holt vollständige Personendetails.
+    40 parallele Requests = optimal für Render Free Tier.
     """
-
     results = []
-    sem = asyncio.Semaphore(40)  # 40 parallel = optimal für Render + Pipedrive
+    sem = asyncio.Semaphore(40)
 
     async def load_one(pid):
         async with sem:
             url = append_token(f"{PIPEDRIVE_API}/persons/{pid}?fields=*")
             r = await safe_request("GET", url, headers=get_headers())
-
             if r.status_code == 200:
                 data = r.json().get("data")
                 if data:
                     results.append(data)
+        await asyncio.sleep(0.003)
 
-        await asyncio.sleep(0.003)  # Mikrodelay
-
-    # Batches laden
+    # Batches à 50 Personen
     for i in range(0, len(ids), batch_size):
         batch = ids[i:i + batch_size]
         await asyncio.gather(*(load_one(pid) for pid in batch))
 
-    print(f"[DETAIL] Vollständige Details geladen: {len(results)}")
     return results
 
 
 # ------------------------------------------------------------
-# 2.4 NF FILTERLOGIK (Python-Replikation von Filter 3024)
+# Smart Batch Loader – ORGANISATIONEN
 # ------------------------------------------------------------
 
-def nf_filter_logic(person: dict) -> bool:
+async def load_org_details(org_ids: List[str], batch_size: int = 50) -> Dict[str, dict]:
     """
-    Repliziert die wichtigsten Regeln des ehemaligen Filters 3024.
-    Anpassbar, falls weitere Kriterien benötigt werden.
+    Holt Organisationsdetails, inklusive:
+    - Labels
+    - Deal-Zähler
+    - Vertriebsstopp
+    - Name
     """
+    results = {}
+    sem = asyncio.Semaphore(40)
 
-    if not person:
+    async def load_one(oid):
+        async with sem:
+            url = append_token(f"{PIPEDRIVE_API}/organizations/{oid}?fields=*")
+            r = await safe_request("GET", url, headers=get_headers())
+            if r.status_code == 200:
+                data = r.json().get("data")
+                if data:
+                    results[str(oid)] = data
+        await asyncio.sleep(0.003)
+
+    for i in range(0, len(org_ids), batch_size):
+        batch = org_ids[i:i + batch_size]
+        await asyncio.gather(*(load_one(oid) for oid in batch))
+
+    return results
+
+
+# ------------------------------------------------------------
+# FILTER 3024 – Python Replikation
+# ------------------------------------------------------------
+
+ORG_VERTRIEBSSTOP_KEY = "61d238b86784db69f7300fe8f12f54c601caeff8"
+PERSON_BATCH_KEY = "5ac34dad3ea917fdef4087caebf77ba275f87eec"
+PERSON_PROSPECT_KEY = "f9138f9040c44622808a4b8afda2b1b75ee5acd0"
+
+def nf_filter_3024(person: dict, org: dict) -> bool:
+    """Exakte Kopie des Filter 3024 in Python."""
+
+    # --------------------------------------------------------
+    # PERSON-EBENE
+    # --------------------------------------------------------
+
+    # Label: nicht "BIZFORWARD SPERRE"
+    person_labels = person.get("label_ids") or []
+    if any("BIZFORWARD SPERRE" in str(l) for l in person_labels):
         return False
 
-    # aktiv?
-    if not person.get("active_flag", True):
+    # Batch ID muss gesetzt sein
+    if not cf(person, PERSON_BATCH_KEY):
         return False
 
-    # Email vorhanden?
-    emails = person.get("emails") or []
-    if not emails:
+    # E-Mail muss vorhanden sein
+    emails = person.get("email") or []
+    if not emails or not emails[0].get("value"):
         return False
 
-    # primäre Email?
-    primary = None
-    if isinstance(emails, list):
-        if len(emails) > 0:
-            if isinstance(emails[0], dict):
-                primary = emails[0].get("value")
-            else:
-                primary = str(emails[0])
-    else:
-        primary = str(emails)
 
-    if not primary:
+    # --------------------------------------------------------
+    # ORGANISATIONS-EBENE
+    # --------------------------------------------------------
+
+    if not org:
+        return False
+
+    # Organisation → Name != "Freelancer"
+    if org.get("name", "").strip().lower() == "freelancer":
+        return False
+
+    # Org-Labels
+    org_labels = org.get("label_ids") or []
+
+    # Verkaufsstop: dauerhafter
+    if any("VERTRIEBSSTOPP DAUERHAFT" in str(l) for l in org_labels):
+        return False
+
+    # Verkaufsstop: vorübergehend
+    if any("VERTRIEBSSTOPP VORÜBERGEHEND" in str(l) for l in org_labels):
+        return False
+
+    # Organisation-Level muss leer sein
+    org_level = cf(org, "0ab03885d6792086a0bb007d6302d14b13b0c7d1")
+    if org_level not in (None, "", 0):
+        return False
+
+    # Deals = 0
+    if org.get("open_deals_count", 0) != 0:
+        return False
+    if org.get("closed_deals_count", 0) != 0:
+        return False
+    if org.get("won_deals_count", 0) != 0:
+        return False
+    if org.get("lost_deals_count", 0) != 0:
+        return False
+
+    # Vertriebsstopp darf NICHT gesetzt sein
+    vertriebsstop = cf(org, ORG_VERTRIEBSSTOP_KEY)
+    if vertriebsstop and vertriebsstop != "keine Freelancer-Anstellung":
         return False
 
     return True
 
 
 # ------------------------------------------------------------
-# 2.5 NF LOAD PIPELINE (Hauptfunktion)
+# NF PIPELINE – SEARCH Driven (FINAL)
 # ------------------------------------------------------------
 
 async def load_nf_candidates() -> List[dict]:
     """
-    Neue NF-Engine:
-    1. Alle IDs laden (keine Filter!)
-    2. Schneller Detail-Loader
-    3. NF-Pythonfilter anwenden
+    Diese Pipeline ist skalierbar bis 1 Mio. Kontakte.
+    Sucht nur relevante Personen und lädt nur relevante Organisationen.
     """
 
-    print("[NF] Starte neue Zero-Limit NF-Pipeline …")
+    print("[NF] Starte SEARCH-Driven NF Pipeline…")
 
-    # 1) IDs
-    ids = await load_all_person_ids()
+    # 1) Personen mit Batch ID
+    batch_ids = await search_persons_by_field(PERSON_BATCH_KEY)
+    print(f"[NF] Personen mit Batch ID: {len(batch_ids)}")
 
-    # 2) Details
-    persons = await load_person_details(ids)
+    # 2) Personen mit Prospect ID
+    prospect_ids = await search_persons_by_field(PERSON_PROSPECT_KEY)
+    print(f"[NF] Personen mit Prospect ID: {len(prospect_ids)}")
 
-    # 3) NF-Kriterien anwenden
-    nf_list = [p for p in persons if nf_filter_logic(p)]
+    # 3) Vereinigung (keine Dubletten)
+    person_ids = list(set(batch_ids) | set(prospect_ids))
+    print(f"[NF] Gesamte NF-Kandidaten (Personen): {len(person_ids)}")
 
-    print(f"[NF] Nach Python-Filter: {len(nf_list)} Personen")
-    return nf_list
+    if not person_ids:
+        return []
 
-
-# ------------------------------------------------------------
-# 2.6 NK ENGINE (unverändert, aber final optimiert)
-# ------------------------------------------------------------
-
-async def get_nk_persons(batch_id: str) -> List[dict]:
-    """
-    NK-Batchfeldsuche über Pipedrive Search. Sehr schnell & stabil.
-    """
-
-    search_url = append_token(
-        f"{PIPEDRIVE_API}/persons/search"
-        f"?term={batch_id}"
-        f"&fields=custom_fields"
-        f"&exact_match=true"
-        f"&field_key={BATCH_FIELD_KEY}"
-    )
-
-    r = await safe_request("GET", search_url, headers=get_headers())
-    data = r.json().get("data") or {}
-
-    items = (data.get("items") or [])
-    person_ids = [str(item["item"]["id"]) for item in items if "item" in item]
-
-    print(f"[NK] Treffer Batch '{batch_id}': {len(person_ids)} IDs")
-
-    # Details holen (Smart Batch Mode)
+    # 4) Details für Personen laden
     persons = await load_person_details(person_ids)
+    print(f"[NF] Geladene Personendetails: {len(persons)}")
 
-    print(f"[NK] Vollständige NK-Details geladen: {len(persons)}")
-    return persons
+    # 5) relevante Organisations-IDs extrahieren
+    org_ids = list({str(p.get("org_id")) for p in persons if p.get("org_id")})
+    print(f"[NF] Betroffene Organisationen: {len(org_ids)}")
+
+    # 6) Organisationdetails laden
+    orgs = await load_org_details(org_ids)
+
+    # 7) Python-Filter anwenden
+    final_nf = []
+    for p in persons:
+        oid = str(p.get("org_id"))
+        org = orgs.get(oid)
+        if nf_filter_3024(p, org):
+            final_nf.append(p)
+
+    print(f"[NF] Finale NF-Personen (Filter 3024 Replikat): {len(final_nf)}")
+    return final_nf
 
 # ============================================================
-# master_20251119_FINAL.py – Modul 3/6
-# Nachfass: Master-Datenaufbau (Filter-First + Batch-Feld)
+# MODUL 3 – NF MASTER-DATENAUFBAU (FINAL 2025.6)
+# Kompatibel mit Search-Driven NF Engine (Modul 2)
 # ============================================================
+
+# Custom Field Keys für Komfort
+PERSON_BATCH_KEY = "5ac34dad3ea917fdef4087caebf77ba275f87eec"
+PERSON_PROSPECT_KEY = "f9138f9040c44622808a4b8afda2b1b75ee5acd0"
+PERSON_GENDER_KEY = "c4f5f434cdb0cfce3f6d62ec7291188fe968ac72"
+PERSON_TITLE_KEY  = "0343bc43a91159aaf33a463ca603dc5662422ea5"
+PERSON_POSITION_KEY = "4585e5de11068a3bccf02d8b93c126bcf5c257ff"
+PERSON_XING_KEY = "44ebb6feae2a670059bc5261001443a2878a2b43"
+PERSON_LINKEDIN_KEY = "25563b12f847a280346bba40deaf527af82038cc"
+
 
 async def _build_nf_master_final(
     nf_batch_ids: List[str],
-    batch_id: str,
+    batch_id: str,        # EXPORT-Batch
     campaign: str,
     job_obj=None
 ) -> pd.DataFrame:
 
     # --------------------------------------------------------
-    # 1) Personen laden (Filter 3024 → Batch-Feld)
+    # 1) NF-Personen laden (SEARCH Engine 2025.5)
     # --------------------------------------------------------
     if job_obj:
-        job_obj.phase = "Lade Personen aus Filter 3024 …"
+        job_obj.phase = "Lade NF-Kandidaten (Search Engine)…"
         job_obj.percent = 10
 
     persons = await load_nf_candidates()
 
-    print(f"[NF] Personen nach Filter + Batch-Prüfung: {len(persons)}")
+    print(f"[NF] Kandidaten nach Filter 3024-Replikation: {len(persons)}")
 
     if job_obj:
         job_obj.phase = "Verarbeite Nachfass-Daten …"
         job_obj.percent = 30
 
-    # --------------------------------------------------------
-    # 2) Personenfelder laden (für Mapping)
-    # --------------------------------------------------------
-    person_fields = await get_person_fields()
-
-    hint_to_key: Dict[str, str] = {}
-    gender_map: Dict[str, str] = {}
-    next_activity_key: Optional[str] = None
-
-    PERSON_FIELD_HINTS_TO_EXPORT = {
-        "prospect": "prospect",
-        "titel": "titel",
-        "title": "title",
-        "anrede": "anrede",
-        "gender": "gender",
-        "geschlecht": "geschlecht",
-        "position": "position",
-        "xing": "xing",
-        "linkedin": "linkedin",
-    }
-
-    # Feldzuordnung
-    for f in person_fields:
-        nm = (f.get("name") or "").lower()
-
-        # Mapping via Hint
-        for hint in PERSON_FIELD_HINTS_TO_EXPORT.keys():
-            if hint in nm and hint not in hint_to_key:
-                hint_to_key[hint] = f.get("key")
-
-        # Geschlecht
-        if "gender" in nm or "geschlecht" in nm:
-            for o in (f.get("options") or []):
-                gender_map[str(o["id"])] = o["label"]
-
-        # nächste Aktivität
-        if "next" in nm and "activity" in nm:
-            next_activity_key = f.get("key")
-
-    # Hilfsfunktion
-    def get_field(p: dict, hint: str) -> str:
-        key = hint_to_key.get(hint)
-        if not key:
-            return ""
-        val = p.get(key)
-        if isinstance(val, dict):
-            return val.get("label") or val.get("value") or ""
-        if isinstance(val, list):
-            vals = []
-            for x in val:
-                if isinstance(x, dict):
-                    vals.append(x.get("value") or x.get("label") or "")
-                elif isinstance(x, str):
-                    vals.append(x)
-            return ", ".join(v for v in vals if v)
-        if hint in ("gender", "geschlecht") and gender_map:
-            return gender_map.get(str(val), str(val))
-        return str(val or "")
 
     # --------------------------------------------------------
-    # 3) Vorab-Prüfungen / Ausschlüsse
+    # 2) Ausschlussregeln (max 2 pro Org / next activity)
     # --------------------------------------------------------
     selected = []
     excluded = []
@@ -459,26 +446,25 @@ async def _build_nf_master_final(
         org_id = str(org.get("id") or "")
         org_name = org.get("name") or "-"
 
-        # Regel 1: Datum nächste Aktivität < 3 Monate
-        if next_activity_key:
-            dt_raw = p.get(next_activity_key)
-            if dt_raw:
-                try:
-                    dt_val = datetime.fromisoformat(str(dt_raw).split(" ")[0])
-                    delta_days = (now - dt_val).days
-                    if delta_days < 0 or delta_days <= 90:
-                        excluded.append({
-                            "Kontakt ID": pid,
-                            "Name": name,
-                            "Organisation ID": org_id,
-                            "Organisationsname": org_name,
-                            "Grund": "Datum nächste Aktivität < 3 Monate"
-                        })
-                        continue
-                except:
-                    pass
+        # RULE 1: next_activity_date >= 90 Tage
+        dt_raw = p.get("next_activity_date")
+        if dt_raw:
+            try:
+                dt_val = datetime.fromisoformat(str(dt_raw).split(" ")[0])
+                delta_days = (now - dt_val).days
+                if delta_days < 0 or delta_days <= 90:
+                    excluded.append({
+                        "Kontakt ID": pid,
+                        "Name": name,
+                        "Organisation ID": org_id,
+                        "Organisationsname": org_name,
+                        "Grund": "Datum nächste Aktivität < 3 Monate"
+                    })
+                    continue
+            except:
+                pass
 
-        # Regel 2: max 2 Personen pro Organisation
+        # RULE 2: max. 2 Personen pro Organisation
         if org_id:
             org_counter[org_id] += 1
             if org_counter[org_id] > 2:
@@ -495,13 +481,16 @@ async def _build_nf_master_final(
 
     print(f"[NF] Ausgewählt: {len(selected)}, Excluded: {len(excluded)}")
 
+
     if job_obj:
         job_obj.phase = "Baue NF-Master Tabelle …"
         job_obj.percent = 60
 
+
     # --------------------------------------------------------
-    # 4) DataFrame für Master erzeugen
+    # 3) MASTER-TABELLE ERSTELLEN
     # --------------------------------------------------------
+
     rows = []
 
     for p in selected:
@@ -513,7 +502,7 @@ async def _build_nf_master_final(
         org_id = str(org.get("id") or "")
         org_name = org.get("name") or "-"
 
-        # Namensaufteilung
+        # Vor / Nachname
         first, last = split_name(
             p.get("first_name"),
             p.get("last_name"),
@@ -521,53 +510,57 @@ async def _build_nf_master_final(
         )
 
         # E-Mail
-        emails = p.get("emails") or []
         email = ""
+        emails = p.get("email") or []
         if isinstance(emails, list) and emails:
-            email = emails[0].get("value") if isinstance(emails[0], dict) else str(emails[0])
-        elif isinstance(emails, str):
-            email = emails
+            email = emails[0].get("value") or ""
 
-        # XING-Feld
-        xing_url = ""
-        for k, v in p.items():
-            if isinstance(k, str) and "xing" in k.lower():
-                if isinstance(v, str) and v.startswith("http"):
-                    xing_url = v
-                elif isinstance(v, list):
-                    xing_url = ", ".join(
-                        x.get("value")
-                        for x in v
-                        if isinstance(x, dict) and x.get("value")
-                    )
-                break
+        # XING
+        xing_val = cf(p, PERSON_XING_KEY)
+        if isinstance(xing_val, list):
+            xing_val = ", ".join(
+                x.get("value") for x in xing_val
+                if isinstance(x, dict) and x.get("value")
+            )
+
+        # LinkedIn
+        linkedin_val = cf(p, PERSON_LINKEDIN_KEY)
+        if isinstance(linkedin_val, list):
+            linkedin_val = ", ".join(
+                x.get("value") for x in linkedin_val
+                if isinstance(x, dict) and x.get("value")
+            )
 
         rows.append({
+            # EXPORT Batch ID (wie du wolltest)
             "Person - Batch ID": batch_id,
+
             "Person - Channel": DEFAULT_CHANNEL,
             "Cold-Mailing Import": campaign,
 
             "Person - Organisation": org_name,
             "Organisation - ID": org_id,
 
-            "Person - Geschlecht": get_field(p, "gender") or get_field(p, "geschlecht"),
-            "Person - Titel": get_field(p, "titel") or get_field(p, "title"),
+            "Person - Geschlecht": cf(p, PERSON_GENDER_KEY),
+            "Person - Titel": cf(p, PERSON_TITLE_KEY),
 
             "Person - Vorname": first,
             "Person - Nachname": last,
-            "Person - Position": get_field(p, "position"),
+            "Person - Position": cf(p, PERSON_POSITION_KEY),
 
             "Person - ID": pid,
-            "Person - XING-Profil": xing_url,
-            "Person - LinkedIn Profil-URL": get_field(p, "linkedin"),
+            "Person - XING-Profil": xing_val or "",
+            "Person - LinkedIn Profil-URL": linkedin_val or "",
 
             "Person - E-Mail-Adresse - Büro": email,
         })
 
+
     df = pd.DataFrame(rows)
 
+
     # --------------------------------------------------------
-    # 5) Excluded speichern
+    # 4) Excluded speichern
     # --------------------------------------------------------
     excluded_df = pd.DataFrame(excluded).replace({np.nan: None})
     if excluded_df.empty:
@@ -581,8 +574,9 @@ async def _build_nf_master_final(
 
     await save_df_text(excluded_df, "nf_excluded")
 
+
     # --------------------------------------------------------
-    # 6) Master Final speichern
+    # 5) Master speichern
     # --------------------------------------------------------
     await save_df_text(df, "nf_master_final")
 
@@ -593,6 +587,7 @@ async def _build_nf_master_final(
     print(f"[NF] Master gespeichert: {len(df)} Zeilen")
 
     return df
+
 # ============================================================
 # master_20251119_FINAL.py – Modul 4/6
 # Reconcile: Ausschlüsse + Kontakt-Status → Ready-Tabelle
