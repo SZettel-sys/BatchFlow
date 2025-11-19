@@ -1035,3 +1035,27 @@ function showError(msg) {
 </html>
         """
     )
+# ============================================================
+# UI ENDPOINT (HTML)
+# ============================================================
+
+@ui_router.get("/", response_class=HTMLResponse)
+async def ui_page():
+    return """
+    <html>
+       <head>...</head>
+       <body> ... </body>
+    </html>
+    """
+
+# ============================================================
+# FASTAPI APP BOOTSTRAP
+# ============================================================
+
+from fastapi import FastAPI
+
+app = FastAPI()
+
+# Router registrieren
+app.include_router(ui_router)
+
