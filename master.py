@@ -90,6 +90,80 @@ def http_client():
         _http_client = httpx.AsyncClient(timeout=30.0)
     return _http_client
 
+# ============================================================
+# Hilfsfunktionen (API Handling): Token, Header, safe_request
+# ============================================================
+
+import httpx
+import asyncio
+
+# API-Basis
+PIPEDRIVE_API = "https://api.pipedrive.com/v1"
+PD_API_TOKEN = os.getenv("PD_API_TOKEN", "").strip()
+
+
+def append_token(url: str) -> str:
+    """Fügt den API-Token korrekt an jede Pipedrive-URL an."""
+    sep = "&" if "?" in url else "?"
+    return f"{url}{sep}api_token={PD_API_TOKEN}"
+
+
+def get_headers() -> dict:
+    """Standard-Header für Pipedrive API."""
+    return {
+        "Accept": "application/json",
+        "Content-Type": "application/json"
+    }
+
+
+async def safe_request(
+    method: str,
+    url: str,
+    headers: dict,
+    max_retries: int = 10,
+    initial_delay: float = 1.5
+):
+    """
+    Sichere API-Abfrage mit:
+        - 429 Retry (Rate Limit)
+        - Fehlerlogging
+        - Exponentiellem Backoff
+        - Stabil für 300.000+ Kontakte
+    """
+
+    delay = initial_delay
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                r = await client.request(method, url, headers=headers)
+
+            # 200 OK → zurückgeben
+            if r.status_code == 200:
+                return r
+
+            # 429 → Warte & Retry
+            if r.status_code == 429:
+                print(f"[Retry] 429 erhalten. Warte {delay:.1f}s …")
+                await asyncio.sleep(delay)
+                delay *= 1.7
+                continue
+
+            # andere Fehler → loggen, aber nicht sofort crashen
+            print(f"[WARN] API Fehler {r.status_code}: {url}")
+            print(r.text)
+            return r
+
+        except Exception as e:
+            print(f"[ERR] safe_request Exception: {e}")
+
+        await asyncio.sleep(delay)
+        delay *= 1.5
+
+    # Wenn alle Versuche gagalgen
+    raise Exception(f"Request fehlgeschlagen nach {max_retries} Retries: {url}")
+
+
 # ------------------------------------------------------------
 # DB Pool
 # ------------------------------------------------------------
