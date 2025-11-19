@@ -42,7 +42,7 @@ if os.path.isdir("static"):
 
 # ------------------------------------------------------------
 # Environment Variablen
-# ------------------------------------------------------------
+# ------------------------------------------------------------ 
 
 PD_API_TOKEN = os.getenv("PD_API_TOKEN", "")
 PIPEDRIVE_API = "https://api.pipedrive.com/v1"
