@@ -553,7 +553,7 @@ async def _build_nf_master_final(
 
     persons = []
     # ← DEINE bestehende Streaming-Funktion (NICHT verändert!)
-    async for batch in stream_persons_by_batch_ids(nf_batch_ids):
+    async for batch in stream_persons_by_batch_id(nf_batch_ids):
         persons.extend(batch)
 
     print(f"[NF] Personen geladen aus Batch-IDs: {len(persons)}")
