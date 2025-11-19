@@ -554,7 +554,10 @@ async def _build_nf_master_final(
     persons = []
 
     # ▶ FIX: dies ist deine echte Funktion
-    async for batch in stream_persons_by_batch_id(nf_batch_ids):
+    async for batch in stream_persons_by_batch_id(
+        FIELD_BATCH_ID,   # dein echtes Batch-Feld
+        nf_batch_ids      # die Liste der Batch-Werte
+    ):
         persons.extend(batch)
 
     print(f"[NF] Personen geladen aus Batch-IDs: {len(persons)}")
