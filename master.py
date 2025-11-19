@@ -523,7 +523,7 @@ async def stream_persons_by_filter(
         start += len(data)
 
 # ============================================================
-# NACHFASS: MASTER-DATENAUFBAU (Final 2025)
+# NACHFASS: MASTER-DATENAUFBAU (Final 2025 – FIXED Loader)
 # ============================================================
 
 async def _build_nf_master_final(
@@ -534,7 +534,7 @@ async def _build_nf_master_final(
 ) -> pd.DataFrame:
 
     # ------------------------------------------------------------
-    # 0) Field-Key Mapping (stabil & exakt)
+    # 0) Field-Key Mapping
     # ------------------------------------------------------------
     FIELD_BATCH_ID              = "5ac34dad3ea917fdef4087caebf77ba275f87eec"
     FIELD_PROSPECT_ID           = "f9138f9040c44622808a4b8afda2b1b75ee5acd0"
@@ -545,14 +545,15 @@ async def _build_nf_master_final(
     FIELD_LINKEDIN              = "25563b12f847a280346bba40deaf527af82038cc"
 
     # ------------------------------------------------------------
-    # 1) Personen laden – aus deiner bestehenden hoch-performanten Engine
+    # 1) Personen laden – mit DEINER echten Loader-Funktion
     # ------------------------------------------------------------
     if job_obj:
         job_obj.phase = "Lade NF-Kandidaten …"
         job_obj.percent = 10
 
     persons = []
-    # ← DEINE bestehende Streaming-Funktion (NICHT verändert!)
+
+    # ▶ FIX: dies ist deine echte Funktion
     async for batch in stream_persons_by_batch_id(nf_batch_ids):
         persons.extend(batch)
 
@@ -563,30 +564,26 @@ async def _build_nf_master_final(
         job_obj.percent = 25
 
     # ------------------------------------------------------------
-    # 2) Filter-Logik (Final 2025, exakt wie besprochen)
+    # 2) Regeln anwenden (wie definiert)
     # ------------------------------------------------------------
+
     selected = []
     excluded = []
     org_counter = defaultdict(int)
     today = datetime.now().date()
 
     def is_date_valid(dt_raw):
-        """dt_raw muss leer ODER älter als 90 Tage sein."""
         if not dt_raw:
             return True
         try:
-            date_str = str(dt_raw).split(" ")[0]
-            dt = datetime.fromisoformat(date_str).date()
+            dt = datetime.fromisoformat(str(dt_raw).split(" ")[0]).date()
         except:
-            return True  # Wenn Pipedrive Mist liefert → nicht ausschließen
+            return True
 
         if dt > today:
-            return False  # Zukunft → ausschließen
-
-        diff = (today - dt).days
-        if diff <= 90:
-            return False  # Jünger als 3 Monate → ausschließen
-
+            return False
+        if (today - dt).days <= 90:
+            return False
         return True
 
     for p in persons:
@@ -596,9 +593,8 @@ async def _build_nf_master_final(
         org_id = str(org.get("id") or "")
         org_name = org.get("name") or ""
 
-        # Regel 1: next_activity_date
-        next_activity_date = p.get("next_activity_date")
-        if not is_date_valid(next_activity_date):
+        next_activity = p.get("next_activity_date")
+        if not is_date_valid(next_activity):
             excluded.append({
                 "Kontakt ID": pid,
                 "Name": p.get("name"),
@@ -607,7 +603,6 @@ async def _build_nf_master_final(
             })
             continue
 
-        # Regel 2: Max. 2 Personen pro Organisation
         if org_id:
             org_counter[org_id] += 1
             if org_counter[org_id] > 2:
@@ -628,7 +623,7 @@ async def _build_nf_master_final(
         job_obj.percent = 55
 
     # ------------------------------------------------------------
-    # 3) Excel-Ausgabe gemäß deiner gewünschten Spaltenreihenfolge
+    # 3) Excel Daten (mit Field-Keys)
     # ------------------------------------------------------------
     rows = []
 
@@ -639,14 +634,12 @@ async def _build_nf_master_final(
         org_name = org.get("name") or ""
         org_id = str(org.get("id") or "")
 
-        # Namen sauber splitten
         first, last = split_name(
             p.get("first_name"),
             p.get("last_name"),
             p.get("name")
         )
 
-        # Primäre E-Mail (Regel A)
         email = ""
         emails = p.get("emails") or []
         if isinstance(emails, list):
@@ -655,8 +648,7 @@ async def _build_nf_master_final(
                     email = e.get("value", "")
                     break
 
-        # Custom Fields stabil per Field-Key
-        row = {
+        rows.append({
             "Person - Batch ID": batch_id,
             "Person - Channel": DEFAULT_CHANNEL,
             "Cold E-Mail": campaign,
@@ -676,15 +668,10 @@ async def _build_nf_master_final(
             "Person - LinkedIn Profil-URL": p.get(FIELD_LINKEDIN, ""),
 
             "Person - E-Mail-Adresse - Büro": email,
-        }
-
-        rows.append(row)
+        })
 
     df = pd.DataFrame(rows).replace({None: ""})
 
-    # ------------------------------------------------------------
-    # 4) Excluded-Sheet speichern
-    # ------------------------------------------------------------
     excluded_df = pd.DataFrame(excluded).replace({None: ""})
     if excluded_df.empty:
         excluded_df = pd.DataFrame([{
@@ -695,10 +682,6 @@ async def _build_nf_master_final(
         }])
 
     await save_df_text(excluded_df, "nf_excluded")
-
-    # ------------------------------------------------------------
-    # 5) Master speichern
-    # ------------------------------------------------------------
     await save_df_text(df, "nf_master_final")
 
     if job_obj:
@@ -708,6 +691,7 @@ async def _build_nf_master_final(
     print(f"[NF] Master gespeichert: {len(df)} Zeilen")
 
     return df
+
 
 
 # =============================================================================
