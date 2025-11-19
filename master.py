@@ -11,6 +11,7 @@ from fastapi import FastAPI, Request, Body, Query, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, StreamingResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.gzip import GZipMiddleware
+from collections import defaultdict
 
 fuzz.default_processor = lambda s: s  # kein Vor-Preprocessing
 
