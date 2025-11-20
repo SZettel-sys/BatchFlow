@@ -765,14 +765,14 @@ for p in selected:
 
 df = pd.DataFrame(rows).replace({None: ""})
 
-    # ------------------------------------------------------------
-    # 5) Excluded speichern (UI)
-    # ------------------------------------------------------------
-    ex = pd.DataFrame(excluded).replace({None: ""})
-    await save_df_text(ex, "nf_excluded")
+# ------------------------------------------------------------
+# 5) Excluded speichern (UI)
+# ------------------------------------------------------------
+ex = pd.DataFrame(excluded).replace({None: ""})
+await save_df_text(ex, "nf_excluded")
 
-    # Master speichern (für Excel)
-    await save_df_text(df, "nf_master_final")
+# Master speichern (für Excel)
+await save_df_text(df, "nf_master_final")
 
     if job_obj:
         job_obj.phase = "Nachfass-Master erstellt"
