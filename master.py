@@ -156,6 +156,37 @@ def slugify_filename(name: str, fallback="BatchFlow_Export") -> str:
     s = re.sub(r"[^\w\-. ]+", "", (name or "").strip())
     return re.sub(r"\s+", "_", s) or fallback
 
+
+def _df_to_excel_bytes(df: pd.DataFrame) -> bytes:
+    """
+    Wandelt ein DataFrame in eine Excel-Datei (Bytes) um.
+    """
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        df.to_excel(writer, index=False, sheet_name="Export")
+    return output.getvalue()
+
+
+def _build_export_from_ready(filename: str):
+    """
+    Baut die FileResponse für Downloads aus /tmp/.
+    """
+    path = f"/tmp/{filename}"
+
+    # Falls Datei nicht existiert → Fehler zurückgeben
+    if not os.path.exists(path):
+        return Response(
+            content=f"File not found: {filename}",
+            status_code=404
+        )
+
+    # Excel zurückgeben
+    return FileResponse(
+        path,
+        filename=filename,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
 # -----------------------------------------------------------------------------
 # DB-Helper
 # -----------------------------------------------------------------------------
