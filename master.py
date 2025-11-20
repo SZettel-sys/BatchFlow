@@ -829,7 +829,7 @@ async def _reconcile(prefix: str) -> None:
                 "Name": f"{row.get('Person Vorname','')} {row.get('Person Nachname','')}".strip(),
                 "Organisation ID": row[col_orgid],
                 "Organisationsname": name,
-                "Grund": f"Ähnlichkeit {best[1]}%"
+                "Grund": f"Ähnlichkeit {best[1]}% mit '{best[0]}'"
             })
 
     df = df.drop(drop_idx)
