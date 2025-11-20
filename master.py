@@ -523,8 +523,9 @@ async def stream_persons_by_filter(
             break
         start += len(data)
 
+
 # ============================================================
-# NACHFASS: MASTER-DATENAUFBAU – BEREINIGTE FINALVERSION
+# NACHFASS: MASTER-DATENAUFBAU – FINAL BEREINIGT
 # ============================================================
 
 async def _build_nf_master_final(
@@ -535,7 +536,7 @@ async def _build_nf_master_final(
 ) -> pd.DataFrame:
 
     # ------------------------------------------------------------
-    # 0) Field-Key Mapping (stabil)
+    # 0) Feld-Keys (fest nach Vorgabe)
     # ------------------------------------------------------------
     FIELD_BATCH_ID    = "5ac34dad3ea917fdef4087caebf77ba275f87eec"
     FIELD_PROSPECT_ID = "f9138f9040c44622808a4b8afda2b1b75ee5acd0"
@@ -559,65 +560,60 @@ async def _build_nf_master_final(
     print(f"[NF] Personen geladen aus Batch-IDs: {len(persons)}")
 
     # ------------------------------------------------------------
-    # 2) Feld-Key für 'Datum nächste Aktivität' holen
+    # 2) Field-Key für 'Datum nächste Aktivität'
     # ------------------------------------------------------------
     NEXT_KEY = await get_next_activity_key()
 
     # ------------------------------------------------------------
-    # 3) Filter-Logik (Datum + max 2 pro Organisation)
+    # 3) Filter-Logik: Datum + maximal 2 Kontakte pro Organisation
     # ------------------------------------------------------------
     selected = []
     excluded = []
+
     org_counter = defaultdict(int)
     today = datetime.now().date()
 
-    def is_date_valid(dt_raw):
-        """
-        TRUE  → Kontakt darf verwendet werden
-        FALSE → Kontakt wird ausgeschlossen
-        """
-        if not dt_raw:
-            return True  # kein Datum = OK
-
+    def is_date_valid(raw):
+        if not raw:
+            return True
         try:
-            dt = datetime.fromisoformat(dt_raw.split(" ")[0]).date()
+            dt = datetime.fromisoformat(raw.split(" ")[0]).date()
         except:
-            return True  # unlesbares Datum = OK
-
+            return True
         if dt > today:
-            return False  # Zukunft
+            return False
         if (today - dt).days <= 90:
-            return False  # jünger als 3 Monate
+            return False
         return True
 
     # ------------------------------------------------------------
-    # Verarbeitung aller Personen
+    # Personen verarbeiten
     # ------------------------------------------------------------
     for p in persons:
 
         pid = str(p.get("id") or "")
         name = p.get("name") or ""
-        org  = p.get("organization") or {}
+
+        org = p.get("organization") or {}
         org_id = str(org.get("id") or "")
         org_name = org.get("name") or ""
 
-        # Datum extrahieren
-        next_activity = extract_field_date(p, NEXT_KEY)
+        next_act = extract_field_date(p, NEXT_KEY)
 
-        # ❌ Ausschlussgrund 1 – nächste Aktivität < 3 Monate
-        if not is_date_valid(next_activity):
+        # ❌ Ausschlussgrund: Datum ungültig
+        if not is_date_valid(next_act):
             excluded.append({
                 "Kontakt ID": pid,
                 "Name": name,
                 "Organisation ID": org_id,
                 "Organisationsname": org_name,
-                "Grund": f"Nächste Aktivität {next_activity or '–'} < 3 Monate oder in der Zukunft",
+                "Grund": f"Nächste Aktivität {next_act or '–'} < 3 Monate oder in der Zukunft",
                 "Quelle": "Batch-/Filter-Ausschluss"
             })
-            print(f"[NF-DEBUG] EXCLUDE PID={pid} ORG={org_name} → NextActivity={next_activity}")
+            print(f"[NF-DEBUG] EXCLUDE PID={pid} ORG={org_name} → NextActivity={next_act}")
             continue
 
-        # ❌ Ausschlussgrund 2 – mehr als 2 Kontakte pro Organisation
+        # ❌ Ausschlussgrund: mehr als 2 Kontakte pro Org
         if org_id:
             org_counter[org_id] += 1
             if org_counter[org_id] > 2:
@@ -638,11 +634,11 @@ async def _build_nf_master_final(
     print(f"[NF] Ausgewählt: {len(selected)}, Excluded: {len(excluded)}")
 
     if job_obj:
-        job_obj.phase = "Baue Excel…"
+        job_obj.phase = "Baue Excel …"
         job_obj.percent = 55
 
     # ------------------------------------------------------------
-    # 4) Excel-Daten aufbauen
+    # 4) Excel-Zeilen aufbauen
     # ------------------------------------------------------------
     rows = []
     for p in selected:
@@ -658,6 +654,7 @@ async def _build_nf_master_final(
             p.get("name")
         )
 
+        # Büro-Email (primär)
         email = ""
         emails = p.get("emails") or []
         if isinstance(emails, list):
@@ -667,31 +664,35 @@ async def _build_nf_master_final(
                     break
 
         rows.append({
-            "Person ID": pid,                           # FIXED
+            "Batch ID": batch_id,
+            "Channel": DEFAULT_CHANNEL,
+            "Cold-Mailing Import": campaign,
+
+            "Person ID": pid,
             "Person Vorname": first,
             "Person Nachname": last,
             "Person Titel": p.get(FIELD_TITLE, ""),
             "Person Geschlecht": p.get(FIELD_GENDER, ""),
             "Person Position": p.get(FIELD_POSITION, ""),
             "Person E-Mail": email,
-            "XING Profil": p.get(FIELD_XING, ""),
-            "LinkedIn URL": p.get(FIELD_LINKEDIN, ""),
+
+            "Prospect ID": p.get(FIELD_PROSPECT_ID, ""),
             "Organisation Name": org_name,
             "Organisation ID": org_id,
-            "Batch ID": batch_id,
-            "Channel": DEFAULT_CHANNEL,
-            "Cold-Mailing Import": campaign,
-            "Prospect ID": p.get(FIELD_PROSPECT_ID, "")
+            "XING Profil": p.get(FIELD_XING, ""),
+            "LinkedIn URL": p.get(FIELD_LINKEDIN, "")
         })
 
     df = pd.DataFrame(rows).replace({None: ""})
 
     # ------------------------------------------------------------
-    # 5) Excluded sauber speichern
+    # 5) Excluded speichern (UI)
     # ------------------------------------------------------------
     ex = pd.DataFrame(excluded).replace({None: ""})
-    await save_df_text(ex, "nf_excluded")      # UI-Tabelle
-    await save_df_text(df, "nf_master_final")  # Excel-Tabelle
+    await save_df_text(ex, "nf_excluded")
+
+    # Master speichern (für Excel)
+    await save_df_text(df, "nf_master_final")
 
     if job_obj:
         job_obj.phase = "Nachfass-Master erstellt"
@@ -701,169 +702,285 @@ async def _build_nf_master_final(
 
     return df
 
+# =============================================================================
+# BASIS-ABGLEICH (Organisationen & IDs) – MODUL 4 FINAL
+# =============================================================================
+
+def bucket_key(name: str) -> str:
+    """2-Buchstaben-Bucket für schnellen Fuzzy-Match."""
+    n = normalize_name(name)
+    return n[:2] if len(n) > 1 else n
+
+def fast_fuzzy(a: str, b: str) -> int:
+    """Schnellerer Fuzzy-Matcher."""
+    return fuzz.partial_ratio(a, b)
 
 # =============================================================================
-# BASIS-ABGLEICH (Organisationen & IDs)
+# Fuzzy-Bucket-Ladung (Orga-Dubletten-Abgleich)
 # =============================================================================
 async def _fetch_org_names_for_filter_capped(
     filter_id: int, page_limit: int, cap_total: int, cap_bucket: int
 ) -> Dict[str, List[str]]:
-    """Holt Organisationsnamen pro Anfangsbuchstabe – capped."""
+    """
+    Holt Organisationsnamen aus Pipedrive-Filter.
+    • normalized
+    • alphabetisch gebucket
+    • capped pro Bucket & Gesamtanzahl
+    """
     buckets: Dict[str, List[str]] = {}
     total = 0
+
     async for chunk in stream_organizations_by_filter(filter_id, page_limit):
         for o in chunk:
             n = normalize_name(o.get("name") or "")
             if not n:
                 continue
-            b = n[0]
+
+            b = bucket_key(n)
             lst = buckets.setdefault(b, [])
+
             if len(lst) >= cap_bucket:
                 continue
+
             if not lst or lst[-1] != n:
                 lst.append(n)
                 total += 1
+
                 if total >= cap_total:
                     return buckets
+
     return buckets
 
 
-def bucket_key(name: str) -> str:
-    """Bildet 2-Buchstaben-Buckets für schnelleren Fuzzy-Vergleich."""
-    n = normalize_name(name)
-    return n[:2] if len(n) > 1 else n
-
-
-def fast_fuzzy(a: str, b: str) -> int:
-    """Schnellerer Fuzzy-Matcher (partial_ratio)."""
-    return fuzz.partial_ratio(a, b)
-
 # =============================================================================
-# Nachfass – Performanter Organisations- und Personenabgleich (3 Filter + Log)
+# RECONCILE – Nachfass Abgleich (Organisation + Person-ID)
 # =============================================================================
 async def _reconcile(prefix: str) -> None:
     """
-    Fuzzy-Abgleich (≥95 %) + Entfernen bereits kontaktierter Personen.
-    Orga-Filter: 1245, 851, 1521. Personen-ID-Filter: 1216, 1708.
-    Ergebnis: *_master_ready + *_delete_log
+    Abgleich für Nachfass:
+    1) Fuzzy Organisation ≥95 % → entfernen
+    2) Personen-ID Dubletten aus Filter 1216/1708 → entfernen
+    3) Delete-Log speichern
     """
     t = tables(prefix)
-    master = await load_df_text(t["final"])
-    if master is None or master.empty:
+    df = await load_df_text(t["final"])
+
+    if df.empty:
         await save_df_text(pd.DataFrame(), t["ready"])
         await save_df_text(pd.DataFrame(columns=["reason","id","name","org_id","org_name","extra"]), t["log"])
         return
 
-    col_person_id, col_org_name, col_org_id = "Person ID", "Organisation Name", "Organisation ID"
-    delete_rows: List[Dict[str, str]] = []
+    col_pid = "Person ID"
+    col_orgname = "Organisation Name"
+    col_orgid = "Organisation ID"
 
-    # 1) Orgas einsammeln (1245, 851, 1521)
-    filter_ids_org = [1245, 851, 1521]
+    delete_rows = []
+
+    # -----------------------------------------------
+    # 1) Organisation fuzzy ≥ 95 % Ähnlichkeit
+    # -----------------------------------------------
+    filter_ids_org = [1245, 851, 1521]   # Orga-Dublettenfilter
+
     buckets_all: Dict[str, List[str]] = {}
-    collected_total = 0
+    total_collected = 0
+
     for fid in filter_ids_org:
-        caps_left = max(0, MAX_ORG_NAMES - collected_total)
+        caps_left = MAX_ORG_NAMES - total_collected
         if caps_left <= 0:
             break
-        buckets = await _fetch_org_names_for_filter_capped(fid, PAGE_LIMIT, caps_left, MAX_ORG_BUCKET)
-        for k, lst in buckets.items():
-            slot = buckets_all.setdefault(k, [])
-            for n in lst:
-                if len(slot) >= MAX_ORG_BUCKET:
+
+        sub = await _fetch_org_names_for_filter_capped(
+            fid, PAGE_LIMIT, caps_left, MAX_ORG_BUCKET
+        )
+
+        for key, vals in sub.items():
+            bucket = buckets_all.setdefault(key, [])
+            for v in vals:
+                if len(bucket) >= MAX_ORG_BUCKET:
                     break
-                if n not in slot:
-                    slot.append(n)
-                    collected_total += 1
-        if collected_total >= MAX_ORG_NAMES:
+                if v not in bucket:
+                    bucket.append(v)
+                    total_collected += 1
+
+        if total_collected >= MAX_ORG_NAMES:
             break
 
-    # 2) Fuzzy ≥95 %
     drop_idx = []
-    for idx, row in master.iterrows():
-        cand = str(row.get(col_org_name) or "").strip()
-        cand_norm = normalize_name(cand)
-        if not cand_norm:
+
+    for idx, row in df.iterrows():
+        org_name = str(row.get(col_orgname) or "").strip()
+        norm = normalize_name(org_name)
+
+        if not norm:
             continue
-        bucket = buckets_all.get(cand_norm[0])
+
+        b = bucket_key(norm)
+        bucket = buckets_all.get(b)
+
         if not bucket:
             continue
-        near = [n for n in bucket if abs(len(n) - len(cand_norm)) <= 4]
+
+        # Kandidaten enger begrenzen
+        near = [n for n in bucket if abs(len(n) - len(norm)) <= 4]
         if not near:
             continue
-        best = process.extractOne(cand_norm, near, scorer=fuzz.token_sort_ratio)
+
+        best = process.extractOne(norm, near, scorer=fuzz.token_sort_ratio)
         if best and best[1] >= 95:
             drop_idx.append(idx)
             delete_rows.append({
                 "reason": "org_match_95",
-                "id": str(row.get(col_person_id) or ""),
-                "name": f"{row.get('Person Vorname') or ''} {row.get('Person Nachname') or ''}".strip(),
-                "org_id": str(row.get(col_org_id) or ""),
-                "org_name": cand,
-                "extra": f"Ähnlichkeit: {best[0]} ({best[1]} %)"
+                "id": row.get(col_pid, ""),
+                "name": f"{row.get('Person Vorname','')} {row.get('Person Nachname','')}".strip(),
+                "org_id": row.get(col_orgid, ""),
+                "org_name": org_name,
+                "extra": f"Ähnlichkeit {best[1]}%"
             })
 
     if drop_idx:
-        master = master.drop(index=drop_idx)
+        df = df.drop(index=drop_idx)
 
-    # 3) Bereits kontaktierte Personen entfernen (1216/1708)
+
+    # -----------------------------------------------
+    # 2) Personen-ID Dubletten (Filter 1216 & 1708)
+    # -----------------------------------------------
     suspect_ids = set()
+
     for f_id in (1216, 1708):
-        async for page in stream_person_ids_by_filter(f_id):
-            suspect_ids.update(page)
+        async for ids in stream_person_ids_by_filter(f_id):
+            suspect_ids.update(ids)
 
     if suspect_ids:
-        mask = master[col_person_id].astype(str).isin(suspect_ids)
-        removed = master[mask].copy()
+        mask = df[col_pid].astype(str).isin(suspect_ids)
+        removed = df[mask]
+
         for _, r in removed.iterrows():
             delete_rows.append({
                 "reason": "person_id_match",
-                "id": str(r.get(col_person_id) or ""),
-                "name": f"{r.get('Person Vorname') or ''} {r.get('Person Nachname') or ''}".strip(),
-                "org_id": str(r.get(col_org_id) or ""),
-                "org_name": str(r.get(col_org_name) or ""),
+                "id": str(r.get(col_pid) or ""),
+                "name": f"{r.get('Person Vorname','')} {r.get('Person Nachname','')}".strip(),
+                "org_id": str(r.get(col_orgid) or ""),
+                "org_name": str(r.get(col_orgname) or ""),
                 "extra": "Bereits in Filter 1216/1708"
             })
-        master = master[~mask].copy()
 
-    # 4) Speichern
-    await save_df_text(master, t["ready"])
+        df = df[~mask]
+
+    # -----------------------------------------------
+    # 3) Speichern
+    # -----------------------------------------------
+    await save_df_text(df, t["ready"])
     log_df = pd.DataFrame(delete_rows, columns=["reason","id","name","org_id","org_name","extra"])
     await save_df_text(log_df, t["log"])
-    try:
-        df_del = await load_df_text("nf_delete_log")
-        print(f"[Reconcile] {len(df_del)} Zeilen im Delete-Log gespeichert.")
-    except Exception as e:
-        print(f"[Reconcile] Delete-Log konnte nicht geladen werden: {e}")
 
+    print(f"[Reconcile] {len(delete_rows)} Zeilen im Delete-Log gespeichert.")
 
 # =============================================================================
-# Excel-Export-Helfer
+# Excel-Export-Helfer – FINAL MODUL 3
 # =============================================================================
-def build_export_from_ready(df: pd.DataFrame) -> pd.DataFrame:
-    """Erzeugt sauberen Export mit konsistenter Spaltenreihenfolge."""
-    out = pd.DataFrame(columns=TEMPLATE_COLUMNS)
-    for col in TEMPLATE_COLUMNS:
-        out[col] = df[col] if col in df.columns else ""
-    for c in ("Organisation ID", "Person ID"):
+
+# 1) Reihenfolge der Exportspalten (Final)
+NF_EXPORT_COLUMNS = [
+    "Batch ID",
+    "Channel",
+    "Cold-Mailing Import",
+    "Prospect ID",
+    "Organisation ID",
+    "Organisation Name",
+    "Person ID",
+    "Person Vorname",
+    "Person Nachname",
+    "Person Titel",
+    "Person Geschlecht",
+    "Person Position",
+    "Person E-Mail",
+    "XING Profil",
+    "LinkedIn URL",
+]
+
+
+def build_nf_export(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Baut den finalen Excel-Export in exakt definierter Spaltenreihenfolge.
+    Fehlende Spalten werden automatisch erzeugt.
+    """
+    out = pd.DataFrame(columns=NF_EXPORT_COLUMNS)
+
+    for col in NF_EXPORT_COLUMNS:
+        if col in df.columns:
+            out[col] = df[col]
+        else:
+            out[col] = ""
+
+    # String-Säuberung
+    for c in ("Person ID", "Organisation ID"):
         if c in out.columns:
-            out[c] = out[c].astype(str).fillna("").replace("nan", "")
+            out[c] = out[c].astype(str).replace("nan", "").fillna("")
+
     return out
 
-def _df_to_excel_bytes(df: pd.DataFrame) -> bytes:
-    """Konvertiert DataFrame in Excel-Datei (Bytes, speicherschonend)."""
+
+def _df_to_excel_bytes_nf(df: pd.DataFrame) -> bytes:
+    """Konvertiert DataFrame → Excel Bytes."""
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Export")
-        ws = writer.sheets["Export"]
+        df.to_excel(writer, index=False, sheet_name="Nachfass")
+
+        ws = writer.sheets["Nachfass"]
+
+        # IDs in Excel als TEXT formatieren
+        id_cols = ["Organisation ID", "Person ID"]
         col_index = {col: i + 1 for i, col in enumerate(df.columns)}
-        for name in ("Organisation ID", "Person ID"):
+
+        for name in id_cols:
             if name in col_index:
                 j = col_index[name]
                 for i in range(2, len(df) + 2):
                     ws.cell(i, j).number_format = "@"
+
         writer.book.properties.creator = "BatchFlow"
+
     buf.seek(0)
     return buf.getvalue()
+
+
+# =============================================================================
+# /nachfass/export_download – FINAL (mit Kampagnennamen!)
+# =============================================================================
+
+@app.get("/nachfass/export_download")
+async def nachfass_export_download(job_id: str = Query(...)):
+    """
+    Liefert den finalen Nachfass-Export als Excel-Download.
+    Der Dateiname = Kampagnenname.xlsx
+    """
+    job = JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job nicht gefunden")
+
+    try:
+        # finalen Master laden
+        df = await load_df_text("nf_master_final")
+
+        if df.empty:
+            raise FileNotFoundError("Keine Exportdaten vorhanden")
+
+        # Export bauen
+        export_df = build_nf_export(df)
+        excel_bytes = _df_to_excel_bytes_nf(export_df)
+
+        # Kampagnennamen als Dateiname
+        filename = slugify_filename(job.filename_base or "Nachfass_Export") + ".xlsx"
+
+        return StreamingResponse(
+            io.BytesIO(excel_bytes),
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
+
+    except Exception as e:
+        print(f"[ERROR] /nachfass/export_download: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 # =============================================================================
 # JOB-VERWALTUNG & FORTSCHRITT
@@ -974,26 +1091,7 @@ async def neukontakte_export_progress(job_id: str = Query(...)):
         "done": job.done, "error": job.error,
     })
 
-@app.get("/nachfass/export_progress")
-async def nachfass_export_progress(job_id: str = Query(...)):
-    job = JOBS.get(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job nicht gefunden")
-    return JSONResponse({
-        "phase": job.phase, "percent": job.percent,
-        "done": job.done, "error": job.error,
-    })
 
-@app.get("/neukontakte/export_download")
-async def neukontakte_export_download(job_id: str = Query(...)):
-    job = JOBS.get(job_id)
-    if not job or not job.path:
-        raise HTTPException(status_code=404, detail="Datei nicht gefunden")
-    return FileResponse(
-        job.path,
-        filename=f"{job.filename_base}.xlsx",
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
 
 # -------------------------------------------------------------------------
 # Download des erzeugten Nachfass-Exports
@@ -1155,7 +1253,7 @@ loadOptions();
 </body></html>""")
 
 # =============================================================================
-# Frontend – Nachfass (stabil, ohne f-string/.format())
+# Frontend – Nachfass (stabil, modern, sauber)
 # =============================================================================
 @app.get("/nachfass", response_class=HTMLResponse)
 async def nachfass_page(request: Request):
@@ -1205,10 +1303,13 @@ async def nachfass_page(request: Request):
     <label>Batch IDs (1–2 Werte)</label>
     <textarea id="nf_batch_ids" rows="3" placeholder="z. B. B111, B222"></textarea>
     <small style="color:#64748b">Komma oder Zeilenumbruch. Max. 2 IDs werden berücksichtigt.</small>
+
     <label style="margin-top:12px">Batch ID (Export)</label>
     <input id="batch_id" placeholder="B999"/>
+
     <label style="margin-top:12px">Kampagnenname</label>
     <input id="campaign" placeholder="z. B. Nachfass KW45"/>
+
     <div style="margin-top:20px;text-align:right">
       <button class="btn" id="btnExportNf">Abgleich & Download</button>
     </div>
@@ -1217,7 +1318,7 @@ async def nachfass_page(request: Request):
   <section id="excludedSection" style="margin-top:30px;">
     <h3>Nicht berücksichtigte Datensätze</h3>
     <div id="excludedTable">
-      <table style="width:100%">
+      <table>
         <thead>
           <tr>
             <th>Kontakt ID</th>
@@ -1243,8 +1344,7 @@ async def nachfass_page(request: Request):
 
 <script>
 const el = id => document.getElementById(id);
-
-function showOverlay(msg){el('phase').textContent=msg||'';el('overlay').style.display='flex';}
+function showOverlay(m){el('phase').textContent=m||'';el('overlay').style.display='flex';}
 function hideOverlay(){el('overlay').style.display='none';}
 function setProgress(p){el('bar').style.width=Math.max(0,Math.min(100,p))+'%';}
 
@@ -1279,44 +1379,34 @@ async function startExportNf(){
 async function loadExcludedTable(){
   try{
     const r = await fetch('/nachfass/excluded/json');
-    if (!r.ok) throw new Error(`Serverfehler: ${r.status}`);
+    if(!r.ok) throw new Error('Serverfehler: '+r.status);
     const data = await r.json();
 
-    const table = document.querySelector('#excluded-table-body');
-    if (!table) return;
+    const body = document.querySelector('#excluded-table-body');
+    body.innerHTML = '';
 
-    table.innerHTML = '';
-
-    if (!data || !data.rows || data.rows.length === 0) {
-      table.innerHTML = `
-        <tr><td colspan="6" style="text-align:center;color:#888">
-          Keine Datensätze ausgeschlossen
-        </td></tr>`;
+    if(!data.rows || data.rows.length === 0){
+      body.innerHTML = `<tr><td colspan="6" style="text-align:center;color:#888">Keine Datensätze ausgeschlossen</td></tr>`;
       return;
     }
 
-    for (const r of data.rows) {
-      const tr = document.createElement('tr');
+    for(const row of data.rows){
+      const tr=document.createElement('tr');
       tr.innerHTML = `
-        <td>${r['Kontakt ID'] || r.id || ''}</td>
-        <td>${r['Name'] || ''}</td>
-        <td>${r['Organisation ID'] || ''}</td>
-        <td>${r['Organisationsname'] || r['org'] || ''}</td>
-        <td>${r['Grund'] || ''}</td>
-        <td>${r['Quelle'] || ''}</td>
+        <td>${row["Kontakt ID"] || row["id"] || ""}</td>
+        <td>${row["Name"] || row["name"] || ""}</td>
+        <td>${row["Organisation ID"] || ""}</td>
+        <td>${row["Organisationsname"] || row["org"] || ""}</td>
+        <td>${row["Grund"] || row["grund"] || ""}</td>
+        <td>${row["Quelle"] || ""}</td>
       `;
-      table.appendChild(tr);
+      body.appendChild(tr);
     }
-
-  } catch (err) {
-    console.error('Fehler beim Laden der ausgeschlossenen Datensätze:', err);
-    const table = document.querySelector('#excluded-table-body');
-    if (table) {
-      table.innerHTML = `
-        <tr><td colspan="6" style="text-align:center;color:red">
-          Fehler beim Laden der Daten (${err.message})
-        </td></tr>`;
-    }
+  }catch(err){
+    const body = document.querySelector('#excluded-table-body');
+    body.innerHTML = `<tr><td colspan="6" style="text-align:center;color:red">
+      Fehler beim Laden (${err.message})
+    </td></tr>`;
   }
 }
 
@@ -1327,7 +1417,7 @@ async function poll(job_id){
     const r=await fetch('/nachfass/export_progress?job_id='+encodeURIComponent(job_id));
     if(!r.ok)break;
     const s=await r.json();
-    if(s.phase)el('phase').textContent=s.phase+' ('+ (s.percent||0)+'%)';
+    el('phase').textContent=s.phase+' ('+(s.percent||0)+'%)';
     setProgress(s.percent||0);
     if(s.error){alert(s.error);hideOverlay();return;}
     done=s.done;
@@ -1339,10 +1429,10 @@ async function poll(job_id){
   hideOverlay();
 }
 
-el('btnExportNf').addEventListener('click',startExportNf);
+el('btnExportNf').addEventListener('click', startExportNf);
 </script>
-</body></html>"""
 
+</body></html>"""
     return HTMLResponse(html)
 
 # =============================================================================
@@ -1397,57 +1487,68 @@ async def nachfass_summary(job_id: str = Query(...)):
     <a href='/campaign'>Zur Übersicht</a></main></body></html>"""
     return HTMLResponse(html)
     
-# -------------------------------------------------------------------------
-# 1️⃣ JSON-Endpunkt: liefert alle ausgeschlossenen Datensätze
-# -------------------------------------------------------------------------
+# =============================================================================
+# MODUL 7 – EXCLUDED + SUMMARY + DEBUG (FINAL & KOMPATIBEL)
+# =============================================================================
+
 @app.get("/nachfass/excluded/json")
 async def nachfass_excluded_json():
     """
-    Liefert alle ausgeschlossenen Nachfass-Datensätze als JSON:
-    - kombiniert nf_excluded (Batch-/Filter-Ausschluss)
-    - und nf_delete_log (Abgleich auf Kontakt-/Organisationsebene)
+    Liefert alle ausgeschlossenen Nachfass-Datensätze als JSON.
+    Kombiniert:
+      - nf_excluded  (Ausschlüsse im Build-Prozess)
+      - nf_delete_log (Ausschlüsse im Fuzzy/ID-Abgleich)
+    Ausgabe ohne NaN, mit Quelle.
     """
     import pandas as pd
-    from fastapi.responses import JSONResponse
 
     excluded_df = pd.DataFrame()
-    deleted_df = pd.DataFrame()
+    deleted_df  = pd.DataFrame()
 
+    # nf_excluded (Datum + >2 Kontakte)
     try:
         excluded_df = await load_df_text("nf_excluded")
     except Exception as e:
-        print(f"[WARN] Konnte nf_excluded nicht laden: {e}")
+        print(f"[WARN] nf_excluded konnte nicht geladen werden: {e}")
 
+    # nf_delete_log (Reconcile: Fuzzy/ID)
     try:
         deleted_df = await load_df_text("nf_delete_log")
     except Exception as e:
-        print(f"[WARN] Konnte nf_delete_log nicht laden: {e}")
+        print(f"[WARN] nf_delete_log konnte nicht geladen werden: {e}")
 
+    # Quellen markieren
     if not excluded_df.empty:
         excluded_df["Quelle"] = "Batch-/Filter-Ausschluss"
     if not deleted_df.empty:
         deleted_df["Quelle"] = "Abgleich (Fuzzy/Kontaktfilter)"
 
+    # Zusammenführen
     df_all = pd.concat([excluded_df, deleted_df], ignore_index=True)
 
     if df_all.empty:
         return JSONResponse({"total": 0, "rows": []})
 
-    # Begrenze Ausgabe auf die letzten 200 Datensätze für Performance
+    # NaN entfernen (JSON-safe!)
+    df_all = df_all.replace({pd.NA: "", None: "", float("nan"): ""})
+
+    # Ausgabe begrenzen
     rows = df_all.tail(200).to_dict(orient="records")
+
     return JSONResponse({
         "total": len(df_all),
         "rows": rows
     })
 
 
-# -------------------------------------------------------------------------
-# 2️⃣ HTML-Endpunkt: Rendert Seite mit Tabelle + JS zum Nachladen
-# -------------------------------------------------------------------------
+# =============================================================================
+# HTML-Seite (Excluded Viewer)
+# =============================================================================
 @app.get("/nachfass/excluded", response_class=HTMLResponse)
 async def nachfass_excluded():
     """
-    Rendert die HTML-Seite mit Tabelle und dynamischem JS-Nachladen
+    HTML-Tabelle für alle nicht berücksichtigten Datensätze.
+    Lädt via JS die JSON-Daten aus /nachfass/excluded/json.
     """
     html = r"""
     <!DOCTYPE html>
@@ -1461,33 +1562,31 @@ async def nachfass_excluded():
           margin: 30px auto;
           max-width: 1100px;
           padding: 0 20px;
+          background: #f6f8fb;
         }
-        h2 {
-          margin-bottom: 16px;
-        }
-        table {
-          width: 100%;
-          border-collapse: collapse;
-        }
+        table { width: 100%; border-collapse: collapse; }
         th, td {
-          border-bottom: 1px solid #eee;
-          padding: 8px;
+          border-bottom: 1px solid #e5e7eb;
+          padding: 8px 10px;
           text-align: left;
         }
         th {
-          background: #f9f9f9;
+          background: #f1f5f9;
+          font-weight: 600;
         }
         tr:hover td {
-          background: #fafafa;
+          background: #f9fafb;
         }
         .center {
           text-align: center;
-          color: #888;
+          color: #6b7280;
         }
       </style>
     </head>
     <body>
+
       <h2>Nicht berücksichtigte Datensätze</h2>
+
       <table>
         <thead>
           <tr>
@@ -1500,65 +1599,121 @@ async def nachfass_excluded():
           </tr>
         </thead>
         <tbody id="excluded-table-body">
-          <tr><td colspan="6" class="center">Lade Daten...</td></tr>
+          <tr><td colspan="6" class="center">Lade Daten…</td></tr>
         </tbody>
       </table>
 
       <script>
-      async function loadExcludedTable() {
-        try {
-          const r = await fetch('/nachfass/excluded/json');
-          if (!r.ok) throw new Error(`Serverfehler: ${r.status}`);
-          const data = await r.json();
+        async function loadExcludedTable() {
+          try {
+            const r = await fetch('/nachfass/excluded/json');
+            const data = await r.json();
+            const body = document.getElementById('excluded-table-body');
+            body.innerHTML = '';
 
-          const table = document.querySelector('#excluded-table-body');
-          if (!table) return;
-          table.innerHTML = '';
+            if (!data.rows || data.rows.length === 0) {
+              body.innerHTML = '<tr><td colspan="6" class="center">Keine Datensätze ausgeschlossen</td></tr>';
+              return;
+            }
 
-          if (!data || !data.rows || data.rows.length === 0) {
-            table.innerHTML = `
-              <tr><td colspan="6" class="center">
-                Keine Datensätze ausgeschlossen
-              </td></tr>`;
-            return;
-          }
-
-          for (const r of data.rows) {
-            const tr = document.createElement('tr');
-            tr.innerHTML = `
-              <td>${r['Kontakt ID'] || r['id'] || ''}</td>
-              <td>${r['Name'] || r['name'] || ''}</td>
-              <td>${r['Organisation ID'] || ''}</td>
-              <td>${r['Organisationsname'] || r['org'] || ''}</td>
-              <td>${r['Grund'] || r['grund'] || ''}</td>
-              <td>${r['Quelle'] || ''}</td>
-            `;
-            table.appendChild(tr);
-          }
-        } catch (err) {
-          console.error('Fehler beim Laden der ausgeschlossenen Datensätze:', err);
-          const table = document.querySelector('#excluded-table-body');
-          if (table) {
-            table.innerHTML = `
-              <tr><td colspan="6" class="center" style="color:red">
-                Fehler beim Laden der Daten (${err.message})
-              </td></tr>`;
+            for (const row of data.rows) {
+              const tr = document.createElement('tr');
+              tr.innerHTML = `
+                <td>${row["Kontakt ID"] || row["id"] || ""}</td>
+                <td>${row["Name"] || row["name"] || ""}</td>
+                <td>${row["Organisation ID"] || ""}</td>
+                <td>${row["Organisationsname"] || row["org_name"] || ""}</td>
+                <td>${row["Grund"] || row["reason"] || ""}</td>
+                <td>${row["Quelle"] || ""}</td>
+              `;
+              body.appendChild(tr);
+            }
+          } catch (err) {
+            console.error("Fehler bei excluded:", err);
+            document.getElementById('excluded-table-body').innerHTML =
+              '<tr><td colspan="6" class="center" style="color:red">Fehler beim Laden</td></tr>';
           }
         }
-      }
 
-      // Initial laden
-      loadExcludedTable();
+        loadExcludedTable();
       </script>
+
     </body>
     </html>
     """
-    return HTMLResponse(content=html)
-  
+    return HTMLResponse(html)
 
-# -------------------------------------------------------------------------
-# Startet den Nachfass-Export (BatchFlow)
-# -------------------------------------------------------------------------
+
+# =============================================================================
+# SUMMARY-SEITE – Überblick nach Export
+# =============================================================================
+@app.get("/nachfass/summary", response_class=HTMLResponse)
+async def nachfass_summary(job_id: str = Query(...)):
+    """
+    Übersicht nach Nachfass-Export:
+    - Gesamtzeilen
+    - Orga ≥95% entfernt
+    - Person-ID-Dubletten entfernt
+    - letzte 50 geloggte Ausschlüsse
+    """
+    ready = await load_df_text("nf_master_ready")
+    log   = await load_df_text("nf_delete_log")
+
+    def count(df: pd.DataFrame, reason_keys: list) -> int:
+        if df.empty:
+            return 0
+        if "reason" not in df.columns:
+            return 0
+        keys = [k.lower() for k in reason_keys]
+        return int(df["reason"].astype(str).str.lower().isin(keys).sum())
+
+    total    = len(ready)
+    cnt_org  = count(log, ["org_match_95"])
+    cnt_pid  = count(log, ["person_id_match"])
+    removed  = cnt_org + cnt_pid
+
+    # Tabelle mit letzten 50 Ausschlüssen
+    if not log.empty:
+        view = log.tail(50).copy()
+        view["Grund"] = view.apply(
+            lambda r: f"{r['reason']} – {r['extra']}", axis=1
+        )
+        table_html = view[["id", "name", "org_name", "Grund"]].to_html(
+            index=False, border=0
+        )
+    else:
+        table_html = "<i>Keine entfernt</i>"
+
+    html = f"""
+    <!doctype html>
+    <html lang="de">
+    <head><meta charset="utf-8"/>
+    <title>Nachfass – Ergebnis</title>
+    </head>
+    <body style="font-family:Inter,sans-serif;max-width:1100px;margin:30px auto;padding:0 20px">
+      <h2>Nachfass – Ergebnis</h2>
+
+      <ul>
+        <li>Gesamt exportierte Zeilen: <b>{total}</b></li>
+        <li>Organisationen ≥95% Ähnlichkeit entfernt: <b>{cnt_org}</b></li>
+        <li>Bereits kontaktierte Personen entfernt: <b>{cnt_pid}</b></li>
+        <li><b>Gesamt entfernt: {removed}</b></li>
+      </ul>
+
+      <h3>Letzte Ausschlüsse</h3>
+      {table_html}
+
+      <p><a href="/campaign">Zur Übersicht</a></p>
+    </body>
+    </html>
+    """
+
+    return HTMLResponse(html)
+
+# =============================================================================
+# MODUL 6 – FINALER JOB-/WORKFLOW FÜR NACHFASS (EXPORT/PROGRESS/DOWNLOAD)
+# =============================================================================
+
 @app.post("/nachfass/export_start")
 async def export_start_nf(request: Request):
     """
@@ -1571,15 +1726,15 @@ async def export_start_nf(request: Request):
     try:
         data = await request.json()
         nf_batch_ids = data.get("nf_batch_ids") or []
-        batch_id = data.get("batch_id") or ""
-        campaign = data.get("campaign") or ""
+        batch_id     = data.get("batch_id") or ""
+        campaign     = data.get("campaign") or ""
 
         if not nf_batch_ids:
             return JSONResponse({"error": "Keine Batch-IDs übergeben."}, status_code=400)
 
-        # ---------------------------------------------------------------
-        # Job erstellen (ohne Parameter im Konstruktor!)
-        # ---------------------------------------------------------------
+        # ---------------------------------------------------
+        # 1) Job erstellen
+        # ---------------------------------------------------
         job_id = str(uuid.uuid4())
         job_obj = Job()
         job_obj.id = job_id
@@ -1588,15 +1743,16 @@ async def export_start_nf(request: Request):
         job_obj.percent = 0
         job_obj.done = False
         job_obj.error = None
+        job_obj.filename_base = slugify_filename(campaign or f"Nachfass_{batch_id}")
 
         JOBS[job_id] = job_obj
 
-        # ---------------------------------------------------------------
-        # Asynchronen Export starten
-        # ---------------------------------------------------------------
+        # ---------------------------------------------------
+        # 2) Asynchronen Export starten
+        # ---------------------------------------------------
         async def run_export():
             try:
-                # 1️⃣ Nachfass-Daten aufbauen
+                # 1️⃣ Personen laden
                 job_obj.phase = "Lade Nachfass-Daten aus Pipedrive …"
                 job_obj.percent = 5
 
@@ -1607,49 +1763,91 @@ async def export_start_nf(request: Request):
                     job_obj=job_obj
                 )
 
+                # Speichern für späteren Download
                 await save_df_text(df, tables("nf")["final"])
+
                 job_obj.phase = f"Daten geladen ({len(df)} Zeilen)"
-                job_obj.percent = 60
+                job_obj.percent = 55
 
-                # 2️⃣ Abgleichslogik anwenden (Organisation + Personen)
-                try:
-                    job_obj.phase = "Führe Abgleichslogik aus …"
-                    job_obj.percent = 80
-                    await reconcile_with_progress(job_obj, "nf")
-                except Exception as e:
-                    print(f"[WARN] Abgleich fehlgeschlagen: {e}")
-                    job_obj.phase = f"Abgleich fehlgeschlagen: {e}"
+                # 2️⃣ Abgleich (Orga + Kontakt)
+                job_obj.phase = "Führe Abgleichslogik aus …"
+                job_obj.percent = 75
 
-                # 3️⃣ Abschlussstatus
-                job_obj.phase = "Export und Abgleich abgeschlossen"
+                await _reconcile("nf")
+
+                job_obj.phase = "Abgleich abgeschlossen"
+                job_obj.percent = 90
+
+                # 3️⃣ Excel erzeugen
+                job_obj.phase = "Erzeuge Excel-Datei …"
+                job_obj.percent = 95
+
+                ready = await load_df_text("nf_master_ready")
+
+                # Aufbereitung in Zielschema
+                export_df = build_export_from_ready(ready)
+                excel_data = _df_to_excel_bytes(export_df)
+
+                # Temporäre Datei schreiben
+                file_path = f"/tmp/{job_obj.filename_base}.xlsx"
+                with open(file_path, "wb") as f:
+                    f.write(excel_data)
+
+                job_obj.path = file_path
+                job_obj.total_rows = len(export_df)
+
+                job_obj.phase = f"Fertig – {job_obj.total_rows} Zeilen"
                 job_obj.percent = 100
                 job_obj.done = True
 
-                # optional: Anzahl ausgeschlossener Datensätze (nf_excluded)
-                try:
-                    excluded_df = await load_df_text("nf_excluded")
-                    job_obj.excluded_count = len(excluded_df)
-                except Exception:
-                    job_obj.excluded_count = 0
-
-                print(f"[Nachfass] Export + Abgleich fertig ({len(df)} Zeilen, {job_obj.excluded_count} ausgeschlossen)")
-
             except Exception as e:
-                job_obj.phase = "Fehler beim Nachfass-Export"
+                job_obj.phase = "Fehler beim Export"
                 job_obj.error = str(e)
                 job_obj.done = True
-                print(f"[ERROR] Nachfass-Export fehlgeschlagen: {e}")
+                job_obj.percent = 100
+                print(f"[ERROR] Nachfass Export: {e}")
 
         asyncio.create_task(run_export())
 
-        # ---------------------------------------------------------------
-        # Job-ID für Frontend zurückgeben
-        # ---------------------------------------------------------------
         return JSONResponse({"job_id": job_id})
 
     except Exception as e:
         print(f"[ERROR] /nachfass/export_start: {e}")
         return JSONResponse({"error": str(e)}, status_code=500)
+
+
+
+# =============================================================================
+# Fortschritt abfragen
+# =============================================================================
+@app.get("/nachfass/export_progress")
+async def nachfass_export_progress(job_id: str = Query(...)):
+    job = JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job nicht gefunden")
+    return JSONResponse({
+        "phase": job.phase,
+        "percent": job.percent,
+        "done": job.done,
+        "error": job.error
+    })
+
+
+
+# =============================================================================
+# Download
+# =============================================================================
+@app.get("/nachfass/export_download")
+async def nachfass_export_download(job_id: str = Query(...)):
+    job = JOBS.get(job_id)
+    if not job or not job.path:
+        raise HTTPException(status_code=404, detail="Datei nicht gefunden")
+
+    return FileResponse(
+        job.path,
+        filename=f"{job.filename_base}.xlsx",
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
 # =============================================================================
 # Redirects & Fallbacks (fix für /overview & ungültige Pfade)
