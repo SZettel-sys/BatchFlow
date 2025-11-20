@@ -524,7 +524,7 @@ async def stream_persons_by_filter(
         start += len(data)
 
 # ============================================================
-# NACHFASS: MASTER-DATENAUFBAU (Final 2025 – FIXED Loader)
+# NACHFASS: MASTER-DATENAUFBAU – BEREINIGTE FINALVERSION
 # ============================================================
 
 async def _build_nf_master_final(
@@ -535,108 +535,122 @@ async def _build_nf_master_final(
 ) -> pd.DataFrame:
 
     # ------------------------------------------------------------
-    # 0) Field-Key Mapping
+    # 0) Field-Key Mapping (stabil)
     # ------------------------------------------------------------
-    FIELD_BATCH_ID              = "5ac34dad3ea917fdef4087caebf77ba275f87eec"
-    FIELD_PROSPECT_ID           = "f9138f9040c44622808a4b8afda2b1b75ee5acd0"
-    FIELD_GENDER                = "c4f5f434cdb0cfce3f6d62ec7291188fe968ac72"
-    FIELD_TITLE                 = "0343bc43a91159aaf33a463ca603dc5662422ea5"
-    FIELD_POSITION              = "4585e5de11068a3bccf02d8b93c126bcf5c257ff"
-    FIELD_XING                  = "44ebb6feae2a670059bc5261001443a2878a2b43"
-    FIELD_LINKEDIN              = "25563b12f847a280346bba40deaf527af82038cc"
+    FIELD_BATCH_ID    = "5ac34dad3ea917fdef4087caebf77ba275f87eec"
+    FIELD_PROSPECT_ID = "f9138f9040c44622808a4b8afda2b1b75ee5acd0"
+    FIELD_GENDER      = "c4f5f434cdb0cfce3f6d62ec7291188fe968ac72"
+    FIELD_TITLE       = "0343bc43a91159aaf33a463ca603dc5662422ea5"
+    FIELD_POSITION    = "4585e5de11068a3bccf02d8b93c126bcf5c257ff"
+    FIELD_XING        = "44ebb6feae2a670059bc5261001443a2878a2b43"
+    FIELD_LINKEDIN    = "25563b12f847a280346bba40deaf527af82038cc"
 
     # ------------------------------------------------------------
-    # 1) Personen laden – mit DEINER echten Loader-Funktion
+    # 1) Personen per Batch-ID laden
     # ------------------------------------------------------------
     if job_obj:
-        job_obj.phase = "Lade NF-Kandidaten …"
+        job_obj.phase = "Lade Nachfass-Kandidaten …"
         job_obj.percent = 10
 
-    persons = []
-
-    # ▶ FIX: dies ist deine echte Funktion
     persons = await stream_persons_by_batch_id(
         FIELD_BATCH_ID,
         nf_batch_ids
     )
-
-   
     print(f"[NF] Personen geladen aus Batch-IDs: {len(persons)}")
 
-    if job_obj:
-        job_obj.phase = "Filtere Kandidaten …"
-        job_obj.percent = 25
+    # ------------------------------------------------------------
+    # 2) Feld-Key für 'Datum nächste Aktivität' holen
+    # ------------------------------------------------------------
+    NEXT_KEY = await get_next_activity_key()
 
     # ------------------------------------------------------------
-    # 2) Regeln anwenden (wie definiert)
+    # 3) Filter-Logik (Datum + max 2 pro Organisation)
     # ------------------------------------------------------------
-
     selected = []
     excluded = []
     org_counter = defaultdict(int)
     today = datetime.now().date()
 
     def is_date_valid(dt_raw):
+        """
+        TRUE  → Kontakt darf verwendet werden
+        FALSE → Kontakt wird ausgeschlossen
+        """
         if not dt_raw:
-            return True
+            return True  # kein Datum = OK
+
         try:
-            dt = datetime.fromisoformat(str(dt_raw).split(" ")[0]).date()
+            dt = datetime.fromisoformat(dt_raw.split(" ")[0]).date()
         except:
-            return True
+            return True  # unlesbares Datum = OK
 
         if dt > today:
-            return False
+            return False  # Zukunft
         if (today - dt).days <= 90:
-            return False
+            return False  # jünger als 3 Monate
         return True
 
+    # ------------------------------------------------------------
+    # Verarbeitung aller Personen
+    # ------------------------------------------------------------
     for p in persons:
 
         pid = str(p.get("id") or "")
-        org = p.get("organization") or {}
+        name = p.get("name") or ""
+        org  = p.get("organization") or {}
         org_id = str(org.get("id") or "")
         org_name = org.get("name") or ""
 
-        next_activity = p.get("next_activity_date")
+        # Datum extrahieren
+        next_activity = extract_field_date(p, NEXT_KEY)
+
+        # ❌ Ausschlussgrund 1 – nächste Aktivität < 3 Monate
         if not is_date_valid(next_activity):
             excluded.append({
                 "Kontakt ID": pid,
-                "Name": p.get("name"),
-                "Organisation": org_name,
-                "Grund": "Next Activity < 3 Monate oder Zukunft"
+                "Name": name,
+                "Organisation ID": org_id,
+                "Organisationsname": org_name,
+                "Grund": f"Nächste Aktivität {next_activity or '–'} < 3 Monate oder in der Zukunft",
+                "Quelle": "Batch-/Filter-Ausschluss"
             })
+            print(f"[NF-DEBUG] EXCLUDE PID={pid} ORG={org_name} → NextActivity={next_activity}")
             continue
 
+        # ❌ Ausschlussgrund 2 – mehr als 2 Kontakte pro Organisation
         if org_id:
             org_counter[org_id] += 1
             if org_counter[org_id] > 2:
                 excluded.append({
                     "Kontakt ID": pid,
-                    "Name": p.get("name"),
-                    "Organisation": org_name,
-                    "Grund": "Mehr als 2 Kontakte pro Organisation"
+                    "Name": name,
+                    "Organisation ID": org_id,
+                    "Organisationsname": org_name,
+                    "Grund": "Mehr als 2 Kontakte pro Organisation",
+                    "Quelle": "Batch-/Filter-Ausschluss"
                 })
+                print(f"[NF-DEBUG] EXCLUDE PID={pid} ORG={org_name} → >2 Kontakte")
                 continue
 
+        # ✔ akzeptiert
         selected.append(p)
 
     print(f"[NF] Ausgewählt: {len(selected)}, Excluded: {len(excluded)}")
 
     if job_obj:
-        job_obj.phase = "Baue Excel-Daten …"
+        job_obj.phase = "Baue Excel…"
         job_obj.percent = 55
 
     # ------------------------------------------------------------
-    # 3) Excel Daten (mit Field-Keys)
+    # 4) Excel-Daten aufbauen
     # ------------------------------------------------------------
     rows = []
-
     for p in selected:
 
         pid = str(p.get("id") or "")
         org = p.get("organization") or {}
-        org_name = org.get("name") or ""
         org_id = str(org.get("id") or "")
+        org_name = org.get("name") or ""
 
         first, last = split_name(
             p.get("first_name"),
@@ -653,40 +667,31 @@ async def _build_nf_master_final(
                     break
 
         rows.append({
-            "Person - Batch ID": batch_id,
-            "Person - Channel": DEFAULT_CHANNEL,
-            "Cold E-Mail": campaign,
-
-            "Person - Prospect ID": p.get(FIELD_PROSPECT_ID, ""),
-            "Person - Organisation": org_name,
-            "Organisation - ID": org_id,
-            "Person - Geschlecht": p.get(FIELD_GENDER, ""),
-            "Person - Titel": p.get(FIELD_TITLE, ""),
-
-            "Person - Vorname": first,
-            "Person - Nachname": last,
-            "Person - Position": p.get(FIELD_POSITION, ""),
-
-            "Person - ID": pid,
-            "Person - XING-Profil": p.get(FIELD_XING, ""),
-            "Person - LinkedIn Profil-URL": p.get(FIELD_LINKEDIN, ""),
-
-            "Person - E-Mail-Adresse - Büro": email,
+            "Person ID": pid,                           # FIXED
+            "Person Vorname": first,
+            "Person Nachname": last,
+            "Person Titel": p.get(FIELD_TITLE, ""),
+            "Person Geschlecht": p.get(FIELD_GENDER, ""),
+            "Person Position": p.get(FIELD_POSITION, ""),
+            "Person E-Mail": email,
+            "XING Profil": p.get(FIELD_XING, ""),
+            "LinkedIn URL": p.get(FIELD_LINKEDIN, ""),
+            "Organisation Name": org_name,
+            "Organisation ID": org_id,
+            "Batch ID": batch_id,
+            "Channel": DEFAULT_CHANNEL,
+            "Cold-Mailing Import": campaign,
+            "Prospect ID": p.get(FIELD_PROSPECT_ID, "")
         })
 
     df = pd.DataFrame(rows).replace({None: ""})
 
-    excluded_df = pd.DataFrame(excluded).replace({None: ""})
-    if excluded_df.empty:
-        excluded_df = pd.DataFrame([{
-            "Kontakt ID": "-",
-            "Name": "-",
-            "Organisation": "-",
-            "Grund": "Keine Ausschlüsse"
-        }])
-
-    await save_df_text(excluded_df, "nf_excluded")
-    await save_df_text(df, "nf_master_final")
+    # ------------------------------------------------------------
+    # 5) Excluded sauber speichern
+    # ------------------------------------------------------------
+    ex = pd.DataFrame(excluded).replace({None: ""})
+    await save_df_text(ex, "nf_excluded")      # UI-Tabelle
+    await save_df_text(df, "nf_master_final")  # Excel-Tabelle
 
     if job_obj:
         job_obj.phase = "Nachfass-Master erstellt"
@@ -695,7 +700,6 @@ async def _build_nf_master_final(
     print(f"[NF] Master gespeichert: {len(df)} Zeilen")
 
     return df
-
 
 
 # =============================================================================
