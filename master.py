@@ -1055,7 +1055,7 @@ async def export_start_nk(
             # 3️⃣ Excel-Datei generieren
             await update_progress("Erzeuge Excel-Datei …", 80)
             ready = await load_df_text("nk_master_ready")
-            export_df = build_export_from_ready(ready)
+            export_df = build_nf_export(ready)
             data = _df_to_excel_bytes(export_df)
 
             # 4️⃣ Datei speichern
@@ -1785,7 +1785,7 @@ async def export_start_nf(request: Request):
                 ready = await load_df_text("nf_master_ready")
 
                 # Aufbereitung in Zielschema
-                export_df = build_export_from_ready(ready)
+                export_df = build_nf_export(ready)
                 excel_data = _df_to_excel_bytes(export_df)
 
                 # Temporäre Datei schreiben
