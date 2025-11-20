@@ -669,52 +669,56 @@ async def _build_nf_master_final(
         job_obj.percent = 55
 
     # ------------------------------------------------------------
-    # 4) Excel-Zeilen aufbauen
-    # ------------------------------------------------------------
-    rows = []
-    for p in selected:
+# 4) Excel-Zeilen aufbauen (saubere, stabile Exportfelder)
+# ------------------------------------------------------------
+rows = []
 
-        pid = str(p.get("id") or "")
-        org = p.get("organization") or {}
-        org_id = str(org.get("id") or "")
-        org_name = org.get("name") or ""
+for p in selected:
 
-        first, last = split_name(
-            p.get("first_name"),
-            p.get("last_name"),
-            p.get("name")
-        )
+    pid = str(p.get("id") or "")
+    org = p.get("organization") or {}
+    org_id = str(org.get("id") or "")
+    org_name = org.get("name") or ""
 
-        # Büro-Email (primär)
-        email = ""
-        emails = p.get("emails") or []
-        if isinstance(emails, list):
-            for e in emails:
-                if isinstance(e, dict) and e.get("primary"):
-                    email = e.get("value", "")
-                    break
+    # Namen sauber splitten
+    first, last = split_name(
+        p.get("first_name"),
+        p.get("last_name"),
+        p.get("name")
+    )
 
-        rows.append({
-            "Batch ID": batch_id,
-            "Channel": DEFAULT_CHANNEL,
-            "Cold-Mailing Import": campaign,
+    # Büro-Email (primär)
+    email = ""
+    emails = p.get("emails") or []
+    if isinstance(emails, list):
+        for e in emails:
+            if isinstance(e, dict) and e.get("primary"):
+                email = e.get("value") or ""
+                break
 
-            "Person ID": pid,
-            "Person Vorname": first,
-            "Person Nachname": last,
-            "Person Titel": p.get(FIELD_TITLE, ""),
-            "Person Geschlecht": p.get(FIELD_GENDER, ""),
-            "Person Position": p.get(FIELD_POSITION, ""),
-            "Person E-Mail": email,
+    rows.append({
+        "Batch ID": batch_id,
+        "Channel": DEFAULT_CHANNEL,
+        "Cold-Mailing Import": campaign,
 
-            "Prospect ID": p.get(FIELD_PROSPECT_ID, ""),
-            "Organisation Name": org_name,
-            "Organisation ID": org_id,
-            "XING Profil": p.get(FIELD_XING, ""),
-            "LinkedIn URL": p.get(FIELD_LINKEDIN, "")
-        })
+        "Person ID": pid,
+        "Person Vorname": first,
+        "Person Nachname": last,
+        "Person Titel": p.get(FIELD_TITLE) or "",
+        "Person Geschlecht": p.get(FIELD_GENDER) or "",
+        "Person Position": p.get(FIELD_POSITION) or "",
+        "Person E-Mail": email,
 
-    df = pd.DataFrame(rows).replace({None: ""})
+        "Prospect ID": p.get(FIELD_PROSPECT_ID) or "",
+
+        "Organisation Name": org_name,
+        "Organisation ID": org_id,
+
+        "XING Profil": p.get(FIELD_XING) or "",
+        "LinkedIn URL": p.get(FIELD_LINKEDIN) or "",
+    })
+
+df = pd.DataFrame(rows).replace({None: ""})
 
     # ------------------------------------------------------------
     # 5) Excluded speichern (UI)
