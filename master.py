@@ -595,38 +595,34 @@ async def _build_nf_master_final(
     # ------------------------------------------------------------
     NEXT_KEY = await get_next_activity_key()
 
-    # ------------------------------------------------------------
-    # 3) Filter-Logik: Datum + maximal 2 Kontakte pro Organisation
-    # ------------------------------------------------------------
-    # ------------------------------------------------------------
+# ------------------------------------------------------------
 # 3) Filter-Logik: Datum + maximal 2 Kontakte pro Organisation
 # ------------------------------------------------------------
 
 selected = []
+
+# Hinweis-Zähler
+count_org_limit = 0
+count_date_invalid = 0
+
 org_counter = defaultdict(int)
-
-# Zähler für die Hinweisbox
-excluded_due_to_date = 0
-excluded_due_to_org_limit = 0
-
 today = datetime.now().date()
 
 
 def is_date_valid(raw):
     """
-    Prüfung 'nächste Aktivität' nach deinen Regeln:
-    - Wenn kein Datum → gültig
-    - Wenn Datum > heute → ausschließen
-    - Wenn Datum innerhalb der letzten 90 Tage → ausschließen
-    - Sonst gültig
+    Datum ist nur gültig, wenn:
+    - kein Datum vorhanden => OK
+    - Datum nicht in Zukunft
+    - Datum NICHT innerhalb der letzten 90 Tage
     """
     if not raw:
         return True
 
     try:
-        dt = datetime.fromisoformat(str(raw).split(" ")[0]).date()
+        dt = datetime.fromisoformat(raw.split(" ")[0]).date()
     except:
-        return True  # unlesbare Werte nicht blockieren
+        return True
 
     if dt > today:
         return False
@@ -637,41 +633,84 @@ def is_date_valid(raw):
     return True
 
 
-# ------------------------------------------------------------
-# Haupt-Schleife über alle Personen
-# ------------------------------------------------------------
 for p in persons:
 
-    pid = str(p.get("id") or "")
-    name = p.get("name") or ""
-
     org = p.get("organization") or {}
-    org_id = str(org.get("id") or "")
-    org_name = org.get("name") or ""
+    org_id = org.get("id")
 
-    # 1. Datum 'Nächste Aktivität'
-    next_raw = p.get(FIELD_NEXT_ACTIVITY)
-    if not is_date_valid(next_raw):
-        excluded_due_to_date += 1
+    # 1) Datum-Check
+    if not is_date_valid(p.get("next_activity_date")):
+        count_date_invalid += 1
         continue
 
-    # 2. Max. zwei Kontakte pro Organisation
+    # 2) Max. 2 Kontakte pro Organisation
     if org_id:
         org_counter[org_id] += 1
         if org_counter[org_id] > 2:
-            excluded_due_to_org_limit += 1
+            count_org_limit += 1
             continue
 
-    # Wenn alle Checks bestanden sind → aufnehmen
+    # → Person ist gültig
+    selected.append(p)
+# ------------------------------------------------------------
+# 3) Filter-Logik: Datum + maximal 2 Kontakte pro Organisation
+# ------------------------------------------------------------
+
+selected = []
+
+# Hinweis-Zähler
+count_org_limit = 0
+count_date_invalid = 0
+
+org_counter = defaultdict(int)
+today = datetime.now().date()
+
+
+def is_date_valid(raw):
+    """
+    Datum ist nur gültig, wenn:
+    - kein Datum vorhanden => OK
+    - Datum nicht in Zukunft
+    - Datum NICHT innerhalb der letzten 90 Tage
+    """
+    if not raw:
+        return True
+
+    try:
+        dt = datetime.fromisoformat(raw.split(" ")[0]).date()
+    except:
+        return True
+
+    if dt > today:
+        return False
+
+    if (today - dt).days <= 90:
+        return False
+
+    return True
+
+
+for p in persons:
+
+    org = p.get("organization") or {}
+    org_id = org.get("id")
+
+    # 1) Datum-Check
+    if not is_date_valid(p.get("next_activity_date")):
+        count_date_invalid += 1
+        continue
+
+    # 2) Max. 2 Kontakte pro Organisation
+    if org_id:
+        org_counter[org_id] += 1
+        if org_counter[org_id] > 2:
+            count_org_limit += 1
+            continue
+
+    # → Person ist gültig
     selected.append(p)
 
 
-print(f"[NF] Ausgewählt: {len(selected)}")
-print(f"[NF] Ausgeschlossen (Datum): {excluded_due_to_date}")
-print(f"[NF] Ausgeschlossen (Org-Limit): {excluded_due_to_org_limit}")
-
-# Diese Werte gehen später in die Hinweisbox auf der HTML-Seite
-return selected, excluded_due_to_date, excluded_due_to_org_limit
 
 
 # ------------------------------------------------------------
@@ -960,6 +999,13 @@ def build_nf_export(df: pd.DataFrame) -> pd.DataFrame:
 
     return out
 
+# ------------------------------------------------------------
+# HINWEIS: Nicht berücksichtigte Datensätze (nur Zähler)
+# ------------------------------------------------------------
+nf_info = {
+    "excluded_date": 0,
+    "excluded_org": 0
+}
 
 def _df_to_excel_bytes_nf(df: pd.DataFrame) -> bytes:
     """Konvertiert DataFrame → Excel Bytes."""
@@ -1130,6 +1176,8 @@ async def neukontakte_export_progress(job_id: str = Query(...)):
     return JSONResponse({
         "phase": job.phase, "percent": job.percent,
         "done": job.done, "error": job.error,
+        "note_org_limit": job.get("note_org_limit", 0),
+        "note_date_invalid": job.get("note_date_invalid", 0)
     })
 
 
