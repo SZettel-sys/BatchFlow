@@ -578,11 +578,25 @@ async def _build_nf_master_final(
     FIELD_XING        = "44ebb6feae2a670059bc5261001443a2878a2b43"
     FIELD_LINKEDIN    = "25563b12f847a280346bba40deaf527af82038cc"
 
+    #def cf(p, key):
+    #    v = p.get(key)
+    #    if isinstance(v, dict):
+    #        return v.get("value") or v.get("label") or ""
+    #    return v or ""
     def cf(p, key):
         v = p.get(key)
+
+        # Array? → ersten Wert nehmen
+        if isinstance(v, list):
+            if len(v) > 0:
+                v = v[0]
+
+        # Dict? → value oder label
         if isinstance(v, dict):
             return v.get("value") or v.get("label") or ""
+
         return v or ""
+
 
     # ------------------------------------------------------------
     # Personen laden
@@ -591,7 +605,15 @@ async def _build_nf_master_final(
         job_obj.phase = "Lade Nachfass-Kandidaten …"
         job_obj.percent = 10
 
-    persons = await stream_persons_by_batch_id(FIELD_BATCH_ID, nf_batch_ids)
+    #persons = await stream_persons_by_batch_id(FIELD_BATCH_ID, nf_batch_ids)
+    # 1) Personen über Search laden
+    persons_search = await stream_persons_by_batch_id(FIELD_BATCH_ID, nf_batch_ids)
+    
+    # 2) IDs extrahieren
+    ids = [str(p.get("id")) for p in persons_search if p.get("id")]
+    
+    # 3) Personen vollständig laden
+    persons = await fetch_person_details(ids)
 
     # Datum prüfen
     today = datetime.now().date()
