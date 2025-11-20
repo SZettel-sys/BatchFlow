@@ -598,77 +598,83 @@ async def _build_nf_master_final(
     # ------------------------------------------------------------
     # 3) Filter-Logik: Datum + maximal 2 Kontakte pro Organisation
     # ------------------------------------------------------------
-    selected = []
-    excluded = []
+    # ------------------------------------------------------------
+# 3) Filter-Logik: Datum + maximal 2 Kontakte pro Organisation
+# ------------------------------------------------------------
 
-    org_counter = defaultdict(int)
-    today = datetime.now().date()
+selected = []
+org_counter = defaultdict(int)
 
-    def is_date_valid(raw):
-        if not raw:
-            return True
-        try:
-            dt = datetime.fromisoformat(raw.split(" ")[0]).date()
-        except:
-            return True
-        if dt > today:
-            return False
-        if (today - dt).days <= 90:
-            return False
+# Zähler für die Hinweisbox
+excluded_due_to_date = 0
+excluded_due_to_org_limit = 0
+
+today = datetime.now().date()
+
+
+def is_date_valid(raw):
+    """
+    Prüfung 'nächste Aktivität' nach deinen Regeln:
+    - Wenn kein Datum → gültig
+    - Wenn Datum > heute → ausschließen
+    - Wenn Datum innerhalb der letzten 90 Tage → ausschließen
+    - Sonst gültig
+    """
+    if not raw:
         return True
 
-    # ------------------------------------------------------------
-    # Personen verarbeiten
-    # ------------------------------------------------------------
-    for p in persons:
+    try:
+        dt = datetime.fromisoformat(str(raw).split(" ")[0]).date()
+    except:
+        return True  # unlesbare Werte nicht blockieren
 
-        pid = str(p.get("id") or "")
-        name = p.get("name") or ""
+    if dt > today:
+        return False
 
-        org = p.get("organization") or {}
-        org_id = str(org.get("id") or "")
-        org_name = org.get("name") or ""
+    if (today - dt).days <= 90:
+        return False
 
-        next_act = extract_field_date(p, NEXT_KEY)
+    return True
 
-        # ❌ Ausschlussgrund: Datum ungültig
-        if not is_date_valid(next_act):
-            excluded.append({
-                "Kontakt ID": pid,
-                "Name": name,
-                "Organisation ID": org_id,
-                "Organisationsname": org_name,
-                "Grund": f"Nächste Aktivität {next_act or '–'} < 3 Monate oder in der Zukunft",
-                "Quelle": "Batch-/Filter-Ausschluss"
-            })
-            print(f"[NF-DEBUG] EXCLUDE PID={pid} ORG={org_name} → NextActivity={next_act}")
+
+# ------------------------------------------------------------
+# Haupt-Schleife über alle Personen
+# ------------------------------------------------------------
+for p in persons:
+
+    pid = str(p.get("id") or "")
+    name = p.get("name") or ""
+
+    org = p.get("organization") or {}
+    org_id = str(org.get("id") or "")
+    org_name = org.get("name") or ""
+
+    # 1. Datum 'Nächste Aktivität'
+    next_raw = p.get(FIELD_NEXT_ACTIVITY)
+    if not is_date_valid(next_raw):
+        excluded_due_to_date += 1
+        continue
+
+    # 2. Max. zwei Kontakte pro Organisation
+    if org_id:
+        org_counter[org_id] += 1
+        if org_counter[org_id] > 2:
+            excluded_due_to_org_limit += 1
             continue
 
-        # ❌ Ausschlussgrund: mehr als 2 Kontakte pro Org
-        if org_id:
-            org_counter[org_id] += 1
-            if org_counter[org_id] > 2:
-                excluded.append({
-                    "Kontakt ID": pid,
-                    "Name": name,
-                    "Organisation ID": org_id,
-                    "Organisationsname": org_name,
-                    "Grund": "Mehr als 2 Kontakte pro Organisation",
-                    "Quelle": "Batch-/Filter-Ausschluss"
-                })
-                print(f"[NF-DEBUG] EXCLUDE PID={pid} ORG={org_name} → >2 Kontakte")
-                continue
+    # Wenn alle Checks bestanden sind → aufnehmen
+    selected.append(p)
 
-        # ✔ akzeptiert
-        selected.append(p)
 
-    print(f"[NF] Ausgewählt: {len(selected)}, Excluded: {len(excluded)}")
+print(f"[NF] Ausgewählt: {len(selected)}")
+print(f"[NF] Ausgeschlossen (Datum): {excluded_due_to_date}")
+print(f"[NF] Ausgeschlossen (Org-Limit): {excluded_due_to_org_limit}")
 
-    if job_obj:
-        job_obj.phase = "Baue Excel …"
-        job_obj.percent = 55
+# Diese Werte gehen später in die Hinweisbox auf der HTML-Seite
+return selected, excluded_due_to_date, excluded_due_to_org_limit
 
-    # ------------------------------------------------------------
+
+# ------------------------------------------------------------
 # 4) Excel-Zeilen aufbauen (saubere, stabile Exportfelder)
 # ------------------------------------------------------------
 rows = []
