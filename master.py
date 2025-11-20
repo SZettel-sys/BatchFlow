@@ -24,7 +24,7 @@ if os.path.isdir("static"):
     app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # -----------------------------------------------------------------------------
-# Umgebungsvariablen & Konstanten
+# Umgebungsvariablen & Konstanten setzen
 # -----------------------------------------------------------------------------
 PD_API_TOKEN = os.getenv("PD_API_TOKEN", "")
 PIPEDRIVE_API = "https://api.pipedrive.com/v1"
