@@ -567,7 +567,7 @@ async def _build_nf_master_final(
 ) -> pd.DataFrame:
 
     # ------------------------------------------------------------
-    # 0) Feld-Keys (fest nach Vorgabe)
+    # 0) Feld-Keys
     # ------------------------------------------------------------
     FIELD_BATCH_ID    = "5ac34dad3ea917fdef4087caebf77ba275f87eec"
     FIELD_PROSPECT_ID = "f9138f9040c44622808a4b8afda2b1b75ee5acd0"
@@ -578,208 +578,132 @@ async def _build_nf_master_final(
     FIELD_LINKEDIN    = "25563b12f847a280346bba40deaf527af82038cc"
 
     # ------------------------------------------------------------
-    # 1) Personen per Batch-ID laden
+    # 1) Personen laden
     # ------------------------------------------------------------
     if job_obj:
         job_obj.phase = "Lade Nachfass-Kandidaten …"
         job_obj.percent = 10
 
-    persons = await stream_persons_by_batch_id(
-        FIELD_BATCH_ID,
-        nf_batch_ids
-    )
+    persons = await stream_persons_by_batch_id(FIELD_BATCH_ID, nf_batch_ids)
     print(f"[NF] Personen geladen aus Batch-IDs: {len(persons)}")
 
     # ------------------------------------------------------------
-    # 2) Field-Key für 'Datum nächste Aktivität'
+    # 2) Key für nächste Aktivität
     # ------------------------------------------------------------
     NEXT_KEY = await get_next_activity_key()
 
-# ------------------------------------------------------------
-# 3) Filter-Logik: Datum + maximal 2 Kontakte pro Organisation
-# ------------------------------------------------------------
+    # ------------------------------------------------------------
+    # 3) Filter-Logik
+    # ------------------------------------------------------------
+    selected = []
 
-selected = []
+    count_org_limit = 0
+    count_date_invalid = 0
 
-# Hinweis-Zähler
-count_org_limit = 0
-count_date_invalid = 0
+    org_counter = defaultdict(int)
+    today = datetime.now().date()
 
-org_counter = defaultdict(int)
-today = datetime.now().date()
+    def is_date_valid(raw):
+        if not raw:
+            return True
+        try:
+            dt = datetime.fromisoformat(raw.split(" ")[0]).date()
+        except:
+            return True
 
+        if dt > today:
+            return False
+        if (today - dt).days <= 90:
+            return False
 
-def is_date_valid(raw):
-    """
-    Datum ist nur gültig, wenn:
-    - kein Datum vorhanden => OK
-    - Datum nicht in Zukunft
-    - Datum NICHT innerhalb der letzten 90 Tage
-    """
-    if not raw:
         return True
 
-    try:
-        dt = datetime.fromisoformat(raw.split(" ")[0]).date()
-    except:
-        return True
+    for p in persons:
 
-    if dt > today:
-        return False
+        org = p.get("organization") or {}
+        org_id = org.get("id")
 
-    if (today - dt).days <= 90:
-        return False
-
-    return True
-
-
-for p in persons:
-
-    org = p.get("organization") or {}
-    org_id = org.get("id")
-
-    # 1) Datum-Check
-    if not is_date_valid(p.get("next_activity_date")):
-        count_date_invalid += 1
-        continue
-
-    # 2) Max. 2 Kontakte pro Organisation
-    if org_id:
-        org_counter[org_id] += 1
-        if org_counter[org_id] > 2:
-            count_org_limit += 1
+        # 1) Datum check
+        if not is_date_valid(p.get("next_activity_date")):
+            count_date_invalid += 1
             continue
 
-    # → Person ist gültig
-    selected.append(p)
-# ------------------------------------------------------------
-# 3) Filter-Logik: Datum + maximal 2 Kontakte pro Organisation
-# ------------------------------------------------------------
+        # 2) Max 2 pro Orga
+        if org_id:
+            org_counter[org_id] += 1
+            if org_counter[org_id] > 2:
+                count_org_limit += 1
+                continue
 
-selected = []
+        selected.append(p)
 
-# Hinweis-Zähler
-count_org_limit = 0
-count_date_invalid = 0
+    # ------------------------------------------------------------
+    # 4) Export-Zeilen aufbauen
+    # ------------------------------------------------------------
+    rows = []
 
-org_counter = defaultdict(int)
-today = datetime.now().date()
+    for p in selected:
 
+        pid = str(p.get("id") or "")
+        org = p.get("organization") or {}
+        org_id = str(org.get("id") or "")
+        org_name = org.get("name") or ""
 
-def is_date_valid(raw):
-    """
-    Datum ist nur gültig, wenn:
-    - kein Datum vorhanden => OK
-    - Datum nicht in Zukunft
-    - Datum NICHT innerhalb der letzten 90 Tage
-    """
-    if not raw:
-        return True
+        first, last = split_name(p.get("first_name"), p.get("last_name"), p.get("name"))
 
-    try:
-        dt = datetime.fromisoformat(raw.split(" ")[0]).date()
-    except:
-        return True
+        email = ""
+        emails = p.get("emails") or []
+        if isinstance(emails, list):
+            for e in emails:
+                if isinstance(e, dict) and e.get("primary"):
+                    email = e.get("value") or ""
+                    break
 
-    if dt > today:
-        return False
+        rows.append({
+            "Batch ID": batch_id,
+            "Channel": DEFAULT_CHANNEL,
+            "Cold-Mailing Import": campaign,
 
-    if (today - dt).days <= 90:
-        return False
+            "Person ID": pid,
+            "Person Vorname": first,
+            "Person Nachname": last,
+            "Person Titel": p.get(FIELD_TITLE) or "",
+            "Person Geschlecht": p.get(FIELD_GENDER) or "",
+            "Person Position": p.get(FIELD_POSITION) or "",
+            "Person E-Mail": email,
 
-    return True
+            "Prospect ID": p.get(FIELD_PROSPECT_ID) or "",
 
+            "Organisation Name": org_name,
+            "Organisation ID": org_id,
 
-for p in persons:
+            "XING Profil": p.get(FIELD_XING) or "",
+            "LinkedIn URL": p.get(FIELD_LINKEDIN) or "",
+        })
 
-    org = p.get("organization") or {}
-    org_id = org.get("id")
+    df = pd.DataFrame(rows).replace({None: ""})
 
-    # 1) Datum-Check
-    if not is_date_valid(p.get("next_activity_date")):
-        count_date_invalid += 1
-        continue
+    # ------------------------------------------------------------
+    # 5) Hinweise speichern
+    # ------------------------------------------------------------
+    excluded = [
+        {"Grund": "Max 2 Kontakte pro Organisation", "Anzahl": count_org_limit},
+        {"Grund": "Datum nächste Aktivität ungültig", "Anzahl": count_date_invalid},
+    ]
 
-    # 2) Max. 2 Kontakte pro Organisation
-    if org_id:
-        org_counter[org_id] += 1
-        if org_counter[org_id] > 2:
-            count_org_limit += 1
-            continue
+    ex = pd.DataFrame(excluded)
+    await save_df_text(ex, "nf_excluded")
 
-    # → Person ist gültig
-    selected.append(p)
+    # → Finaler Export
+    await save_df_text(df, "nf_master_final")
 
+    if job_obj:
+        job_obj.phase = "Nachfass-Master erstellt"
+        job_obj.percent = 80
 
+    print(f"[NF] Master gespeichert: {len(df)} Zeilen")
+    return df
 
-
-# ------------------------------------------------------------
-# 4) Excel-Zeilen aufbauen (saubere, stabile Exportfelder)
-# ------------------------------------------------------------
-rows = []
-
-for p in selected:
-
-    pid = str(p.get("id") or "")
-    org = p.get("organization") or {}
-    org_id = str(org.get("id") or "")
-    org_name = org.get("name") or ""
-
-    # Namen sauber splitten
-    first, last = split_name(
-        p.get("first_name"),
-        p.get("last_name"),
-        p.get("name")
-    )
-
-    # Büro-Email (primär)
-    email = ""
-    emails = p.get("emails") or []
-    if isinstance(emails, list):
-        for e in emails:
-            if isinstance(e, dict) and e.get("primary"):
-                email = e.get("value") or ""
-                break
-
-    rows.append({
-        "Batch ID": batch_id,
-        "Channel": DEFAULT_CHANNEL,
-        "Cold-Mailing Import": campaign,
-
-        "Person ID": pid,
-        "Person Vorname": first,
-        "Person Nachname": last,
-        "Person Titel": p.get(FIELD_TITLE) or "",
-        "Person Geschlecht": p.get(FIELD_GENDER) or "",
-        "Person Position": p.get(FIELD_POSITION) or "",
-        "Person E-Mail": email,
-
-        "Prospect ID": p.get(FIELD_PROSPECT_ID) or "",
-
-        "Organisation Name": org_name,
-        "Organisation ID": org_id,
-
-        "XING Profil": p.get(FIELD_XING) or "",
-        "LinkedIn URL": p.get(FIELD_LINKEDIN) or "",
-    })
-
-df = pd.DataFrame(rows).replace({None: ""})
-
-# ------------------------------------------------------------
-# 5) Excluded speichern (UI)
-# ------------------------------------------------------------
-ex = pd.DataFrame(excluded).replace({None: ""})
-await save_df_text(ex, "nf_excluded")
-
-# Master speichern (für Excel)
-await save_df_text(df, "nf_master_final")
-if job_obj:
-    job_obj.phase = "Nachfass-Master erstellt"
-    job_obj.percent = 80
-
-print(f"[NF] Master gespeichert: {len(df)} Zeilen")
-
-return df
 
 # =============================================================================
 # BASIS-ABGLEICH (Organisationen & IDs) – MODUL 4 FINAL
