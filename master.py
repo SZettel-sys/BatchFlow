@@ -773,14 +773,13 @@ await save_df_text(ex, "nf_excluded")
 
 # Master speichern (für Excel)
 await save_df_text(df, "nf_master_final")
+if job_obj:
+    job_obj.phase = "Nachfass-Master erstellt"
+    job_obj.percent = 80
 
-    if job_obj:
-        job_obj.phase = "Nachfass-Master erstellt"
-        job_obj.percent = 80
+print(f"[NF] Master gespeichert: {len(df)} Zeilen")
 
-    print(f"[NF] Master gespeichert: {len(df)} Zeilen")
-
-    return df
+return df
 
 # =============================================================================
 # BASIS-ABGLEICH (Organisationen & IDs) – MODUL 4 FINAL
