@@ -559,6 +559,7 @@ async def stream_persons_by_filter(
 # NACHFASS: MASTER-DATENAUFBAU – FINAL BEREINIGT
 # ============================================================
 
+
 async def _build_nf_master_final(
     nf_batch_ids: List[str],
     batch_id: str,
@@ -567,7 +568,7 @@ async def _build_nf_master_final(
 ) -> pd.DataFrame:
 
     # ------------------------------------------------------------
-    # 0) Feld-Keys
+    # Feld-Keys der Custom-Fields
     # ------------------------------------------------------------
     FIELD_BATCH_ID    = "5ac34dad3ea917fdef4087caebf77ba275f87eec"
     FIELD_PROSPECT_ID = "f9138f9040c44622808a4b8afda2b1b75ee5acd0"
@@ -577,30 +578,22 @@ async def _build_nf_master_final(
     FIELD_XING        = "44ebb6feae2a670059bc5261001443a2878a2b43"
     FIELD_LINKEDIN    = "25563b12f847a280346bba40deaf527af82038cc"
 
+    def cf(p, key):
+        v = p.get(key)
+        if isinstance(v, dict):
+            return v.get("value") or v.get("label") or ""
+        return v or ""
+
     # ------------------------------------------------------------
-    # 1) Personen laden
+    # Personen laden
     # ------------------------------------------------------------
     if job_obj:
         job_obj.phase = "Lade Nachfass-Kandidaten …"
         job_obj.percent = 10
 
     persons = await stream_persons_by_batch_id(FIELD_BATCH_ID, nf_batch_ids)
-    print(f"[NF] Personen geladen aus Batch-IDs: {len(persons)}")
 
-    # ------------------------------------------------------------
-    # 2) Key für nächste Aktivität
-    # ------------------------------------------------------------
-    NEXT_KEY = await get_next_activity_key()
-
-    # ------------------------------------------------------------
-    # 3) Filter-Logik
-    # ------------------------------------------------------------
-    selected = []
-
-    count_org_limit = 0
-    count_date_invalid = 0
-
-    org_counter = defaultdict(int)
+    # Datum prüfen
     today = datetime.now().date()
 
     def is_date_valid(raw):
@@ -610,25 +603,25 @@ async def _build_nf_master_final(
             dt = datetime.fromisoformat(raw.split(" ")[0]).date()
         except:
             return True
-
         if dt > today:
             return False
         if (today - dt).days <= 90:
             return False
-
         return True
 
-    for p in persons:
+    selected = []
+    org_counter = defaultdict(int)
+    count_org_limit = 0
+    count_date_invalid = 0
 
+    for p in persons:
         org = p.get("organization") or {}
         org_id = org.get("id")
 
-        # 1) Datum check
         if not is_date_valid(p.get("next_activity_date")):
             count_date_invalid += 1
             continue
 
-        # 2) Max 2 pro Orga
         if org_id:
             org_counter[org_id] += 1
             if org_counter[org_id] > 2:
@@ -638,7 +631,7 @@ async def _build_nf_master_final(
         selected.append(p)
 
     # ------------------------------------------------------------
-    # 4) Export-Zeilen aufbauen
+    # Export-Zeilen
     # ------------------------------------------------------------
     rows = []
 
@@ -646,8 +639,6 @@ async def _build_nf_master_final(
 
         pid = str(p.get("id") or "")
         org = p.get("organization") or {}
-        org_id = str(org.get("id") or "")
-        org_name = org.get("name") or ""
 
         first, last = split_name(p.get("first_name"), p.get("last_name"), p.get("name"))
 
@@ -667,43 +658,36 @@ async def _build_nf_master_final(
             "Person ID": pid,
             "Person Vorname": first,
             "Person Nachname": last,
-            "Person Titel": p.get(FIELD_TITLE) or "",
-            "Person Geschlecht": p.get(FIELD_GENDER) or "",
-            "Person Position": p.get(FIELD_POSITION) or "",
+            "Person Titel": cf(p, FIELD_TITLE),
+            "Person Geschlecht": cf(p, FIELD_GENDER),
+            "Person Position": cf(p, FIELD_POSITION),
             "Person E-Mail": email,
 
-            "Prospect ID": p.get(FIELD_PROSPECT_ID) or "",
+            "Prospect ID": cf(p, FIELD_PROSPECT_ID),
+            "Organisation ID": str(org.get("id") or ""),
+            "Organisation Name": org.get("name") or "",
 
-            "Organisation Name": org_name,
-            "Organisation ID": org_id,
-
-            "XING Profil": p.get(FIELD_XING) or "",
-            "LinkedIn URL": p.get(FIELD_LINKEDIN) or "",
+            "XING Profil": cf(p, FIELD_XING),
+            "LinkedIn URL": cf(p, FIELD_LINKEDIN),
         })
 
     df = pd.DataFrame(rows).replace({None: ""})
 
-    # ------------------------------------------------------------
-    # 5) Hinweise speichern
-    # ------------------------------------------------------------
+    # Ausschlüsse speichern
     excluded = [
         {"Grund": "Max 2 Kontakte pro Organisation", "Anzahl": count_org_limit},
         {"Grund": "Datum nächste Aktivität ungültig", "Anzahl": count_date_invalid},
     ]
-
     ex = pd.DataFrame(excluded)
     await save_df_text(ex, "nf_excluded")
 
-    # → Finaler Export
     await save_df_text(df, "nf_master_final")
 
     if job_obj:
         job_obj.phase = "Nachfass-Master erstellt"
         job_obj.percent = 80
 
-    print(f"[NF] Master gespeichert: {len(df)} Zeilen")
     return df
-
 
 # =============================================================================
 # BASIS-ABGLEICH (Organisationen & IDs) – MODUL 4 FINAL
@@ -759,18 +743,14 @@ async def _fetch_org_names_for_filter_capped(
 # RECONCILE – Nachfass Abgleich (Organisation + Person-ID)
 # =============================================================================
 async def _reconcile(prefix: str) -> None:
-    """
-    Abgleich für Nachfass:
-    1) Fuzzy Organisation ≥95 % → entfernen
-    2) Personen-ID Dubletten aus Filter 1216/1708 → entfernen
-    3) Delete-Log speichern
-    """
     t = tables(prefix)
     df = await load_df_text(t["final"])
 
     if df.empty:
         await save_df_text(pd.DataFrame(), t["ready"])
-        await save_df_text(pd.DataFrame(columns=["reason","id","name","org_id","org_name","extra"]), t["log"])
+        await save_df_text(pd.DataFrame(columns=[
+            "reason","Kontakt ID","Name","Organisation ID","Organisationsname","Grund"
+        ]), t["log"])
         return
 
     col_pid = "Person ID"
@@ -778,13 +758,13 @@ async def _reconcile(prefix: str) -> None:
     col_orgid = "Organisation ID"
 
     delete_rows = []
+    drop_idx = []
 
     # -----------------------------------------------
-    # 1) Organisation fuzzy ≥ 95 % Ähnlichkeit
+    # 1) Fuzzy Organisation
     # -----------------------------------------------
-    filter_ids_org = [1245, 851, 1521]   # Orga-Dublettenfilter
-
-    buckets_all: Dict[str, List[str]] = {}
+    filter_ids_org = [1245, 851, 1521]
+    buckets_all = {}
     total_collected = 0
 
     for fid in filter_ids_org:
@@ -797,33 +777,23 @@ async def _reconcile(prefix: str) -> None:
         )
 
         for key, vals in sub.items():
-            bucket = buckets_all.setdefault(key, [])
+            b = buckets_all.setdefault(key, [])
             for v in vals:
-                if len(bucket) >= MAX_ORG_BUCKET:
-                    break
-                if v not in bucket:
-                    bucket.append(v)
+                if v not in b:
+                    b.append(v)
                     total_collected += 1
 
-        if total_collected >= MAX_ORG_NAMES:
-            break
-
-    drop_idx = []
-
     for idx, row in df.iterrows():
-        org_name = str(row.get(col_orgname) or "").strip()
-        norm = normalize_name(org_name)
-
+        name = str(row.get(col_orgname) or "")
+        norm = normalize_name(name)
         if not norm:
             continue
 
         b = bucket_key(norm)
         bucket = buckets_all.get(b)
-
         if not bucket:
             continue
 
-        # Kandidaten enger begrenzen
         near = [n for n in bucket if abs(len(n) - len(norm)) <= 4]
         if not near:
             continue
@@ -833,19 +803,17 @@ async def _reconcile(prefix: str) -> None:
             drop_idx.append(idx)
             delete_rows.append({
                 "reason": "org_match_95",
-                "id": row.get(col_pid, ""),
-                "name": f"{row.get('Person Vorname','')} {row.get('Person Nachname','')}".strip(),
-                "org_id": row.get(col_orgid, ""),
-                "org_name": org_name,
-                "extra": f"Ähnlichkeit {best[1]}%"
+                "Kontakt ID": row[col_pid],
+                "Name": f"{row.get('Person Vorname','')} {row.get('Person Nachname','')}".strip(),
+                "Organisation ID": row[col_orgid],
+                "Organisationsname": name,
+                "Grund": f"Ähnlichkeit {best[1]}%"
             })
 
-    if drop_idx:
-        df = df.drop(index=drop_idx)
-
+    df = df.drop(drop_idx)
 
     # -----------------------------------------------
-    # 2) Personen-ID Dubletten (Filter 1216 & 1708)
+    # 2) Personen-ID Dubletten
     # -----------------------------------------------
     suspect_ids = set()
 
@@ -853,30 +821,27 @@ async def _reconcile(prefix: str) -> None:
         async for ids in stream_person_ids_by_filter(f_id):
             suspect_ids.update(ids)
 
-    if suspect_ids:
-        mask = df[col_pid].astype(str).isin(suspect_ids)
-        removed = df[mask]
+    mask = df[col_pid].astype(str).isin(suspect_ids)
+    removed = df[mask]
 
-        for _, r in removed.iterrows():
-            delete_rows.append({
-                "reason": "person_id_match",
-                "id": str(r.get(col_pid) or ""),
-                "name": f"{r.get('Person Vorname','')} {r.get('Person Nachname','')}".strip(),
-                "org_id": str(r.get(col_orgid) or ""),
-                "org_name": str(r.get(col_orgname) or ""),
-                "extra": "Bereits in Filter 1216/1708"
-            })
+    for _, r in removed.iterrows():
+        delete_rows.append({
+            "reason": "person_id_match",
+            "Kontakt ID": r[col_pid],
+            "Name": f"{r.get('Person Vorname','')} {r.get('Person Nachname','')}".strip(),
+            "Organisation ID": r[col_orgid],
+            "Organisationsname": r[col_orgname],
+            "Grund": "Bereits in Filter 1216/1708"
+        })
 
-        df = df[~mask]
+    df = df[~mask]
 
     # -----------------------------------------------
-    # 3) Speichern
+    # Speichern
     # -----------------------------------------------
     await save_df_text(df, t["ready"])
-    log_df = pd.DataFrame(delete_rows, columns=["reason","id","name","org_id","org_name","extra"])
+    log_df = pd.DataFrame(delete_rows)
     await save_df_text(log_df, t["log"])
-
-    print(f"[Reconcile] {len(delete_rows)} Zeilen im Delete-Log gespeichert.")
 
 # =============================================================================
 # Excel-Export-Helfer – FINAL MODUL 3
@@ -1544,77 +1509,35 @@ async def nachfass_summary(job_id: str = Query(...)):
 # =============================================================================
 @app.get("/nachfass/excluded/json")
 async def nachfass_excluded_json():
-    """
-    Liefert alle ausgeschlossenen Nachfass-Datensätze als JSON.
 
-    Änderungen:
-    - 'Quelle' wird nicht mehr ausgegeben.
-    - nf_excluded (Datum ungültig / max 2 Orga) wird NICHT mehr als Zeilen
-      dargestellt, sondern nur als kompakte Summary.
-    - Fuzzy/ID-Abgleich (nf_delete_log) wird normalisiert auf:
-      Kontakt ID, Name, Organisation ID, Organisationsname, Grund
-    """
-    import pandas as pd
-
-    # ------------------------------
-    # 1) nf_excluded laden (Batch/Filter)
-    # ------------------------------
-    excluded_df = pd.DataFrame()
-    try:
-        excluded_df = await load_df_text("nf_excluded")
-    except Exception as e:
-        print(f"[WARN] nf_excluded konnte nicht geladen werden: {e}")
+    excluded_df = await load_df_text("nf_excluded")
+    deleted_df  = await load_df_text("nf_delete_log")
 
     excluded_summary = []
     if not excluded_df.empty:
-        excluded_summary = [
-            {
-                "Grund": str(r.get("Grund") or ""),
-                "Anzahl": int(r.get("Anzahl") or 0)
-            }
-            for _, r in excluded_df.iterrows()
-        ]
-
-    # ------------------------------
-    # 2) nf_delete_log laden (Fuzzy + ID-Dubletten)
-    # ------------------------------
-    deleted_df = pd.DataFrame()
-    try:
-        deleted_df = await load_df_text("nf_delete_log")
-    except Exception as e:
-        print(f"[WARN] nf_delete_log konnte nicht geladen werden: {e}")
-
-    # ------------------------------
-    # 3) Normalisieren für Ausgabe
-    # ------------------------------
-    rows = []
-    if not deleted_df.empty:
-
-        # Mapping erzeugen (Name, ID etc)
-        deleted_df = deleted_df.replace({pd.NA: "", None: "", float("nan"): ""})
-
-        for _, r in deleted_df.iterrows():
-            grund = r.get("reason", "")
-            extra = r.get("extra", "")
-
-            if extra:
-                grund = f"{grund} – {extra}"
-
-            rows.append({
-                "Kontakt ID": r.get("id", ""),
-                "Name": r.get("name", ""),
-                "Organisation ID": r.get("org_id", ""),
-                "Organisationsname": r.get("org_name", ""),
-                "Grund": grund,
+        for _, r in excluded_df.iterrows():
+            excluded_summary.append({
+                "Grund": r["Grund"],
+                "Anzahl": int(r["Anzahl"])
             })
 
-    # ------------------------------
-    # 4) Rückgabe – OHNE „Quelle“
-    # ------------------------------
+    rows = []
+    if not deleted_df.empty:
+        deleted_df = deleted_df.replace({None: "", np.nan: ""})
+
+        for _, r in deleted_df.iterrows():
+            rows.append({
+                "Kontakt ID": r.get("Kontakt ID") or r.get("id") or "",
+                "Name": r.get("Name") or "",
+                "Organisation ID": r.get("Organisation ID") or "",
+                "Organisationsname": r.get("Organisationsname") or "",
+                "Grund": r.get("Grund") or r.get("reason") or ""
+            })
+
     return JSONResponse({
-        "summary": excluded_summary,   # z. B. [{Grund: "...", Anzahl: 2}]
-        "total": len(rows),            # nur Fuzzy/ID
-        "rows": rows                   # fertige Tabelle
+        "summary": excluded_summary,
+        "total": len(rows),
+        "rows": rows
     })
 
 
@@ -1790,107 +1713,62 @@ async def nachfass_summary(job_id: str = Query(...)):
 # =============================================================================
 # MODUL 6 – FINALER JOB-/WORKFLOW FÜR NACHFASS (EXPORT/PROGRESS/DOWNLOAD)
 # =============================================================================
-
 @app.post("/nachfass/export_start")
 async def export_start_nf(request: Request):
-    """
-    Startet den asynchronen Nachfass-Export:
-    - Erstellt Job-Objekt (für Fortschritt & Status)
-    - Ruft _build_nf_master_final asynchron auf
-    - Führt anschließend den Abgleich (_reconcile) aus
-    - Liefert Job-ID für Fortschrittsabfragen zurück
-    """
     try:
         data = await request.json()
         nf_batch_ids = data.get("nf_batch_ids") or []
         batch_id     = data.get("batch_id") or ""
         campaign     = data.get("campaign") or ""
 
-        if not nf_batch_ids:
-            return JSONResponse({"error": "Keine Batch-IDs übergeben."}, status_code=400)
-
-        # ---------------------------------------------------
-        # 1) Job erstellen
-        # ---------------------------------------------------
         job_id = str(uuid.uuid4())
-        job_obj = Job()
-        job_obj.id = job_id
-        job_obj.name = f"Nachfass Export ({batch_id})"
-        job_obj.phase = "Starte Nachfass-Export …"
-        job_obj.percent = 0
-        job_obj.done = False
-        job_obj.error = None
-        job_obj.filename_base = slugify_filename(campaign or f"Nachfass_{batch_id}")
+        job = Job()
+        JOBS[job_id] = job
 
-        JOBS[job_id] = job_obj
+        job.filename_base = slugify_filename(campaign or f"Nachfass_{batch_id}")
+        job.phase = "Starte Nachfass-Export …"
+        job.percent = 0
 
-        # ---------------------------------------------------
-        # 2) Asynchronen Export starten
-        # ---------------------------------------------------
-        async def run_export():
+        async def run():
             try:
-                # 1️⃣ Personen laden
-                job_obj.phase = "Lade Nachfass-Daten aus Pipedrive …"
-                job_obj.percent = 5
+                job.phase = "Lade Nachfass-Daten …"
+                job.percent = 10
 
-                df = await _build_nf_master_final(
-                    nf_batch_ids=nf_batch_ids,
-                    batch_id=batch_id,
-                    campaign=campaign,
-                    job_obj=job_obj
-                )
+                df = await _build_nf_master_final(nf_batch_ids, batch_id, campaign, job_obj=job)
 
-                # Speichern für späteren Download
-                await save_df_text(df, tables("nf")["final"])
-
-                job_obj.phase = f"Daten geladen ({len(df)} Zeilen)"
-                job_obj.percent = 55
-
-                # 2️⃣ Abgleich (Orga + Kontakt)
-                job_obj.phase = "Führe Abgleichslogik aus …"
-                job_obj.percent = 75
-
+                job.phase = "Führe Abgleich durch …"
+                job.percent = 60
                 await _reconcile("nf")
 
-                job_obj.phase = "Abgleich abgeschlossen"
-                job_obj.percent = 90
-
-                # 3️⃣ Excel erzeugen
-                job_obj.phase = "Erzeuge Excel-Datei …"
-                job_obj.percent = 95
+                job.phase = "Erzeuge Excel-Datei …"
+                job.percent = 85
 
                 ready = await load_df_text("nf_master_ready")
-
-                # Aufbereitung in Zielschema
                 export_df = build_nf_export(ready)
-                excel_data = _df_to_excel_bytes(export_df)
+                excel_bytes = _df_to_excel_bytes(export_df)
 
-                # Temporäre Datei schreiben
-                file_path = f"/tmp/{job_obj.filename_base}.xlsx"
+                file_path = f"/tmp/{job.filename_base}.xlsx"
                 with open(file_path, "wb") as f:
-                    f.write(excel_data)
+                    f.write(excel_bytes)
 
-                job_obj.path = file_path
-                job_obj.total_rows = len(export_df)
-
-                job_obj.phase = f"Fertig – {job_obj.total_rows} Zeilen"
-                job_obj.percent = 100
-                job_obj.done = True
+                job.path = file_path
+                job.total_rows = len(export_df)
+                job.phase = f"Fertig – {job.total_rows} Zeilen"
+                job.percent = 100
+                job.done = True
 
             except Exception as e:
-                job_obj.phase = "Fehler beim Export"
-                job_obj.error = str(e)
-                job_obj.done = True
-                job_obj.percent = 100
-                print(f"[ERROR] Nachfass Export: {e}")
+                job.error = str(e)
+                job.phase = "Fehler"
+                job.percent = 100
+                job.done = True
 
-        asyncio.create_task(run_export())
-
-        return JSONResponse({"job_id": job_id})
+        asyncio.create_task(run())
+        return {"job_id": job_id}
 
     except Exception as e:
-        print(f"[ERROR] /nachfass/export_start: {e}")
         return JSONResponse({"error": str(e)}, status_code=500)
+
 
 
 
@@ -1898,32 +1776,30 @@ async def export_start_nf(request: Request):
 # Fortschritt abfragen
 # =============================================================================
 @app.get("/nachfass/export_progress")
-async def nachfass_export_progress(job_id: str = Query(...)):
+async def nachfass_export_progress(job_id: str):
     job = JOBS.get(job_id)
     if not job:
-        raise HTTPException(status_code=404, detail="Job nicht gefunden")
-    return JSONResponse({
+        return JSONResponse({"error": "Job nicht gefunden"}, status_code=404)
+    return {
         "phase": job.phase,
         "percent": job.percent,
         "done": job.done,
         "error": job.error
-    })
-
-
+    }
 
 # =============================================================================
 # Download
 # =============================================================================
 @app.get("/nachfass/export_download")
-async def nachfass_export_download(job_id: str = Query(...)):
+async def nachfass_export_download(job_id: str):
     job = JOBS.get(job_id)
     if not job or not job.path:
-        raise HTTPException(status_code=404, detail="Datei nicht gefunden")
+        return JSONResponse({"error": "Keine Datei gefunden"}, status_code=404)
 
     return FileResponse(
         job.path,
-        filename=f"{job.filename_base}.xlsx",
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename=f"{job.filename_base}.xlsx"
     )
 
 # =============================================================================
