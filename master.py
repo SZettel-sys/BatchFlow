@@ -1329,6 +1329,9 @@ async def nachfass_page(request: Request):
 
   <section id="excludedSection" style="margin-top:30px;">
     <h3>Nicht berücksichtigte Datensätze</h3>
+
+    <!-- Summary Box wird dynamisch eingefügt -->
+
     <div id="excludedTable">
       <table>
         <thead>
@@ -1338,11 +1341,10 @@ async def nachfass_page(request: Request):
             <th>Organisation ID</th>
             <th>Organisationsname</th>
             <th>Grund</th>
-            <th>Quelle</th>
           </tr>
         </thead>
         <tbody id="excluded-table-body">
-          <tr><td colspan="6" style="text-align:center;color:#888">Noch keine Daten geladen</td></tr>
+          <tr><td colspan="5" style="text-align:center;color:#888">Noch keine Daten geladen</td></tr>
         </tbody>
       </table>
     </div>
@@ -1391,34 +1393,71 @@ async function startExportNf(){
 async function loadExcludedTable(){
   try{
     const r = await fetch('/nachfass/excluded/json');
-    if(!r.ok) throw new Error('Serverfehler: '+r.status);
     const data = await r.json();
 
     const body = document.querySelector('#excluded-table-body');
     body.innerHTML = '';
 
-    if(!data.rows || data.rows.length === 0){
-      body.innerHTML = `<tr><td colspan="6" style="text-align:center;color:#888">Keine Datensätze ausgeschlossen</td></tr>`;
+    // ---------------------------
+    // 1) Summary Box (Batch/Filter)
+    // ---------------------------
+    const summaryBoxId = "excluded-summary-box";
+    let summaryBox = document.getElementById(summaryBoxId);
+
+    if (!summaryBox) {
+      summaryBox = document.createElement("div");
+      summaryBox.id = summaryBoxId;
+      summaryBox.style.margin = "15px 0";
+      summaryBox.style.padding = "12px 16px";
+      summaryBox.style.background = "#fff";
+      summaryBox.style.border = "1px solid #e2e8f0";
+      summaryBox.style.borderRadius = "10px";
+      summaryBox.style.boxShadow = "0 2px 8px rgba(2,8,23,.04)";
+      document.querySelector("#excludedSection").prepend(summaryBox);
+    }
+
+    if (data.summary && data.summary.length > 0) {
+      let html = "<b>Batch-/Filter-Ausschlüsse:</b><ul style='margin-top:6px'>";
+      for (const s of data.summary) {
+        html += `<li>${s.Grund}: <b>${s.Anzahl}</b></li>`;
+      }
+      html += "</ul>";
+      summaryBox.innerHTML = html;
+    } else {
+      summaryBox.innerHTML = "<b>Keine Batch-/Filter-Ausschlüsse</b>";
+    }
+
+    // ---------------------------
+    // 2) Abgleich-Zeilen (Fuzzy/ID)
+    // ---------------------------
+    if (!data.rows || data.rows.length === 0){
+      body.innerHTML = `
+        <tr>
+          <td colspan="5" style="text-align:center;color:#888">
+            Keine Datensätze durch Abgleich entfernt
+          </td>
+        </tr>`;
       return;
     }
 
-    for(const row of data.rows){
-      const tr=document.createElement('tr');
+    for (const row of data.rows){
+      const tr = document.createElement('tr');
       tr.innerHTML = `
-        <td>${row["Kontakt ID"] || row["id"] || ""}</td>
-        <td>${row["Name"] || row["name"] || ""}</td>
+        <td>${row["Kontakt ID"] || ""}</td>
+        <td>${row["Name"] || ""}</td>
         <td>${row["Organisation ID"] || ""}</td>
-        <td>${row["Organisationsname"] || row["org"] || ""}</td>
-        <td>${row["Grund"] || row["grund"] || ""}</td>
-        <td>${row["Quelle"] || ""}</td>
+        <td>${row["Organisationsname"] || ""}</td>
+        <td>${row["Grund"] || ""}</td>
       `;
       body.appendChild(tr);
     }
-  }catch(err){
+
+  } catch(err){
     const body = document.querySelector('#excluded-table-body');
-    body.innerHTML = `<tr><td colspan="6" style="text-align:center;color:red">
-      Fehler beim Laden (${err.message})
-    </td></tr>`;
+    body.innerHTML = `
+      <tr><td colspan="5" style="text-align:center;color:red">
+        Fehler beim Laden (${err.message})
+      </td></tr>`;
   }
 }
 
@@ -1446,6 +1485,7 @@ el('btnExportNf').addEventListener('click', startExportNf);
 
 </body></html>"""
     return HTMLResponse(html)
+
 
 # =============================================================================
 # Summary-Seiten
@@ -1500,56 +1540,81 @@ async def nachfass_summary(job_id: str = Query(...)):
     return HTMLResponse(html)
     
 # =============================================================================
-# MODUL 7 – EXCLUDED + SUMMARY + DEBUG (FINAL & KOMPATIBEL)
+# EXCLUDED + SUMMARY + DEBUG (FINAL & KOMPATIBEL)
 # =============================================================================
-
 @app.get("/nachfass/excluded/json")
 async def nachfass_excluded_json():
     """
     Liefert alle ausgeschlossenen Nachfass-Datensätze als JSON.
-    Kombiniert:
-      - nf_excluded  (Ausschlüsse im Build-Prozess)
-      - nf_delete_log (Ausschlüsse im Fuzzy/ID-Abgleich)
-    Ausgabe ohne NaN, mit Quelle.
+
+    Änderungen:
+    - 'Quelle' wird nicht mehr ausgegeben.
+    - nf_excluded (Datum ungültig / max 2 Orga) wird NICHT mehr als Zeilen
+      dargestellt, sondern nur als kompakte Summary.
+    - Fuzzy/ID-Abgleich (nf_delete_log) wird normalisiert auf:
+      Kontakt ID, Name, Organisation ID, Organisationsname, Grund
     """
     import pandas as pd
 
+    # ------------------------------
+    # 1) nf_excluded laden (Batch/Filter)
+    # ------------------------------
     excluded_df = pd.DataFrame()
-    deleted_df  = pd.DataFrame()
-
-    # nf_excluded (Datum + >2 Kontakte)
     try:
         excluded_df = await load_df_text("nf_excluded")
     except Exception as e:
         print(f"[WARN] nf_excluded konnte nicht geladen werden: {e}")
 
-    # nf_delete_log (Reconcile: Fuzzy/ID)
+    excluded_summary = []
+    if not excluded_df.empty:
+        excluded_summary = [
+            {
+                "Grund": str(r.get("Grund") or ""),
+                "Anzahl": int(r.get("Anzahl") or 0)
+            }
+            for _, r in excluded_df.iterrows()
+        ]
+
+    # ------------------------------
+    # 2) nf_delete_log laden (Fuzzy + ID-Dubletten)
+    # ------------------------------
+    deleted_df = pd.DataFrame()
     try:
         deleted_df = await load_df_text("nf_delete_log")
     except Exception as e:
         print(f"[WARN] nf_delete_log konnte nicht geladen werden: {e}")
 
-    # Quellen markieren
-    if not excluded_df.empty:
-        excluded_df["Quelle"] = "Batch-/Filter-Ausschluss"
+    # ------------------------------
+    # 3) Normalisieren für Ausgabe
+    # ------------------------------
+    rows = []
     if not deleted_df.empty:
-        deleted_df["Quelle"] = "Abgleich (Fuzzy/Kontaktfilter)"
 
-    # Zusammenführen
-    df_all = pd.concat([excluded_df, deleted_df], ignore_index=True)
+        # Mapping erzeugen (Name, ID etc)
+        deleted_df = deleted_df.replace({pd.NA: "", None: "", float("nan"): ""})
 
-    if df_all.empty:
-        return JSONResponse({"total": 0, "rows": []})
+        for _, r in deleted_df.iterrows():
+            grund = r.get("reason", "")
+            extra = r.get("extra", "")
 
-    # NaN entfernen (JSON-safe!)
-    df_all = df_all.replace({pd.NA: "", None: "", float("nan"): ""})
+            if extra:
+                grund = f"{grund} – {extra}"
 
-    # Ausgabe begrenzen
-    rows = df_all.tail(200).to_dict(orient="records")
+            rows.append({
+                "Kontakt ID": r.get("id", ""),
+                "Name": r.get("name", ""),
+                "Organisation ID": r.get("org_id", ""),
+                "Organisationsname": r.get("org_name", ""),
+                "Grund": grund,
+            })
 
+    # ------------------------------
+    # 4) Rückgabe – OHNE „Quelle“
+    # ------------------------------
     return JSONResponse({
-        "total": len(df_all),
-        "rows": rows
+        "summary": excluded_summary,   # z. B. [{Grund: "...", Anzahl: 2}]
+        "total": len(rows),            # nur Fuzzy/ID
+        "rows": rows                   # fertige Tabelle
     })
 
 
