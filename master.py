@@ -38,13 +38,13 @@ FILTER_NACHFASS   = int(os.getenv("FILTER_NACHFASS", "3024"))
 FIELD_FACHBEREICH_HINT = os.getenv("FIELD_FACHBEREICH_HINT", "fachbereich")
 
 DEFAULT_CHANNEL = "Cold E-Mail"
-PAGE_LIMIT = int(os.getenv("PAGE_LIMIT", "500"))
+PAGE_LIMIT = int(os.getenv("PAGE_LIMIT", "200"))
 NF_PAGE_LIMIT = int(os.getenv("NF_PAGE_LIMIT", "500"))
 NF_MAX_ROWS = int(os.getenv("NF_MAX_ROWS", "10000"))
 RECONCILE_MAX_ROWS = int(os.getenv("RECONCILE_MAX_ROWS", "20000"))
 PER_ORG_DEFAULT_LIMIT = int(os.getenv("PER_ORG_DEFAULT_LIMIT", "2"))
-MAX_ORG_NAMES = int(os.getenv("MAX_ORG_NAMES", "100000"))
-MAX_ORG_BUCKET = int(os.getenv("MAX_ORG_BUCKET", "12000"))
+MAX_ORG_NAMES = int(os.getenv("MAX_ORG_NAMES", "5000"))
+MAX_ORG_BUCKET = int(os.getenv("MAX_ORG_BUCKET", "500"))
 
 # -----------------------------------------------------------------------------
 # Cache-Strukturen
@@ -419,25 +419,55 @@ async def stream_persons_by_batch_id(
 # Nachfass – Aufbau Master (robust, progressiv & vollständig)
 # =============================================================================
 import asyncio
-
 async def fetch_person_details(person_ids: List[str]) -> List[dict]:
-    """Lädt vollständige Datensätze für Personen-IDs parallel."""
+    """Lädt vollständige Datensätze für Personen-IDs parallel (mit 429-Retry)."""
+
     results = []
-    sem = asyncio.Semaphore(15)  # Max. 6 gleichzeitige Requests für Render
+
+    # WICHTIG: nicht mehr 15, sondern 4 gleichzeitige Requests!
+    sem = asyncio.Semaphore(4)
 
     async def fetch_one(pid):
-        async with sem:
-            url = append_token(f"{PIPEDRIVE_API}/persons/{pid}")
-            r = await http_client().get(url, headers=get_headers())
-            if r.status_code == 200:
-                data = r.json().get("data")
-                if data:
-                    results.append(data)
-            await asyncio.sleep(0.05)  # Eventloop frei lassen
+        retries = 5
+        while retries > 0:
+            try:
+                async with sem:
+                    url = append_token(f"{PIPEDRIVE_API}/persons/{pid}")
+                    r = await http_client().get(url, headers=get_headers())
 
-    await asyncio.gather(*[fetch_one(pid) for pid in person_ids])
+                    # -------------------------
+                    # RATE LIMIT (429)
+                    # -------------------------
+                    if r.status_code == 429:
+                        await asyncio.sleep(2)
+                        retries -= 1
+                        continue
+
+                    # -------------------------
+                    # ERFOLG
+                    # -------------------------
+                    if r.status_code == 200:
+                        data = r.json().get("data")
+                        if data:
+                            results.append(data)
+                        break
+
+                # kleine Pause, um Eventloop frei zu halten
+                await asyncio.sleep(0.05)
+
+            except Exception:
+                retries -= 1
+                await asyncio.sleep(1)
+
+    # IDs chunken (nicht 500 gleichzeitig anstoßen!)
+    chunks = [person_ids[i:i+50] for i in range(0, len(person_ids), 50)]
+    for group in chunks:
+        await asyncio.gather(*(fetch_one(pid) for pid in group))
+
     print(f"[DEBUG] Vollständige Personendaten geladen: {len(results)}")
     return results
+
+
 # -----------------------------------------------------------------------------
 # INTERNER CACHE
 # -----------------------------------------------------------------------------
@@ -583,21 +613,21 @@ async def _build_nf_master_final(
     #    if isinstance(v, dict):
     #        return v.get("value") or v.get("label") or ""
     #    return v or ""
+    
     def cf(p, key):
         v = p.get(key)
 
-        # Array? → ersten Wert nehmen
-        if isinstance(v, list):
-            if len(v) > 0:
-                v = v[0]
+    # Manche Pipedrive-Felder liefern arrays
+        if isinstance(v, list) and len(v) > 0:
+            v = v[0]
 
-        # Dict? → value oder label
+    # Standard für Custom-Fields
         if isinstance(v, dict):
             return v.get("value") or v.get("label") or ""
 
         return v or ""
 
-
+  
     # ------------------------------------------------------------
     # Personen laden
     # ------------------------------------------------------------
@@ -605,7 +635,7 @@ async def _build_nf_master_final(
         job_obj.phase = "Lade Nachfass-Kandidaten …"
         job_obj.percent = 10
 
-    #persons = await stream_persons_by_batch_id(FIELD_BATCH_ID, nf_batch_ids)
+    
     # 1) Personen über Search laden
     persons_search = await stream_persons_by_batch_id(FIELD_BATCH_ID, nf_batch_ids)
     
@@ -698,7 +728,7 @@ async def _build_nf_master_final(
     # Ausschlüsse speichern
     excluded = [
         {"Grund": "Max 2 Kontakte pro Organisation", "Anzahl": count_org_limit},
-        {"Grund": "Datum nächste Aktivität ungültig", "Anzahl": count_date_invalid},
+        {"Grund": "Datum nächste Aktivität steht an bzw. liegt in nahen Vergangenheit", "Anzahl": count_date_invalid},
     ]
     ex = pd.DataFrame(excluded)
     await save_df_text(ex, "nf_excluded")
