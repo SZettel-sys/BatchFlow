@@ -188,7 +188,7 @@ def _build_export_from_ready(filename: str):
     )
 
 # -----------------------------------------------------------------------------
-# DB-Helper
+# DB-Helper Neon
 # -----------------------------------------------------------------------------
 async def ensure_table_text(conn: asyncpg.Connection, table: str, cols: List[str]):
     defs = ", ".join([f'"{c}" TEXT' for c in cols])
