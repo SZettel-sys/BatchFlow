@@ -423,39 +423,47 @@ async def fetch_person_details(person_ids: List[str]) -> List[dict]:
     """Lädt vollständige Datensätze für Personen-IDs parallel (inkl. 429-Retry & Custom Fields)."""
 
     results = []
-
-    # frühere Version: 15 → viel zu hoch, erzeugt 429
-    sem = asyncio.Semaphore(8)   # Schnell & sicher
+    sem = asyncio.Semaphore(8)   # performant & sicher
 
     async def fetch_one(pid):
         retries = 5
         while retries > 0:
             try:
                 async with sem:
-                    # WICHTIG: vollständige Felder & Organisation laden
+
+                    # WICHTIG:
+                    # - return_all_custom_fields=1  → alle Custom-Felder (auch Label!)
+                    # - include=organization,organization_fields → vollständige Organisation mit Name
+                    #   (Pipedrive OAuth liefert sonst NUR die ID!)
                     url = append_token(
-                        f"{PIPEDRIVE_API}/persons/{pid}?return_all_custom_fields=1&include=organization"
+                        f"{PIPEDRIVE_API}/persons/{pid}"
+                        "?return_all_custom_fields=1"
+                        "&include=organization,organization_fields"
                     )
+
                     r = await http_client().get(url, headers=get_headers())
 
+                    # --- Rate Limit Handling (429) ---
                     if r.status_code == 429:
                         await asyncio.sleep(2)
                         retries -= 1
                         continue
 
+                    # --- Erfolg ---
                     if r.status_code == 200:
                         data = r.json().get("data")
                         if data:
                             results.append(data)
                         break
 
+                # Eventloop entlasten
                 await asyncio.sleep(0.05)
 
             except Exception:
                 retries -= 1
                 await asyncio.sleep(1)
 
-    # größere, aber sichere Chunks → Performance statt 50 → 100
+    # Große, aber stabile Chunks (100 IDs pro Batch)
     chunks = [person_ids[i:i+100] for i in range(0, len(person_ids), 100)]
 
     for group in chunks:
@@ -463,7 +471,6 @@ async def fetch_person_details(person_ids: List[str]) -> List[dict]:
 
     print(f"[DEBUG] Vollständige Personendaten geladen: {len(results)}")
     return results
-
 
 # -----------------------------------------------------------------------------
 # INTERNER CACHE
