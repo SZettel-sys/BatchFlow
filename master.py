@@ -420,7 +420,7 @@ async def stream_persons_by_batch_id(
 # =============================================================================
 import asyncio
 async def fetch_person_details(person_ids: List[str]) -> List[dict]:
-    """Lädt vollständige Datensätze für Personen-IDs parallel (inkl. 429-Retry & Custom Fields)."""
+    """Lädt vollständige Datensätze für Personen-IDs parallel (inkl. 429-Retry, Organisation & Dedup)."""
 
     results = []
     sem = asyncio.Semaphore(8)   # performant & sicher
@@ -431,10 +431,9 @@ async def fetch_person_details(person_ids: List[str]) -> List[dict]:
             try:
                 async with sem:
 
-                    # WICHTIG:
-                    # - return_all_custom_fields=1  → alle Custom-Felder (auch Label!)
-                    # - include=organization,organization_fields → vollständige Organisation mit Name
-                    #   (Pipedrive OAuth liefert sonst NUR die ID!)
+                    # --- WICHTIG ---
+                    # return_all_custom_fields=1     → liefert alle Custom-Felder inkl. Label
+                    # include=organization,organization_fields → liefert vollständige Organisation (id+name)
                     url = append_token(
                         f"{PIPEDRIVE_API}/persons/{pid}"
                         "?return_all_custom_fields=1"
@@ -443,33 +442,43 @@ async def fetch_person_details(person_ids: List[str]) -> List[dict]:
 
                     r = await http_client().get(url, headers=get_headers())
 
-                    # --- Rate Limit Handling (429) ---
+                    # Rate Limit (429)
                     if r.status_code == 429:
                         await asyncio.sleep(2)
                         retries -= 1
                         continue
 
-                    # --- Erfolg ---
+                    # Erfolg
                     if r.status_code == 200:
                         data = r.json().get("data")
                         if data:
                             results.append(data)
                         break
 
-                # Eventloop entlasten
+                # Eventloop kurz freigeben
                 await asyncio.sleep(0.05)
 
             except Exception:
                 retries -= 1
                 await asyncio.sleep(1)
 
-    # Große, aber stabile Chunks (100 IDs pro Batch)
+    # Personen in stabile Chunks aufteilen
     chunks = [person_ids[i:i+100] for i in range(0, len(person_ids), 100)]
 
     for group in chunks:
         await asyncio.gather(*(fetch_one(pid) for pid in group))
 
-    print(f"[DEBUG] Vollständige Personendaten geladen: {len(results)}")
+
+    # --------------------------------------------------------------
+    # DUPLIKAT-SCHUTZ → entfernt doppelte Personen-IDs
+    # --------------------------------------------------------------
+    unique = {}
+    for p in results:
+        unique[p["id"]] = p
+
+    results = list(unique.values())
+
+    print(f"[DEBUG] Vollständige Personendaten geladen (unique): {len(results)}")
     return results
 
 # -----------------------------------------------------------------------------
