@@ -43,8 +43,8 @@ NF_PAGE_LIMIT = int(os.getenv("NF_PAGE_LIMIT", "500"))
 NF_MAX_ROWS = int(os.getenv("NF_MAX_ROWS", "10000"))
 RECONCILE_MAX_ROWS = int(os.getenv("RECONCILE_MAX_ROWS", "20000"))
 PER_ORG_DEFAULT_LIMIT = int(os.getenv("PER_ORG_DEFAULT_LIMIT", "2"))
-MAX_ORG_NAMES = int(os.getenv("MAX_ORG_NAMES", "5000"))
-MAX_ORG_BUCKET = int(os.getenv("MAX_ORG_BUCKET", "500"))
+MAX_ORG_NAMES = int(os.getenv("MAX_ORG_NAMES", "1000"))
+MAX_ORG_BUCKET = int(os.getenv("MAX_ORG_BUCKET", "200"))
 
 # -----------------------------------------------------------------------------
 # Cache-Strukturen
@@ -420,47 +420,44 @@ async def stream_persons_by_batch_id(
 # =============================================================================
 import asyncio
 async def fetch_person_details(person_ids: List[str]) -> List[dict]:
-    """Lädt vollständige Datensätze für Personen-IDs parallel (mit 429-Retry)."""
+    """Lädt vollständige Datensätze für Personen-IDs parallel (inkl. 429-Retry & Custom Fields)."""
 
     results = []
 
-    # WICHTIG: nicht mehr 15, sondern 4 gleichzeitige Requests!
-    sem = asyncio.Semaphore(4)
+    # frühere Version: 15 → viel zu hoch, erzeugt 429
+    sem = asyncio.Semaphore(8)   # Schnell & sicher
 
     async def fetch_one(pid):
         retries = 5
         while retries > 0:
             try:
                 async with sem:
-                    url = append_token(f"{PIPEDRIVE_API}/persons/{pid}")
+                    # WICHTIG: vollständige Felder & Organisation laden
+                    url = append_token(
+                        f"{PIPEDRIVE_API}/persons/{pid}?return_all_custom_fields=1&include=organization"
+                    )
                     r = await http_client().get(url, headers=get_headers())
 
-                    # -------------------------
-                    # RATE LIMIT (429)
-                    # -------------------------
                     if r.status_code == 429:
                         await asyncio.sleep(2)
                         retries -= 1
                         continue
 
-                    # -------------------------
-                    # ERFOLG
-                    # -------------------------
                     if r.status_code == 200:
                         data = r.json().get("data")
                         if data:
                             results.append(data)
                         break
 
-                # kleine Pause, um Eventloop frei zu halten
                 await asyncio.sleep(0.05)
 
             except Exception:
                 retries -= 1
                 await asyncio.sleep(1)
 
-    # IDs chunken (nicht 500 gleichzeitig anstoßen!)
-    chunks = [person_ids[i:i+50] for i in range(0, len(person_ids), 50)]
+    # größere, aber sichere Chunks → Performance statt 50 → 100
+    chunks = [person_ids[i:i+100] for i in range(0, len(person_ids), 100)]
+
     for group in chunks:
         await asyncio.gather(*(fetch_one(pid) for pid in group))
 
@@ -607,13 +604,7 @@ async def _build_nf_master_final(
     FIELD_POSITION    = "4585e5de11068a3bccf02d8b93c126bcf5c257ff"
     FIELD_XING        = "44ebb6feae2a670059bc5261001443a2878a2b43"
     FIELD_LINKEDIN    = "25563b12f847a280346bba40deaf527af82038cc"
-
-    #def cf(p, key):
-    #    v = p.get(key)
-    #    if isinstance(v, dict):
-    #        return v.get("value") or v.get("label") or ""
-    #    return v or ""
-    
+      
     def cf(p, key):
         v = p.get(key)
 
@@ -623,7 +614,7 @@ async def _build_nf_master_final(
 
     # Standard für Custom-Fields
         if isinstance(v, dict):
-            return v.get("value") or v.get("label") or ""
+            return v.get("label") or v.get("value") or ""
 
         return v or ""
 
@@ -695,9 +686,9 @@ async def _build_nf_master_final(
         first, last = split_name(p.get("first_name"), p.get("last_name"), p.get("name"))
 
         email = ""
-        emails = p.get("emails") or []
-        if isinstance(emails, list):
-            for e in emails:
+        email = p.get("email") or []
+        if isinstance(email, list):
+            for e in email:
                 if isinstance(e, dict) and e.get("primary"):
                     email = e.get("value") or ""
                     break
