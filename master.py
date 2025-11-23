@@ -436,6 +436,24 @@ from collections import defaultdict
 from datetime import datetime
 from thefuzz import process
 
+# ============================================================
+# NACHFASS – DEBUG VERSION (vollständige Transparenz)
+# ============================================================
+
+# Diese Debug-Version protokolliert:
+# - alle Fuzzy-Organisationstreffer (inkl. Filter)
+# - alle Kontakt-Filtertreffer (1216 / 1708)
+# - alle entfernten Datensätze mit Grund
+# - fehlende Personen beim Fetch
+# - vollständige geladene Personendaten
+# - verbleibende Personen nach Reconcile
+
+import asyncio
+import pandas as pd
+from collections import defaultdict
+from datetime import datetime
+from rapidfuzz import fuzz, process
+
 # ------------------------------------------------------------
 # FETCH PERSON DETAILS (inkl. Debug + De-Dup + Orga-Fix)
 # ------------------------------------------------------------
@@ -549,6 +567,87 @@ async def fetch_person_details(person_ids: list) -> list:
     print(f"[DEBUG] fetch: Fehlende IDs: {missing}")
 
     return results
+
+# ------------------------------------------------------------
+# DEBUG-Funktionen für Reconcile
+# ------------------------------------------------------------
+def debug_org_match(org_name, best, filter_id):
+    print(f"[ORG-MATCH] '{org_name}' ↔ '{best[0]}' = {best[1]}% (Filter {filter_id})")
+
+def debug_person_match(pid, filter_id):
+    print(f"[PERSON-MATCH] Person-ID {pid} in Filter {filter_id}")
+
+def debug_removed(p, reason):
+    print(f"[REMOVED] {p.get('id')} {p.get('first_name')} {p.get('last_name')} Grund: {reason}")
+
+# ------------------------------------------------------------
+# RECONCILE NACHFASS – DEBUG VERSION
+# ------------------------------------------------------------
+async def _reconcile(mode: str):
+    print("[DEBUG] Starte Reconcile…")
+
+    ready = await load_df_text("nf_master_final")
+    df = pd.read_json(ready)
+
+    removed = []
+    remaining = []
+
+    # Lade Filter
+    org_filters = {
+        1245: await load_orgs_by_filter(1245),
+        851: await load_orgs_by_filter(851),
+        1521: await load_orgs_by_filter(1521)
+    }
+
+    person_filters = {
+        1216: await load_persons_by_filter(1216),
+        1708: await load_persons_by_filter(1708)
+    }
+
+    blocked_person_ids = set()
+    for f_id, persons in person_filters.items():
+        for p in persons:
+            blocked_person_ids.add(p.get("id"))
+
+    for idx, row in df.iterrows():
+        org_name = row.get("Organisation Name") or ""
+        p_id = row.get("Person ID")
+
+        # Kontakt-Filter
+        if p_id in blocked_person_ids:
+            for f_id in person_filters.keys():
+                if p_id in [p.get("id") for p in person_filters[f_id]]:
+                    debug_person_match(p_id, f_id)
+            reason = f"Kontakt in Filter"
+            debug_removed(row, reason)
+            removed.append(row)
+            continue
+
+        # Organisations-Fuzzy
+        matched = False
+        for f_id, org_list in org_filters.items():
+            if org_name:
+                names = [o.get("name") for o in org_list if o.get("name")]
+                if names:
+                    best = process.extractOne(org_name, names)
+                    debug_org_match(org_name, best, f_id)
+                    if best[1] >= 95:
+                        reason = f"Org-Fuzzy {best[1]}% (Filter {f_id})"
+                        debug_removed(row, reason)
+                        removed.append(row)
+                        matched = True
+                        break
+
+        if not matched:
+            remaining.append(row)
+
+    print(f"[REPORT] Orga-/Kontakt entfernt: {len(removed)}")
+    print(f"[REPORT] Final übrig: {len(remaining)}")
+
+    df_ready = pd.DataFrame(remaining)
+    await save_df_text(df_ready, "nf_master_ready")
+
+    return True
 
 # ------------------------------------------------------------
 # DEBUG-Funktionen für Reconcile
