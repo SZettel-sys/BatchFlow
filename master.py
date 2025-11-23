@@ -481,6 +481,7 @@ async def fetch_person_details(person_ids: List[str]) -> List[dict]:
     print(f"[DEBUG] Vollständige Personendaten geladen (unique): {len(results)}")
     return results
 
+
 # -----------------------------------------------------------------------------
 # INTERNER CACHE
 # -----------------------------------------------------------------------------
