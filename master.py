@@ -265,6 +265,9 @@ async def get_person_fields() -> List[dict]:
         return _PERSON_FIELDS_CACHE
     url = append_token(f"{PIPEDRIVE_API}/personFields")
     r = await http_client().get(url, headers=get_headers())
+    if r.status_code not in (200, 429):
+        print(f"[ERROR][FETCH] Person {pid} – Status {r.status_code}: {r.text}")
+
     r.raise_for_status()
     _PERSON_FIELDS_CACHE = r.json().get("data") or []
     return _PERSON_FIELDS_CACHE
@@ -303,6 +306,7 @@ async def stream_organizations_by_filter(filter_id: int, page_limit: int = PAGE_
             raise Exception(f"Pipedrive Fehler (Orgs {filter_id}): {r.text}")
         data = r.json().get("data") or []
         if not data:
+            print(f"[ERROR][FETCH] Person {pid} returned data=None (owner/visibility/deleted?)")
             break
         yield data
         if len(data) < page_limit:
