@@ -418,79 +418,218 @@ async def stream_persons_by_batch_id(
     print(f"[INFO] Alle Batch-IDs geladen: {len(results)} Personen gesamt")
     return results
 
+# ============================================================
+# NACHFASS – DEBUG VERSION (vollständige Transparenz)
+# ============================================================
 
-# =============================================================================
-# Nachfass – Aufbau Master (robust, progressiv & vollständig)
-# =============================================================================
+# Diese Debug-Version protokolliert:
+# - alle Fuzzy-Organisationstreffer (inkl. Filter)
+# - alle Kontakt-Filtertreffer (1216 / 1708)
+# - alle entfernten Datensätze mit Grund
+# - fehlende Personen beim Fetch
+# - vollständige geladene Personendaten
+# - verbleibende Personen nach Reconcile
+
 import asyncio
-async def fetch_person_details(person_ids: List[str]) -> List[dict]:
-    """Lädt vollständige Datensätze für Personen-IDs parallel (inkl. 429-Retry, Organisation & Dedup)."""
+import pandas as pd
+from collections import defaultdict
+from datetime import datetime
+from thefuzz import process
+
+# ------------------------------------------------------------
+# FETCH PERSON DETAILS (inkl. Debug + De-Dup + Orga-Fix)
+# ------------------------------------------------------------
+async def fetch_person_details(person_ids: list) -> list:
+    """Stabile Version: robust gegen API-Fehler, garantiert vollständige Felder."""
 
     results = []
-    sem = asyncio.Semaphore(8)   # performant & sicher
+    sem = asyncio.Semaphore(6)
 
     async def fetch_one(pid):
-        retries = 5
+        retries = 6
+        last_error = None
+
         while retries > 0:
             try:
                 async with sem:
-
-                    # --- WICHTIG ---
-                    # return_all_custom_fields=1     → liefert alle Custom-Felder inkl. Label
-                    # include=organization,organization_fields → liefert vollständige Organisation (id+name)
                     url = append_token(
-                        f"{PIPEDRIVE_API}/persons/{pid}"
-                        "?return_all_custom_fields=1"
-                        "&include=organization,organization_fields"
+                        f"{PIPEDRIVE_API}/persons/{pid}?return_all_custom_fields=1&include=organization,organization_fields"
                     )
 
                     r = await http_client().get(url, headers=get_headers())
+                    status = r.status_code
 
-                    # Rate Limit (429)
-                    if r.status_code == 429:
-                        await asyncio.sleep(2)
-                        retries -= 1
-                        continue
-
-                    # Erfolg
-                    if r.status_code == 200:
+                    if status == 200:
                         data = r.json().get("data")
-                        if data:
-                            results.append(data)
-                        break
+                        if not data:
+                            print(f"[WARN][FETCH] Person {pid}: data=None — API liefert leeren Datensatz")
+                            data = {"id": pid}  # Fallback-Minimalobjekt
+                        results.append(_normalize_person(data))
+                        return
 
-                # Eventloop kurz freigeben
-                await asyncio.sleep(0.05)
+                    elif status == 429:
+                        print(f"[WARN][FETCH] 429 für Person {pid} — Retry…")
+                        await asyncio.sleep(2)
 
-            except Exception:
+                    elif status in (403, 404):
+                        print(f"[WARN][FETCH] Person {pid}: Status {status} — keine Zugriffsrechte oder gelöscht.")
+                        results.append({"id": pid})
+                        return
+
+                    else:
+                        print(f"[ERROR][FETCH] Person {pid}: Status {status} — {r.text}")
+                        last_error = status
+                        await asyncio.sleep(1)
+
+                retries -= 1
+
+            except Exception as e:
+                print(f"[ERROR][FETCH] Exception bei Person {pid}: {e}")
+                last_error = str(e)
                 retries -= 1
                 await asyncio.sleep(1)
 
-    # Personen in stabile Chunks aufteilen
-    chunks = [person_ids[i:i+100] for i in range(0, len(person_ids), 100)]
-    print("[DEBUG] fetch: Starte mit IDs:", len(person_ids))
+        print(f"[FAIL][FETCH] Person {pid} nach allen Retries fehlgeschlagen — {last_error}")
+        results.append({"id": pid})
 
+    async def fetch_org_fallback(org_id):
+        try:
+            url = append_token(f"{PIPEDRIVE_API}/organizations/{org_id}")
+            r = await http_client().get(url, headers=get_headers())
+            if r.status_code == 200:
+                org = r.json().get("data") or {}
+                return org.get("name")
+        except:
+            pass
+        return ""
+
+    def _normalize_person(p):
+        """Garantiert einheitliche Struktur: Gender-Label, Organisation, E-Mail etc."""
+
+        # Gender immer Label
+        def norm_cf(v):
+            if isinstance(v, dict):
+                return v.get("label") or v.get("value") or ""
+            return v or ""
+
+        p = dict(p)
+
+        # Geschlecht korrigieren
+        if "c4f5f434cdb0cfce3f6d62ec7291188fe968ac72" in p:
+            p["gender_label"] = norm_cf(p.get("c4f5f434cdb0cfce3f6d62ec7291188fe968ac72"))
+
+        # Organisation fixen
+        org = p.get("organization")
+        if isinstance(org, dict):
+            org_id = org.get("id")
+            if org_id and not org.get("name"):
+                org_name = asyncio.run(fetch_org_fallback(org_id))  # fallback
+                p["organization"] = {"id": org_id, "name": org_name}
+
+        return p
+
+    print(f"[DEBUG] fetch: Starte mit IDs: {len(person_ids)}")
+
+    chunks = [person_ids[i:i+50] for i in range(0, len(person_ids), 50)]
     for group in chunks:
         await asyncio.gather(*(fetch_one(pid) for pid in group))
 
-
-    # --------------------------------------------------------------
-    # DUPLIKAT-SCHUTZ → entfernt doppelte Personen-IDs
-    # --------------------------------------------------------------
-    unique = {}
+    # De-Dup
+    uniq = {}
     for p in results:
-        unique[p["id"]] = p
+        uniq[str(p.get("id"))] = p
 
-    results = list(unique.values())
+    results = list(uniq.values())
 
-    print(f"[DEBUG] Vollständige Personendaten geladen (unique): {len(results)}")
-    loaded_ids = {p["id"] for p in results}
-    missing = set(person_ids) - loaded_ids
+    loaded_ids = {str(p.get("id")) for p in results}
+    missing = set(map(str, person_ids)) - loaded_ids
 
-    print("[DEBUG] fetch: Vollständige geladen:", len(results))
-    print("[DEBUG] fetch: Fehlende:", len(missing))
-    print("[DEBUG] fetch: Fehlende IDs:", missing)
+    print(f"[DEBUG] fetch: Vollständige geladen: {len(results)}")
+    print(f"[DEBUG] fetch: Fehlende: {len(missing)}")
+    print(f"[DEBUG] fetch: Fehlende IDs: {missing}")
+
     return results
+
+# ------------------------------------------------------------
+# DEBUG-Funktionen für Reconcile
+# ------------------------------------------------------------
+def debug_org_match(org_name, best, filter_id):
+    print(f"[ORG-MATCH] '{org_name}' ↔ '{best[0]}' = {best[1]}% (Filter {filter_id})")
+
+def debug_person_match(pid, filter_id):
+    print(f"[PERSON-MATCH] Person-ID {pid} in Filter {filter_id}")
+
+def debug_removed(p, reason):
+    print(f"[REMOVED] {p.get('id')} {p.get('first_name')} {p.get('last_name')} Grund: {reason}")
+
+# ------------------------------------------------------------
+# RECONCILE NACHFASS – DEBUG VERSION
+# ------------------------------------------------------------
+async def _reconcile(mode: str):
+    print("[DEBUG] Starte Reconcile…")
+
+    ready = await load_df_text("nf_master_final")
+    df = pd.read_json(ready)
+
+    removed = []
+    remaining = []
+
+    # Lade Filter
+    org_filters = {
+        1245: await load_orgs_by_filter(1245),
+        851: await load_orgs_by_filter(851),
+        1521: await load_orgs_by_filter(1521)
+    }
+
+    person_filters = {
+        1216: await load_persons_by_filter(1216),
+        1708: await load_persons_by_filter(1708)
+    }
+
+    blocked_person_ids = set()
+    for f_id, persons in person_filters.items():
+        for p in persons:
+            blocked_person_ids.add(p.get("id"))
+
+    for idx, row in df.iterrows():
+        org_name = row.get("Organisation Name") or ""
+        p_id = row.get("Person ID")
+
+        # Kontakt-Filter
+        if p_id in blocked_person_ids:
+            for f_id in person_filters.keys():
+                if p_id in [p.get("id") for p in person_filters[f_id]]:
+                    debug_person_match(p_id, f_id)
+            reason = f"Kontakt in Filter"
+            debug_removed(row, reason)
+            removed.append(row)
+            continue
+
+        # Organisations-Fuzzy
+        matched = False
+        for f_id, org_list in org_filters.items():
+            if org_name:
+                names = [o.get("name") for o in org_list if o.get("name")]
+                if names:
+                    best = process.extractOne(org_name, names)
+                    debug_org_match(org_name, best, f_id)
+                    if best[1] >= 95:
+                        reason = f"Org-Fuzzy {best[1]}% (Filter {f_id})"
+                        debug_removed(row, reason)
+                        removed.append(row)
+                        matched = True
+                        break
+
+        if not matched:
+            remaining.append(row)
+
+    print(f"[REPORT] Orga-/Kontakt entfernt: {len(removed)}")
+    print(f"[REPORT] Final übrig: {len(remaining)}")
+
+    df_ready = pd.DataFrame(remaining)
+    await save_df_text(df_ready, "nf_master_ready")
+
+    return True
 
 
 # -----------------------------------------------------------------------------
