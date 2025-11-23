@@ -866,6 +866,8 @@ async def _reconcile(prefix: str) -> None:
             continue
 
         best = process.extractOne(norm, near, scorer=fuzz.token_sort_ratio)
+        # DEBUG Logging für Fuzzy-Abgleich
+        print(f"[DEBUG][ORGA-FUZZY] '{name}'  → best match = {best}")
         if best and best[1] >= 95:
             drop_idx.append(idx)
             delete_rows.append({
@@ -887,11 +889,19 @@ async def _reconcile(prefix: str) -> None:
     for f_id in (1216, 1708):
         async for ids in stream_person_ids_by_filter(f_id):
             suspect_ids.update(ids)
-
+    # Debug: Zeige welche IDs aus welchen Filtern stammen
+    print(f"[DEBUG][PERSON-FILTER] Verdächtige IDs aus 1216/1708: {len(suspect_ids)} → {suspect_ids}")
     mask = df[col_pid].astype(str).isin(suspect_ids)
     removed = df[mask]
 
     for _, r in removed.iterrows():
+        print(
+            f"[DEBUG][PERSON-FILTER HIT] "
+            f"PID={r[col_pid]}, "
+            f"Name={r.get('Person Vorname','')} {r.get('Person Nachname','')}, "
+            f"Org={r[col_orgname]}, "
+            f"Grund='Bereits in Filter 1216/1708'"
+        )
         delete_rows.append({
             "reason": "person_id_match",
             "Kontakt ID": r[col_pid],
