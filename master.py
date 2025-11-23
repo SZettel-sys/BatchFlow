@@ -464,6 +464,7 @@ async def fetch_person_details(person_ids: List[str]) -> List[dict]:
 
     # Personen in stabile Chunks aufteilen
     chunks = [person_ids[i:i+100] for i in range(0, len(person_ids), 100)]
+    print("[DEBUG] fetch: Starte mit IDs:", len(person_ids))
 
     for group in chunks:
         await asyncio.gather(*(fetch_one(pid) for pid in group))
@@ -479,6 +480,12 @@ async def fetch_person_details(person_ids: List[str]) -> List[dict]:
     results = list(unique.values())
 
     print(f"[DEBUG] Vollständige Personendaten geladen (unique): {len(results)}")
+    loaded_ids = {p["id"] for p in results}
+    missing = set(person_ids) - loaded_ids
+
+    print("[DEBUG] fetch: Vollständige geladen:", len(results))
+    print("[DEBUG] fetch: Fehlende:", len(missing))
+    print("[DEBUG] fetch: Fehlende IDs:", missing)
     return results
 
 
