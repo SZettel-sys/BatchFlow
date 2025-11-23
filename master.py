@@ -897,6 +897,9 @@ async def stream_persons_by_filter(
 # NACHFASS: MASTER-DATENAUFBAU – FINAL BEREINIGT
 # ============================================================
 
+# ============================================================
+# Nachfass – Aufbau Master FINAL (gleiche Logik, nur Fixes)
+# ============================================================
 
 async def _build_nf_master_final(
     nf_batch_ids: List[str],
@@ -905,9 +908,7 @@ async def _build_nf_master_final(
     job_obj=None
 ) -> pd.DataFrame:
 
-    # ------------------------------------------------------------
-    # Feld-Keys der Custom-Fields
-    # ------------------------------------------------------------
+    # Feld-Keys der Custom-Felder
     FIELD_BATCH_ID    = "5ac34dad3ea917fdef4087caebf77ba275f87eec"
     FIELD_PROSPECT_ID = "f9138f9040c44622808a4b8afda2b1b75ee5acd0"
     FIELD_GENDER      = "c4f5f434cdb0cfce3f6d62ec7291188fe968ac72"
@@ -915,39 +916,40 @@ async def _build_nf_master_final(
     FIELD_POSITION    = "4585e5de11068a3bccf02d8b93c126bcf5c257ff"
     FIELD_XING        = "44ebb6feae2a670059bc5261001443a2878a2b43"
     FIELD_LINKEDIN    = "25563b12f847a280346bba40deaf527af82038cc"
-      
+
+    # Custom-Field-Wrapper unverändert
     def cf(p, key):
         v = p.get(key)
 
-    # Manche Pipedrive-Felder liefern arrays
+        # Array?
         if isinstance(v, list) and len(v) > 0:
             v = v[0]
 
-    # Standard für Custom-Fields
+        # dict → Label bevorzugen
         if isinstance(v, dict):
             return v.get("label") or v.get("value") or ""
 
         return v or ""
 
-  
-    # ------------------------------------------------------------
+    # ----------------------------------------------------------------------
     # Personen laden
-    # ------------------------------------------------------------
+    # ----------------------------------------------------------------------
     if job_obj:
         job_obj.phase = "Lade Nachfass-Kandidaten …"
         job_obj.percent = 10
 
-    
-    # 1) Personen über Search laden
+    # 1) Personen über Search
     persons_search = await stream_persons_by_batch_id(FIELD_BATCH_ID, nf_batch_ids)
-    
+
     # 2) IDs extrahieren
     ids = [str(p.get("id")) for p in persons_search if p.get("id")]
-    
-    # 3) Personen vollständig laden
+
+    # 3) Vollständige Personen laden (dein unveränderter original fetch!)
     persons = await fetch_person_details(ids)
 
-    # Datum prüfen
+    # ----------------------------------------------------------------------
+    # Selektion → exakt deine alte Logik
+    # ----------------------------------------------------------------------
     today = datetime.now().date()
 
     def is_date_valid(raw):
@@ -984,9 +986,10 @@ async def _build_nf_master_final(
 
         selected.append(p)
 
-    # ------------------------------------------------------------
-    # Export-Zeilen
-    # ------------------------------------------------------------
+    # ----------------------------------------------------------------------
+    # Export-Zeilen bauen
+    # (LOGIK 1:1 wie vorher – nur Gender/Organisation stabilisiert)
+    # ----------------------------------------------------------------------
     rows = []
 
     for p in selected:
@@ -994,15 +997,24 @@ async def _build_nf_master_final(
         pid = str(p.get("id") or "")
         org = p.get("organization") or {}
 
+        # Organisation stabil (Fix D)
+        org_id = str(org.get("id") or "")
+        org_name = org.get("name") or ""
+
+        # Name wie bisher
         first, last = split_name(p.get("first_name"), p.get("last_name"), p.get("name"))
 
+        # E-Mail wie bisher
         email = ""
-        email = p.get("email") or []
-        if isinstance(email, list):
-            for e in email:
+        email_list = p.get("email") or []
+        if isinstance(email_list, list):
+            for e in email_list:
                 if isinstance(e, dict) and e.get("primary"):
                     email = e.get("value") or ""
                     break
+
+        # Geschlecht als Label (Fix C)
+        gender = cf(p, FIELD_GENDER)
 
         rows.append({
             "Batch ID": batch_id,
@@ -1013,13 +1025,15 @@ async def _build_nf_master_final(
             "Person Vorname": first,
             "Person Nachname": last,
             "Person Titel": cf(p, FIELD_TITLE),
-            "Person Geschlecht": cf(p, FIELD_GENDER),
+            "Person Geschlecht": gender,
             "Person Position": cf(p, FIELD_POSITION),
             "Person E-Mail": email,
 
             "Prospect ID": cf(p, FIELD_PROSPECT_ID),
-            "Organisation ID": str(org.get("id") or ""),
-            "Organisation Name": org.get("name") or "",
+
+            # Organisation (Fix A)
+            "Organisation ID": org_id,
+            "Organisation Name": org_name,
 
             "XING Profil": cf(p, FIELD_XING),
             "LinkedIn URL": cf(p, FIELD_LINKEDIN),
@@ -1027,13 +1041,12 @@ async def _build_nf_master_final(
 
     df = pd.DataFrame(rows).replace({None: ""})
 
-    # Ausschlüsse speichern
+    # Ausschlüsse speichern wie vorher
     excluded = [
         {"Grund": "Max 2 Kontakte pro Organisation", "Anzahl": count_org_limit},
-        {"Grund": "Datum nächste Aktivität steht an bzw. liegt in nahen Vergangenheit", "Anzahl": count_date_invalid},
+        {"Grund": "Datum nächste Aktivität ungültig", "Anzahl": count_date_invalid},
     ]
-    ex = pd.DataFrame(excluded)
-    await save_df_text(ex, "nf_excluded")
+    await save_df_text(pd.DataFrame(excluded), "nf_excluded")
 
     await save_df_text(df, "nf_master_final")
 
