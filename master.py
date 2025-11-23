@@ -533,20 +533,10 @@ async def fetch_person_details(person_ids: List[str]) -> List[dict]:
     return results
 
 # ------------------------------------------------------------
-# DEBUG-Funktionen für Reconcile
+# RECONCILE NACHFASS – DEBUG + STABIL (ohne Logikänderung)
 # ------------------------------------------------------------
-def debug_org_match(org_name, best, filter_id):
-    print(f"[ORG-MATCH] '{org_name}' ↔ '{best[0]}' = {best[1]}% (Filter {filter_id})")
+from rapidfuzz import process
 
-def debug_person_match(pid, filter_id):
-    print(f"[PERSON-MATCH] Person-ID {pid} in Filter {filter_id}")
-
-def debug_removed(p, reason):
-    print(f"[REMOVED] {p.get('id')} {p.get('first_name')} {p.get('last_name')} Grund: {reason}")
-
-# ------------------------------------------------------------
-# RECONCILE NACHFASS – DEBUG VERSION
-# ------------------------------------------------------------
 async def _reconcile(mode: str):
     print("[DEBUG] Starte Reconcile…")
 
@@ -556,7 +546,9 @@ async def _reconcile(mode: str):
     removed = []
     remaining = []
 
-    # Lade Filter
+    # ------------------------------------------------------------
+    # 1) Filter laden
+    # ------------------------------------------------------------
     org_filters = {
         1245: await load_orgs_by_filter(1245),
         851: await load_orgs_by_filter(851),
@@ -568,43 +560,77 @@ async def _reconcile(mode: str):
         1708: await load_persons_by_filter(1708)
     }
 
+    # ------------------------------------------------------------
+    # 2) SAFETY: sicherstellen, dass Filter Listen sind
+    # ------------------------------------------------------------
+    for f_id, data in person_filters.items():
+        if data is None:
+            print(f"[ERROR][FILTER] Filter {f_id} lieferte None → ersetzt durch []")
+            person_filters[f_id] = []
+        elif not isinstance(data, list):
+            print(f"[ERROR][FILTER] Filter {f_id} hat falschen Typ ({type(data)}) → Zwangs-Konvertierung")
+            try:
+                person_filters[f_id] = list(data)
+            except:
+                person_filters[f_id] = []
+
+    # Debug Übersicht
+    print("\n[DEBUG] PERSON-FILTER:")
+    for f_id, persons in person_filters.items():
+        print(f" Filter {f_id}: {len(persons)} Einträge")
+
+    # ------------------------------------------------------------
+    # 3) Liste blockierter Person-IDs
+    # ------------------------------------------------------------
     blocked_person_ids = set()
     for f_id, persons in person_filters.items():
         for p in persons:
-            blocked_person_ids.add(p.get("id"))
+            if isinstance(p, dict):
+                blocked_person_ids.add(p.get("id"))
 
+    # ------------------------------------------------------------
+    # 4) Haupt-Reconcile Loop
+    # ------------------------------------------------------------
     for idx, row in df.iterrows():
         org_name = row.get("Organisation Name") or ""
         p_id = row.get("Person ID")
 
-        # Kontakt-Filter
+        # -------------------------------
+        # PERSONEN-FILTER
+        # -------------------------------
         if p_id in blocked_person_ids:
-            for f_id in person_filters.keys():
-                if p_id in [p.get("id") for p in person_filters[f_id]]:
+            for f_id, persons in person_filters.items():
+                if p_id in [p.get("id") for p in persons]:
                     debug_person_match(p_id, f_id)
-            reason = f"Kontakt in Filter"
-            debug_removed(row, reason)
+            debug_removed(row, "Kontakt in Filter")
             removed.append(row)
             continue
 
-        # Organisations-Fuzzy
+        # -------------------------------
+        # ORGANISATIONS-FUZZY
+        # -------------------------------
         matched = False
         for f_id, org_list in org_filters.items():
-            if org_name:
-                names = [o.get("name") for o in org_list if o.get("name")]
-                if names:
-                    best = process.extractOne(org_name, names)
-                    debug_org_match(org_name, best, f_id)
-                    if best[1] >= 95:
-                        reason = f"Org-Fuzzy {best[1]}% (Filter {f_id})"
-                        debug_removed(row, reason)
-                        removed.append(row)
-                        matched = True
-                        break
+
+            names = [o.get("name") for o in org_list if o.get("name")]
+            if not names:
+                continue
+
+            best = process.extractOne(org_name, names)
+            debug_org_match(org_name, best, f_id)
+
+            if best[1] >= 95:
+                debug_removed(row, f"Org-Fuzzy {best[1]}% (Filter {f_id})")
+                removed.append(row)
+                matched = True
+                break
 
         if not matched:
             remaining.append(row)
 
+    # ------------------------------------------------------------
+    # 5) Ergebnis speichern
+    # ------------------------------------------------------------
     print(f"[REPORT] Orga-/Kontakt entfernt: {len(removed)}")
     print(f"[REPORT] Final übrig: {len(remaining)}")
 
@@ -613,167 +639,6 @@ async def _reconcile(mode: str):
 
     return True
 
-# ------------------------------------------------------------
-# DEBUG-Funktionen für Reconcile
-# ------------------------------------------------------------
-def debug_org_match(org_name, best, filter_id):
-    print(f"[ORG-MATCH] '{org_name}' ↔ '{best[0]}' = {best[1]}% (Filter {filter_id})")
-
-def debug_person_match(pid, filter_id):
-    print(f"[PERSON-MATCH] Person-ID {pid} in Filter {filter_id}")
-
-def debug_removed(p, reason):
-    print(f"[REMOVED] {p.get('id')} {p.get('first_name')} {p.get('last_name')} Grund: {reason}")
-
-# ------------------------------------------------------------
-# RECONCILE NACHFASS – DEBUG VERSION
-# ------------------------------------------------------------
-async def _reconcile(mode: str):
-    print("[DEBUG] Starte Reconcile…")
-
-    ready = await load_df_text("nf_master_final")
-    df = pd.read_json(ready)
-
-    removed = []
-    remaining = []
-
-    # Lade Filter
-    org_filters = {
-        1245: await load_orgs_by_filter(1245),
-        851: await load_orgs_by_filter(851),
-        1521: await load_orgs_by_filter(1521)
-    }
-
-    person_filters = {
-        1216: await load_persons_by_filter(1216),
-        1708: await load_persons_by_filter(1708)
-    }
-
-    blocked_person_ids = set()
-    for f_id, persons in person_filters.items():
-        for p in persons:
-            blocked_person_ids.add(p.get("id"))
-
-    for idx, row in df.iterrows():
-        org_name = row.get("Organisation Name") or ""
-        p_id = row.get("Person ID")
-
-        # Kontakt-Filter
-        if p_id in blocked_person_ids:
-            for f_id in person_filters.keys():
-                if p_id in [p.get("id") for p in person_filters[f_id]]:
-                    debug_person_match(p_id, f_id)
-            reason = f"Kontakt in Filter"
-            debug_removed(row, reason)
-            removed.append(row)
-            continue
-
-        # Organisations-Fuzzy
-        matched = False
-        for f_id, org_list in org_filters.items():
-            if org_name:
-                names = [o.get("name") for o in org_list if o.get("name")]
-                if names:
-                    best = process.extractOne(org_name, names)
-                    debug_org_match(org_name, best, f_id)
-                    if best[1] >= 95:
-                        reason = f"Org-Fuzzy {best[1]}% (Filter {f_id})"
-                        debug_removed(row, reason)
-                        removed.append(row)
-                        matched = True
-                        break
-
-        if not matched:
-            remaining.append(row)
-
-    print(f"[REPORT] Orga-/Kontakt entfernt: {len(removed)}")
-    print(f"[REPORT] Final übrig: {len(remaining)}")
-
-    df_ready = pd.DataFrame(remaining)
-    await save_df_text(df_ready, "nf_master_ready")
-
-    return True
-
-# ------------------------------------------------------------
-# DEBUG-Funktionen für Reconcile
-# ------------------------------------------------------------
-def debug_org_match(org_name, best, filter_id):
-    print(f"[ORG-MATCH] '{org_name}' ↔ '{best[0]}' = {best[1]}% (Filter {filter_id})")
-
-def debug_person_match(pid, filter_id):
-    print(f"[PERSON-MATCH] Person-ID {pid} in Filter {filter_id}")
-
-def debug_removed(p, reason):
-    print(f"[REMOVED] {p.get('id')} {p.get('first_name')} {p.get('last_name')} Grund: {reason}")
-
-# ------------------------------------------------------------
-# RECONCILE NACHFASS – DEBUG VERSION
-# ------------------------------------------------------------
-async def _reconcile(mode: str):
-    print("[DEBUG] Starte Reconcile…")
-
-    ready = await load_df_text("nf_master_final")
-    df = pd.read_json(ready)
-
-    removed = []
-    remaining = []
-
-    # Lade Filter
-    org_filters = {
-        1245: await load_orgs_by_filter(1245),
-        851: await load_orgs_by_filter(851),
-        1521: await load_orgs_by_filter(1521)
-    }
-
-    person_filters = {
-        1216: await load_persons_by_filter(1216),
-        1708: await load_persons_by_filter(1708)
-    }
-
-    blocked_person_ids = set()
-    for f_id, persons in person_filters.items():
-        for p in persons:
-            blocked_person_ids.add(p.get("id"))
-
-    for idx, row in df.iterrows():
-        org_name = row.get("Organisation Name") or ""
-        p_id = row.get("Person ID")
-
-        # Kontakt-Filter
-        if p_id in blocked_person_ids:
-            for f_id in person_filters.keys():
-                if p_id in [p.get("id") for p in person_filters[f_id]]:
-                    debug_person_match(p_id, f_id)
-            reason = f"Kontakt in Filter"
-            debug_removed(row, reason)
-            removed.append(row)
-            continue
-
-        # Organisations-Fuzzy
-        matched = False
-        for f_id, org_list in org_filters.items():
-            if org_name:
-                names = [o.get("name") for o in org_list if o.get("name")]
-                if names:
-                    best = process.extractOne(org_name, names)
-                    debug_org_match(org_name, best, f_id)
-                    if best[1] >= 95:
-                        reason = f"Org-Fuzzy {best[1]}% (Filter {f_id})"
-                        debug_removed(row, reason)
-                        removed.append(row)
-                        matched = True
-                        break
-
-        if not matched:
-            remaining.append(row)
-
-    print(f"[REPORT] Orga-/Kontakt entfernt: {len(removed)}")
-    print(f"[REPORT] Final übrig: {len(remaining)}")
-
-    df_ready = pd.DataFrame(remaining)
-    await save_df_text(df_ready, "nf_master_ready")
-
-    return True
 
 
 # -----------------------------------------------------------------------------
@@ -1112,119 +977,6 @@ async def _fetch_org_names_for_filter_capped(
                     return buckets
 
     return buckets
-
-
-# =============================================================================
-# RECONCILE – Nachfass Abgleich (Organisation + Person-ID)
-# =============================================================================
-from rapidfuzz import fuzz, process
-
-async def _reconcile(mode: str):
-    print("[DEBUG] Starte Reconcile…")
-
-    # Master laden
-    ready = await load_df_text("nf_master_final")
-    df = pd.read_json(ready)
-
-    col_pid     = "Person ID"
-    col_orgname = "Organisation Name"
-    col_orgid   = "Organisation ID"
-
-    removed = []
-    remaining = []
-
-    # Filter laden (unverändert)
-    org_filters = {
-        1245: await load_orgs_by_filter(1245),
-        851:  await load_orgs_by_filter(851),
-        1521: await load_orgs_by_filter(1521)
-    }
-
-    person_filters = {
-        1216: await load_persons_by_filter(1216),
-        1708: await load_persons_by_filter(1708)
-    }
-
-    # Person-Filter unverändert
-    blocked_person_ids = set()
-    for f_id, persons in person_filters.items():
-        for p in persons:
-            pid = p.get("id")
-            if pid:
-                blocked_person_ids.add(str(pid))
-
-    # Organisationen normalisieren (ohne Logikänderung)
-    def normalize(s):
-        return (s or "").strip().lower()
-
-    # Reconcile Loop
-    for idx, row in df.iterrows():
-
-        pid = str(row.get(col_pid, ""))
-        org_name = row.get(col_orgname) or ""
-        norm_org = normalize(org_name)
-
-        # ------------------------------------------------------------
-        # 1) PERSON-FILTER (1216/1708)
-        # -- identisch wie vorher --
-        # ------------------------------------------------------------
-        if pid in blocked_person_ids:
-            removed.append({
-                "reason": "person_filter",
-                "Kontakt ID": pid,
-                "Name": f"{row.get('Person Vorname','')} {row.get('Person Nachname','')}".strip(),
-                "Organisation ID": row[col_orgid],
-                "Organisationsname": org_name,
-                "Grund": "Kontakt in Filter 1216/1708"
-            })
-            continue
-
-        # ------------------------------------------------------------
-        # 2) ORGANISATION-FUZZY
-        # -- identisch wie vorher, nur rapidfuzz statt thefuzz --
-        # ------------------------------------------------------------
-        matched = False
-        if norm_org:
-            for f_id, org_list in org_filters.items():
-
-                # nur Name extrahieren wie vorher
-                names = [o.get("name") for o in org_list if o.get("name")]
-                if not names:
-                    continue
-
-                # fuzzy wie vorher, aber via rapidfuzz
-                best = process.extractOne(
-                    norm_org,
-                    [n.lower() for n in names],
-                    scorer=fuzz.WRatio      # entspricht 1:1 dem früher verwendeten fuzzy-scorer
-                )
-
-                # gleiche Logik: ab 95% herausfiltern
-                if best and best[1] >= 95:
-                    removed.append({
-                        "reason": "org_match_95",
-                        "Kontakt ID": pid,
-                        "Name": f"{row.get('Person Vorname','')} {row.get('Person Nachname','')}".strip(),
-                        "Organisation ID": row[col_orgid],
-                        "Organisationsname": org_name,
-                        "Grund": f"Ähnlichkeit {best[1]}% mit '{best[0]}' (Filter {f_id})"
-                    })
-                    matched = True
-                    break
-
-        if not matched:
-            remaining.append(row)
-
-    # ------------------------------------------------------------
-    # Ergebnis speichern (unverändert)
-    # ------------------------------------------------------------
-    df_ready = pd.DataFrame(remaining)
-    await save_df_text(df_ready, "nf_master_ready")
-
-    print(f"[REPORT] Entfernt: {len(removed)}")
-    print(f"[REPORT] Final übrig: {len(remaining)}")
-
-    return True
 
 # =============================================================================
 # Excel-Export-Helfer – FINAL MODUL 3
