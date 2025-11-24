@@ -629,16 +629,28 @@ async def stream_persons_by_filter(
 # ============================================================
 # NACHFASS – MASTER FINAL (stabil, bereinigt + Gender-FIX)
 # ============================================================
-# ============================================================
-# NACHFASS – MASTER FINAL (robust, stabil, Gender-Fix)
-# ============================================================
-
 async def _build_nf_master_final(
     nf_batch_ids: List[str],
     batch_id: str,
     campaign: str,
     job_obj=None
 ) -> pd.DataFrame:
+
+    # ------------------------------------------------------------
+    # 🔒 Batch-IDs robust stabilisieren (Fix für „method is not iterable“)
+    # ------------------------------------------------------------
+    if not isinstance(nf_batch_ids, list):
+        if callable(nf_batch_ids):
+            nf_batch_ids = []
+        elif nf_batch_ids is None:
+            nf_batch_ids = []
+        elif isinstance(nf_batch_ids, str):
+            nf_batch_ids = [nf_batch_ids.strip()]
+        else:
+            try:
+                nf_batch_ids = list(nf_batch_ids)
+            except:
+                nf_batch_ids = []
 
     # ------------------------------------------------------------
     # Custom-Field Keys
@@ -656,13 +668,10 @@ async def _build_nf_master_final(
     # ------------------------------------------------------------
     def cf(p, key):
         v = p.get(key)
-
         if isinstance(v, list) and v:
             v = v[0]
-
         if isinstance(v, dict):
             return v.get("label") or v.get("value") or ""
-
         return v or ""
 
     # ------------------------------------------------------------
@@ -673,9 +682,7 @@ async def _build_nf_master_final(
         job_obj.percent = 10
 
     persons_search = await stream_persons_by_batch_id(FIELD_BATCH_ID, nf_batch_ids)
-
     ids = [str(p.get("id")) for p in persons_search if p.get("id")]
-
     persons = await fetch_person_details(ids)
 
     # ------------------------------------------------------------
@@ -736,15 +743,15 @@ async def _build_nf_master_final(
     for p in selected:
         pid = str(p.get("id") or "")
 
-        # ========================================================
+        # --------------------------------------------------------
         # Organisation robust ermitteln (dict / list / str / int / None)
-        # ========================================================
+        # --------------------------------------------------------
         raw_org = p.get("organization")
 
         if isinstance(raw_org, dict):
             org_id = str(raw_org.get("id") or "")
             org_name = raw_org.get("name") or \
-                        search_org_fallback.get(pid, {}).get("org_name") or "-"
+                       search_org_fallback.get(pid, {}).get("org_name") or "-"
 
         elif isinstance(raw_org, list):
             org_id = ""
@@ -758,32 +765,26 @@ async def _build_nf_master_final(
             org_id = str(search_org_fallback.get(pid, {}).get("org_id") or "")
             org_name = search_org_fallback.get(pid, {}).get("org_name") or "-"
 
-        # --------------------------------------------------------
-        # Name
-        # --------------------------------------------------------
+        # ------------------------------------
+        # Name & E-Mail
+        # ------------------------------------
         first, last = split_name(
             p.get("first_name"),
             p.get("last_name"),
             p.get("name")
         )
 
-        # --------------------------------------------------------
-        # E-Mail (primär)
-        # --------------------------------------------------------
         email = ""
         for e in p.get("email") or []:
             if isinstance(e, dict) and e.get("primary"):
                 email = e.get("value") or ""
                 break
 
-        # --------------------------------------------------------
-        # Geschlecht (LABEL) → garantiert durch cf()
-        # --------------------------------------------------------
+        # ------------------------------------
+        # Geschlecht – immer Label
+        # ------------------------------------
         gender = cf(p, FIELD_GENDER)
 
-        # --------------------------------------------------------
-        # Zeile erzeugen
-        # --------------------------------------------------------
         rows.append({
             "Batch ID": batch_id,
             "Channel": DEFAULT_CHANNEL,
@@ -808,18 +809,12 @@ async def _build_nf_master_final(
 
     df = pd.DataFrame(rows).replace({None: ""})
 
-    # ------------------------------------------------------------
-    # Ausschlüsse speichern
-    # ------------------------------------------------------------
     excluded = [
         {"Grund": "Max 2 Kontakte pro Organisation", "Anzahl": count_org_limit},
         {"Grund": "Datum nächste Aktivität ungültig", "Anzahl": count_date_invalid},
     ]
     await save_df_text(pd.DataFrame(excluded), "nf_excluded")
 
-    # ------------------------------------------------------------
-    # Master speichern
-    # ------------------------------------------------------------
     await save_df_text(df, "nf_master_final")
 
     if job_obj:
@@ -827,9 +822,6 @@ async def _build_nf_master_final(
         job_obj.percent = 80
 
     return df
-
-
-
 
 # =============================================================================
 # BASIS-ABGLEICH (Organisationen & IDs) – MODUL 4 FINAL
