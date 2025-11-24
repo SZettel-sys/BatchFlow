@@ -809,9 +809,30 @@ async def _build_nf_master_final(
     print("[DEBUG] nf_batch_ids TYPE:", type(nf_batch_ids))
     print("[DEBUG] nf_batch_ids:", nf_batch_ids)
 
+    
+    # 🧠 Stabilisieren – egal ob String, None, Tuple, Method, Int, Request-Objekt
     if not isinstance(nf_batch_ids, list):
-        print("[ERROR] nf_batch_ids ist KEINE Liste sondern:", type(nf_batch_ids))
-        nf_batch_ids = list(nf_batch_ids) if hasattr(nf_batch_ids, "__iter__") else []
+        print("[ERROR] nf_batch_ids falscher Typ:", type(nf_batch_ids))
+
+        # Methoden → sofort leere Liste
+        if callable(nf_batch_ids):
+            nf_batch_ids = []
+
+        # None → leere Liste
+        elif nf_batch_ids is None:
+            nf_batch_ids = []
+
+        # String → einzelnes Element (NICHT char-by-char zerschneiden!)
+        elif isinstance(nf_batch_ids, str):
+            nf_batch_ids = [nf_batch_ids.strip()]
+
+        # Everything else → TypeError vermeiden
+        else:
+            try:
+                nf_batch_ids = list(nf_batch_ids)
+            except:
+                nf_batch_ids = []
+
 
 
 
