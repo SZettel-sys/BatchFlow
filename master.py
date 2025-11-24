@@ -768,69 +768,68 @@ async def _build_nf_master_final(
     job_obj=None
 ) -> pd.DataFrame:
 
-    # Feld-Keys
-    FIELD_BATCH_ID    = "5ac34dad3ea917fdef4087caebf77ba275f87eec"
-    FIELD_PROSPECT_ID = "f9138f9040c44622808a4b8afda2b1b75ee5acd0"
-    FIELD_GENDER      = "c4f5f434cdb0cfce3f6d62ec7291188fe968ac72"
-    FIELD_TITLE       = "0343bc43a91159aaf33a463ca603dc5662422ea5"
-    FIELD_POSITION    = "4585e5de11068a3bccf02d8b93c126bcf5c257ff"
-    FIELD_XING        = "44ebb6feae2a670059bc5261001443a2878a2b43"
-    FIELD_LINKEDIN    = "25563b12f847a280346bba40deaf527af82038cc"
+    # ============================================================
+    # 0) Batch-IDs robust normalisieren (Fehlerursache fixed)
+    # ============================================================
+    raw_val = nf_batch_ids
 
-    # Custom Field Helper
-    def cf(p, key):
-        v = p.get(key)
-        if isinstance(v, list) and v:
-            v = v[0]
-        if isinstance(v, dict):
-            return v.get("label") or v.get("value") or ""
-        return v or ""
+    # Methoden / Funktionen sind nicht iterierbar → sofort leeren
+    if callable(raw_val):
+        print("[ERROR] nf_batch_ids ist callable → setze []")
+        nf_batch_ids = []
 
-    # ------------------------------------------------------------
-    # 1) Stabilisiere nf_batch_ids **BEVOR** die Funktion benutzt wird!
-    # ------------------------------------------------------------
-    print("[DEBUG] nf_batch_ids TYPE:", type(nf_batch_ids))
+    elif raw_val is None:
+        nf_batch_ids = []
 
-    if not isinstance(nf_batch_ids, list):
+    elif isinstance(raw_val, str):
+        nf_batch_ids = [raw_val.strip()]
 
-        # Methoden → direkt leere Liste
-        if callable(nf_batch_ids):
-            print("[ERROR] nf_batch_ids war eine Methode → korrigiert")
+    elif isinstance(raw_val, list):
+        # okay
+        pass
+
+    else:
+        # fallback: Versuch einer Iteration
+        try:
+            nf_batch_ids = list(raw_val)
+        except Exception:
+            print(f"[ERROR] nf_batch_ids ist nicht iterierbar ({type(raw_val)}) → setze []")
             nf_batch_ids = []
 
-        # None → leere Liste
-        elif nf_batch_ids is None:
-            nf_batch_ids = []
+    print("[DEBUG] FINAL nf_batch_ids:", nf_batch_ids)
 
-        # String → NICHT char-by-char!
-        elif isinstance(nf_batch_ids, str):
-            nf_batch_ids = [nf_batch_ids.strip()]
+    # Falls leer → sofort abbrechen
+    if len(nf_batch_ids) == 0:
+        print("[ERROR] Keine gültigen Batch-IDs → leere Tabelle")
+        empty_df = pd.DataFrame([])
+        await save_df_text(empty_df, "nf_master_final")
+        return empty_df
 
-        # Fallback: konvertierbar?
-        else:
-            try:
-                nf_batch_ids = list(nf_batch_ids)
-            except:
-                print("[ERROR] nf_batch_ids konnte nicht iteriert werden → fallback []")
-                nf_batch_ids = []
+    # ============================================================
+    # 1) Personen suchen
+    # ============================================================
+    if job_obj:
+        job_obj.phase = "Lade Nachfass-Kandidaten …"
+        job_obj.percent = 10
 
-    print("[DEBUG] nf_batch_ids stabilisiert:", nf_batch_ids)
+    persons_search = await stream_persons_by_batch_id(
+        "5ac34dad3ea917fdef4087caebf77ba275f87eec",   # FIELD_BATCH_ID
+        nf_batch_ids
+    )
 
-    # ------------------------------------------------------------
-    # 2) Personen über Search laden
-    # ------------------------------------------------------------
-    persons_search = await stream_persons_by_batch_id(FIELD_BATCH_ID, nf_batch_ids)
-    print(f"[DEBUG] Batch-Suche: {len(persons_search)} Personen")
+    print("[DEBUG] Personen über Search:", len(persons_search))
 
-    # 3) IDs extrahieren
+    # IDs extrahieren
     ids = [str(p.get("id")) for p in persons_search if p.get("id")]
 
-    # 4) Vollständige Personen laden
+    # ============================================================
+    # 2) Vollständige Personendaten laden (ORIGINAL-FETCH)
+    # ============================================================
     persons = await fetch_person_details(ids)
 
-    # ------------------------------------------------------------
-    # 5) Selektion (unveränderte Logik)
-    # ------------------------------------------------------------
+    # ============================================================
+    # 3) Selektionslogik (1:1 wie vorher)
+    # ============================================================
     today = datetime.now().date()
 
     def is_date_valid(raw):
@@ -853,7 +852,6 @@ async def _build_nf_master_final(
 
     for p in persons:
         org = p.get("organization") or {}
-
         org_id = org.get("id")
 
         if not is_date_valid(p.get("next_activity_date")):
@@ -868,55 +866,79 @@ async def _build_nf_master_final(
 
         selected.append(p)
 
-    # ------------------------------------------------------------
-    # 6) Export-Zeilen bauen (Original-Logik)
-    # ------------------------------------------------------------
+    # ============================================================
+    # 4) Export-Zeilen aufbauen (LOGIK UNVERÄNDERT)
+    # ============================================================
+
+    FIELD_PROSPECT_ID = "f9138f9040c44622808a4b8afda2b1b75ee5acd0"
+    FIELD_GENDER      = "c4f5f434cdb0cfce3f6d62ec7291188fe968ac72"
+    FIELD_TITLE       = "0343bc43a91159aaf33a463ca603dc5662422ea5"
+    FIELD_POSITION    = "4585e5de11068a3bccf02d8b93c126bcf5c257ff"
+    FIELD_XING        = "44ebb6feae2a670059bc5261001443a2878a2b43"
+    FIELD_LINKEDIN    = "25563b12f847a280346bba40deaf527af82038cc"
+
+    def cf(p, key):
+        v = p.get(key)
+        if isinstance(v, list) and v:
+            v = v[0]
+        if isinstance(v, dict):
+            return v.get("label") or v.get("value") or ""
+        return v or ""
+
     rows = []
 
     for p in selected:
+        pid = str(p.get("id") or "")
         org = p.get("organization") or {}
 
-        pid = str(p.get("id") or "")
         org_id = str(org.get("id") or "")
         org_name = org.get("name") or ""
 
-        first, last = split_name(p.get("first_name"),
-                                 p.get("last_name"),
-                                 p.get("name"))
+        first, last = split_name(p.get("first_name"), p.get("last_name"), p.get("name"))
 
+        # Primäre E-Mail
         email = ""
-        em = p.get("email") or []
-        if isinstance(em, list):
-            for e in em:
-                if isinstance(e, dict) and e.get("primary"):
-                    email = e.get("value") or ""
-                    break
+        for e in (p.get("email") or []):
+            if isinstance(e, dict) and e.get("primary"):
+                email = e.get("value") or ""
+                break
+
+        gender = cf(p, FIELD_GENDER)
 
         rows.append({
             "Batch ID": batch_id,
             "Channel": DEFAULT_CHANNEL,
             "Cold-Mailing Import": campaign,
+
             "Person ID": pid,
             "Person Vorname": first,
             "Person Nachname": last,
             "Person Titel": cf(p, FIELD_TITLE),
-            "Person Geschlecht": cf(p, FIELD_GENDER),
+            "Person Geschlecht": gender,
             "Person Position": cf(p, FIELD_POSITION),
             "Person E-Mail": email,
+
             "Prospect ID": cf(p, FIELD_PROSPECT_ID),
+
             "Organisation ID": org_id,
             "Organisation Name": org_name,
+
             "XING Profil": cf(p, FIELD_XING),
             "LinkedIn URL": cf(p, FIELD_LINKEDIN),
         })
 
     df = pd.DataFrame(rows).replace({None: ""})
 
+    # ============================================================
+    # 5) Ausschlüsse speichern
+    # ============================================================
     excluded = [
         {"Grund": "Max 2 Kontakte pro Organisation", "Anzahl": count_org_limit},
         {"Grund": "Datum nächste Aktivität ungültig", "Anzahl": count_date_invalid},
     ]
     await save_df_text(pd.DataFrame(excluded), "nf_excluded")
+
+    # Ergebnis speichern
     await save_df_text(df, "nf_master_final")
 
     if job_obj:
