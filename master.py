@@ -632,7 +632,6 @@ async def stream_persons_by_filter(
             break
         start += len(data)
 
-
 # ============================================================
 # NACHFASS – MASTER FINAL (bereinigt & stabil)
 # ============================================================
@@ -649,14 +648,14 @@ async def _build_nf_master_final(
     # ------------------------------------------------------------
     FIELD_BATCH_ID    = "5ac34dad3ea917fdef4087caebf77ba275f87eec"
     FIELD_PROSPECT_ID = "f9138f9040c44622808a4b8afda2b1b75ee5acd0"
-    FIELD_GENDER      = "c4f5f434cdb0cfce3f6d62ec7291188fe968ac72" 
+    FIELD_GENDER      = "c4f5f434cdb0cfce3f6d62ec7291188fe968ac72"
     FIELD_TITLE       = "0343bc43a91159aaf33a463ca603dc5662422ea5"
     FIELD_POSITION    = "4585e5de11068a3bccf02d8b93c126bcf5c257ff"
     FIELD_XING        = "44ebb6feae2a670059bc5261001443a2878a2b43"
     FIELD_LINKEDIN    = "25563b12f847a280346bba40deaf527af82038cc"
 
     # ------------------------------------------------------------
-    # Custom-Field-Wrapper
+    # Custom-Field Wrapper
     # ------------------------------------------------------------
     def cf(p, key):
         v = p.get(key)
@@ -673,16 +672,16 @@ async def _build_nf_master_final(
         job_obj.phase = "Lade Nachfass-Kandidaten …"
         job_obj.percent = 10
 
-    # Search liefert org_id + org_name (nicht: organization)
-    persons_search = await stream_persons_by_batch_id(FIELD_BATCH_ID, nf_batch_ids)
+    # Search liefert org_id + org_name
+    persons_search = await stream_persons_by_batch_id(FIELD_BATCH_ID, list(nf_batch_ids))
 
     ids = [str(p.get("id")) for p in persons_search if p.get("id")]
 
-    # Fetch liefert organization=dict (id+name)
+    # Fetch liefert vollständige Personen (inkl. organization=dict)
     persons = await fetch_person_details(ids)
 
     # ------------------------------------------------------------
-    # Selektion (alte Logik 1:1)
+    # Datum prüfen
     # ------------------------------------------------------------
     today = datetime.now().date()
 
@@ -704,7 +703,7 @@ async def _build_nf_master_final(
     count_org_limit = 0
     count_date_invalid = 0
 
-    # Search-Org-Daten für Fallback-Organisation abspeichern
+    # Fallback-Org-Daten aus Search
     search_org_fallback = {
         str(p.get("id")): {
             "org_id": p.get("org_id"),
@@ -713,6 +712,9 @@ async def _build_nf_master_final(
         for p in persons_search if p.get("id")
     }
 
+    # ------------------------------------------------------------
+    # Selektion (alte Logik)
+    # ------------------------------------------------------------
     for p in persons:
         org = p.get("organization") or {}
         org_id = org.get("id")
@@ -730,33 +732,29 @@ async def _build_nf_master_final(
         selected.append(p)
 
     # ------------------------------------------------------------
-    # Export-Zeilen bauen
+    # Export-Zeilen
     # ------------------------------------------------------------
     rows = []
 
     for p in selected:
-
         pid = str(p.get("id") or "")
 
         # --------------------------------------------------------
-        # Organisation robust ermitteln (alle API-Fälle!)
+        # Organisation robust ermitteln
         # --------------------------------------------------------
         org_name, org_id = "-", ""
         org = p.get("organization") or p.get("org_id") or p.get("org_name")
 
-        # 1) dict (vollständige Daten)
         if isinstance(org, dict):
-            org_name = org.get("name") or search_org_fallback[pid].get("org_name") or "-"
+            org_name = org.get("name") or search_org_fallback.get(pid, {}).get("org_name") or "-"
             oid = org.get("id") if org.get("id") is not None else org.get("value")
-            if oid is not None and str(oid).strip():
+            if oid:
                 org_id = str(oid)
 
-        # 2) int/str aus Search
         elif isinstance(org, (int, str)) and str(org).strip():
             org_id = str(org).strip()
             org_name = search_org_fallback.get(pid, {}).get("org_name") or "-"
 
-        # 3) search fallback (org_name)
         elif search_org_fallback.get(pid):
             org_id = str(search_org_fallback[pid].get("org_id") or "")
             org_name = search_org_fallback[pid].get("org_name") or "-"
@@ -767,19 +765,34 @@ async def _build_nf_master_final(
         first, last = split_name(p.get("first_name"), p.get("last_name"), p.get("name"))
 
         # --------------------------------------------------------
-        # E-Mail (primär)
+        # E-Mail
         # --------------------------------------------------------
         email = ""
         for e in p.get("email") or []:
             if isinstance(e, dict) and e.get("primary"):
                 email = e.get("value") or ""
                 break
+
         # --------------------------------------------------------
-        # Geschlecht - Label anzeigen
+        # Geschlecht (robust + Label)
         # --------------------------------------------------------
-        #gender = p.get("gender_label") or cf(p, FIELD_GENDER)
+        raw_gender = p.get(FIELD_GENDER)
+        if isinstance(raw_gender, list) and raw_gender:
+            raw_gender = raw_gender[0]
+
+        if isinstance(raw_gender, dict):
+            gender = raw_gender.get("label") or raw_gender.get("value") or ""
+        else:
+            GENDER_MAP = {
+                "71": "unbekannt",
+                "72": "männlich",
+                "73": "weiblich",
+                "74": "divers"
+            }
+            gender = GENDER_MAP.get(str(raw_gender), str(raw_gender) or "")
+
         # --------------------------------------------------------
-        # Row erzeugen
+        # Row
         # --------------------------------------------------------
         rows.append({
             "Batch ID": batch_id,
@@ -790,7 +803,7 @@ async def _build_nf_master_final(
             "Person Vorname": first,
             "Person Nachname": last,
             "Person Titel": cf(p, FIELD_TITLE),
-            "Person Geschlecht": cf(p, FIELD_GENDER),
+            "Person Geschlecht": gender,
             "Person Position": cf(p, FIELD_POSITION),
             "Person E-Mail": email,
 
@@ -806,7 +819,7 @@ async def _build_nf_master_final(
     df = pd.DataFrame(rows).replace({None: ""})
 
     # ------------------------------------------------------------
-    # Ausschlüsse speichern
+    # Ausschlüsse
     # ------------------------------------------------------------
     excluded = [
         {"Grund": "Max 2 Kontakte pro Organisation", "Anzahl": count_org_limit},
@@ -824,6 +837,8 @@ async def _build_nf_master_final(
         job_obj.percent = 80
 
     return df
+
+
 
 # =============================================================================
 # BASIS-ABGLEICH (Organisationen & IDs) – MODUL 4 FINAL
