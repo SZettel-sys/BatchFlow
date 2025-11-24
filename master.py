@@ -747,7 +747,10 @@ async def _build_nf_master_final(
             if isinstance(e, dict) and e.get("primary"):
                 email = e.get("value") or ""
                 break
-
+        # --------------------------------------------------------
+        # Geschlecht - Label anzeigen
+        # --------------------------------------------------------
+        gender = p.get("gender_label") or cf(p, FIELD_GENDER)
         # --------------------------------------------------------
         # Row erzeugen
         # --------------------------------------------------------
@@ -760,7 +763,7 @@ async def _build_nf_master_final(
             "Person Vorname": first,
             "Person Nachname": last,
             "Person Titel": cf(p, FIELD_TITLE),
-            "Person Geschlecht": cf(p, FIELD_GENDER),
+            "Person Geschlecht": gender,
             "Person Position": cf(p, FIELD_POSITION),
             "Person E-Mail": email,
 
