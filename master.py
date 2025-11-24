@@ -293,24 +293,23 @@ async def get_person_field_by_hint(label_hint: str) -> Optional[dict]:
 # =============================================================================
 # STREAMING-FUNKTIONEN (mit Paging)
 # =============================================================================
-async def stream_organizations_by_filter(filter_id: int, page_limit: int = 500):
-    """Stabiler Orga-Stream – neue Pipedrive-Search-API mit Pflicht-Parameter ?term=""."""
 
+async def stream_organizations_by_filter(filter_id: int, page_limit: int = 500):
+    """
+    Holt Organisationen stabil per FILTER (nie Search).
+    Verursacht keinen 429 und keinen 'term'-Fehler.
+    """
     start = 0
+
     while True:
         url = append_token(
-            f"{PIPEDRIVE_API}/organizations/search"
-            f"?term="                     # Pflichtfeld, auch wenn leer!
-            f"&filter_id={filter_id}"
-            f"&start={start}"
-            f"&limit={page_limit}"
+            f"{PIPEDRIVE_API}/organizations?filter_id={filter_id}&start={start}&limit={page_limit}"
         )
 
         r = await http_client().get(url, headers=get_headers())
 
-        # Rate Limit → warten
         if r.status_code == 429:
-            print("[WARN][ORG-STREAM] 429 – warte 2 Sekunden …")
+            print(f"[WARN][ORG-STREAM] Rate limit 429 → warte 2 Sekunden…")
             await asyncio.sleep(2)
             continue
 
@@ -318,21 +317,17 @@ async def stream_organizations_by_filter(filter_id: int, page_limit: int = 500):
             print(f"[ERROR][ORG-STREAM] Filter {filter_id}: {r.text}")
             return
 
-        data = r.json().get("data", {})
-        items = data.get("items", [])
+        data = (r.json().get("data") or {}).get("items") or []
 
-        if not items:
-            return
+        if not data:
+            break
 
-        # Ergebnis extrahieren – Pipedrive verschachtelt Org bei .get("item")
-        batch = [it.get("item") for it in items if it.get("item")]
-        yield batch
+        yield data
 
-        # Pagination
-        if len(items) < page_limit:
-            return
+        if len(data) < page_limit:
+            break
 
-        start += len(items)
+        start += len(data)
         await asyncio.sleep(0.1)
 
 
@@ -631,9 +626,8 @@ async def stream_persons_by_filter(
         if len(data) < page_limit:
             break
         start += len(data)
-
 # ============================================================
-# NACHFASS – MASTER FINAL (bereinigt & stabil)
+# NACHFASS – MASTER FINAL (stabil, bereinigt + Gender-FIX)
 # ============================================================
 
 async def _build_nf_master_final(
@@ -655,7 +649,19 @@ async def _build_nf_master_final(
     FIELD_LINKEDIN    = "25563b12f847a280346bba40deaf527af82038cc"
 
     # ------------------------------------------------------------
-    # Custom-Field Wrapper
+    # Gender Mapping (ENUM → Label)
+    # ------------------------------------------------------------
+    GENDER_MAP = {
+        "1": "männlich",
+        "2": "weiblich",
+        "3": "divers",
+        "male": "männlich",
+        "female": "weiblich",
+        "other": "divers",
+    }
+
+    # ------------------------------------------------------------
+    # Custom-Field-Wrapper
     # ------------------------------------------------------------
     def cf(p, key):
         v = p.get(key)
@@ -666,22 +672,38 @@ async def _build_nf_master_final(
         return v or ""
 
     # ------------------------------------------------------------
+    # Gender-Resolver (der FIX!)
+    # ------------------------------------------------------------
+    def gender_label(p):
+        v = p.get(FIELD_GENDER)
+
+        # A: korrektes dict
+        if isinstance(v, dict):
+            return v.get("label") or v.get("value") or ""
+
+        # B: Enum-ID als string ("1", "2", "3")
+        if isinstance(v, str):
+            return GENDER_MAP.get(v.strip(), "")
+
+        return ""
+
+    # ------------------------------------------------------------
     # Personen laden
     # ------------------------------------------------------------
     if job_obj:
         job_obj.phase = "Lade Nachfass-Kandidaten …"
         job_obj.percent = 10
 
-    # Search liefert org_id + org_name
-    persons_search = await stream_persons_by_batch_id(FIELD_BATCH_ID, list(nf_batch_ids))
+    # Search liefert org_id + org_name (NICHT: organization)
+    persons_search = await stream_persons_by_batch_id(FIELD_BATCH_ID, nf_batch_ids)
 
     ids = [str(p.get("id")) for p in persons_search if p.get("id")]
 
-    # Fetch liefert vollständige Personen (inkl. organization=dict)
+    # fetch_person_details liefert vollständige "organization": {id,name}
     persons = await fetch_person_details(ids)
 
     # ------------------------------------------------------------
-    # Datum prüfen
+    # Selektion (alte Logik, unverändert)
     # ------------------------------------------------------------
     today = datetime.now().date()
 
@@ -703,7 +725,7 @@ async def _build_nf_master_final(
     count_org_limit = 0
     count_date_invalid = 0
 
-    # Fallback-Org-Daten aus Search
+    # Search-Felder als Fallback speichern
     search_org_fallback = {
         str(p.get("id")): {
             "org_id": p.get("org_id"),
@@ -712,9 +734,6 @@ async def _build_nf_master_final(
         for p in persons_search if p.get("id")
     }
 
-    # ------------------------------------------------------------
-    # Selektion (alte Logik)
-    # ------------------------------------------------------------
     for p in persons:
         org = p.get("organization") or {}
         org_id = org.get("id")
@@ -732,68 +751,46 @@ async def _build_nf_master_final(
         selected.append(p)
 
     # ------------------------------------------------------------
-    # Export-Zeilen
+    # Export-Zeilen bauen
     # ------------------------------------------------------------
     rows = []
 
     for p in selected:
+
         pid = str(p.get("id") or "")
 
-        # --------------------------------------------------------
-        # Organisation robust ermitteln
-        # --------------------------------------------------------
+        # --- Organisation robust ermitteln (alle API-Fälle abgedeckt) ---
         org_name, org_id = "-", ""
         org = p.get("organization") or p.get("org_id") or p.get("org_name")
 
+        # Fall 1: dict aus fetch-person-details (korrekt)
         if isinstance(org, dict):
             org_name = org.get("name") or search_org_fallback.get(pid, {}).get("org_name") or "-"
             oid = org.get("id") if org.get("id") is not None else org.get("value")
-            if oid:
+            if oid is not None and str(oid).strip():
                 org_id = str(oid)
 
+        # Fall 2: int/string aus Search (org_id)
         elif isinstance(org, (int, str)) and str(org).strip():
             org_id = str(org).strip()
             org_name = search_org_fallback.get(pid, {}).get("org_name") or "-"
 
+        # Fall 3: Search liefert nur Namen
         elif search_org_fallback.get(pid):
             org_id = str(search_org_fallback[pid].get("org_id") or "")
             org_name = search_org_fallback[pid].get("org_name") or "-"
 
-        # --------------------------------------------------------
-        # Name
-        # --------------------------------------------------------
+        # --- Name ---
         first, last = split_name(p.get("first_name"), p.get("last_name"), p.get("name"))
 
-        # --------------------------------------------------------
-        # E-Mail
-        # --------------------------------------------------------
+        # --- Email ---
         email = ""
         for e in p.get("email") or []:
             if isinstance(e, dict) and e.get("primary"):
                 email = e.get("value") or ""
                 break
 
-        # --------------------------------------------------------
-        # Geschlecht (robust + Label)
-        # --------------------------------------------------------
-        raw_gender = p.get(FIELD_GENDER)
-        if isinstance(raw_gender, list) and raw_gender:
-            raw_gender = raw_gender[0]
-
-        if isinstance(raw_gender, dict):
-            gender = raw_gender.get("label") or raw_gender.get("value") or ""
-        else:
-            GENDER_MAP = {
-                "71": "unbekannt",
-                "72": "männlich",
-                "73": "weiblich",
-                "74": "divers"
-            }
-            gender = GENDER_MAP.get(str(raw_gender), str(raw_gender) or "")
-
-        # --------------------------------------------------------
-        # Row
-        # --------------------------------------------------------
+        # --- Row ---
         rows.append({
             "Batch ID": batch_id,
             "Channel": DEFAULT_CHANNEL,
@@ -803,7 +800,7 @@ async def _build_nf_master_final(
             "Person Vorname": first,
             "Person Nachname": last,
             "Person Titel": cf(p, FIELD_TITLE),
-            "Person Geschlecht": gender,
+            "Person Geschlecht": gender_label(p),   # <<< FIX!
             "Person Position": cf(p, FIELD_POSITION),
             "Person E-Mail": email,
 
@@ -819,7 +816,7 @@ async def _build_nf_master_final(
     df = pd.DataFrame(rows).replace({None: ""})
 
     # ------------------------------------------------------------
-    # Ausschlüsse
+    # Ausschlüsse speichern
     # ------------------------------------------------------------
     excluded = [
         {"Grund": "Max 2 Kontakte pro Organisation", "Anzahl": count_org_limit},
@@ -837,6 +834,7 @@ async def _build_nf_master_final(
         job_obj.percent = 80
 
     return df
+
 
 
 
