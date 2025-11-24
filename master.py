@@ -757,11 +757,6 @@ async def stream_persons_by_filter(
             break
         start += len(data)
 
-
-# ============================================================
-# NACHFASS: MASTER-DATENAUFBAU – FINAL BEREINIGT
-# ============================================================
-
 # ============================================================
 # Nachfass – Aufbau Master FINAL (gleiche Logik, nur Fixes)
 # ============================================================
@@ -773,7 +768,7 @@ async def _build_nf_master_final(
     job_obj=None
 ) -> pd.DataFrame:
 
-    # Feld-Keys der Custom-Felder
+    # Feld-Keys
     FIELD_BATCH_ID    = "5ac34dad3ea917fdef4087caebf77ba275f87eec"
     FIELD_PROSPECT_ID = "f9138f9040c44622808a4b8afda2b1b75ee5acd0"
     FIELD_GENDER      = "c4f5f434cdb0cfce3f6d62ec7291188fe968ac72"
@@ -782,69 +777,60 @@ async def _build_nf_master_final(
     FIELD_XING        = "44ebb6feae2a670059bc5261001443a2878a2b43"
     FIELD_LINKEDIN    = "25563b12f847a280346bba40deaf527af82038cc"
 
-    # Custom-Field-Wrapper unverändert
+    # Custom Field Helper
     def cf(p, key):
         v = p.get(key)
-
-        # Array?
-        if isinstance(v, list) and len(v) > 0:
+        if isinstance(v, list) and v:
             v = v[0]
-
-        # dict → Label bevorzugen
         if isinstance(v, dict):
             return v.get("label") or v.get("value") or ""
-
         return v or ""
 
-    # ----------------------------------------------------------------------
-    # Personen laden
-    # ----------------------------------------------------------------------
-    if job_obj:
-        job_obj.phase = "Lade Nachfass-Kandidaten …"
-        job_obj.percent = 10
-
-    # 1) Personen über Search
-    #persons_search = await stream_persons_by_batch_id(FIELD_BATCH_ID, nf_batch_ids)
-    persons_search = await stream_persons_by_batch_id(FIELD_BATCH_ID, list(nf_batch_ids))
+    # ------------------------------------------------------------
+    # 1) Stabilisiere nf_batch_ids **BEVOR** die Funktion benutzt wird!
+    # ------------------------------------------------------------
     print("[DEBUG] nf_batch_ids TYPE:", type(nf_batch_ids))
-    print("[DEBUG] nf_batch_ids:", nf_batch_ids)
 
-    
-    # 🧠 Stabilisieren – egal ob String, None, Tuple, Method, Int, Request-Objekt
     if not isinstance(nf_batch_ids, list):
-        print("[ERROR] nf_batch_ids falscher Typ:", type(nf_batch_ids))
 
-        # Methoden → sofort leere Liste
+        # Methoden → direkt leere Liste
         if callable(nf_batch_ids):
+            print("[ERROR] nf_batch_ids war eine Methode → korrigiert")
             nf_batch_ids = []
 
         # None → leere Liste
         elif nf_batch_ids is None:
             nf_batch_ids = []
 
-        # String → einzelnes Element (NICHT char-by-char zerschneiden!)
+        # String → NICHT char-by-char!
         elif isinstance(nf_batch_ids, str):
             nf_batch_ids = [nf_batch_ids.strip()]
 
-        # Everything else → TypeError vermeiden
+        # Fallback: konvertierbar?
         else:
             try:
                 nf_batch_ids = list(nf_batch_ids)
             except:
+                print("[ERROR] nf_batch_ids konnte nicht iteriert werden → fallback []")
                 nf_batch_ids = []
 
+    print("[DEBUG] nf_batch_ids stabilisiert:", nf_batch_ids)
 
+    # ------------------------------------------------------------
+    # 2) Personen über Search laden
+    # ------------------------------------------------------------
+    persons_search = await stream_persons_by_batch_id(FIELD_BATCH_ID, nf_batch_ids)
+    print(f"[DEBUG] Batch-Suche: {len(persons_search)} Personen")
 
-
-    # 2) IDs extrahieren
+    # 3) IDs extrahieren
     ids = [str(p.get("id")) for p in persons_search if p.get("id")]
 
-    # 3) Vollständige Personen laden (dein unveränderter original fetch!)
+    # 4) Vollständige Personen laden
     persons = await fetch_person_details(ids)
 
-    # ----------------------------------------------------------------------
-    # Selektion → exakt deine alte Logik
-    # ----------------------------------------------------------------------
+    # ------------------------------------------------------------
+    # 5) Selektion (unveränderte Logik)
+    # ------------------------------------------------------------
     today = datetime.now().date()
 
     def is_date_valid(raw):
@@ -867,13 +853,6 @@ async def _build_nf_master_final(
 
     for p in persons:
         org = p.get("organization") or {}
-        # DEBUG → Organisation prüfen
-        if not org:
-            print(f"[DEBUG][ORGA MISSING] Person {p.get('id')}: organization=None")
-        elif not org.get("id"):
-            print(f"[DEBUG][ORGA MISSING] Person {p.get('id')}: organization ohne ID → {org}")
-        elif not org.get("name"):
-            print(f"[DEBUG][ORGA NAME MISSING] Person {p.get('id')}: org_id={org.get('id')} → Name fehlt")
 
         org_id = org.get("id")
 
@@ -889,68 +868,55 @@ async def _build_nf_master_final(
 
         selected.append(p)
 
-    # ----------------------------------------------------------------------
-    # Export-Zeilen bauen
-    # (LOGIK 1:1 wie vorher – nur Gender/Organisation stabilisiert)
-    # ----------------------------------------------------------------------
+    # ------------------------------------------------------------
+    # 6) Export-Zeilen bauen (Original-Logik)
+    # ------------------------------------------------------------
     rows = []
 
     for p in selected:
-
-        pid = str(p.get("id") or "")
         org = p.get("organization") or {}
 
-        # Organisation stabil (Fix D)
+        pid = str(p.get("id") or "")
         org_id = str(org.get("id") or "")
         org_name = org.get("name") or ""
 
-        # Name wie bisher
-        first, last = split_name(p.get("first_name"), p.get("last_name"), p.get("name"))
+        first, last = split_name(p.get("first_name"),
+                                 p.get("last_name"),
+                                 p.get("name"))
 
-        # E-Mail wie bisher
         email = ""
-        email_list = p.get("email") or []
-        if isinstance(email_list, list):
-            for e in email_list:
+        em = p.get("email") or []
+        if isinstance(em, list):
+            for e in em:
                 if isinstance(e, dict) and e.get("primary"):
                     email = e.get("value") or ""
                     break
-
-        # Geschlecht als Label (Fix C)
-        gender = cf(p, FIELD_GENDER)
 
         rows.append({
             "Batch ID": batch_id,
             "Channel": DEFAULT_CHANNEL,
             "Cold-Mailing Import": campaign,
-
             "Person ID": pid,
             "Person Vorname": first,
             "Person Nachname": last,
             "Person Titel": cf(p, FIELD_TITLE),
-            "Person Geschlecht": gender,
+            "Person Geschlecht": cf(p, FIELD_GENDER),
             "Person Position": cf(p, FIELD_POSITION),
             "Person E-Mail": email,
-
             "Prospect ID": cf(p, FIELD_PROSPECT_ID),
-
-            # Organisation (Fix A)
             "Organisation ID": org_id,
             "Organisation Name": org_name,
-
             "XING Profil": cf(p, FIELD_XING),
             "LinkedIn URL": cf(p, FIELD_LINKEDIN),
         })
 
     df = pd.DataFrame(rows).replace({None: ""})
 
-    # Ausschlüsse speichern wie vorher
     excluded = [
         {"Grund": "Max 2 Kontakte pro Organisation", "Anzahl": count_org_limit},
         {"Grund": "Datum nächste Aktivität ungültig", "Anzahl": count_date_invalid},
     ]
     await save_df_text(pd.DataFrame(excluded), "nf_excluded")
-
     await save_df_text(df, "nf_master_final")
 
     if job_obj:
@@ -958,6 +924,8 @@ async def _build_nf_master_final(
         job_obj.percent = 80
 
     return df
+
+
 
 # =============================================================================
 # BASIS-ABGLEICH (Organisationen & IDs) – MODUL 4 FINAL
