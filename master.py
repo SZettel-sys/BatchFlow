@@ -626,8 +626,9 @@ async def stream_persons_by_filter(
         if len(data) < page_limit:
             break
         start += len(data)
+
 # ============================================================
-# NACHFASS – MASTER FINAL (robust + Gender-Fix)
+# NACHFASS – MASTER FINAL (robust + Gender-Fix + BatchID-Fix)
 # ============================================================
 
 async def _build_nf_master_final(
@@ -637,9 +638,9 @@ async def _build_nf_master_final(
     job_obj=None
 ) -> pd.DataFrame:
 
-    # ------------------------------------------------------------
-    # Feld-Keys der Custom-Felder
-    # ------------------------------------------------------------
+    # -------------------------------
+    # Feld-Keys
+    # -------------------------------
     FIELD_BATCH_ID    = "5ac34dad3ea917fdef4087caebf77ba275f87eec"
     FIELD_PROSPECT_ID = "f9138f9040c44622808a4b8afda2b1b75ee5acd0"
     FIELD_GENDER      = "c4f5f434cdb0cfce3f6d62ec7291188fe968ac72"
@@ -648,25 +649,39 @@ async def _build_nf_master_final(
     FIELD_XING        = "44ebb6feae2a670059bc5261001443a2878a2b43"
     FIELD_LINKEDIN    = "25563b12f847a280346bba40deaf527af82038cc"
 
-    # ------------------------------------------------------------
+    # -------------------------------
     # Custom-Field Helper
-    # ------------------------------------------------------------
+    # -------------------------------
     def cf(p, key):
         v = p.get(key)
-
-        # Array?
-        if isinstance(v, list) and len(v) > 0:
+        if isinstance(v, list) and v:
             v = v[0]
-
-        # Label bevorzugen
         if isinstance(v, dict):
             return v.get("label") or v.get("value") or ""
-
         return v or ""
 
-    # ------------------------------------------------------------
-    # Personen laden
-    # ------------------------------------------------------------
+    # -------------------------------
+    # BatchIDs stabilisieren (!! FIX !!)
+    # -------------------------------
+    if callable(nf_batch_ids):
+        nf_batch_ids = []
+
+    if nf_batch_ids is None:
+        nf_batch_ids = []
+
+    if isinstance(nf_batch_ids, str):
+        nf_batch_ids = [nf_batch_ids.strip()]
+
+    try:
+        nf_batch_ids = list(nf_batch_ids)
+    except Exception:
+        nf_batch_ids = []
+
+    nf_batch_ids = [str(x).strip() for x in nf_batch_ids if str(x).strip()]
+
+    # -------------------------------
+    # Personen via Search
+    # -------------------------------
     if job_obj:
         job_obj.phase = "Lade Nachfass-Kandidaten …"
         job_obj.percent = 10
@@ -676,7 +691,9 @@ async def _build_nf_master_final(
     ids = [str(p.get("id")) for p in persons_search if p.get("id")]
     persons = await fetch_person_details(ids)
 
-    # Search-Fallback für Orga
+    # ---------------------------------
+    # Orga-Fallback (Search-Daten)
+    # ---------------------------------
     search_org_fallback = {
         str(p.get("id")): {
             "org_id": p.get("org_id"),
@@ -685,9 +702,9 @@ async def _build_nf_master_final(
         for p in persons_search if p.get("id")
     }
 
-    # ------------------------------------------------------------
-    # Selektion
-    # ------------------------------------------------------------
+    # ---------------------------------
+    # Selektionslogik (unverändert)
+    # ---------------------------------
     today = datetime.now().date()
 
     def is_date_valid(raw):
@@ -724,16 +741,15 @@ async def _build_nf_master_final(
 
         selected.append(p)
 
-    # ------------------------------------------------------------
-    # Export-Zeilen
-    # ------------------------------------------------------------
+    # ---------------------------------
+    # Export-Zeilen bauen
+    # ---------------------------------
     rows = []
 
     for p in selected:
-
         pid = str(p.get("id") or "")
 
-        # -------- Organisation robust --------
+        # --- Orga robust ---
         org_name, org_id = "-", ""
         org = p.get("organization") or p.get("org_id") or p.get("org_name")
 
@@ -742,35 +758,30 @@ async def _build_nf_master_final(
             oid = org.get("id") if org.get("id") is not None else org.get("value")
             if oid:
                 org_id = str(oid)
-
         elif isinstance(org, (int, str)) and str(org).strip():
             org_id = str(org)
             org_name = search_org_fallback.get(pid, {}).get("org_name") or "-"
-
         else:
             org_id = str(search_org_fallback.get(pid, {}).get("org_id") or "")
             org_name = search_org_fallback.get(pid, {}).get("org_name") or "-"
 
-        # -------- Name --------
+        # --- Name ---
         first, last = split_name(p.get("first_name"), p.get("last_name"), p.get("name"))
 
-        # -------- E-Mail (primär) --------
+        # --- Email ---
         email = ""
-        email_list = p.get("email") or []
-        if isinstance(email_list, list):
-            for e in email_list:
-                if isinstance(e, dict) and e.get("primary"):
-                    email = e.get("value") or ""
-                    break
+        for e in p.get("email") or []:
+            if isinstance(e, dict) and e.get("primary"):
+                email = e.get("value") or ""
+                break
 
-        # -------- Geschlecht LABEL (Fix) --------
+        # --- GENDER FIX (Label) ---
         gender = cf(p, FIELD_GENDER)
 
         rows.append({
             "Batch ID": batch_id,
             "Channel": DEFAULT_CHANNEL,
             "Cold-Mailing Import": campaign,
-
             "Person ID": pid,
             "Person Vorname": first,
             "Person Nachname": last,
@@ -778,29 +789,21 @@ async def _build_nf_master_final(
             "Person Geschlecht": gender,
             "Person Position": cf(p, FIELD_POSITION),
             "Person E-Mail": email,
-
             "Prospect ID": cf(p, FIELD_PROSPECT_ID),
             "Organisation ID": org_id,
             "Organisation Name": org_name,
-
             "XING Profil": cf(p, FIELD_XING),
             "LinkedIn URL": cf(p, FIELD_LINKEDIN),
         })
 
     df = pd.DataFrame(rows).replace({None: ""})
 
-    # ------------------------------------------------------------
-    # Ausschlüsse
-    # ------------------------------------------------------------
     excluded = [
         {"Grund": "Max 2 Kontakte pro Organisation", "Anzahl": count_org_limit},
         {"Grund": "Datum nächste Aktivität ungültig", "Anzahl": count_date_invalid},
     ]
     await save_df_text(pd.DataFrame(excluded), "nf_excluded")
 
-    # ------------------------------------------------------------
-    # Speichern
-    # ------------------------------------------------------------
     await save_df_text(df, "nf_master_final")
 
     if job_obj:
