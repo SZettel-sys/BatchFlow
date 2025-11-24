@@ -804,7 +804,16 @@ async def _build_nf_master_final(
         job_obj.percent = 10
 
     # 1) Personen über Search
-    persons_search = await stream_persons_by_batch_id(FIELD_BATCH_ID, nf_batch_ids)
+    #persons_search = await stream_persons_by_batch_id(FIELD_BATCH_ID, nf_batch_ids)
+    persons_search = await stream_persons_by_batch_id(FIELD_BATCH_ID, list(nf_batch_ids))
+    print("[DEBUG] nf_batch_ids TYPE:", type(nf_batch_ids))
+    print("[DEBUG] nf_batch_ids:", nf_batch_ids)
+
+    if not isinstance(nf_batch_ids, list):
+        print("[ERROR] nf_batch_ids ist KEINE Liste sondern:", type(nf_batch_ids))
+        nf_batch_ids = list(nf_batch_ids) if hasattr(nf_batch_ids, "__iter__") else []
+
+
 
     # 2) IDs extrahieren
     ids = [str(p.get("id")) for p in persons_search if p.get("id")]
