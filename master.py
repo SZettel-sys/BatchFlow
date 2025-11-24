@@ -293,21 +293,40 @@ async def get_person_field_by_hint(label_hint: str) -> Optional[dict]:
 # =============================================================================
 # STREAMING-FUNKTIONEN (mit Paging)
 # =============================================================================
-async def stream_organizations_by_filter(filter_id: int, page_limit: int = PAGE_LIMIT) -> AsyncGenerator[List[dict], None]:
-    """Streamt Organisationen mit Pagination."""
+async def stream_organizations_by_filter(filter_id: int, page_limit: int = 100):
     start = 0
+
     while True:
-        url = append_token(f"{PIPEDRIVE_API}/organizations?filter_id={filter_id}&start={start}&limit={page_limit}")
+        url = append_token(
+            f"{PIPEDRIVE_API}/organizations/search?"
+            f"filter_id={filter_id}&start={start}&limit={page_limit}"
+        )
+
         r = await http_client().get(url, headers=get_headers())
+
+        # NEW: Quick-Fix gegen 429
+        await asyncio.sleep(0.25)
+
+        if r.status_code == 429:
+            print(f"[WARN][ORG-STREAM] 429 – warte 2 Sekunden… (Filter {filter_id})")
+            await asyncio.sleep(2)
+            continue
+
         if r.status_code != 200:
-            raise Exception(f"Pipedrive Fehler (Orgs {filter_id}): {r.text}")
-        data = r.json().get("data") or []
+            print(f"[ERROR][ORG-STREAM] Filter {filter_id}: {r.text}")
+            break
+
+        data = r.json().get("data", {}).get("items", [])
         if not data:
             break
-        yield data
-        if len(data) < page_limit:
+
+        orgs = [it.get("item") for it in data if it.get("item")]
+        yield orgs
+
+        if len(orgs) < page_limit:
             break
-        start += len(data)
+
+        start += len(orgs)
 
 async def stream_person_ids_by_filter(filter_id: int, page_limit: int = PAGE_LIMIT) -> AsyncGenerator[List[str], None]:
     """Streamt nur Personen-IDs – speicherschonend."""
