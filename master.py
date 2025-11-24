@@ -641,7 +641,7 @@ async def _build_nf_master_final(
     # ------------------------------------------------------------
     FIELD_BATCH_ID    = "5ac34dad3ea917fdef4087caebf77ba275f87eec"
     FIELD_PROSPECT_ID = "f9138f9040c44622808a4b8afda2b1b75ee5acd0"
-    FIELD_GENDER      = "c4f5f434cdb0cfce3f6d62ec7291188fe968ac72"
+    FIELD_GENDER      = "c4f5f434cdb0cfce3f6d62ec7291188fe968ac72" 
     FIELD_TITLE       = "0343bc43a91159aaf33a463ca603dc5662422ea5"
     FIELD_POSITION    = "4585e5de11068a3bccf02d8b93c126bcf5c257ff"
     FIELD_XING        = "44ebb6feae2a670059bc5261001443a2878a2b43"
@@ -769,7 +769,7 @@ async def _build_nf_master_final(
         # --------------------------------------------------------
         # Geschlecht - Label anzeigen
         # --------------------------------------------------------
-        gender = p.get("gender_label") or cf(p, FIELD_GENDER)
+        #gender = p.get("gender_label") or cf(p, FIELD_GENDER)
         # --------------------------------------------------------
         # Row erzeugen
         # --------------------------------------------------------
@@ -782,7 +782,7 @@ async def _build_nf_master_final(
             "Person Vorname": first,
             "Person Nachname": last,
             "Person Titel": cf(p, FIELD_TITLE),
-            "Person Geschlecht": gender,
+            "Person Geschlecht": cf(p, FIELD_GENDER),
             "Person Position": cf(p, FIELD_POSITION),
             "Person E-Mail": email,
 
