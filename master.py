@@ -629,6 +629,9 @@ async def stream_persons_by_filter(
 # ============================================================
 # NACHFASS – MASTER FINAL (stabil, bereinigt + Gender-FIX)
 # ============================================================
+# ============================================================
+# NACHFASS – MASTER FINAL (robust, stabil, Gender-Fix)
+# ============================================================
 
 async def _build_nf_master_final(
     nf_batch_ids: List[str],
@@ -638,7 +641,7 @@ async def _build_nf_master_final(
 ) -> pd.DataFrame:
 
     # ------------------------------------------------------------
-    # Feld-Keys der Custom-Felder
+    # Custom-Field Keys
     # ------------------------------------------------------------
     FIELD_BATCH_ID    = "5ac34dad3ea917fdef4087caebf77ba275f87eec"
     FIELD_PROSPECT_ID = "f9138f9040c44622808a4b8afda2b1b75ee5acd0"
@@ -649,43 +652,18 @@ async def _build_nf_master_final(
     FIELD_LINKEDIN    = "25563b12f847a280346bba40deaf527af82038cc"
 
     # ------------------------------------------------------------
-    # Gender Mapping (ENUM → Label)
-    # ------------------------------------------------------------
-    GENDER_MAP = {
-        "1": "männlich",
-        "2": "weiblich",
-        "3": "divers",
-        "male": "männlich",
-        "female": "weiblich",
-        "other": "divers",
-    }
-
-    # ------------------------------------------------------------
-    # Custom-Field-Wrapper
+    # Custom-Field Helper → gibt IMMER Label zurück
     # ------------------------------------------------------------
     def cf(p, key):
         v = p.get(key)
+
         if isinstance(v, list) and v:
             v = v[0]
+
         if isinstance(v, dict):
             return v.get("label") or v.get("value") or ""
+
         return v or ""
-
-    # ------------------------------------------------------------
-    # Gender-Resolver (der FIX!)
-    # ------------------------------------------------------------
-    def gender_label(p):
-        v = p.get(FIELD_GENDER)
-
-        # A: korrektes dict
-        if isinstance(v, dict):
-            return v.get("label") or v.get("value") or ""
-
-        # B: Enum-ID als string ("1", "2", "3")
-        if isinstance(v, str):
-            return GENDER_MAP.get(v.strip(), "")
-
-        return ""
 
     # ------------------------------------------------------------
     # Personen laden
@@ -694,16 +672,14 @@ async def _build_nf_master_final(
         job_obj.phase = "Lade Nachfass-Kandidaten …"
         job_obj.percent = 10
 
-    # Search liefert org_id + org_name (NICHT: organization)
     persons_search = await stream_persons_by_batch_id(FIELD_BATCH_ID, nf_batch_ids)
 
     ids = [str(p.get("id")) for p in persons_search if p.get("id")]
 
-    # fetch_person_details liefert vollständige "organization": {id,name}
     persons = await fetch_person_details(ids)
 
     # ------------------------------------------------------------
-    # Selektion (alte Logik, unverändert)
+    # Datum prüfen
     # ------------------------------------------------------------
     today = datetime.now().date()
 
@@ -720,12 +696,9 @@ async def _build_nf_master_final(
             return False
         return True
 
-    selected = []
-    org_counter = defaultdict(int)
-    count_org_limit = 0
-    count_date_invalid = 0
-
-    # Search-Felder als Fallback speichern
+    # ------------------------------------------------------------
+    # Search-Fallback für Organisationen
+    # ------------------------------------------------------------
     search_org_fallback = {
         str(p.get("id")): {
             "org_id": p.get("org_id"),
@@ -733,6 +706,11 @@ async def _build_nf_master_final(
         }
         for p in persons_search if p.get("id")
     }
+
+    selected = []
+    org_counter = defaultdict(int)
+    count_org_limit = 0
+    count_date_invalid = 0
 
     for p in persons:
         org = p.get("organization") or {}
@@ -751,46 +729,61 @@ async def _build_nf_master_final(
         selected.append(p)
 
     # ------------------------------------------------------------
-    # Export-Zeilen bauen
+    # Export erzeugen
     # ------------------------------------------------------------
     rows = []
 
     for p in selected:
-
         pid = str(p.get("id") or "")
 
-        # --- Organisation robust ermitteln (alle API-Fälle abgedeckt) ---
-        org_name, org_id = "-", ""
-        org = p.get("organization") or p.get("org_id") or p.get("org_name")
+        # ========================================================
+        # Organisation robust ermitteln (dict / list / str / int / None)
+        # ========================================================
+        raw_org = p.get("organization")
 
-        # Fall 1: dict aus fetch-person-details (korrekt)
-        if isinstance(org, dict):
-            org_name = org.get("name") or search_org_fallback.get(pid, {}).get("org_name") or "-"
-            oid = org.get("id") if org.get("id") is not None else org.get("value")
-            if oid is not None and str(oid).strip():
-                org_id = str(oid)
+        if isinstance(raw_org, dict):
+            org_id = str(raw_org.get("id") or "")
+            org_name = raw_org.get("name") or \
+                        search_org_fallback.get(pid, {}).get("org_name") or "-"
 
-        # Fall 2: int/string aus Search (org_id)
-        elif isinstance(org, (int, str)) and str(org).strip():
-            org_id = str(org).strip()
+        elif isinstance(raw_org, list):
+            org_id = ""
+            org_name = ""
+
+        elif isinstance(raw_org, (str, int)):
+            org_id = str(raw_org).strip()
             org_name = search_org_fallback.get(pid, {}).get("org_name") or "-"
 
-        # Fall 3: Search liefert nur Namen
-        elif search_org_fallback.get(pid):
-            org_id = str(search_org_fallback[pid].get("org_id") or "")
-            org_name = search_org_fallback[pid].get("org_name") or "-"
+        else:
+            org_id = str(search_org_fallback.get(pid, {}).get("org_id") or "")
+            org_name = search_org_fallback.get(pid, {}).get("org_name") or "-"
 
-        # --- Name ---
-        first, last = split_name(p.get("first_name"), p.get("last_name"), p.get("name"))
+        # --------------------------------------------------------
+        # Name
+        # --------------------------------------------------------
+        first, last = split_name(
+            p.get("first_name"),
+            p.get("last_name"),
+            p.get("name")
+        )
 
-        # --- Email ---
+        # --------------------------------------------------------
+        # E-Mail (primär)
+        # --------------------------------------------------------
         email = ""
         for e in p.get("email") or []:
             if isinstance(e, dict) and e.get("primary"):
                 email = e.get("value") or ""
                 break
 
-        # --- Row ---
+        # --------------------------------------------------------
+        # Geschlecht (LABEL) → garantiert durch cf()
+        # --------------------------------------------------------
+        gender = cf(p, FIELD_GENDER)
+
+        # --------------------------------------------------------
+        # Zeile erzeugen
+        # --------------------------------------------------------
         rows.append({
             "Batch ID": batch_id,
             "Channel": DEFAULT_CHANNEL,
@@ -800,7 +793,7 @@ async def _build_nf_master_final(
             "Person Vorname": first,
             "Person Nachname": last,
             "Person Titel": cf(p, FIELD_TITLE),
-            "Person Geschlecht": gender_label(p),   # <<< FIX!
+            "Person Geschlecht": gender,
             "Person Position": cf(p, FIELD_POSITION),
             "Person E-Mail": email,
 
@@ -887,110 +880,125 @@ async def _fetch_org_names_for_filter_capped(
 
     return buckets
 
+# ============================================================
+# NACHFASS – FINAL RECONCILE (schnell, stabil, ohne API-Calls)
+# ============================================================
 
-# =============================================================================
-# RECONCILE – Nachfass Abgleich (Organisation + Person-ID)
-# =============================================================================
-async def _reconcile(prefix: str) -> None:
-    t = tables(prefix)
-    df = await load_df_text(t["final"])
+from rapidfuzz import process, fuzz
 
-    if df.empty:
-        await save_df_text(pd.DataFrame(), t["ready"])
-        await save_df_text(pd.DataFrame(columns=[
-            "reason","Kontakt ID","Name","Organisation ID","Organisationsname","Grund"
-        ]), t["log"])
-        return
+async def _reconcile(mode: str):
+    print("[DEBUG] Starte Reconcile…")
 
-    col_pid = "Person ID"
-    col_orgname = "Organisation Name"
-    col_orgid = "Organisation ID"
+    # DataFrame laden (aus Build)
+    ready = await load_df_text("nf_master_final")
+    df = pd.read_json(ready)
 
-    delete_rows = []
-    drop_idx = []
+    removed = []
+    remaining = []
 
-    # -----------------------------------------------
-    # 1) Fuzzy Organisation
-    # -----------------------------------------------
-    filter_ids_org = [1245, 851, 1521]
-    buckets_all = {}
-    total_collected = 0
+    # ------------------------------------------------------------
+    # Lade Filter-LISTEN aus Pipedrive (NUR EINMAL)
+    # KEINE Suche mit ?term=… → KEIN 429 mehr
+    # ------------------------------------------------------------
+    org_filters = {
+        1245: await load_orgs_by_filter(1245),
+        851: await load_orgs_by_filter(851),
+        1521: await load_orgs_by_filter(1521)
+    }
 
-    for fid in filter_ids_org:
-        caps_left = MAX_ORG_NAMES - total_collected
-        if caps_left <= 0:
-            break
+    person_filters = {
+        1216: await load_persons_by_filter(1216),
+        1708: await load_persons_by_filter(1708)
+    }
 
-        sub = await _fetch_org_names_for_filter_capped(
-            fid, PAGE_LIMIT, caps_left, MAX_ORG_BUCKET
-        )
+    # ------------------------------------------------------------
+    # Schnell-Lookup für Personen-IDs
+    # ------------------------------------------------------------
+    blocked_person_ids = set()
+    for f_id, persons in person_filters.items():
+        for p in persons:
+            pid = p.get("id")
+            if pid:
+                blocked_person_ids.add(pid)
 
-        for key, vals in sub.items():
-            b = buckets_all.setdefault(key, [])
-            for v in vals:
-                if v not in b:
-                    b.append(v)
-                    total_collected += 1
+    # ------------------------------------------------------------
+    # Vorbereiten: Organisationsnamen-Buckets
+    # ------------------------------------------------------------
+    org_buckets = {}
 
+    for f_id, org_list in org_filters.items():
+
+        names = [o.get("name", "").strip()
+                 for o in org_list if o.get("name")]
+
+        # alphabetisch gruppieren → viel schneller bei großen Listen
+        bucketed = {}
+        for n in names:
+            key = n[:1].lower()
+            bucketed.setdefault(key, []).append(n)
+
+        org_buckets[f_id] = bucketed
+
+    # ------------------------------------------------------------
+    # Haupt-Loop über DF
+    # ------------------------------------------------------------
     for idx, row in df.iterrows():
-        name = str(row.get(col_orgname) or "")
-        norm = normalize_name(name)
-        if not norm:
+
+        org_name = (row.get("Organisation Name") or "").strip()
+        p_id = row.get("Person ID")
+
+        # --------------------------------------------------------
+        # 1) Personenfilter
+        # --------------------------------------------------------
+        if p_id in blocked_person_ids:
+            removed.append(row)
             continue
 
-        b = bucket_key(norm)
-        bucket = buckets_all.get(b)
-        if not bucket:
-            continue
+        # --------------------------------------------------------
+        # 2) Organisations-Fuzzy (lokal + Bucket)
+        # --------------------------------------------------------
+        if org_name:
+            key = org_name[:1].lower()
 
-        near = [n for n in bucket if abs(len(n) - len(norm)) <= 4]
-        if not near:
-            continue
+            matched = False
 
-        best = process.extractOne(norm, near, scorer=fuzz.token_sort_ratio)
-        if best and best[1] >= 95:
-            drop_idx.append(idx)
-            delete_rows.append({
-                "reason": "org_match_95",
-                "Kontakt ID": row[col_pid],
-                "Name": f"{row.get('Person Vorname','')} {row.get('Person Nachname','')}".strip(),
-                "Organisation ID": row[col_orgid],
-                "Organisationsname": name,
-                "Grund": f"Ähnlichkeit {best[1]}% mit '{best[0]}'"
-            })
+            for f_id, buckets in org_buckets.items():
 
-    df = df.drop(drop_idx)
+                # nur relevanten Bucket nehmen
+                candidates = buckets.get(key, [])
+                if not candidates:
+                    continue
 
-    # -----------------------------------------------
-    # 2) Personen-ID Dubletten
-    # -----------------------------------------------
-    suspect_ids = set()
+                best = process.extractOne(
+                    org_name,
+                    candidates,
+                    scorer=fuzz.partial_ratio
+                )
 
-    for f_id in (1216, 1708):
-        async for ids in stream_person_ids_by_filter(f_id):
-            suspect_ids.update(ids)
+                if best:
+                    match_name, score, _ = best
+                    # selbe Grenze wie vorher
+                    if score >= 95:
+                        removed.append(row)
+                        matched = True
+                        break
 
-    mask = df[col_pid].astype(str).isin(suspect_ids)
-    removed = df[mask]
+            if matched:
+                continue
 
-    for _, r in removed.iterrows():
-        delete_rows.append({
-            "reason": "person_id_match",
-            "Kontakt ID": r[col_pid],
-            "Name": f"{r.get('Person Vorname','')} {r.get('Person Nachname','')}".strip(),
-            "Organisation ID": r[col_orgid],
-            "Organisationsname": r[col_orgname],
-            "Grund": "Bereits in Filter 1216/1708"
-        })
+        # --------------------------------------------------------
+        # 3) sonst behalten
+        # --------------------------------------------------------
+        remaining.append(row)
 
-    df = df[~mask]
+    print(f"[REPORT] Entfernte durch Person-/Orga-Filter: {len(removed)}")
+    print(f"[REPORT] Final übrig: {len(remaining)}")
 
-    # -----------------------------------------------
-    # Speichern
-    # -----------------------------------------------
-    await save_df_text(df, t["ready"])
-    log_df = pd.DataFrame(delete_rows)
-    await save_df_text(log_df, t["log"])
+    df_ready = pd.DataFrame(remaining)
+    await save_df_text(df_ready, "nf_master_ready")
+
+    return True
+
 
 # =============================================================================
 # Excel-Export-Helfer – FINAL MODUL 3
