@@ -945,7 +945,20 @@ async def _reconcile(mode: str):
     # RECONCILE-LOOP
     # ---------------------------------------------------------------
     for idx, row in df.iterrows():
-        org_name = (row.get("Organisation Name") or "").strip()
+        #org_name = (row.get("Organisation Name") or "").strip()
+        org_name_raw = row.get("Organisation Name")
+
+        # Falls Liste → ersten Eintrag verwenden
+        if isinstance(org_name_raw, list):
+            org_name_raw = org_name_raw[0] if org_name_raw else ""
+
+        # Falls Dict → Name extrahieren
+        if isinstance(org_name_raw, dict):
+            org_name_raw = org_name_raw.get("name") or ""
+
+        # Alles zu sauberem String
+        org_name = str(org_name_raw or "").strip()
+
         p_id     = row.get("Person ID")
 
         # -----------------------------------------------------------
