@@ -749,21 +749,32 @@ async def _build_nf_master_final(
     for p in selected:
         pid = str(p.get("id") or "")
 
+        
         # --- Orga robust ---
-        org_name, org_id = "-", ""
-        org = p.get("organization") or p.get("org_id") or p.get("org_name")
+        org_raw = p.get("organization")
 
-        if isinstance(org, dict):
-            org_name = org.get("name") or search_org_fallback.get(pid, {}).get("org_name") or "-"
-            oid = org.get("id") if org.get("id") is not None else org.get("value")
-            if oid:
-                org_id = str(oid)
-        elif isinstance(org, (int, str)) and str(org).strip():
-            org_id = str(org)
-            org_name = search_org_fallback.get(pid, {}).get("org_name") or "-"
-        else:
-            org_id = str(search_org_fallback.get(pid, {}).get("org_id") or "")
-            org_name = search_org_fallback.get(pid, {}).get("org_name") or "-"
+        # Pipedrive liefert manchmal eine Liste (Search / include=organization_fields)
+        if isinstance(org_raw, list):
+            org_raw = org_raw[0] if org_raw else {}
+
+        # Wenn es kein dict ist → leeres dict
+        if not isinstance(org_raw, dict):
+            org_raw = {}
+
+        # Name & ID extrahieren (fallback auf Search-Daten)
+        org_name = (
+            org_raw.get("name")
+            or search_org_fallback.get(pid, {}).get("org_name")
+            or "-"
+        )
+
+        oid = (
+            org_raw.get("id")
+            or search_org_fallback.get(pid, {}).get("org_id")
+            or ""
+        )
+
+        org_id = str(oid) if oid else ""
 
         # --- Name ---
         first, last = split_name(p.get("first_name"), p.get("last_name"), p.get("name"))
