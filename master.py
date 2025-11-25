@@ -916,14 +916,28 @@ async def _reconcile(mode: str):
         return orgs
 
     async def load_person_filter(fid):
-        persons = []
-        async for chunk in stream_persons_by_filter(fid, page_limit=500):
-            for p in chunk:
-                pid = p.get("id")
-                if pid:
-                    persons.append(pid)
-        print(f"[PERSON-FILTER] {fid}: {len(persons)} IDs geladen")
-        return persons
+    persons = []
+    async for chunk in stream_persons_by_filter(fid, page_limit=500):
+        for p in chunk:
+
+            # ❗ Falls Pipedrive eine LISTE zurückgibt: ersten Wert nehmen
+            if isinstance(p, list):
+                if p:
+                    p = p[0]
+                else:
+                    continue
+
+            # ❗ Falls dennoch kein dict: überspringen
+            if not isinstance(p, dict):
+                continue
+
+            pid = p.get("id")
+            if pid:
+                persons.append(pid)
+
+    print(f"[PERSON-FILTER] {fid}: {len(persons)} IDs geladen")
+    return persons
+
 
     # Filter laden (KEIN SUCH-API-HAMMER!)
     org_filters = {
