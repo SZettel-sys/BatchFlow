@@ -878,7 +878,7 @@ async def _reconcile(mode: str):
     #raw = await load_df_text("nf_master_final")
     #df = pd.read_json(raw)
 
-   df = await load_df_text("nf_master_final")
+    df = await load_df_text("nf_master_final")
     if df is None or df.empty:
         print("[WARN] nf_master_final leer")
         return False
