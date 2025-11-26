@@ -1333,6 +1333,19 @@ async def run_nachfass_job(job: "Job", job_id: str):
         job.percent = 100
         job.done = True
         print(f"[ERROR] run_nachfass_job: {e}")
+    except Exception as e:
+        import traceback
+        job.error = f"{type(e).__name__}: {e}"
+        job.phase = "Fehler"
+
+        # Vollständigen Stacktrace ins Log
+        print("=========== TRACEBACK ===========")
+        traceback.print_exc()
+        print("=========== END TRACEBACK =======")
+
+        job.done = True
+        job.percent = 100
+
 
 
 # =============================================================================
