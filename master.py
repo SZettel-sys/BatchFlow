@@ -1327,12 +1327,7 @@ async def run_nachfass_job(job: "Job", job_id: str):
         job.percent = 100
         job.done = True
 
-    except Exception as e:
-        job.error = f"Fehler im Nachfass-Job: {e}"
-        job.phase = "Fehler"
-        job.percent = 100
-        job.done = True
-        print(f"[ERROR] run_nachfass_job: {e}")
+  
     except Exception as e:
         import traceback
         job.error = f"{type(e).__name__}: {e}"
