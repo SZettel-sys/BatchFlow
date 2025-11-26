@@ -888,6 +888,12 @@ async def _build_nf_master_final(
             "LinkedIn URL": cf(p, "25563b12f847a280346bba40deaf527af82038cc"),
         })
 
+   
+    # ALLE Werte nochmals deepen-sanitizen
+    for r in rows:
+        for k, v in r.items():
+            r[k] = sanitize(v)
+
     df = pd.DataFrame(rows).replace({None: ""})
 
     # =================================================================
