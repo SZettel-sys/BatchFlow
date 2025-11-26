@@ -392,22 +392,20 @@ def _pretty_reason(reason: str, extra: str = "") -> str:
 # =============================================================================
 async def stream_persons_by_batch_id(field_key: str, batch_ids: List[str]):
     """
-    Streamt Personen aus Pipedrive anhand des Batch-ID-Custom-Fields.
-    Pipedrive liefert seit Nov 2024 teilweise verschachtelte Listen in "items".
-    Diese Version ist vollständig robust gegenüber allen Strukturen.
+    Streamt Personen anhand eines Custom-Fields (Batch-ID).
+    Diese Version ist komplett robust gegenüber den neuen Pipedrive-API-Strukturen
+    (Listen, verschachtelte Listen, Dictionaries).
     """
 
     out = []
-
-    # Pipedrive-API liefert bei mehrseitigen Ergebnissen paginiert
     start = 0
     limit = 500
 
     while True:
 
-        url = f"https://api.pipedrive.com/v1/persons/search"
+        url = "https://api.pipedrive.com/v1/persons/search"
         params = {
-            "api_token": PIPEDRIVE_API_TOKEN,
+            "api_token": PD_API_TOKEN,          # <-- DEIN TOKEN
             "limit": limit,
             "start": start,
             "term": "",
@@ -420,78 +418,81 @@ async def stream_persons_by_batch_id(field_key: str, batch_ids: List[str]):
             r.raise_for_status()
             data = r.json()
 
-        # --- defensive extraction ---
-        items = []
-
+        # --------------------------------------------------
+        # defensive extraction of raw "items"
+        # --------------------------------------------------
         try:
             items_raw = data.get("data", {}).get("items", [])
         except Exception:
             items_raw = []
 
-        # ======================================================
-        #  ROBUSTER EXTRACTOR – verarbeitet alle Datenstrukturen
-        # ======================================================
-        def extract_items(obj):
+        items = []
+
+        # ==================================================
+        #  ROBUSTER REKURSIVER EXTRACTOR
+        # ==================================================
+        def extract(obj):
             """
-            Pipedrive liefert z.B.:
+            Pipedrive liefert seit Nov 2024 u. a.:
 
             - {"item": {...}}
-            - [{"item": {...}}, {"item": {...}}]
+            - [{"item": {...}}]
             - [[{"item": {...}}]]
+            - [ {"item": {...}}, [ {"item": {...}} ] ]
             - None
-            - leere Listen
-            """
 
+            Diese Funktion extrahiert ALLE item-Dicts sicher.
+            """
             if obj is None:
                 return
 
-            # Fall: Liste
+            # Liste → alle Elemente verarbeiten
             if isinstance(obj, list):
                 for e in obj:
-                    extract_items(e)
+                    extract(e)
                 return
 
-            # Fall: dict
+            # Dict → item extrahieren
             if isinstance(obj, dict):
-                if "item" in obj and isinstance(obj["item"], dict):
-                    items.append(obj["item"])
+                item = obj.get("item")
+                if isinstance(item, dict):
+                    items.append(item)
                 return
 
-            # Irrelevante Typen ignorieren
+            # alle anderen Typen ignorieren
             return
 
-        extract_items(items_raw)
+        extract(items_raw)
 
-        # ======================================================
-        #  FILTERN AUF DIE BATCH-ID
-        # ======================================================
+        # ==================================================
+        # normalizer für matching
+        # ==================================================
+        def normalize(v):
+            if v is None:
+                return ""
+            if isinstance(v, list):
+                return normalize(v[0]) if v else ""
+            if isinstance(v, dict):
+                return (
+                    normalize(v.get("value"))
+                    or normalize(v.get("label"))
+                    or normalize(v.get("name"))
+                    or normalize(v.get("id"))
+                    or ""
+                )
+            return str(v)
+
+        # ==================================================
+        #  FILTERUNG AUF DIE BATCH-ID
+        # ==================================================
         for p in items:
-            val_raw = p.get(field_key)
-
-            # Sanitizing für die korrekte Vergleichbarkeit
-            def sanitize(v):
-                if v is None:
-                    return ""
-                if isinstance(v, list):
-                    return sanitize(v[0]) if v else ""
-                if isinstance(v, dict):
-                    return (
-                        v.get("value")
-                        or v.get("label")
-                        or v.get("name")
-                        or v.get("id")
-                        or ""
-                    )
-                return str(v)
-
-            val = sanitize(val_raw)
-
+            val = normalize(p.get(field_key))
             if val in batch_ids:
                 out.append(p)
 
-        # ======================================================
-        #  Pagination
-        # ======================================================
+        # ==================================================
+        #  PAGINATION
+        # ==================================================
         more = data.get("data", {}).get("more_items_in_collection")
         next_start = data.get("data", {}).get("next_start")
 
