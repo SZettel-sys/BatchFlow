@@ -437,51 +437,61 @@ async def stream_organizations_by_filter(filter_id: int, page_limit: int = 500):
         start += len(data)
         await asyncio.sleep(0.1)
 
-
 async def stream_person_ids_by_filter(filter_id: int, page_limit: int = PAGE_LIMIT) -> AsyncGenerator[List[str], None]:
-    """Streamt nur Personen-IDs – robust gegen Pipedrive-Listenstrukturen."""
+    """
+    Streamt NUR echte Personen-IDs als Strings.
+    Entfernt alle Listen, Dicts, Nested Values.
+    Macht die gesamte Nachfass-Pipeline STABIL.
+    """
 
-    start = 0
-    while True:
-        url = append_token(
-            f"{PIPEDRIVE_API}/persons?filter_id={filter_id}&start={start}&limit={page_limit}&sort=id"
-        )
-        r = await http_client().get(url, headers=get_headers())
+    async with http_client() as client:
+        start = 0
 
-        if r.status_code != 200:
-            raise Exception(f"Pipedrive Fehler IDs {filter_id}: {r.text}")
+        while True:
+            url = append_token(
+                f"{PIPEDRIVE_API}/persons?filter_id={filter_id}&start={start}&limit={page_limit}&sort=id"
+            )
 
-        raw = r.json().get("data") or []
-        if not raw:
-            break
+            r = await client.get(url, headers=get_headers())
+            if r.status_code != 200:
+                raise Exception(
+                    f"Pipedrive Fehler (IDs für Filter {filter_id}): {r.text}"
+                )
 
-        ids: List[str] = []
+            data = r.json().get("data") or []
+            if not data:
+                break
 
-        # ------------------------------
-        # ROBUSTE EXTRAKTION (FIX)
-        # ------------------------------
-        def extract(obj):
-            """Extrahiert IDs aus dicts und Listen."""
-            if obj is None:
-                return
-            if isinstance(obj, dict):
-                _id = obj.get("id")
-                if _id:
-                    ids.append(str(_id))
-            elif isinstance(obj, list):
-                for sub in obj:
-                    extract(sub)
+            # SICHERER EXTRAKTOR
+            ids = []
+            for p in data:
+                v = p.get("id")
 
-        for entry in raw:
-            extract(entry)
+                # falls Liste, Dict oder Müll → extrahieren
+                if isinstance(v, list):
+                    if v:
+                        v = v[0]
 
-        if ids:
+                if isinstance(v, dict):
+                    v = (
+                        v.get("id")
+                        or v.get("value")
+                        or v.get("label")
+                        or v.get("name")
+                    )
+
+                if v is None:
+                    continue
+
+                ids.append(str(v))
+
             yield ids
 
-        if len(raw) < page_limit:
-            break
+            if len(data) < page_limit:
+                break
 
-        start += len(raw)
+            start += len(data)
+
 
 # =============================================================================
 # Organisationen – Bucketing + Kappung (Performanceoptimiert)
