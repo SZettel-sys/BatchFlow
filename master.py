@@ -1135,7 +1135,7 @@ async def _reconcile(prefix: str) -> None:
     await save_df_text(log_df, t["log"])
 
 
-async def run_nachfass_job(job: Job, job_id: str):
+async def run_nachfass_job(job: "Job", job_id: str):
     """
     Führt den kompletten Nachfass-Workflow aus:
     1) Personen nach Batch-IDs laden
