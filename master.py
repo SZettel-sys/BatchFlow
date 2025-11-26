@@ -289,14 +289,62 @@ def tables(prefix: str) -> dict:
     }
 
 
-async def load_df_text(table:str)->pd.DataFrame:
+async def load_df_text(table: str) -> pd.DataFrame:
+    """
+    Lädt eine TEXT-Tabelle und sanitizt ALLE Werte:
+    * JSON-Strings
+    * echte Listen
+    * echte Dicts
+    * None / NaN
+    * nested Strukturen
+    """
+    def sanitize_value(v):
+        if v is None:
+            return ""
+
+        # floats mit NaN
+        if isinstance(v, float) and pd.isna(v):
+            return ""
+
+        # Strings zuerst trimmen
+        if isinstance(v, str):
+            s = v.strip()
+            # JSON-Strings entschlüsseln
+            if (s.startswith("[") and s.endswith("]")) or (s.startswith("{") and s.endswith("}")):
+                try:
+                    return sanitize_value(json.loads(s))
+                except:
+                    return s
+            return s
+
+        # Dicts -> wichtigste Felder extrahieren
+        if isinstance(v, dict):
+            for k in ("value", "label", "name", "id"):
+                if k in v:
+                    return sanitize_value(v[k])
+            return ""
+
+        # Listen -> erstes Element
+        if isinstance(v, list):
+            if not v:
+                return ""
+            return sanitize_value(v[0])
+
+        # Rest -> String
+        return str(v)
+
     async with get_pool().acquire() as conn:
         rows = await conn.fetch(f'SELECT * FROM "{SCHEMA}"."{table}"')
-    if not rows: return pd.DataFrame()
-    cols=list(rows[0].keys())
-    return pd.DataFrame([{c:r[c] for c in cols} for r in rows]).replace({"":np.nan})
-# master_fixed_v2_part2.py — Teil 2/5
-# Pipedrive-Anbindung, Streaming und Nachfass-Datenaufbau (parallel, performant)
+        if not rows:
+            return pd.DataFrame()
+
+        cols = list(rows[0].keys())
+        clean_rows = []
+
+        for r in rows:
+            clean_rows.append({c: sanitize_value(r[c]) for c in cols})
+
+        return pd.DataFrame(clean_rows).replace({"": np.nan})
 
 # =============================================================================
 # PIPEDRIVE API-HELPERS
