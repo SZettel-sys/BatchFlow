@@ -198,21 +198,80 @@ async def clear_table(conn: asyncpg.Connection, table: str):
     await conn.execute(f'DROP TABLE IF EXISTS "{SCHEMA}"."{table}"')
 
 async def save_df_text(df: pd.DataFrame, table: str):
+    """
+    Speichert DataFrame absolut safe in die TEXT-Tabelle.
+    * Entfernt Listen, Dicts, Arrays
+    * Entfernt NaN / None
+    * Rest -> sauberer String
+    """
+    # --- Sicherer Sanitizer ---
+    def sanitize_value(v):
+        if v is None:
+            return ""
+
+        # floats mit NaN
+        if isinstance(v, float) and pd.isna(v):
+            return ""
+
+        # Strings normalisieren
+        if isinstance(v, str):
+            s = v.strip()
+            # JSON-Strings von Pipedrive entschärfen
+            if (s.startswith("[") and s.endswith("]")) or (s.startswith("{") and s.endswith("}")):
+                try:
+                    return sanitize_value(json.loads(s))
+                except:
+                    return s
+            return s
+
+        # Dicts => wichtigsten Wert extrahieren
+        if isinstance(v, dict):
+            for k in ("value", "label", "name", "id"):
+                if k in v:
+                    return sanitize_value(v[k])
+            # fallback
+            return ""
+
+        # Listen => erstes Element nehmen
+        if isinstance(v, list):
+            if not v:
+                return ""
+            return sanitize_value(v[0])
+
+        # Rest als String
+        return str(v)
+
+    # ------------------------------
+    # EMPTY
+    # ------------------------------
+    if df.empty:
+        return
+
     async with get_pool().acquire() as conn:
         await clear_table(conn, table)
         await ensure_table_text(conn, table, list(df.columns))
-        if df.empty: return
-        cols, cols_sql = list(df.columns), ", ".join(f'"{c}"' for c in df.columns)
-        ph = ", ".join(f'${i}' for i in range(1, len(cols)+1))
+
+        cols = list(df.columns)
+        cols_sql = ", ".join(f'"{c}"' for c in cols)
+        ph = ", ".join([f"${i}" for i in range(1, len(cols) + 1)])
+
         sql = f'INSERT INTO "{SCHEMA}"."{table}" ({cols_sql}) VALUES ({ph})'
-        batch=[]
+
+        batch = []
+
         async with conn.transaction():
             for _, row in df.iterrows():
-                vals = ["" if pd.isna(v) else str(v) for v in row.tolist()]
+                vals = [sanitize_value(v) for v in row.tolist()]
                 batch.append(vals)
-                if len(batch)>=1000:
-                    await conn.executemany(sql, batch); batch=[]
-            if batch: await conn.executemany(sql, batch)
+
+                # Flush
+                if len(batch) >= 1000:
+                    await conn.executemany(sql, batch)
+                    batch = []
+
+            if batch:
+                await conn.executemany(sql, batch)
+
 
 # =============================================================================
 # Tabellen-Namenszuordnung (einheitlich für Nachfass / Neukontakte)
