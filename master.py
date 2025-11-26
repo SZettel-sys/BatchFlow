@@ -627,9 +627,6 @@ async def stream_persons_by_filter(
             break
         start += len(data)
 
-# ============================================================
-# NACHFASS – MASTER FINAL (robust + Gender-Fix + BatchID-Fix)
-# ============================================================
 async def _build_nf_master_final(
     nf_batch_ids: List[str],
     batch_id: str,
@@ -638,7 +635,7 @@ async def _build_nf_master_final(
 ) -> pd.DataFrame:
 
     # ------------------------------------------------------------
-    # Personen-Felder
+    # Feld-Keys der Custom-Fields
     # ------------------------------------------------------------
     FIELD_BATCH_ID    = "5ac34dad3ea917fdef4087caebf77ba275f87eec"
     FIELD_PROSPECT_ID = "f9138f9040c44622808a4b8afda2b1b75ee5acd0"
@@ -647,16 +644,13 @@ async def _build_nf_master_final(
     FIELD_POSITION    = "4585e5de11068a3bccf02d8b93c126bcf5c257ff"
     FIELD_XING        = "44ebb6feae2a670059bc5261001443a2878a2b43"
     FIELD_LINKEDIN    = "25563b12f847a280346bba40deaf527af82038cc"
-
+      
     def cf(p, key):
         v = p.get(key)
 
-        # Pipedrive liefert manchmal Listen
-        if isinstance(v, list):
-            if len(v) > 0:
-                v = v[0]
-            else:
-                return ""
+        # Manche Felder kommen als Liste
+        if isinstance(v, list) and len(v) > 0:
+            v = v[0]
 
         if isinstance(v, dict):
             return v.get("label") or v.get("value") or ""
@@ -672,11 +666,10 @@ async def _build_nf_master_final(
 
     persons_search = await stream_persons_by_batch_id(FIELD_BATCH_ID, nf_batch_ids)
     ids = [str(p.get("id")) for p in persons_search if p.get("id")]
-
     persons = await fetch_person_details(ids)
 
     # ------------------------------------------------------------
-    # Datum-Filter
+    # Validierungen (Datum + max. 2 pro Orga)
     # ------------------------------------------------------------
     today = datetime.now().date()
 
@@ -695,45 +688,64 @@ async def _build_nf_master_final(
 
     selected = []
     org_counter = defaultdict(int)
+    count_org_limit = 0
+    count_date_invalid = 0
 
     for p in persons:
-        org = p.get("organization") or {}
-        oid = org.get("id")
 
+        # ------------------------------------------------------------
+        # ROBUSTER FIX – Das ist der entscheidende Teil!
+        # ------------------------------------------------------------
+        org = p.get("organization")
+
+        if isinstance(org, list):
+            org = org[0] if org else {}
+
+        if not isinstance(org, dict):
+            org = {}
+
+        org_id = org.get("id")
+
+        # ------------------------------------------------------------
+        # Datum prüfen
+        # ------------------------------------------------------------
         if not is_date_valid(p.get("next_activity_date")):
+            count_date_invalid += 1
             continue
 
-        if oid:
-            org_counter[oid] += 1
-            if org_counter[oid] > 2:
+        # ------------------------------------------------------------
+        # Maximal 2 pro Organisation
+        # ------------------------------------------------------------
+        if org_id:
+            org_counter[org_id] += 1
+            if org_counter[org_id] > 2:
+                count_org_limit += 1
                 continue
 
         selected.append(p)
 
     # ------------------------------------------------------------
-    # EXCEL-ROWS
+    # Export-Zeilen generieren
     # ------------------------------------------------------------
     rows = []
 
     for p in selected:
+
         pid = str(p.get("id") or "")
-        org = p.get("organization") or {}
 
-        # Normalisieren des Orga-Namens (HARTER FIX)
-        raw_org_name = org.get("name")
+        org = p.get("organization")
 
-        if isinstance(raw_org_name, list):
-            raw_org_name = raw_org_name[0] if raw_org_name else ""
+        # Wieder sicherstellen
+        if isinstance(org, list):
+            org = org[0] if org else {}
+        if not isinstance(org, dict):
+            org = {}
 
-        if isinstance(raw_org_name, dict):
-            raw_org_name = raw_org_name.get("value") or raw_org_name.get("label") or raw_org_name.get("name") or ""
+        org_name = org.get("name") or ""
 
-        org_name = str(raw_org_name or "").strip()
-
-        # Name
         first, last = split_name(p.get("first_name"), p.get("last_name"), p.get("name"))
 
-        # E-Mail
+        # Primäre E-Mail extrahieren
         email = ""
         em = p.get("email") or []
         if isinstance(em, list):
@@ -746,6 +758,7 @@ async def _build_nf_master_final(
             "Batch ID": batch_id,
             "Channel": DEFAULT_CHANNEL,
             "Cold-Mailing Import": campaign,
+
             "Person ID": pid,
             "Person Vorname": first,
             "Person Nachname": last,
@@ -753,14 +766,26 @@ async def _build_nf_master_final(
             "Person Geschlecht": cf(p, FIELD_GENDER),
             "Person Position": cf(p, FIELD_POSITION),
             "Person E-Mail": email,
+
             "Prospect ID": cf(p, FIELD_PROSPECT_ID),
+
+            # Sicher & kompatibel:
             "Organisation ID": str(org.get("id") or ""),
             "Organisation Name": org_name,
+
             "XING Profil": cf(p, FIELD_XING),
             "LinkedIn URL": cf(p, FIELD_LINKEDIN),
         })
 
     df = pd.DataFrame(rows).replace({None: ""})
+
+    # Ausschlüsse speichern
+    excluded = [
+        {"Grund": "Max 2 Kontakte pro Organisation", "Anzahl": count_org_limit},
+        {"Grund": "Datum nächste Aktivität steht an bzw. liegt in naher Vergangenheit", "Anzahl": count_date_invalid},
+    ]
+    ex = pd.DataFrame(excluded)
+    await save_df_text(ex, "nf_excluded")
 
     await save_df_text(df, "nf_master_final")
 
@@ -769,7 +794,6 @@ async def _build_nf_master_final(
         job_obj.percent = 80
 
     return df
-
 
 # =============================================================================
 # BASIS-ABGLEICH (Organisationen & IDs) – MODUL 4 FINAL
@@ -819,10 +843,9 @@ async def _fetch_org_names_for_filter_capped(
                     return buckets
 
     return buckets
-
-# ============================================================
-# NACHFASS – FINAL RECONCILE (schnell, stabil, ohne API-Calls)
-# ============================================================
+# =============================================================================
+# _reconcile_nf
+# =============================================================================
 async def _reconcile(prefix: str) -> None:
     t = tables(prefix)
     df = await load_df_text(t["final"])
@@ -834,15 +857,15 @@ async def _reconcile(prefix: str) -> None:
         ]), t["log"])
         return
 
-    col_pid     = "Person ID"
+    col_pid = "Person ID"
     col_orgname = "Organisation Name"
-    col_orgid   = "Organisation ID"
+    col_orgid = "Organisation ID"
 
-    drop_idx = []
     delete_rows = []
+    drop_idx = []
 
     # ------------------------------------------------------------
-    # ORGANISATIONEN LADEN
+    # Organisationsliste aus Pipedrive holen
     # ------------------------------------------------------------
     filter_ids_org = [1245, 851, 1521]
     buckets_all = {}
@@ -865,27 +888,37 @@ async def _reconcile(prefix: str) -> None:
                     total_collected += 1
 
     # ------------------------------------------------------------
-    # 1) Fuzzy-ORGA-Abgleich
+    # 1) Fuzzy – ORGA-Dubletten
     # ------------------------------------------------------------
     for idx, row in df.iterrows():
 
-        # HARTE NORMALISIERUNG (entscheidend!)
-        name_raw = row.get(col_orgname)
+        # ---------------------------------------------
+        # ROBUSTER FIX: Organisation Name bereinigen
+        # ---------------------------------------------
+        name_raw = row.get(col_orgname, "")
 
+        # Wenn als Liste gespeichert
         if isinstance(name_raw, list):
             name_raw = name_raw[0] if name_raw else ""
 
+        # Wenn als Dict gespeichert
         if isinstance(name_raw, dict):
-            name_raw = name_raw.get("value") or name_raw.get("label") or name_raw.get("name") or ""
+            name_raw = (
+                name_raw.get("value")
+                or name_raw.get("label")
+                or name_raw.get("name")
+                or ""
+            )
 
-        name = str(name_raw or "").strip()
-
+        # Jetzt sicher ein string
+        name = str(name_raw).strip()
         norm = normalize_name(name)
+
         if not norm:
             continue
 
-        bucket_key = norm[:2] if len(norm) >= 2 else norm
-        bucket = buckets_all.get(bucket_key)
+        b = bucket_key(norm)
+        bucket = buckets_all.get(b)
         if not bucket:
             continue
 
@@ -901,7 +934,7 @@ async def _reconcile(prefix: str) -> None:
                 "reason": "org_match_95",
                 "Kontakt ID": row[col_pid],
                 "Name": f"{row.get('Person Vorname','')} {row.get('Person Nachname','')}".strip(),
-                "Organisation ID": row[col_orgid],
+                "Organisation ID": row.get(col_orgid, ""),
                 "Organisationsname": name,
                 "Grund": f"Ähnlichkeit {best[1]}% mit '{best[0]}'"
             })
@@ -909,7 +942,7 @@ async def _reconcile(prefix: str) -> None:
     df = df.drop(drop_idx)
 
     # ------------------------------------------------------------
-    # 2) Personen-ID Duplikate
+    # 2) Personen-ID Dubletten (bereits kontaktiert)
     # ------------------------------------------------------------
     suspect_ids = set()
 
@@ -925,19 +958,20 @@ async def _reconcile(prefix: str) -> None:
             "reason": "person_id_match",
             "Kontakt ID": r[col_pid],
             "Name": f"{r.get('Person Vorname','')} {r.get('Person Nachname','')}".strip(),
-            "Organisation ID": r[col_orgid],
-            "Organisationsname": r[col_orgname],
+            "Organisation ID": r.get(col_orgid, ""),
+            "Organisationsname": r.get(col_orgname, ""),
             "Grund": "Bereits in Filter 1216/1708"
         })
 
     df = df[~mask]
 
     # ------------------------------------------------------------
-    # SPEICHERN
+    # SPEICHERN (ready + log)
     # ------------------------------------------------------------
     await save_df_text(df, t["ready"])
     log_df = pd.DataFrame(delete_rows)
     await save_df_text(log_df, t["log"])
+
 
 
 # =============================================================================
