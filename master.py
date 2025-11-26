@@ -695,33 +695,24 @@ async def _build_nf_master_final(
     job_obj=None
 ) -> pd.DataFrame:
 
-    # ============================================================
-    # Hilfsfunktionen
-    # ============================================================
-
+    # =================================================================
+    # Universal Sanitizer – wandelt ALLES in Strings ohne Ausnahmen
+    # =================================================================
     def sanitize(v):
-        """Konvertiert beliebige Pipedrive-Werte (list/dict/None/etc.) in Strings."""
+        """Konvertiert Pipedrive-Werte (list/dict/json/etc.) sicher zu Strings."""
         if v is None or (isinstance(v, float) and pd.isna(v)):
             return ""
 
-        # Strings mit JSON-Inhalt
         if isinstance(v, str):
-            v2 = v.strip()
-            if v2.startswith("[") and v2.endswith("]"):
+            s = v.strip()
+            # JSON-Strings decodieren
+            if (s.startswith("[") and s.endswith("]")) or (s.startswith("{") and s.endswith("}")):
                 try:
-                    parsed = json.loads(v2)
-                    return sanitize(parsed)
-                except:
-                    return v2
-            if v2.startswith("{") and v2.endswith("}"):
-                try:
-                    parsed = json.loads(v2)
-                    return sanitize(parsed)
-                except:
-                    return v2
-            return v2
+                    return sanitize(json.loads(s))
+                except Exception:
+                    return s
+            return s
 
-        # Dict → gängige Keys extrahieren
         if isinstance(v, dict):
             return (
                 sanitize(v.get("value"))
@@ -731,7 +722,6 @@ async def _build_nf_master_final(
                 or ""
             )
 
-        # Liste → nur erstes Element
         if isinstance(v, list):
             return sanitize(v[0]) if v else ""
 
@@ -740,23 +730,41 @@ async def _build_nf_master_final(
     def cf(p, key):
         return sanitize(p.get(key))
 
-    # ============================================================
-    # Personen laden (NEU: Filterbasiert)
-    # ============================================================
-
+    # =================================================================
+    # Personen laden
+    # =================================================================
     if job_obj:
         job_obj.phase = "Lade Nachfass-Kandidaten …"
         job_obj.percent = 10
 
     persons = await stream_persons_by_batch_id(
-        "5ac34dad3ea917fdef4087caebf77ba275f87eec",   # Batch-ID-Feld
+        "5ac34dad3ea917fdef4087caebf77ba275f87eec",   # Batch-ID-CF
         nf_batch_ids
     )
 
-    # ============================================================
-    # Filterregeln
-    # ============================================================
+    # =================================================================
+    # Personen bereinigen — **DER WICHTIGSTE FIX**
+    # =================================================================
+    clean_persons = []
+    for p in persons:
+        if isinstance(p, dict):
+            clean_persons.append(p)
+            continue
 
+        # Fall: Pipedrive liefert [ {person} ]
+        if isinstance(p, list) and p and isinstance(p[0], dict):
+            clean_persons.append(p[0])
+            continue
+
+        # Fall: unbrauchbares Objekt → ignorieren
+        print("WARNUNG: Ungültiger Personen-Datensatz erkannt:", p)
+
+    persons = clean_persons
+    print(f"[CLEANUP] Bereinigte Personen: {len(persons)} von {len(clean_persons)}")
+
+    # =================================================================
+    # Filterregeln (Datum + max 2 pro Organisation)
+    # =================================================================
     today = datetime.now().date()
 
     def is_date_valid(raw):
@@ -778,9 +786,12 @@ async def _build_nf_master_final(
     count_org_limit = 0
     count_date_invalid = 0
 
+    # =================================================================
+    # Personen filtern
+    # =================================================================
     for p in persons:
 
-        # ---------------- ORGANISATION sicher extrahieren ----------------
+        # ---------------- Organisation extrahieren ----------------
         org = p.get("organization")
 
         if isinstance(org, list):
@@ -791,12 +802,12 @@ async def _build_nf_master_final(
 
         org_id = sanitize(org.get("id"))
 
-        # ---------------- Datum prüfen ----------------
+        # ---------------- Datum ----------------
         if not is_date_valid(p.get("next_activity_date")):
             count_date_invalid += 1
             continue
 
-        # ---------------- Max. 2 pro Organisation ----------------
+        # ---------------- Max 2 pro Orga ----------------
         if org_id:
             org_counter[org_id] += 1
             if org_counter[org_id] > 2:
@@ -805,15 +816,13 @@ async def _build_nf_master_final(
 
         selected.append(p)
 
-    # ============================================================
-    # Export-Zeilen erzeugen
-    # ============================================================
-
+    # =================================================================
+    # Export vorbereiten
+    # =================================================================
     rows = []
 
     for p in selected:
 
-        # -------- PERSON --------
         pid = sanitize(p.get("id"))
         first = sanitize(p.get("first_name"))
         last = sanitize(p.get("last_name"))
@@ -824,7 +833,7 @@ async def _build_nf_master_final(
             first = " ".join(parts[:-1]) if len(parts) > 1 else parts[0]
             last = parts[-1] if len(parts) > 1 else ""
 
-        # -------- ORGANISATION --------
+        # -------- Organisation --------
         org = p.get("organization")
         if isinstance(org, list):
             org = org[0] if org else {}
@@ -834,7 +843,7 @@ async def _build_nf_master_final(
         org_id = sanitize(org.get("id"))
         org_name = sanitize(org.get("name"))
 
-        # -------- E-MAIL (verschachtelt flatten) --------
+        # -------- Email flatten --------
         email_field = p.get("email") or []
         emails_flat = []
 
@@ -856,7 +865,7 @@ async def _build_nf_master_final(
         if not email and emails_flat:
             email = sanitize(emails_flat[0].get("value"))
 
-        # -------- Exportzeile --------
+        # -------- Datensatz hinzufügen --------
         rows.append({
             "Batch ID": sanitize(batch_id),
             "Channel": DEFAULT_CHANNEL,
@@ -881,10 +890,9 @@ async def _build_nf_master_final(
 
     df = pd.DataFrame(rows).replace({None: ""})
 
-    # ============================================================
-    # Excluded speichern
-    # ============================================================
-
+    # =================================================================
+    # excluded speichern
+    # =================================================================
     excluded = [
         {"Grund": "Max 2 Kontakte pro Organisation", "Anzahl": count_org_limit},
         {"Grund": "Datum nächste Aktivität steht an bzw. liegt in naher Vergangenheit", "Anzahl": count_date_invalid},
