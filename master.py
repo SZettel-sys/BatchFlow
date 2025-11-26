@@ -1675,7 +1675,12 @@ async def neukontakte_summary(job_id: str = Query(...)):
 @app.get("/nachfass/summary", response_class=HTMLResponse)
 async def nachfass_summary(job_id: str = Query(...)):
     ready = await load_df_text("nf_master_ready")
+    # → sauber machen ALLER Felder in ALLEN Zellen:
+    for col in ready.columns:
+        ready[col] = ready[col].apply(normalize_cell)
+    print("DEBUG READY TYPES:\n", ready.applymap(type).head(20))
     log = await load_df_text("nf_delete_log")
+    print("DEBUG LOG TYPES:\n", log.applymap(type).head(20))
     total = len(ready)
     cnt_org = _count_reason(log, ["org_match_95"])
     cnt_pid = _count_reason(log, ["person_id_match"])
