@@ -16,7 +16,7 @@ from collections import defaultdict
 fuzz.default_processor = lambda s: s  # kein Vor-Preprocessing
 
 # -----------------------------------------------------------------------------
-# App-Grundkonfiguration allgemein
+# App-Grundkonfiguration allgemein (start)
 # -----------------------------------------------------------------------------
 app = FastAPI(title="BatchFlow")
 app.add_middleware(GZipMiddleware, minimum_size=1024)
