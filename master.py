@@ -1135,6 +1135,89 @@ async def _reconcile(prefix: str) -> None:
     await save_df_text(log_df, t["log"])
 
 
+async def run_nachfass_job(job: Job, job_id: str):
+    """
+    Führt den kompletten Nachfass-Workflow aus:
+    1) Personen nach Batch-IDs laden
+    2) Master erstellen
+    3) Abgleich durchführen
+    4) Excel-Datei erzeugen
+    5) Fortschritt aktualisieren
+    """
+
+    try:
+        # Eingaben aus dem Request holen
+        # (Die Request-Daten stehen im Job-Objekt → passe ich unten an)
+        nf_batch_ids = job.nf_batch_ids
+        batch_id     = job.batch_id
+        campaign     = job.campaign
+
+        # -----------------------------------------------------
+        # 1) Personen laden
+        # -----------------------------------------------------
+        job.phase = "Lade Nachfass-Kandidaten …"
+        job.percent = 10
+
+        persons = await stream_persons_by_batch_id(
+            "5ac34dad3ea917fdef4087caebf77ba275f87eec",
+            nf_batch_ids
+        )
+
+        # -----------------------------------------------------
+        # 2) Master erstellen
+        # -----------------------------------------------------
+        job.phase = "Erstelle Master …"
+        job.percent = 40
+
+        df = await _build_nf_master_final(
+            nf_batch_ids=nf_batch_ids,
+            batch_id=batch_id,
+            campaign=campaign,
+            job_obj=job
+        )
+
+        # -----------------------------------------------------
+        # 3) Abgleich
+        # -----------------------------------------------------
+        job.phase = "Führe Abgleich durch …"
+        job.percent = 70
+
+        await _reconcile("nf")
+
+        # -----------------------------------------------------
+        # 4) Excel erzeugen (aus nf_master_ready)
+        # -----------------------------------------------------
+        job.phase = "Erzeuge Excel-Datei …"
+        job.percent = 90
+
+        ready = await load_df_text("nf_master_ready")
+        export_df = build_nf_export(ready)
+        data = _df_to_excel_bytes_nf(export_df)
+
+        # Temporäre Datei schreiben
+        file_path = f"/tmp/nachfass_{job_id}.xlsx"
+        with open(file_path, "wb") as f:
+            f.write(data)
+
+        job.path = file_path
+        job.total_rows = len(export_df)
+        job.filename_base = campaign or "Nachfass_Export"
+
+        # -----------------------------------------------------
+        # Job finalisieren
+        # -----------------------------------------------------
+        job.phase = f"Fertig – {job.total_rows} Zeilen"
+        job.percent = 100
+        job.done = True
+
+    except Exception as e:
+        job.error = f"Fehler im Nachfass-Job: {e}"
+        job.phase = "Fehler"
+        job.percent = 100
+        job.done = True
+        print(f"[ERROR] run_nachfass_job: {e}")
+
+
 # =============================================================================
 # Excel-Export-Helfer – FINAL MODUL 3
 # =============================================================================
@@ -2010,33 +2093,34 @@ async def nachfass_summary(job_id: str = Query(...)):
 # =============================================================================
 # MODUL 6 – FINALER JOB-/WORKFLOW FÜR NACHFASS (EXPORT/PROGRESS/DOWNLOAD)
 # =============================================================================
-from uuid import uuid4   # <--- WICHTIG
+from uuid import uuid4
+
 @app.post("/nachfass/export_start")
-async def nachfass_export_start(request: Request):
-    """
-    Startet den Nachfass-Export-Job.
-    Diese Version setzt alle Job-Felder vollständig zurück,
-    damit alte Fehlermeldungen NICHT erneut angezeigt werden.
-    """
+async def nachfass_export_start(req: Request):
+    body = await req.json()
+
+    nf_batch_ids = body.get("nf_batch_ids") or []
+    batch_id     = body.get("batch_id") or ""
+    campaign     = body.get("campaign") or ""
 
     job_id = str(uuid4())
-
-    # neuen Job anlegen
     job = Job()
     JOBS[job_id] = job
 
-    # ---------------------------
-    # WICHTIGER RESET (Fix)
-    # ---------------------------
-    job.error = None          # alte Fehler löschen
-    job.done = False          # Job ist neu – also nicht fertig
-    job.percent = 0           # Fortschritt zurücksetzen
-    job.phase = "Starte …"    # Startphase definieren
+    # Job-Inputs speichern
+    job.nf_batch_ids = nf_batch_ids
+    job.batch_id     = batch_id
+    job.campaign     = campaign
 
-    # Job im Hintergrund starten
+    # Reset
+    job.error = None
+    job.done = False
+    job.percent = 0
+    job.phase = "Starte …"
+
+    # Hintergrundprozess starten
     asyncio.create_task(run_nachfass_job(job, job_id))
 
-    # Job-ID zurück an das Frontend
     return {"job_id": job_id}
 
 
