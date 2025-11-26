@@ -2010,6 +2010,7 @@ async def nachfass_summary(job_id: str = Query(...)):
 # =============================================================================
 # MODUL 6 – FINALER JOB-/WORKFLOW FÜR NACHFASS (EXPORT/PROGRESS/DOWNLOAD)
 # =============================================================================
+from uuid import uuid4   # <--- WICHTIG
 @app.post("/nachfass/export_start")
 async def nachfass_export_start(request: Request):
     """
