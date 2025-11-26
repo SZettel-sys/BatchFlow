@@ -2011,62 +2011,32 @@ async def nachfass_summary(job_id: str = Query(...)):
 # MODUL 6 – FINALER JOB-/WORKFLOW FÜR NACHFASS (EXPORT/PROGRESS/DOWNLOAD)
 # =============================================================================
 @app.post("/nachfass/export_start")
-async def export_start_nf(request: Request):
-    try:
-        data = await request.json()
-        nf_batch_ids = data.get("nf_batch_ids") or []
-        batch_id     = data.get("batch_id") or ""
-        campaign     = data.get("campaign") or ""
+async def nachfass_export_start(request: Request):
+    """
+    Startet den Nachfass-Export-Job.
+    Diese Version setzt alle Job-Felder vollständig zurück,
+    damit alte Fehlermeldungen NICHT erneut angezeigt werden.
+    """
 
-        job_id = str(uuid.uuid4())
-        job = Job()
-        JOBS[job_id] = job
+    job_id = str(uuid4())
 
-        job.filename_base = slugify_filename(campaign or f"Nachfass_{batch_id}")
-        job.phase = "Starte Nachfass-Export …"
-        job.percent = 0
+    # neuen Job anlegen
+    job = Job()
+    JOBS[job_id] = job
 
-        async def run():
-            try:
-                job.phase = "Lade Nachfass-Daten …"
-                job.percent = 10
+    # ---------------------------
+    # WICHTIGER RESET (Fix)
+    # ---------------------------
+    job.error = None          # alte Fehler löschen
+    job.done = False          # Job ist neu – also nicht fertig
+    job.percent = 0           # Fortschritt zurücksetzen
+    job.phase = "Starte …"    # Startphase definieren
 
-                df = await _build_nf_master_final(nf_batch_ids, batch_id, campaign, job_obj=job)
+    # Job im Hintergrund starten
+    asyncio.create_task(run_nachfass_job(job, job_id))
 
-                job.phase = "Führe Abgleich durch …"
-                job.percent = 60
-                await _reconcile("nf")
-
-                job.phase = "Erzeuge Excel-Datei …"
-                job.percent = 85
-
-                ready = await load_df_text("nf_master_ready")
-                export_df = build_nf_export(ready)
-                excel_bytes = _df_to_excel_bytes(export_df)
-
-                file_path = f"/tmp/{job.filename_base}.xlsx"
-                with open(file_path, "wb") as f:
-                    f.write(excel_bytes)
-
-                job.path = file_path
-                job.total_rows = len(export_df)
-                job.phase = f"Fertig – {job.total_rows} Zeilen"
-                job.percent = 100
-                job.done = True
-
-            except Exception as e:
-                job.error = str(e)
-                job.phase = "Fehler"
-                job.percent = 100
-                job.done = True
-
-        asyncio.create_task(run())
-        return {"job_id": job_id}
-
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
-
-
+    # Job-ID zurück an das Frontend
+    return {"job_id": job_id}
 
 
 # =============================================================================
