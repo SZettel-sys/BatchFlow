@@ -627,6 +627,9 @@ async def stream_persons_by_filter(
             break
         start += len(data)
 
+# -----------------------------------------------------------------------------
+# build_nf_master
+# -----------------------------------------------------------------------------
 async def _build_nf_master_final(
     nf_batch_ids: List[str],
     batch_id: str,
@@ -634,50 +637,83 @@ async def _build_nf_master_final(
     job_obj=None
 ) -> pd.DataFrame:
 
-    # ------------------------------------------------------------
-    # Feld-Keys der Custom-Fields
-    # ------------------------------------------------------------
-    FIELD_BATCH_ID    = "5ac34dad3ea917fdef4087caebf77ba275f87eec"
-    FIELD_PROSPECT_ID = "f9138f9040c44622808a4b8afda2b1b75ee5acd0"
-    FIELD_GENDER      = "c4f5f434cdb0cfce3f6d62ec7291188fe968ac72"
-    FIELD_TITLE       = "0343bc43a91159aaf33a463ca603dc5662422ea5"
-    FIELD_POSITION    = "4585e5de11068a3bccf02d8b93c126bcf5c257ff"
-    FIELD_XING        = "44ebb6feae2a670059bc5261001443a2878a2b43"
-    FIELD_LINKEDIN    = "25563b12f847a280346bba40deaf527af82038cc"
-      
-    def cf(p, key):
-        v = p.get(key)
+    # ============================================================
+    # Universelle Wert-Sanitizer – macht ALLES zu einem sicheren String
+    # ============================================================
+    def sanitize(v):
+        """Konvertiert beliebige Pipedrive-Werte (list/dict/etc.) in Strings."""
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return ""
 
-        # Manche Felder kommen als Liste
-        if isinstance(v, list) and len(v) > 0:
-            v = v[0]
+        # Wenn es ein String ist, aber JSON enthält
+        if isinstance(v, str):
+            v2 = v.strip()
+            # Beispiel: "['123']"
+            if v2.startswith("[") and v2.endswith("]"):
+                try:
+                    parsed = json.loads(v2)
+                    return sanitize(parsed)
+                except:
+                    return v2
+            # Beispiel: {"value": "123"}
+            if v2.startswith("{") and v2.endswith("}"):
+                try:
+                    parsed = json.loads(v2)
+                    return sanitize(parsed)
+                except:
+                    return v2
+            return v2
 
+        # dict
         if isinstance(v, dict):
-            return v.get("label") or v.get("value") or ""
+            return (
+                sanitize(v.get("value"))
+                or sanitize(v.get("label"))
+                or sanitize(v.get("name"))
+                or sanitize(v.get("id"))
+                or ""
+            )
 
-        return v or ""
+        # list
+        if isinstance(v, list):
+            if not v:
+                return ""
+            return sanitize(v[0])
 
-    # ------------------------------------------------------------
+        return str(v)
+
+    # ============================================================
+    # Custom-Field-Extractor → komplett safe
+    # ============================================================
+    def cf(p, key):
+        return sanitize(p.get(key))
+
+    # ============================================================
     # Personen laden
-    # ------------------------------------------------------------
+    # ============================================================
     if job_obj:
         job_obj.phase = "Lade Nachfass-Kandidaten …"
         job_obj.percent = 10
 
-    persons_search = await stream_persons_by_batch_id(FIELD_BATCH_ID, nf_batch_ids)
+    persons_search = await stream_persons_by_batch_id(
+        "5ac34dad3ea917fdef4087caebf77ba275f87eec",  # Batch-ID-Feld
+        nf_batch_ids
+    )
+
     ids = [str(p.get("id")) for p in persons_search if p.get("id")]
     persons = await fetch_person_details(ids)
 
-    # ------------------------------------------------------------
-    # Validierungen (Datum + max. 2 pro Orga)
-    # ------------------------------------------------------------
+    # ============================================================
+    # Filterregeln (Datum + max. 2 pro Organisation)
+    # ============================================================
     today = datetime.now().date()
 
     def is_date_valid(raw):
+        raw = sanitize(raw)
         if not raw:
             return True
         try:
-            dt = datetime.fromisoformat(raw.split(" ")[0]).date()
+            dt = datetime.fromisoformat(raw[:10]).date()
         except:
             return True
         if dt > today:
@@ -692,10 +728,9 @@ async def _build_nf_master_final(
     count_date_invalid = 0
 
     for p in persons:
-
-        # ------------------------------------------------------------
-        # ROBUSTER FIX – Das ist der entscheidende Teil!
-        # ------------------------------------------------------------
+        # ============================================================
+        # Organisation sicher extrahieren
+        # ============================================================
         org = p.get("organization")
 
         if isinstance(org, list):
@@ -704,18 +739,14 @@ async def _build_nf_master_final(
         if not isinstance(org, dict):
             org = {}
 
-        org_id = org.get("id")
+        org_id = sanitize(org.get("id"))
 
-        # ------------------------------------------------------------
-        # Datum prüfen
-        # ------------------------------------------------------------
+        # ---------------- Datum ----------------
         if not is_date_valid(p.get("next_activity_date")):
             count_date_invalid += 1
             continue
 
-        # ------------------------------------------------------------
-        # Maximal 2 pro Organisation
-        # ------------------------------------------------------------
+        # ---------------- Max 2 pro Organisation ----------------
         if org_id:
             org_counter[org_id] += 1
             if org_counter[org_id] > 2:
@@ -724,68 +755,90 @@ async def _build_nf_master_final(
 
         selected.append(p)
 
-    # ------------------------------------------------------------
-    # Export-Zeilen generieren
-    # ------------------------------------------------------------
+    # ============================================================
+    # Exportlisten bauen
+    # ============================================================
     rows = []
 
     for p in selected:
+        pid = sanitize(p.get("id"))
 
-        pid = str(p.get("id") or "")
-
+        # -------- ORGANISATION --------
         org = p.get("organization")
-
-        # Wieder sicherstellen
         if isinstance(org, list):
             org = org[0] if org else {}
         if not isinstance(org, dict):
             org = {}
 
-        org_name = org.get("name") or ""
+        org_id = sanitize(org.get("id"))
+        org_name = sanitize(org.get("name"))
 
-        first, last = split_name(p.get("first_name"), p.get("last_name"), p.get("name"))
+        # -------- NAME --------
+        first = sanitize(p.get("first_name"))
+        last = sanitize(p.get("last_name"))
+        fullname = sanitize(p.get("name"))
 
-        # Primäre E-Mail extrahieren
+        if not first and not last and fullname:
+            parts = fullname.split()
+            first = " ".join(parts[:-1]) if len(parts) > 1 else parts[0]
+            last = parts[-1] if len(parts) > 1 else ""
+
+        # -------- EMAIL (mit flatten) --------
+        email_field = p.get("email") or []
+        emails_flat = []
+
+        def flatten_email(x):
+            if isinstance(x, dict):
+                emails_flat.append(x)
+            elif isinstance(x, list):
+                for i in x:
+                    flatten_email(i)
+
+        flatten_email(email_field)
+
         email = ""
-        em = p.get("email") or []
-        if isinstance(em, list):
-            for e in em:
-                if isinstance(e, dict) and e.get("primary"):
-                    email = e.get("value") or ""
-                    break
+        for e in emails_flat:
+            if e.get("primary"):
+                email = sanitize(e.get("value"))
+                break
 
+        # Fallback – falls kein "primary" existiert
+        if not email and emails_flat:
+            email = sanitize(emails_flat[0].get("value"))
+
+        # -------- Exportzeile --------
         rows.append({
-            "Batch ID": batch_id,
+            "Batch ID": sanitize(batch_id),
             "Channel": DEFAULT_CHANNEL,
-            "Cold-Mailing Import": campaign,
+            "Cold-Mailing Import": sanitize(campaign),
 
             "Person ID": pid,
             "Person Vorname": first,
             "Person Nachname": last,
-            "Person Titel": cf(p, FIELD_TITLE),
-            "Person Geschlecht": cf(p, FIELD_GENDER),
-            "Person Position": cf(p, FIELD_POSITION),
+            "Person Titel": cf(p, "0343bc43a91159aaf33a463ca603dc5662422ea5"),
+            "Person Geschlecht": cf(p, "c4f5f434cdb0cfce3f6d62ec7291188fe968ac72"),
+            "Person Position": cf(p, "4585e5de11068a3bccf02d8b93c126bcf5c257ff"),
             "Person E-Mail": email,
 
-            "Prospect ID": cf(p, FIELD_PROSPECT_ID),
+            "Prospect ID": cf(p, "f9138f9040c44622808a4b8afda2b1b75ee5acd0"),
 
-            # Sicher & kompatibel:
-            "Organisation ID": str(org.get("id") or ""),
+            "Organisation ID": org_id,
             "Organisation Name": org_name,
 
-            "XING Profil": cf(p, FIELD_XING),
-            "LinkedIn URL": cf(p, FIELD_LINKEDIN),
+            "XING Profil": cf(p, "44ebb6feae2a670059bc5261001443a2878a2b43"),
+            "LinkedIn URL": cf(p, "25563b12f847a280346bba40deaf527af82038cc"),
         })
 
     df = pd.DataFrame(rows).replace({None: ""})
 
+    # ============================================================
     # Ausschlüsse speichern
+    # ============================================================
     excluded = [
         {"Grund": "Max 2 Kontakte pro Organisation", "Anzahl": count_org_limit},
         {"Grund": "Datum nächste Aktivität steht an bzw. liegt in naher Vergangenheit", "Anzahl": count_date_invalid},
     ]
-    ex = pd.DataFrame(excluded)
-    await save_df_text(ex, "nf_excluded")
+    await save_df_text(pd.DataFrame(excluded), "nf_excluded")
 
     await save_df_text(df, "nf_master_final")
 
@@ -794,6 +847,7 @@ async def _build_nf_master_final(
         job_obj.percent = 80
 
     return df
+
 
 # =============================================================================
 # BASIS-ABGLEICH (Organisationen & IDs) – MODUL 4 FINAL
