@@ -2071,12 +2071,20 @@ async def nachfass_export_progress(job_id: str):
     job = JOBS.get(job_id)
     if not job:
         return JSONResponse({"error": "Job nicht gefunden"}, status_code=404)
-    return {
-        "phase": job.phase,
-        "percent": job.percent,
-        "done": job.done,
-        "error": job.error
-    }
+
+    print("==== JOB.PROGRESS DEBUG ====")
+    print("phase:", job.phase, type(job.phase))
+    print("percent:", job.percent, type(job.percent))
+    print("done:", job.done, type(job.done))
+    print("error:", job.error, type(job.error))
+    print("================================")
+
+    return JSONResponse({
+        "phase": str(job.phase),
+        "percent": int(job.percent),
+        "done": bool(job.done),
+        "error": str(job.error) if job.error else None
+    })
 
 # =============================================================================
 # Download
