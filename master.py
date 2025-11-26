@@ -847,14 +847,23 @@ async def _fetch_org_names_for_filter_capped(
 # _reconcile_nf
 # =============================================================================
 async def _reconcile(prefix: str) -> None:
+    """
+    Endgültiges Reconcile – mit absolut robuster Normalisierung aller Felder.
+    Verhindert zuverlässig Fehler wie: 'list' object has no attribute 'get'.
+    """
+
     t = tables(prefix)
     df = await load_df_text(t["final"])
 
     if df.empty:
         await save_df_text(pd.DataFrame(), t["ready"])
-        await save_df_text(pd.DataFrame(columns=[
-            "reason","Kontakt ID","Name","Organisation ID","Organisationsname","Grund"
-        ]), t["log"])
+        await save_df_text(
+            pd.DataFrame(columns=[
+                "reason", "Kontakt ID", "Name",
+                "Organisation ID", "Organisationsname", "Grund"
+            ]),
+            t["log"]
+        )
         return
 
     col_pid = "Person ID"
@@ -864,9 +873,70 @@ async def _reconcile(prefix: str) -> None:
     delete_rows = []
     drop_idx = []
 
-    # ------------------------------------------------------------
-    # Organisationsliste aus Pipedrive holen
-    # ------------------------------------------------------------
+    # ----------------------------------------------------------------------
+    # Hilfsfunktion: robustes Bereinigen von OrgName & OrgID aus DB-Werten
+    # ----------------------------------------------------------------------
+    def normalize_cell(value):
+        """Konvertiert Listen, Dicts, NaN, JSON-Strings → zu reinem String."""
+        if value is None or (isinstance(value, float) and pd.isna(value)):
+            return ""
+
+        # Wenn bereits string, aber LISTENFORM als String gespeichert
+        if isinstance(value, str):
+            v = value.strip()
+            # z. B. "['123']"
+            if v.startswith("[") and v.endswith("]"):
+                try:
+                    parsed = json.loads(v)
+                    if isinstance(parsed, list):
+                        return str(parsed[0]) if parsed else ""
+                except:
+                    pass
+            # z. B. {"value": "123"}
+            if v.startswith("{") and v.endswith("}"):
+                try:
+                    parsed = json.loads(v)
+                    if isinstance(parsed, dict):
+                        return (
+                            parsed.get("value")
+                            or parsed.get("label")
+                            or parsed.get("id")
+                            or ""
+                        )
+                except:
+                    pass
+            return v  # normaler String
+
+        # klassische Liste
+        if isinstance(value, list):
+            if not value:
+                return ""
+            first = value[0]
+            if isinstance(first, dict):
+                return (
+                    first.get("value")
+                    or first.get("label")
+                    or first.get("name")
+                    or first.get("id")
+                    or ""
+                )
+            return str(first)
+
+        # klassische Dict
+        if isinstance(value, dict):
+            return (
+                value.get("value")
+                or value.get("label")
+                or value.get("name")
+                or value.get("id")
+                or ""
+            )
+
+        return str(value)
+
+    # ----------------------------------------------------------------------
+    # 1) Organisations-Fuzzy-Abgleich
+    # ----------------------------------------------------------------------
     filter_ids_org = [1245, 851, 1521]
     buckets_all = {}
     total_collected = 0
@@ -887,32 +957,12 @@ async def _reconcile(prefix: str) -> None:
                     b.append(v)
                     total_collected += 1
 
-    # ------------------------------------------------------------
-    # 1) Fuzzy – ORGA-Dubletten
-    # ------------------------------------------------------------
     for idx, row in df.iterrows():
 
-        # ---------------------------------------------
-        # ROBUSTER FIX: Organisation Name bereinigen
-        # ---------------------------------------------
+        # ROBUSTER FIX: Organisation Name sicher extrahieren
         name_raw = row.get(col_orgname, "")
-
-        # Wenn als Liste gespeichert
-        if isinstance(name_raw, list):
-            name_raw = name_raw[0] if name_raw else ""
-
-        # Wenn als Dict gespeichert
-        if isinstance(name_raw, dict):
-            name_raw = (
-                name_raw.get("value")
-                or name_raw.get("label")
-                or name_raw.get("name")
-                or ""
-            )
-
-        # Jetzt sicher ein string
-        name = str(name_raw).strip()
-        norm = normalize_name(name)
+        name_clean = normalize_cell(name_raw)
+        norm = normalize_name(name_clean)
 
         if not norm:
             continue
@@ -930,20 +980,25 @@ async def _reconcile(prefix: str) -> None:
 
         if best and best[1] >= 95:
             drop_idx.append(idx)
+
+            # Normierung Regeln anwenden auf OrgID
+            orgid_raw = row.get(col_orgid, "")
+            orgid_clean = normalize_cell(orgid_raw)
+
             delete_rows.append({
                 "reason": "org_match_95",
-                "Kontakt ID": row[col_pid],
+                "Kontakt ID": row.get(col_pid, ""),
                 "Name": f"{row.get('Person Vorname','')} {row.get('Person Nachname','')}".strip(),
-                "Organisation ID": row.get(col_orgid, ""),
-                "Organisationsname": name,
+                "Organisation ID": orgid_clean,
+                "Organisationsname": name_clean,
                 "Grund": f"Ähnlichkeit {best[1]}% mit '{best[0]}'"
             })
 
     df = df.drop(drop_idx)
 
-    # ------------------------------------------------------------
-    # 2) Personen-ID Dubletten (bereits kontaktiert)
-    # ------------------------------------------------------------
+    # ----------------------------------------------------------------------
+    # 2) Personen-ID Dubletten
+    # ----------------------------------------------------------------------
     suspect_ids = set()
 
     for f_id in (1216, 1708):
@@ -954,22 +1009,26 @@ async def _reconcile(prefix: str) -> None:
     removed = df[mask]
 
     for _, r in removed.iterrows():
+
+        orgid_clean = normalize_cell(r.get(col_orgid, ""))
+        orgname_clean = normalize_cell(r.get(col_orgname, ""))
+
         delete_rows.append({
             "reason": "person_id_match",
-            "Kontakt ID": r[col_pid],
+            "Kontakt ID": r.get(col_pid, ""),
             "Name": f"{r.get('Person Vorname','')} {r.get('Person Nachname','')}".strip(),
-            "Organisation ID": r.get(col_orgid, ""),
-            "Organisationsname": r.get(col_orgname, ""),
+            "Organisation ID": orgid_clean,
+            "Organisationsname": orgname_clean,
             "Grund": "Bereits in Filter 1216/1708"
         })
 
     df = df[~mask]
 
-    # ------------------------------------------------------------
-    # SPEICHERN (ready + log)
-    # ------------------------------------------------------------
+    # ----------------------------------------------------------------------
+    # SPEICHERN
+    # ----------------------------------------------------------------------
     await save_df_text(df, t["ready"])
-    log_df = pd.DataFrame(delete_rows)
+    log_df = pd.DataFrame(delete_rows).replace({None: ""})
     await save_df_text(log_df, t["log"])
 
 
