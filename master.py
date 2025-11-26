@@ -390,51 +390,117 @@ def _pretty_reason(reason: str, extra: str = "") -> str:
 # =============================================================================
 # Nachfass – Personen laden nach Batch-ID (mit Paging & Fortschritt)
 # =============================================================================
-async def stream_persons_by_batch_id(
-    batch_key: str,
-    batch_ids: List[str],
-    page_limit: int = 100,
-    job_obj=None
-) -> List[dict]:
-    results: List[dict] = []
-    sem = asyncio.Semaphore(6)  # gedrosselt, um 429 zu vermeiden
+async def stream_persons_by_batch_id(field_key: str, batch_ids: List[str]):
+    """
+    Streamt Personen aus Pipedrive anhand des Batch-ID-Custom-Fields.
+    Pipedrive liefert seit Nov 2024 teilweise verschachtelte Listen in "items".
+    Diese Version ist vollständig robust gegenüber allen Strukturen.
+    """
 
-    async def fetch_one(bid: str):
-        start = 0
-        total = 0
-        local = []
-        async with sem:
-            while True:
-                url = append_token(
-                    f"{PIPEDRIVE_API}/persons/search?term={bid}&fields=custom_fields&start={start}&limit={page_limit}"
-                )
-                r = await http_client().get(url, headers=get_headers())
-                if r.status_code == 429:
-                    print(f"[WARN] Rate limit erreicht, warte 2 Sekunden ...")
-                    await asyncio.sleep(2)
-                    continue
-                if r.status_code != 200:
-                    print(f"[WARN] Batch {bid} Fehler: {r.text}")
-                    break
-                data = r.json().get("data", {}).get("items", [])
-                if not data:
-                    break
+    out = []
 
-                persons = [it.get("item") for it in data if it.get("item")]
-                local.extend(persons)
-                total += len(persons)
-                start += len(persons)
+    # Pipedrive-API liefert bei mehrseitigen Ergebnissen paginiert
+    start = 0
+    limit = 500
 
-                if len(persons) < page_limit:
-                    break
-                await asyncio.sleep(0.1)  # minimale Pause zwischen Seiten
+    while True:
 
-        print(f"[DEBUG] Batch {bid}: {total} Personen geladen")
-        results.extend(local)
+        url = f"https://api.pipedrive.com/v1/persons/search"
+        params = {
+            "api_token": PIPEDRIVE_API_TOKEN,
+            "limit": limit,
+            "start": start,
+            "term": "",
+            "fields": field_key,
+            "exact_match": False
+        }
 
-    await asyncio.gather(*[fetch_one(bid) for bid in batch_ids])
-    print(f"[INFO] Alle Batch-IDs geladen: {len(results)} Personen gesamt")
-    return results
+        async with httpx.AsyncClient() as client:
+            r = await client.get(url, params=params)
+            r.raise_for_status()
+            data = r.json()
+
+        # --- defensive extraction ---
+        items = []
+
+        try:
+            items_raw = data.get("data", {}).get("items", [])
+        except Exception:
+            items_raw = []
+
+        # ======================================================
+        #  ROBUSTER EXTRACTOR – verarbeitet alle Datenstrukturen
+        # ======================================================
+        def extract_items(obj):
+            """
+            Pipedrive liefert z.B.:
+
+            - {"item": {...}}
+            - [{"item": {...}}, {"item": {...}}]
+            - [[{"item": {...}}]]
+            - None
+            - leere Listen
+            """
+
+            if obj is None:
+                return
+
+            # Fall: Liste
+            if isinstance(obj, list):
+                for e in obj:
+                    extract_items(e)
+                return
+
+            # Fall: dict
+            if isinstance(obj, dict):
+                if "item" in obj and isinstance(obj["item"], dict):
+                    items.append(obj["item"])
+                return
+
+            # Irrelevante Typen ignorieren
+            return
+
+        extract_items(items_raw)
+
+        # ======================================================
+        #  FILTERN AUF DIE BATCH-ID
+        # ======================================================
+        for p in items:
+            val_raw = p.get(field_key)
+
+            # Sanitizing für die korrekte Vergleichbarkeit
+            def sanitize(v):
+                if v is None:
+                    return ""
+                if isinstance(v, list):
+                    return sanitize(v[0]) if v else ""
+                if isinstance(v, dict):
+                    return (
+                        v.get("value")
+                        or v.get("label")
+                        or v.get("name")
+                        or v.get("id")
+                        or ""
+                    )
+                return str(v)
+
+            val = sanitize(val_raw)
+
+            if val in batch_ids:
+                out.append(p)
+
+        # ======================================================
+        #  Pagination
+        # ======================================================
+        more = data.get("data", {}).get("more_items_in_collection")
+        next_start = data.get("data", {}).get("next_start")
+
+        if not more or next_start is None:
+            break
+
+        start = next_start
+
+    return out
 
 
 # =============================================================================
