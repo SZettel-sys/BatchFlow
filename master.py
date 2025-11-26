@@ -400,49 +400,30 @@ async def get_person_field_by_hint(label_hint: str) -> Optional[dict]:
 # =============================================================================
 # STREAMING-FUNKTIONEN (mit Paging)
 # =============================================================================
-async def stream_organizations_by_filter(filter_id: int, page_limit: int = PAGE_LIMIT):
-    """Liefert Organisationen aus einem Filter – robust gegen Pipedrive-Fehler."""
-    start = 0
 
+async def stream_organizations_by_filter(page_limit: int = 500):
+    """Streamt alle Organisationen – OHNE filter_id, OHNE search, stabil."""
+    start = 0
     while True:
-        url = append_token(
-            f"{PIPEDRIVE_API}/organizations/search?"
-            f"filter_id={filter_id}&start={start}&limit={page_limit}&sort=id"
-        )
+        url = f"{PD_API}/organizations?start={start}&limit={page_limit}"
         r = await http_client().get(url, headers=get_headers())
 
         if r.status_code != 200:
-            raise Exception(f"Pipedrive Fehler (orgs filter {filter_id}): {r.text}")
+            raise Exception(f"Pipedrive Fehler (orgs): {r.text}")
 
-        try:
-            js = r.json()
-        except Exception:
-            # Fallback: komplett unbrauchbare Antwort → abbrechen
+        js = r.json()
+
+        # js ist ein Dict {"success":true,"data":[...], ...}
+        data = js.get("data") or []
+        if not data:
             break
 
-        # js kann sein: dict, list, None, Fehler
-        if not isinstance(js, dict):
-            # Wenn Pipedrive eine Liste zurückgibt → keine Daten
+        yield data
+
+        if len(data) < page_limit:
             break
 
-        data = js.get("data") or {}
-
-        # data kann eine Liste sein (!) → abfangen
-        if isinstance(data, list):
-            items = data
-        else:
-            items = data.get("items") or []
-
-        if not items:
-            break
-
-        yield items
-
-        if len(items) < page_limit:
-            break
-
-        start += len(items)
-
+        start += len(data)
 
 
 async def stream_person_ids_by_filter(filter_id: int, page_limit: int = PAGE_LIMIT) -> AsyncGenerator[List[str], None]:
@@ -504,36 +485,31 @@ async def stream_person_ids_by_filter(filter_id: int, page_limit: int = PAGE_LIM
 # =============================================================================
 # Organisationen – Bucketing + Kappung (Performanceoptimiert)
 # =============================================================================
-async def _fetch_org_names_for_filter_capped(
-    filter_id: int,
-    page_limit: int,
-    cap_total: int,
-    cap_bucket: int
-) -> Dict[str, List[str]]:
-    """
-    Holt Organisationsnamen aus einem Pipedrive-Filter, normalisiert sie und
-    legt sie in Buckets nach Anfangsbuchstaben. Die Gesamtanzahl (cap_total)
-    und die maximale Bucketgröße (cap_bucket) werden begrenzt.
-    """
-    buckets: Dict[str, List[str]] = {}
-    total = 0
+async def _fetch_org_names_for_filter_capped(page_limit: int, cap: int, bucket_cap: int):
+    result = {}
+    collected = 0
 
-    async for chunk in stream_organizations_by_filter(filter_id, page_limit):
-        for o in chunk:
-            n = normalize_name(o.get("name") or "")
-            if not n:
+    async for chunk in stream_organizations_by_filter(page_limit):
+        for org in chunk:
+            if collected >= cap:
+                return result
+
+            name = org.get("name") or ""
+            if not name:
                 continue
-            b = n[0]
-            lst = buckets.setdefault(b, [])
-            if len(lst) >= cap_bucket:
+
+            norm = normalize_name(name)
+            key = bucket_key(norm)
+
+            bucket = result.setdefault(key, [])
+            if len(bucket) >= bucket_cap:
                 continue
-            if not lst or lst[-1] != n:
-                lst.append(n)
-                total += 1
-                if total >= cap_total:
-                    return buckets
-    return buckets
-    
+
+            bucket.append(norm)
+            collected += 1
+
+    return result
+
 def _pretty_reason(reason: str, extra: str = "") -> str:
     """Liefert verständlichen Grundtext für entfernte Zeilen."""
     reason = (reason or "").lower()
