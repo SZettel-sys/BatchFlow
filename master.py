@@ -332,20 +332,50 @@ async def stream_organizations_by_filter(filter_id: int, page_limit: int = 500):
 
 
 async def stream_person_ids_by_filter(filter_id: int, page_limit: int = PAGE_LIMIT) -> AsyncGenerator[List[str], None]:
-    """Streamt nur Personen-IDs – speicherschonend."""
+    """Streamt nur Personen-IDs – robust gegen Pipedrive-Listenstrukturen."""
+
     start = 0
     while True:
-        url = append_token(f"{PIPEDRIVE_API}/persons?filter_id={filter_id}&start={start}&limit={page_limit}&sort=id")
+        url = append_token(
+            f"{PIPEDRIVE_API}/persons?filter_id={filter_id}&start={start}&limit={page_limit}&sort=id"
+        )
         r = await http_client().get(url, headers=get_headers())
+
         if r.status_code != 200:
-            raise Exception(f"Pipedrive Fehler (IDs {filter_id}): {r.text}")
-        data = r.json().get("data") or []
-        if not data:
+            raise Exception(f"Pipedrive Fehler IDs {filter_id}: {r.text}")
+
+        raw = r.json().get("data") or []
+        if not raw:
             break
-        yield [str(p.get("id")) for p in data if p.get("id")]
-        if len(data) < page_limit:
+
+        ids: List[str] = []
+
+        # ------------------------------
+        # ROBUSTE EXTRAKTION (FIX)
+        # ------------------------------
+        def extract(obj):
+            """Extrahiert IDs aus dicts und Listen."""
+            if obj is None:
+                return
+            if isinstance(obj, dict):
+                _id = obj.get("id")
+                if _id:
+                    ids.append(str(_id))
+            elif isinstance(obj, list):
+                for sub in obj:
+                    extract(sub)
+
+        for entry in raw:
+            extract(entry)
+
+        if ids:
+            yield ids
+
+        if len(raw) < page_limit:
             break
-        start += len(data)
+
+        start += len(raw)
+
 # =============================================================================
 # Organisationen – Bucketing + Kappung (Performanceoptimiert)
 # =============================================================================
