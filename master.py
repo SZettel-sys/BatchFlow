@@ -390,118 +390,63 @@ def _pretty_reason(reason: str, extra: str = "") -> str:
 # =============================================================================
 # Nachfass – Personen laden nach Batch-ID (mit Paging & Fortschritt)
 # =============================================================================
-async def stream_persons_by_batch_id(field_key: str, batch_ids: List[str]):
+async def stream_persons_by_batch_id(batch_key: str, batch_ids: List[str]) -> List[dict]:
     """
-    Streamt Personen anhand eines Custom-Fields (Batch-ID).
-    Diese Version ist komplett robust gegenüber den neuen Pipedrive-API-Strukturen
-    (Listen, verschachtelte Listen, Dictionaries).
+    Lädt Personen über Pipedrive via Filter (korrekt & stabil).
+    NICHT über Search, da Search keine Custom Fields unterstützt.
     """
+    all_results = []
 
-    out = []
-    start = 0
-    limit = 500
+    # Wir erlauben für Nachfass genau 2 Batch-IDs → jeweils Filter bauen
+    for bid in batch_ids:
 
-    while True:
-
-        url = "https://api.pipedrive.com/v1/persons/search"
-        params = {
-            "api_token": PD_API_TOKEN,          # <-- DEIN TOKEN
-            "limit": limit,
-            "start": start,
-            "term": "",
-            "fields": field_key,
-            "exact_match": False
+        # 1️⃣ Filter definieren (temporärer Filter)
+        filter_payload = {
+            "name": f"tmp_batch_{bid}",
+            "conditions": [{
+                "field_id": batch_key,
+                "operator": "eq",
+                "value": bid
+            }]
         }
 
-        async with httpx.AsyncClient() as client:
-            r = await client.get(url, params=params)
-            r.raise_for_status()
-            data = r.json()
+        # 2️⃣ Filter anlegen
+        create_url = append_token(f"{PIPEDRIVE_API}/filters")
+        r = await http_client().post(create_url, json=filter_payload)
+        r.raise_for_status()
+        filter_id = r.json().get("data", {}).get("id")
 
-        # --------------------------------------------------
-        # defensive extraction of raw "items"
-        # --------------------------------------------------
+        if not filter_id:
+            continue
+
+        # 3️⃣ Personen über den Filter streamen
+        start = 0
+        while True:
+            url = append_token(
+                f"{PIPEDRIVE_API}/persons?filter_id={filter_id}&start={start}&limit=500"
+            )
+            p = await http_client().get(url)
+            p.raise_for_status()
+
+            data = p.json().get("data") or []
+            if not data:
+                break
+
+            all_results.extend(data)
+
+            if len(data) < 500:
+                break
+
+            start += 500
+
+        # 4️⃣ Temporären Filter wieder löschen
+        del_url = append_token(f"{PIPEDRIVE_API}/filters/{filter_id}")
         try:
-            items_raw = data.get("data", {}).get("items", [])
-        except Exception:
-            items_raw = []
+            await http_client().delete(del_url)
+        except:
+            pass
 
-        items = []
-
-        # ==================================================
-        #  ROBUSTER REKURSIVER EXTRACTOR
-        # ==================================================
-        def extract(obj):
-            """
-            Pipedrive liefert seit Nov 2024 u. a.:
-
-            - {"item": {...}}
-            - [{"item": {...}}]
-            - [[{"item": {...}}]]
-            - [ {"item": {...}}, [ {"item": {...}} ] ]
-            - None
-
-            Diese Funktion extrahiert ALLE item-Dicts sicher.
-            """
-            if obj is None:
-                return
-
-            # Liste → alle Elemente verarbeiten
-            if isinstance(obj, list):
-                for e in obj:
-                    extract(e)
-                return
-
-            # Dict → item extrahieren
-            if isinstance(obj, dict):
-                item = obj.get("item")
-                if isinstance(item, dict):
-                    items.append(item)
-                return
-
-            # alle anderen Typen ignorieren
-            return
-
-        extract(items_raw)
-
-        # ==================================================
-        # normalizer für matching
-        # ==================================================
-        def normalize(v):
-            if v is None:
-                return ""
-            if isinstance(v, list):
-                return normalize(v[0]) if v else ""
-            if isinstance(v, dict):
-                return (
-                    normalize(v.get("value"))
-                    or normalize(v.get("label"))
-                    or normalize(v.get("name"))
-                    or normalize(v.get("id"))
-                    or ""
-                )
-            return str(v)
-
-        # ==================================================
-        #  FILTERUNG AUF DIE BATCH-ID
-        # ==================================================
-        for p in items:
-            val = normalize(p.get(field_key))
-            if val in batch_ids:
-                out.append(p)
-
-        # ==================================================
-        #  PAGINATION
-        # ==================================================
-        more = data.get("data", {}).get("more_items_in_collection")
-        next_start = data.get("data", {}).get("next_start")
-
-        if not more or next_start is None:
-            break
-
-        start = next_start
-
-    return out
+    return all_results
 
 
 # =============================================================================
@@ -705,24 +650,23 @@ async def _build_nf_master_final(
 ) -> pd.DataFrame:
 
     # ============================================================
-    # Universelle Wert-Sanitizer – macht ALLES zu einem sicheren String
+    # Hilfsfunktionen
     # ============================================================
+
     def sanitize(v):
-        """Konvertiert beliebige Pipedrive-Werte (list/dict/etc.) in Strings."""
+        """Konvertiert beliebige Pipedrive-Werte (list/dict/None/etc.) in Strings."""
         if v is None or (isinstance(v, float) and pd.isna(v)):
             return ""
 
-        # Wenn es ein String ist, aber JSON enthält
+        # Strings mit JSON-Inhalt
         if isinstance(v, str):
             v2 = v.strip()
-            # Beispiel: "['123']"
             if v2.startswith("[") and v2.endswith("]"):
                 try:
                     parsed = json.loads(v2)
                     return sanitize(parsed)
                 except:
                     return v2
-            # Beispiel: {"value": "123"}
             if v2.startswith("{") and v2.endswith("}"):
                 try:
                     parsed = json.loads(v2)
@@ -731,7 +675,7 @@ async def _build_nf_master_final(
                     return v2
             return v2
 
-        # dict
+        # Dict → gängige Keys extrahieren
         if isinstance(v, dict):
             return (
                 sanitize(v.get("value"))
@@ -741,38 +685,32 @@ async def _build_nf_master_final(
                 or ""
             )
 
-        # list
+        # Liste → nur erstes Element
         if isinstance(v, list):
-            if not v:
-                return ""
-            return sanitize(v[0])
+            return sanitize(v[0]) if v else ""
 
         return str(v)
 
-    # ============================================================
-    # Custom-Field-Extractor → komplett safe
-    # ============================================================
     def cf(p, key):
         return sanitize(p.get(key))
 
     # ============================================================
-    # Personen laden
+    # Personen laden (NEU: Filterbasiert)
     # ============================================================
+
     if job_obj:
         job_obj.phase = "Lade Nachfass-Kandidaten …"
         job_obj.percent = 10
 
-    persons_search = await stream_persons_by_batch_id(
-        "5ac34dad3ea917fdef4087caebf77ba275f87eec",  # Batch-ID-Feld
+    persons = await stream_persons_by_batch_id(
+        "5ac34dad3ea917fdef4087caebf77ba275f87eec",   # Batch-ID-Feld
         nf_batch_ids
     )
 
-    ids = [str(p.get("id")) for p in persons_search if p.get("id")]
-    persons = await fetch_person_details(ids)
+    # ============================================================
+    # Filterregeln
+    # ============================================================
 
-    # ============================================================
-    # Filterregeln (Datum + max. 2 pro Organisation)
-    # ============================================================
     today = datetime.now().date()
 
     def is_date_valid(raw):
@@ -795,9 +733,8 @@ async def _build_nf_master_final(
     count_date_invalid = 0
 
     for p in persons:
-        # ============================================================
-        # Organisation sicher extrahieren
-        # ============================================================
+
+        # ---------------- ORGANISATION sicher extrahieren ----------------
         org = p.get("organization")
 
         if isinstance(org, list):
@@ -808,12 +745,12 @@ async def _build_nf_master_final(
 
         org_id = sanitize(org.get("id"))
 
-        # ---------------- Datum ----------------
+        # ---------------- Datum prüfen ----------------
         if not is_date_valid(p.get("next_activity_date")):
             count_date_invalid += 1
             continue
 
-        # ---------------- Max 2 pro Organisation ----------------
+        # ---------------- Max. 2 pro Organisation ----------------
         if org_id:
             org_counter[org_id] += 1
             if org_counter[org_id] > 2:
@@ -823,12 +760,23 @@ async def _build_nf_master_final(
         selected.append(p)
 
     # ============================================================
-    # Exportlisten bauen
+    # Export-Zeilen erzeugen
     # ============================================================
+
     rows = []
 
     for p in selected:
+
+        # -------- PERSON --------
         pid = sanitize(p.get("id"))
+        first = sanitize(p.get("first_name"))
+        last = sanitize(p.get("last_name"))
+        fullname = sanitize(p.get("name"))
+
+        if not first and not last and fullname:
+            parts = fullname.split()
+            first = " ".join(parts[:-1]) if len(parts) > 1 else parts[0]
+            last = parts[-1] if len(parts) > 1 else ""
 
         # -------- ORGANISATION --------
         org = p.get("organization")
@@ -840,17 +788,7 @@ async def _build_nf_master_final(
         org_id = sanitize(org.get("id"))
         org_name = sanitize(org.get("name"))
 
-        # -------- NAME --------
-        first = sanitize(p.get("first_name"))
-        last = sanitize(p.get("last_name"))
-        fullname = sanitize(p.get("name"))
-
-        if not first and not last and fullname:
-            parts = fullname.split()
-            first = " ".join(parts[:-1]) if len(parts) > 1 else parts[0]
-            last = parts[-1] if len(parts) > 1 else ""
-
-        # -------- EMAIL (mit flatten) --------
+        # -------- E-MAIL (verschachtelt flatten) --------
         email_field = p.get("email") or []
         emails_flat = []
 
@@ -869,7 +807,6 @@ async def _build_nf_master_final(
                 email = sanitize(e.get("value"))
                 break
 
-        # Fallback – falls kein "primary" existiert
         if not email and emails_flat:
             email = sanitize(emails_flat[0].get("value"))
 
@@ -899,14 +836,16 @@ async def _build_nf_master_final(
     df = pd.DataFrame(rows).replace({None: ""})
 
     # ============================================================
-    # Ausschlüsse speichern
+    # Excluded speichern
     # ============================================================
+
     excluded = [
         {"Grund": "Max 2 Kontakte pro Organisation", "Anzahl": count_org_limit},
         {"Grund": "Datum nächste Aktivität steht an bzw. liegt in naher Vergangenheit", "Anzahl": count_date_invalid},
     ]
     await save_df_text(pd.DataFrame(excluded), "nf_excluded")
 
+    # final speichern
     await save_df_text(df, "nf_master_final")
 
     if job_obj:
@@ -969,8 +908,8 @@ async def _fetch_org_names_for_filter_capped(
 # =============================================================================
 async def _reconcile(prefix: str) -> None:
     """
-    Endgültiges Reconcile – mit absolut robuster Normalisierung aller Felder.
-    Verhindert zuverlässig Fehler wie: 'list' object has no attribute 'get'.
+    Bereinigte und robuste Version des Nachfass-Abgleichs.
+    Verhindert zuverlässig 'list' object has no attribute 'get'.
     """
 
     t = tables(prefix)
@@ -978,13 +917,10 @@ async def _reconcile(prefix: str) -> None:
 
     if df.empty:
         await save_df_text(pd.DataFrame(), t["ready"])
-        await save_df_text(
-            pd.DataFrame(columns=[
-                "reason", "Kontakt ID", "Name",
-                "Organisation ID", "Organisationsname", "Grund"
-            ]),
-            t["log"]
-        )
+        await save_df_text(pd.DataFrame(columns=[
+            "reason", "Kontakt ID", "Name",
+            "Organisation ID", "Organisationsname", "Grund"
+        ]), t["log"])
         return
 
     col_pid = "Person ID"
@@ -994,70 +930,45 @@ async def _reconcile(prefix: str) -> None:
     delete_rows = []
     drop_idx = []
 
-    # ----------------------------------------------------------------------
-    # Hilfsfunktion: robustes Bereinigen von OrgName & OrgID aus DB-Werten
-    # ----------------------------------------------------------------------
-    def normalize_cell(value):
-        """Konvertiert Listen, Dicts, NaN, JSON-Strings → zu reinem String."""
-        if value is None or (isinstance(value, float) and pd.isna(value)):
+    # =======================================================
+    # UNIVERSAL SANITIZER – global & sicher
+    # =======================================================
+    def sanitize_cell(v):
+        """Konvertiert jede DF-Zelle zu einem stabilen String."""
+        if v is None or (isinstance(v, float) and pd.isna(v)):
             return ""
 
-        # Wenn bereits string, aber LISTENFORM als String gespeichert
-        if isinstance(value, str):
-            v = value.strip()
-            # z. B. "['123']"
-            if v.startswith("[") and v.endswith("]"):
+        # JSON-Strings → dekodieren
+        if isinstance(v, str):
+            s = v.strip()
+            if (s.startswith("[") and s.endswith("]")) or (s.startswith("{") and s.endswith("}")):
                 try:
-                    parsed = json.loads(v)
-                    if isinstance(parsed, list):
-                        return str(parsed[0]) if parsed else ""
-                except:
-                    pass
-            # z. B. {"value": "123"}
-            if v.startswith("{") and v.endswith("}"):
-                try:
-                    parsed = json.loads(v)
-                    if isinstance(parsed, dict):
-                        return (
-                            parsed.get("value")
-                            or parsed.get("label")
-                            or parsed.get("id")
-                            or ""
-                        )
-                except:
-                    pass
-            return v  # normaler String
+                    parsed = json.loads(s)
+                    return sanitize_cell(parsed)
+                except Exception:
+                    return s
+            return s
 
-        # klassische Liste
-        if isinstance(value, list):
-            if not value:
-                return ""
-            first = value[0]
-            if isinstance(first, dict):
-                return (
-                    first.get("value")
-                    or first.get("label")
-                    or first.get("name")
-                    or first.get("id")
-                    or ""
-                )
-            return str(first)
-
-        # klassische Dict
-        if isinstance(value, dict):
+        # dict → value extrahieren
+        if isinstance(v, dict):
             return (
-                value.get("value")
-                or value.get("label")
-                or value.get("name")
-                or value.get("id")
-                or ""
+                sanitize_cell(v.get("value")) or
+                sanitize_cell(v.get("label")) or
+                sanitize_cell(v.get("name")) or
+                sanitize_cell(v.get("id")) or
+                ""
             )
 
-        return str(value)
+        # list → erstes Element extrahieren
+        if isinstance(v, list):
+            return sanitize_cell(v[0]) if v else ""
 
-    # ----------------------------------------------------------------------
-    # 1) Organisations-Fuzzy-Abgleich
-    # ----------------------------------------------------------------------
+        return str(v)
+
+    # =======================================================
+    # Organisationsliste laden (für Fuzzy Matching)
+    # =======================================================
+
     filter_ids_org = [1245, 851, 1521]
     buckets_all = {}
     total_collected = 0
@@ -1078,11 +989,14 @@ async def _reconcile(prefix: str) -> None:
                     b.append(v)
                     total_collected += 1
 
+    # =======================================================
+    # 1) Fuzzy Matching auf Organisationen
+    # =======================================================
+
     for idx, row in df.iterrows():
 
-        # ROBUSTER FIX: Organisation Name sicher extrahieren
         name_raw = row.get(col_orgname, "")
-        name_clean = normalize_cell(name_raw)
+        name_clean = sanitize_cell(name_raw)
         norm = normalize_name(name_clean)
 
         if not norm:
@@ -1093,6 +1007,7 @@ async def _reconcile(prefix: str) -> None:
         if not bucket:
             continue
 
+        # Kandidaten für fuzzy
         near = [n for n in bucket if abs(len(n) - len(norm)) <= 4]
         if not near:
             continue
@@ -1100,26 +1015,28 @@ async def _reconcile(prefix: str) -> None:
         best = process.extractOne(norm, near, scorer=fuzz.token_sort_ratio)
 
         if best and best[1] >= 95:
-            drop_idx.append(idx)
 
-            # Normierung Regeln anwenden auf OrgID
-            orgid_raw = row.get(col_orgid, "")
-            orgid_clean = normalize_cell(orgid_raw)
+            # saubere Organisation ID
+            orgid_clean = sanitize_cell(row.get(col_orgid))
 
+            # Logging
             delete_rows.append({
                 "reason": "org_match_95",
-                "Kontakt ID": row.get(col_pid, ""),
-                "Name": f"{row.get('Person Vorname','')} {row.get('Person Nachname','')}".strip(),
+                "Kontakt ID": sanitize_cell(row.get(col_pid)),
+                "Name": sanitize_cell(f"{row.get('Person Vorname','')} {row.get('Person Nachname','')}").strip(),
                 "Organisation ID": orgid_clean,
                 "Organisationsname": name_clean,
                 "Grund": f"Ähnlichkeit {best[1]}% mit '{best[0]}'"
             })
 
+            drop_idx.append(idx)
+
     df = df.drop(drop_idx)
 
-    # ----------------------------------------------------------------------
-    # 2) Personen-ID Dubletten
-    # ----------------------------------------------------------------------
+    # =======================================================
+    # 2) Personen bereits kontaktiert (Filter 1216/1708)
+    # =======================================================
+
     suspect_ids = set()
 
     for f_id in (1216, 1708):
@@ -1131,27 +1048,31 @@ async def _reconcile(prefix: str) -> None:
 
     for _, r in removed.iterrows():
 
-        orgid_clean = normalize_cell(r.get(col_orgid, ""))
-        orgname_clean = normalize_cell(r.get(col_orgname, ""))
-
         delete_rows.append({
             "reason": "person_id_match",
-            "Kontakt ID": r.get(col_pid, ""),
-            "Name": f"{r.get('Person Vorname','')} {r.get('Person Nachname','')}".strip(),
-            "Organisation ID": orgid_clean,
-            "Organisationsname": orgname_clean,
+            "Kontakt ID": sanitize_cell(r.get(col_pid)),
+            "Name": sanitize_cell(
+                f"{r.get('Person Vorname','')} {r.get('Person Nachname','')}"
+            ).strip(),
+            "Organisation ID": sanitize_cell(r.get(col_orgid)),
+            "Organisationsname": sanitize_cell(r.get(col_orgname)),
             "Grund": "Bereits in Filter 1216/1708"
         })
 
     df = df[~mask]
 
-    # ----------------------------------------------------------------------
-    # SPEICHERN
-    # ----------------------------------------------------------------------
-    await save_df_text(df, t["ready"])
-    log_df = pd.DataFrame(delete_rows).replace({None: ""})
-    await save_df_text(log_df, t["log"])
+    # =======================================================
+    # 3) Speichern der Ergebnisse
+    # =======================================================
 
+    # READY (bereinigt)
+    ready_df = df.applymap(sanitize_cell)
+    await save_df_text(ready_df, t["ready"])
+
+    # LOG (bereinigt)
+    log_df = pd.DataFrame(delete_rows).replace({None: ""})
+    log_df = log_df.applymap(sanitize_cell)
+    await save_df_text(log_df, t["log"])
 
 
 # =============================================================================
