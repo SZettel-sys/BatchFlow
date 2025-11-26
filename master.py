@@ -400,42 +400,50 @@ async def get_person_field_by_hint(label_hint: str) -> Optional[dict]:
 # =============================================================================
 # STREAMING-FUNKTIONEN (mit Paging)
 # =============================================================================
-
-async def stream_organizations_by_filter(filter_id: int, page_limit: int = 500):
-    """
-    Holt Organisationen stabil per FILTER (nie Search).
-    Verursacht keinen 429 und keinen 'term'-Fehler.
-    """
+async def stream_organizations_by_filter(filter_id: int, page_limit: int = PAGE_LIMIT):
+    """Liefert Organisationen aus einem Filter – robust gegen Pipedrive-Fehler."""
     start = 0
 
     while True:
         url = append_token(
-            f"{PIPEDRIVE_API}/organizations?filter_id={filter_id}&start={start}&limit={page_limit}"
+            f"{PIPEDRIVE_API}/organizations/search?"
+            f"filter_id={filter_id}&start={start}&limit={page_limit}&sort=id"
         )
-
         r = await http_client().get(url, headers=get_headers())
 
-        if r.status_code == 429:
-            print(f"[WARN][ORG-STREAM] Rate limit 429 → warte 2 Sekunden…")
-            await asyncio.sleep(2)
-            continue
-
         if r.status_code != 200:
-            print(f"[ERROR][ORG-STREAM] Filter {filter_id}: {r.text}")
-            return
+            raise Exception(f"Pipedrive Fehler (orgs filter {filter_id}): {r.text}")
 
-        data = (r.json().get("data") or {}).get("items") or []
-
-        if not data:
+        try:
+            js = r.json()
+        except Exception:
+            # Fallback: komplett unbrauchbare Antwort → abbrechen
             break
 
-        yield data
-
-        if len(data) < page_limit:
+        # js kann sein: dict, list, None, Fehler
+        if not isinstance(js, dict):
+            # Wenn Pipedrive eine Liste zurückgibt → keine Daten
             break
 
-        start += len(data)
-        await asyncio.sleep(0.1)
+        data = js.get("data") or {}
+
+        # data kann eine Liste sein (!) → abfangen
+        if isinstance(data, list):
+            items = data
+        else:
+            items = data.get("items") or []
+
+        if not items:
+            break
+
+        yield items
+
+        if len(items) < page_limit:
+            break
+
+        start += len(items)
+
+
 
 async def stream_person_ids_by_filter(filter_id: int, page_limit: int = PAGE_LIMIT) -> AsyncGenerator[List[str], None]:
     """
