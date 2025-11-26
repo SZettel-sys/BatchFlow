@@ -390,63 +390,79 @@ def _pretty_reason(reason: str, extra: str = "") -> str:
 # =============================================================================
 # Nachfass – Personen laden nach Batch-ID (mit Paging & Fortschritt)
 # =============================================================================
-async def stream_persons_by_batch_id(batch_key: str, batch_ids: List[str]) -> List[dict]:
-    """
-    Lädt Personen über Pipedrive via Filter (korrekt & stabil).
-    NICHT über Search, da Search keine Custom Fields unterstützt.
-    """
-    all_results = []
+async def stream_persons_by_batch_id(
+    batch_key: str,
+    batch_ids: List[str],
+    page_limit: int = 100,
+    job_obj=None
+) -> List[dict]:
+    results: List[dict] = []
+    sem = asyncio.Semaphore(6)  # gedrosselt, um 429 zu vermeiden
 
-    # Wir erlauben für Nachfass genau 2 Batch-IDs → jeweils Filter bauen
-    for bid in batch_ids:
-
-        # 1️⃣ Filter definieren (temporärer Filter)
-        filter_payload = {
-            "name": f"tmp_batch_{bid}",
-            "conditions": [{
-                "field_id": batch_key,
-                "operator": "eq",
-                "value": bid
-            }]
-        }
-
-        # 2️⃣ Filter anlegen
-        create_url = append_token(f"{PIPEDRIVE_API}/filters")
-        r = await http_client().post(create_url, json=filter_payload)
-        r.raise_for_status()
-        filter_id = r.json().get("data", {}).get("id")
-
-        if not filter_id:
-            continue
-
-        # 3️⃣ Personen über den Filter streamen
+    async def fetch_one(bid: str):
         start = 0
-        while True:
-            url = append_token(
-                f"{PIPEDRIVE_API}/persons?filter_id={filter_id}&start={start}&limit=500"
-            )
-            p = await http_client().get(url)
-            p.raise_for_status()
+        total = 0
+        local: List[dict] = []
 
-            data = p.json().get("data") or []
-            if not data:
-                break
+        async with sem:
+            while True:
+                url = append_token(
+                    f"{PIPEDRIVE_API}/persons/search?"
+                    f"term={bid}&fields=custom_fields&start={start}&limit={page_limit}"
+                )
+                r = await http_client().get(url, headers=get_headers())
 
-            all_results.extend(data)
+                if r.status_code == 429:
+                    print("[WARN] Rate limit erreicht, warte 2 Sekunden ...")
+                    await asyncio.sleep(2)
+                    continue
 
-            if len(data) < 500:
-                break
+                if r.status_code != 200:
+                    print(f"[WARN] Batch {bid} Fehler: {r.text}")
+                    break
 
-            start += 500
+                raw_items = r.json().get("data", {}).get("items", []) or []
+                if not raw_items:
+                    break
 
-        # 4️⃣ Temporären Filter wieder löschen
-        del_url = append_token(f"{PIPEDRIVE_API}/filters/{filter_id}")
-        try:
-            await http_client().delete(del_url)
-        except:
-            pass
+                # ---------- ROBUSTE ITEMS-EXTRAKTION (FIX) ----------
+                persons: List[dict] = []
 
-    return all_results
+                def add_item(obj):
+                    # rekursiv durch Listen/Dicts laufen und "item" einsammeln
+                    if obj is None:
+                        return
+                    if isinstance(obj, dict):
+                        item = obj.get("item")
+                        if isinstance(item, dict):
+                            persons.append(item)
+                    elif isinstance(obj, list):
+                        for sub in obj:
+                            add_item(sub)
+
+                for it in raw_items:
+                    add_item(it)
+                # ---------------------------------------------------
+
+                if not persons:
+                    break
+
+                local.extend(persons)
+                total += len(persons)
+                start += len(persons)
+
+                if len(persons) < page_limit:
+                    break
+
+                await asyncio.sleep(0.1)  # minimale Pause zwischen Seiten
+
+        print(f"[DEBUG] Batch {bid}: {total} Personen geladen")
+        results.extend(local)
+
+    await asyncio.gather(*(fetch_one(bid) for bid in batch_ids))
+    print(f"[INFO] Alle Batch-IDs geladen: {len(results)} Personen gesamt")
+    return results
+
 
 
 # =============================================================================
