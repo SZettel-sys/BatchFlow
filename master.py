@@ -413,7 +413,7 @@ async def stream_organizations_by_filter(filter_id: int, page_limit: int):
     start = 0
 
     while True:
-        url = f"https://api.pipedrive.com/v1/organizations?filter_id={filter_id}&start={start}&limit={page_limit}&api_token={TOKEN}"
+        url = f"https://api.pipedrive.com/v1/organizations?filter_id={filter_id}&start={start}&limit={page_limit}&api_token={PD_API_TOKEN}"
 
         r = await client.get(url)
         try:
