@@ -487,38 +487,51 @@ async def stream_person_ids_by_filter(filter_id: int, page_limit: int = PAGE_LIM
 # =============================================================================
 # Organisationen – Bucketing + Kappung (Performanceoptimiert)
 # =============================================================================
-async def _fetch_org_names_for_filter_capped(page_limit: int, cap: int, bucket_cap: int):
+async def _fetch_org_names_for_filter_capped(
+    page_limit: int,
+    cap_limit: int,
+    cap_bucket: int
+) -> dict:
     """
-    Holt Organisationen seitenweise, normalisiert Namen und legt sie in Buckets ab.
-    KEIN filter_id mehr nötig.
+    Holt Organisationen für Filter 1245/851/1521 (ohne "term"-Pflicht!)
+    und begrenzt:
+       - cap_limit = maximale Gesamtzahl Namen
+       - cap_bucket = maximale Namen pro Bucket
     """
-    result = {}
-    collected = 0
 
-    async for chunk in stream_organizations_by_filter(page_limit):
-        for org in chunk:
+    buckets_all = {}
+    total = 0
 
-            if collected >= cap:
-                return result
+    # feste Filter-IDs (du hattest das hart verdrahtet)
+    filter_ids_org = [1245, 851, 1521]
 
-            name = org.get("name") or ""
-            if not name:
-                continue
+    for filter_id in filter_ids_org:
 
-            norm = normalize_name(name)
-            if not norm:
-                continue
+        async for chunk in stream_organizations_by_filter(filter_id, page_limit):
+            for name in chunk:
 
-            key = bucket_key(norm)
-            bucket = result.setdefault(key, [])
+                norm = normalize_name(name)
+                if not norm:
+                    continue
 
-            if len(bucket) >= bucket_cap:
-                continue
+                b = bucket_key(norm)
+                bucket = buckets_all.setdefault(b, [])
 
-            bucket.append(norm)
-            collected += 1
+                # limit pro bucket
+                if len(bucket) >= cap_bucket:
+                    continue
 
-    return result
+                # Namen hinzufügen
+                if name not in bucket:
+                    bucket.append(name)
+                    total += 1
+
+                    # globales Limit erreicht?
+                    if total >= cap_limit:
+                        return buckets_all
+
+    return buckets_all
+
 
 def _pretty_reason(reason: str, extra: str = "") -> str:
     """Liefert verständlichen Grundtext für entfernte Zeilen."""
