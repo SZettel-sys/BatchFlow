@@ -413,9 +413,9 @@ async def stream_organizations_by_filter(filter_id: int, page_limit: int):
     start = 0
 
     while True:
-        url = f"https://api.pipedrive.com/v1/organizations?filter_id={filter_id}&start={start}&limit={page_limit}&api_token={PD_API_TOKEN}"
+        url = append_token(f"https://api.pipedrive.com/v1/organizations?filter_id={filter_id}&start={start}&limit={page_limit}")
 
-        r = await client.get(url)
+        r = await http_client().get(url, headers=get_headers())
         try:
             data = r.json().get("data") or {}
         except Exception:
@@ -619,7 +619,7 @@ async def stream_persons_by_batch_id(
                 if len(persons) < page_limit:
                     break
 
-                await asyncio.sleep(2)  # minimale Pause zwischen Seiten
+                await asyncio.sleep(0.1)  # minimale Pause zwischen Seiten
 
         print(f"[DEBUG] Batch {bid}: {total} Personen geladen")
         results.extend(local)
@@ -659,7 +659,7 @@ async def fetch_person_details(person_ids: List[str]) -> List[dict]:
 
                     # Rate Limit (429)
                     if r.status_code == 429:
-                        await asyncio.sleep(2 ** (5 - retries))
+                        await asyncio.sleep(2)
                         retries -= 1
                         continue
 
@@ -671,11 +671,11 @@ async def fetch_person_details(person_ids: List[str]) -> List[dict]:
                         break
 
                 # Eventloop kurz freigeben
-                await asyncio.sleep(2)
+                await asyncio.sleep(0.05)
 
             except Exception:
                 retries -= 1
-                await asyncio.sleep(2)
+                await asyncio.sleep(1)
 
     # Personen in stabile Chunks aufteilen
     chunks = [person_ids[i:i+100] for i in range(0, len(person_ids), 100)]
@@ -1435,10 +1435,10 @@ async def reconcile_with_progress(job: "Job", prefix: str):
     """Führt _reconcile_generic() mit UI-Fortschritt durch."""
     try:
         job.phase = "Vorbereitung läuft …"; job.percent = 10
-        await asyncio.sleep(2)
+        await asyncio.sleep(0.2)
 
         job.phase = "Lade Vergleichsdaten …"; job.percent = 25
-        await asyncio.sleep(2)
+        await asyncio.sleep(0.2)
 
         await _reconcile(prefix)
 
@@ -1470,7 +1470,7 @@ async def export_start_nk(
     async def update_progress(phase: str, percent: int):
         job.phase = phase
         job.percent = min(100, max(0, percent))
-        await asyncio.sleep(2)
+        await asyncio.sleep(0.05)
 
     async def _run():
         try:
@@ -1528,6 +1528,39 @@ async def neukontakte_export_progress(job_id: str = Query(...)):
 # -------------------------------------------------------------------------
 # Download des erzeugten Nachfass-Exports
 # -------------------------------------------------------------------------
+@app.get("/nachfass/export_download")
+async def nachfass_export_download(job_id: str):
+    """
+    Liefert die exportierte Nachfass-Datei als Download zurück.
+    """
+    try:
+        # DataFrame laden
+        df = await load_df_text(tables("nf")["final"])
+
+        if df is None or df.empty:
+            raise FileNotFoundError("Keine Exportdaten gefunden")
+
+        # Temporäre Excel-Datei erzeugen
+        file_path = f"/tmp/nachfass_{job_id}.xlsx"
+        df.to_excel(file_path, index=False)
+
+        # Datei als Download zurückgeben
+        return FileResponse(
+            file_path,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            filename=f"nachfass_{job_id}.xlsx"
+        )
+
+    except FileNotFoundError:
+        return JSONResponse({"detail": "Datei nicht gefunden"}, status_code=404)
+
+    except Exception as e:
+        logging.error(f'[ERROR] Fehler im Export')
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+# =============================================================================
+# Kampagnenübersicht (Home)
+# =============================================================================
 @app.get("/campaign", response_class=HTMLResponse)
 async def campaign_home():
     return HTMLResponse("""<!doctype html><html lang="de">
