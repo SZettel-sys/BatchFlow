@@ -26,7 +26,7 @@ if os.path.isdir("static"):
 # -----------------------------------------------------------------------------
 # Umgebungsvariablen & Konstanten setzen
 # -----------------------------------------------------------------------------
-PD_API_TOKEN = os.getenv("PD_API_TOKEN", "")
+PD_API_PD_API_TOKEN = os.getenv("PD_API_PD_API_TOKEN", "")
 PIPEDRIVE_API = "https://api.pipedrive.com/v1"
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
@@ -94,7 +94,8 @@ async def _startup():
     limits = httpx.Limits(max_keepalive_connections=8, max_connections=16)
     app.state.http = httpx.AsyncClient(timeout=60.0, limits=limits)
     app.state.pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=4)
-    print("[Startup] BatchFlow initialisiert.")
+    import logging
+logging.info("[Startup] BatchFlow initialisiert.")
 
 @app.on_event("shutdown")
 async def _shutdown():
@@ -357,9 +358,9 @@ def append_token(url: str) -> str:
     """Hängt api_token automatisch an (wenn kein OAuth-Token genutzt wird)."""
     if "api_token=" in url:
         return url
-    if not user_tokens.get("default") and PD_API_TOKEN:
+    if not user_tokens.get("default") and PD_API_PD_API_TOKEN:
         sep = "&" if "?" in url else "?"
-        return f"{url}{sep}api_token={PD_API_TOKEN}"
+        return f"{url}{sep}api_token={PD_API_PD_API_TOKEN}"
     return url
 
 # =============================================================================
@@ -404,25 +405,37 @@ async def get_person_field_by_hint(label_hint: str) -> Optional[dict]:
 # stream_organizations_by_filter  (FINAL)
 # =============================================================================
 async def stream_organizations_by_filter(filter_id: int, page_limit: int):
+    """
+    Streamt Organisationen eines Pipedrive-Filters seitenweise.
+    Gibt pro Schleifendurchlauf eine Liste von Organisations-Namen zurück.
+    """
+
     start = 0
 
     while True:
-        url = append_token(
-            f"{PIPEDRIVE_API}/organizations?"
-            f"filter_id={filter_id}&start={start}&limit={page_limit}"
-        )
+        url = f"https://api.pipedrive.com/v1/organizations?filter_id={filter_id}&start={start}&limit={page_limit}&api_token={PD_API_TOKEN}"
 
-        r = await http_client().get(url, headers=get_headers())
-        data = (r.json() or {}).get("data") or []
-        if not data:
+        r = await http_client().get(url)
+        try:
+            data = r.json().get("data") or {}
+        except Exception:
+            raise Exception(f"Pipedrive Fehler (orgs filter {filter_id}): {r.text}")
+
+        items = data.get("items") or []
+        if not items:
             return
 
-        yield [org.get("name","").strip() for org in data if org.get("name")]
+        # Jede Seite → eine Liste mit Namen zurückgeben
+        yield [org.get("name", "").strip() for org in items if org.get("name")]
 
-        if len(data) < page_limit:
+        # Pagination
+        additional = r.json().get("additional_data") or {}
+        pagination = additional.get("pagination") or {}
+
+        if not pagination.get("more_items_in_collection"):
             return
 
-        start += len(data)
+        start = pagination.get("next_start", 0)
 
 
 
@@ -441,7 +454,7 @@ async def stream_person_ids_by_filter(filter_id: int, page_limit: int = PAGE_LIM
                 f"{PIPEDRIVE_API}/persons?filter_id={filter_id}&start={start}&limit={page_limit}&sort=id"
             )
 
-            r = await client.get(url, headers=get_headers())
+            r = await http_client().get(url, headers=get_headers())
             if r.status_code != 200:
                 raise Exception(
                     f"Pipedrive Fehler (IDs für Filter {filter_id}): {r.text}"
@@ -565,12 +578,14 @@ async def stream_persons_by_batch_id(
                 r = await http_client().get(url, headers=get_headers())
 
                 if r.status_code == 429:
-                    print("[WARN] Rate limit erreicht, warte 2 Sekunden ...")
-                    await asyncio.sleep(2)
+                    import logging
+logging.info("[WARN] Rate limit erreicht, warte 2 Sekunden ...")
+                    await asyncio.sleep(2 ** (5 - retries))
                     continue
 
                 if r.status_code != 200:
-                    print(f"[WARN] Batch {bid} Fehler: {r.text}")
+                    import logging
+logging.info(f"[WARN] Batch {bid} Fehler: {r.text}")
                     break
 
                 raw_items = r.json().get("data", {}).get("items", []) or []
@@ -608,11 +623,13 @@ async def stream_persons_by_batch_id(
 
                 await asyncio.sleep(0.1)  # minimale Pause zwischen Seiten
 
-        print(f"[DEBUG] Batch {bid}: {total} Personen geladen")
+        import logging
+logging.info(f"[DEBUG] Batch {bid}: {total} Personen geladen")
         results.extend(local)
 
     await asyncio.gather(*(fetch_one(bid) for bid in batch_ids))
-    print(f"[INFO] Alle Batch-IDs geladen: {len(results)} Personen gesamt")
+    import logging
+logging.info(f"[INFO] Alle Batch-IDs geladen: {len(results)} Personen gesamt")
     return results
 
 
@@ -646,7 +663,7 @@ async def fetch_person_details(person_ids: List[str]) -> List[dict]:
 
                     # Rate Limit (429)
                     if r.status_code == 429:
-                        await asyncio.sleep(2)
+                        await asyncio.sleep(2 ** (5 - retries))
                         retries -= 1
                         continue
 
@@ -666,7 +683,8 @@ async def fetch_person_details(person_ids: List[str]) -> List[dict]:
 
     # Personen in stabile Chunks aufteilen
     chunks = [person_ids[i:i+100] for i in range(0, len(person_ids), 100)]
-    print("[DEBUG] fetch: Starte mit IDs:", len(person_ids))
+    import logging
+logging.info("[DEBUG] fetch: Starte mit IDs:", len(person_ids))
 
     for group in chunks:
         await asyncio.gather(*(fetch_one(pid) for pid in group))
@@ -681,13 +699,17 @@ async def fetch_person_details(person_ids: List[str]) -> List[dict]:
 
     results = list(unique.values())
 
-    print(f"[DEBUG] Vollständige Personendaten geladen (unique): {len(results)}")
+    import logging
+logging.info(f"[DEBUG] Vollständige Personendaten geladen (unique): {len(results)}")
     loaded_ids = {p["id"] for p in results}
     missing = set(person_ids) - loaded_ids
 
-    print("[DEBUG] fetch: Vollständige geladen:", len(results))
-    print("[DEBUG] fetch: Fehlende:", len(missing))
-    print("[DEBUG] fetch: Fehlende IDs:", missing)
+    import logging
+logging.info("[DEBUG] fetch: Vollständige geladen:", len(results))
+    import logging
+logging.info("[DEBUG] fetch: Fehlende:", len(missing))
+    import logging
+logging.info("[DEBUG] fetch: Fehlende IDs:", missing)
     return results
 
 
@@ -860,7 +882,7 @@ async def _build_nf_master_final(
         job_obj.percent = 10
 
     persons = await stream_persons_by_batch_id(
-        "5ac34dad3ea917fdef4087caebf77ba275f87eec",   # Batch-ID-CF
+        os.getenv('BATCH_FIELD_KEY', ''),   # Batch-ID-CF
         nf_batch_ids
     )
 
@@ -879,10 +901,12 @@ async def _build_nf_master_final(
             continue
 
         # Fall: unbrauchbares Objekt → ignorieren
-        print("WARNUNG: Ungültiger Personen-Datensatz erkannt:", p)
+        import logging
+logging.info("WARNUNG: Ungültiger Personen-Datensatz erkannt:", p)
 
     persons = clean_persons
-    print(f"[CLEANUP] Bereinigte Personen: {len(persons)} von {len(clean_persons)}")
+    import logging
+logging.info(f"[CLEANUP] Bereinigte Personen: {len(persons)} von {len(clean_persons)}")
 
     # =================================================================
     # Filterregeln (Datum + max 2 pro Organisation)
@@ -1218,7 +1242,7 @@ async def run_nachfass_job(job: "Job", job_id: str):
         job.percent = 10
 
         persons = await stream_persons_by_batch_id(
-            "5ac34dad3ea917fdef4087caebf77ba275f87eec",
+            os.getenv('BATCH_FIELD_KEY', ''),
             nf_batch_ids
         )
 
@@ -1276,9 +1300,11 @@ async def run_nachfass_job(job: "Job", job_id: str):
         job.phase = "Fehler"
 
         # Vollständigen Stacktrace ins Log
-        print("=========== TRACEBACK ===========")
+        import logging
+logging.info("=========== TRACEBACK ===========")
         traceback.print_exc()
-        print("=========== END TRACEBACK =======")
+        import logging
+logging.info("=========== END TRACEBACK =======")
 
         job.done = True
         job.percent = 100
@@ -1396,7 +1422,8 @@ async def nachfass_export_download(job_id: str = Query(...)):
         )
 
     except Exception as e:
-        print(f"[ERROR] /nachfass/export_download: {e}")
+        import logging
+logging.info(f"[ERROR] /nachfass/export_download: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # =============================================================================
@@ -1440,6 +1467,9 @@ async def reconcile_with_progress(job: "Job", prefix: str):
 # EXPORT-START – NEUKONTAKTE
 # =============================================================================
 @app.post("/neukontakte/export_start")
+async def secure_check():
+    if not (user_tokens.get('default') or PD_API_TOKEN):
+        raise HTTPException(status_code=401, detail='Nicht autorisiert')
 async def export_start_nk(
     fachbereich: str = Body(...),
     take_count: Optional[int] = Body(None),
@@ -1542,7 +1572,8 @@ async def nachfass_export_download(job_id: str):
         return JSONResponse({"detail": "Datei nicht gefunden"}, status_code=404)
 
     except Exception as e:
-        print(f"[ERROR] /nachfass/export_download: {e}")
+        import logging
+logging.info(f"[ERROR] /nachfass/export_download: {e}")
         return JSONResponse({"error": str(e)}, status_code=500)
 
 # =============================================================================
@@ -1589,7 +1620,7 @@ async def campaign_home():
 # =============================================================================
 @app.get("/neukontakte", response_class=HTMLResponse)
 async def neukontakte_page(request: Request, mode: str = Query("new")):
-    authed = bool(user_tokens.get("default") or PD_API_TOKEN)
+    authed = bool(user_tokens.get("default") or PD_API_PD_API_TOKEN)
     authed_html = "<span class='muted'>angemeldet</span>" if authed else "<a href='/login'>Anmelden</a>"
 
     return HTMLResponse(f"""<!doctype html><html lang="de">
@@ -1676,7 +1707,7 @@ loadOptions();
 # =============================================================================
 @app.get("/nachfass", response_class=HTMLResponse)
 async def nachfass_page(request: Request):
-    authed = bool(user_tokens.get("default") or PD_API_TOKEN)
+    authed = bool(user_tokens.get("default") or PD_API_PD_API_TOKEN)
     auth_info = "<span class='muted'>angemeldet</span>" if authed else "<a href='/login'>Anmelden</a>"
 
     html = """<!doctype html><html lang="de">
@@ -1930,9 +1961,11 @@ async def nachfass_summary(job_id: str = Query(...)):
     # → sauber machen ALLER Felder in ALLEN Zellen:
     for col in ready.columns:
         ready[col] = ready[col].apply(normalize_cell)
-    print("DEBUG READY TYPES:\n", ready.applymap(type).head(20))
+    import logging
+logging.info("DEBUG READY TYPES:\n", ready.applymap(type).head(20))
     log = await load_df_text("nf_delete_log")
-    print("DEBUG LOG TYPES:\n", log.applymap(type).head(20))
+    import logging
+logging.info("DEBUG LOG TYPES:\n", log.applymap(type).head(20))
     total = len(ready)
     cnt_org = _count_reason(log, ["org_match_95"])
     cnt_pid = _count_reason(log, ["person_id_match"])
@@ -2163,6 +2196,9 @@ async def nachfass_summary(job_id: str = Query(...)):
 from uuid import uuid4
 
 @app.post("/nachfass/export_start")
+async def secure_check():
+    if not (user_tokens.get('default') or PD_API_TOKEN):
+        raise HTTPException(status_code=401, detail='Nicht autorisiert')
 async def nachfass_export_start(req: Request):
     body = await req.json()
 
@@ -2200,12 +2236,18 @@ async def nachfass_export_progress(job_id: str):
     if not job:
         return JSONResponse({"error": "Job nicht gefunden"}, status_code=404)
 
-    print("==== JOB.PROGRESS DEBUG ====")
-    print("phase:", job.phase, type(job.phase))
-    print("percent:", job.percent, type(job.percent))
-    print("done:", job.done, type(job.done))
-    print("error:", job.error, type(job.error))
-    print("================================")
+    import logging
+logging.info("==== JOB.PROGRESS DEBUG ====")
+    import logging
+logging.info("phase:", job.phase, type(job.phase))
+    import logging
+logging.info("percent:", job.percent, type(job.percent))
+    import logging
+logging.info("done:", job.done, type(job.done))
+    import logging
+logging.info("error:", job.error, type(job.error))
+    import logging
+logging.info("================================")
 
     return JSONResponse({
         "phase": str(job.phase),
@@ -2217,9 +2259,7 @@ async def nachfass_export_progress(job_id: str):
 # =============================================================================
 # Download
 # =============================================================================
-@app.get("/nachfass/export_download")
-async def nachfass_export_download(job_id: str):
-    job = JOBS.get(job_id)
+get(job_id)
     if not job or not job.path:
         return JSONResponse({"error": "Keine Datei gefunden"}, status_code=404)
 
