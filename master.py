@@ -889,10 +889,16 @@ async def _build_nf_master_final(
 
         return str(v)
 
-    def cf(p: dict, key: Optional[str]) -> str:
+   
+    def cf(p: dict, key: str) -> str:
+        """Custom-/Standardfeld holen – schaut auch in custom_fields rein."""
         if not key:
             return ""
-        return sanitize(p.get(key))
+        v = p.get(key)
+        if v is None:
+            v = (p.get("custom_fields") or {}).get(key)
+        return sanitize(v)
+
 
     # =================================================================
     # 1) Personen laden
@@ -984,13 +990,17 @@ async def _build_nf_master_final(
 
     for p in persons:
         # Organisation ziehen
-        org = p.get("organization")
-        if isinstance(org, list):
-            org = org[0] if org else {}
-        if not isinstance(org, dict):
-            org = {}
+        # ---------------- Organisation extrahieren ----------------
+        org_raw = p.get("organization") or p.get("org_id") or {}
 
-        org_id = sanitize(org.get("id"))
+        if isinstance(org_raw, list):
+            org_raw = org_raw[0] if org_raw else {}
+
+        if not isinstance(org_raw, dict):
+            org_raw = {}
+
+        org_id = sanitize(org_raw.get("id") or org_raw.get("value"))
+ 
 
         # Datum filtern
         if not is_date_valid(p.get("next_activity_date")):
@@ -1022,39 +1032,46 @@ async def _build_nf_master_final(
             first = " ".join(parts[:-1]) if len(parts) > 1 else parts[0]
             last = parts[-1] if len(parts) > 1 else ""
 
-        org = p.get("organization")
-        if isinstance(org, list):
-            org = org[0] if org else {}
-        if not isinstance(org, dict):
-            org = {}
+        # -------- Organisation (robust) --------
+        org_raw = p.get("organization") or p.get("org_id") or {}
+        if isinstance(org_raw, list):
+            org_raw = org_raw[0] if org_raw else {}
+        if not isinstance(org_raw, dict):
+            org_raw = {}
 
-        org_id = sanitize(org.get("id"))
-        org_name = sanitize(org.get("name"))
+        org_id = sanitize(org_raw.get("id") or org_raw.get("value"))
+        org_name = sanitize(org_raw.get("name") or org_raw.get("label"))
+
 
         # Email-Feld robust flatten
-        email_data = p.get("email") or []
+        # -------- Email flatten (robust) --------
+        email_field = (
+            p.get("email")
+            or p.get("emails")
+            or p.get("email_address")
+            or []
+        )
         emails_flat: List[dict] = []
 
-        def add_email(obj):
-            if obj is None:
-                return
-            if isinstance(obj, dict):
-                emails_flat.append(obj)
-            elif isinstance(obj, list):
-                for sub in obj:
-                    add_email(sub)
-            else:
-                emails_flat.append({"value": obj})
+        def flatten_email(x):
+            if isinstance(x, dict):
+                emails_flat.append(x)
+            elif isinstance(x, list):
+                for sub in x:
+                    flatten_email(sub)
 
-        add_email(email_data)
+        flatten_email(email_field)
 
         email = ""
+        # bevorzugt primary
         for e in emails_flat:
             if e.get("primary"):
                 email = sanitize(e.get("value"))
                 break
+        # Fallback: erste Adresse
         if not email and emails_flat:
             email = sanitize(emails_flat[0].get("value"))
+
 
         row = {
             "Batch ID": sanitize(batch_id),
