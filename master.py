@@ -1285,6 +1285,98 @@ async def _reconcile(prefix: str) -> None:
     await save_df_text(ready_df, t["ready"])
     await save_df_text(log_df, t["log"])
 
+import traceback  # falls oben noch nicht importiert
+
+async def run_nachfass_job(job: "Job", job_id: str) -> None:
+    """
+    Führt den kompletten Nachfass-Workflow im Hintergrund aus:
+
+    1) Personen zu den angegebenen Batch-IDs laden
+    2) Nachfass-Master bauen (nf_master_final + nf_excluded)
+    3) Abgleich durchführen (Organisationen + bereits kontaktierte Personen)
+    4) nf_master_ready → Excel exportieren
+    5) Job-Status (phase/percent/done/error/path/filename_base) aktualisieren
+    """
+
+    try:
+        # ------------------------------------------------------------------
+        # Eingaben aus dem Job-Objekt (werden in /nachfass/export_start gesetzt)
+        # ------------------------------------------------------------------
+        nf_batch_ids = getattr(job, "nf_batch_ids", []) or []
+        batch_id     = getattr(job, "batch_id", "") or ""
+        campaign     = getattr(job, "campaign", "") or ""
+
+        # ------------------------------------------------------------------
+        # 1) Personen laden (nur fürs Logging / Debug interessant)
+        # ------------------------------------------------------------------
+        job.phase = "Lade Nachfass-Kandidaten …"
+        job.percent = 10
+
+        # Der Rückgabewert wird nicht direkt verwendet – die eigentliche
+        # Selektion passiert in _build_nf_master_final.
+        _ = await stream_persons_by_batch_id(
+            "5ac34dad3ea917fdef4087caebf77ba275f87eec",
+            nf_batch_ids
+        )
+
+        # ------------------------------------------------------------------
+        # 2) Nachfass-Master bauen
+        # ------------------------------------------------------------------
+        job.phase = "Erstelle Master …"
+        job.percent = 40
+
+        df_master = await _build_nf_master_final(
+            nf_batch_ids=nf_batch_ids,
+            batch_id=batch_id,
+            campaign=campaign,
+            job_obj=job
+        )
+
+        # ------------------------------------------------------------------
+        # 3) Abgleich (Organisationen / bereits kontaktierte Personen)
+        # ------------------------------------------------------------------
+        job.phase = "Führe Abgleich durch …"
+        job.percent = 70
+
+        await _reconcile("nf")  # schreibt nf_master_ready + nf_delete_log
+
+        # ------------------------------------------------------------------
+        # 4) Excel-Erzeugung aus nf_master_ready
+        # ------------------------------------------------------------------
+        job.phase = "Erzeuge Excel-Datei …"
+        job.percent = 90
+
+        ready = await load_df_text("nf_master_ready")
+        export_df = build_nf_export(ready)
+        excel_bytes = _df_to_excel_bytes_nf(export_df)
+
+        # Temporäre Datei schreiben
+        file_path = f"/tmp/nachfass_{job_id}.xlsx"
+        with open(file_path, "wb") as f:
+            f.write(excel_bytes)
+
+        job.path = file_path
+        job.total_rows = len(export_df)
+        job.filename_base = campaign or "Nachfass_Export"
+
+        # ------------------------------------------------------------------
+        # 5) Job abschließen
+        # ------------------------------------------------------------------
+        job.phase = f"Fertig – {job.total_rows} Zeilen"
+        job.percent = 100
+        job.done = True
+        job.error = None
+
+    except Exception as e:
+        # Fehler sauber im Job-Objekt vermerken + Log
+        job.error = f"{type(e).__name__}: {e}"
+        job.phase = "Fehler"
+        job.percent = 100
+        job.done = True
+
+        print("=========== TRACEBACK ===========")
+        traceback.print_exc()
+        print("=========== END TRACEBACK =======")
 
 # =============================================================================
 # Excel-Export-Helfer – FINAL MODUL 3
