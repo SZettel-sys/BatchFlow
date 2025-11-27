@@ -1,3 +1,4 @@
+import logging
 # master_fixed_v2_part1.py — Teil 1/5
 # Basis: BatchFlow (FastAPI + Pipedrive + Neon)
 # Getestet für Render Free Tier (Python 3.12, 512 MB RAM)
@@ -578,7 +579,7 @@ async def stream_persons_by_batch_id(
 
                 if r.status_code == 429:
                     print("[WARN] Rate limit erreicht, warte 2 Sekunden ...")
-                    await asyncio.sleep(2 ** (5 - retries))
+                    await asyncio.sleep(2)
                     continue
 
                 if r.status_code != 200:
@@ -618,7 +619,7 @@ async def stream_persons_by_batch_id(
                 if len(persons) < page_limit:
                     break
 
-                await asyncio.sleep(0.1)  # minimale Pause zwischen Seiten
+                await asyncio.sleep(2)  # minimale Pause zwischen Seiten
 
         print(f"[DEBUG] Batch {bid}: {total} Personen geladen")
         results.extend(local)
@@ -670,11 +671,11 @@ async def fetch_person_details(person_ids: List[str]) -> List[dict]:
                         break
 
                 # Eventloop kurz freigeben
-                await asyncio.sleep(0.05)
+                await asyncio.sleep(2)
 
             except Exception:
                 retries -= 1
-                await asyncio.sleep(1)
+                await asyncio.sleep(2)
 
     # Personen in stabile Chunks aufteilen
     chunks = [person_ids[i:i+100] for i in range(0, len(person_ids), 100)]
@@ -1408,8 +1409,7 @@ async def nachfass_export_download(job_id: str = Query(...)):
         )
 
     except Exception as e:
-        import logging
-        logging.error(print(f"[ERROR] /nachfass/export_download: {e}"))
+        logging.error(f'[ERROR] Fehler im Export')
         raise HTTPException(status_code=500, detail=str(e))
 
 # =============================================================================
@@ -1435,10 +1435,10 @@ async def reconcile_with_progress(job: "Job", prefix: str):
     """Führt _reconcile_generic() mit UI-Fortschritt durch."""
     try:
         job.phase = "Vorbereitung läuft …"; job.percent = 10
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(2)
 
         job.phase = "Lade Vergleichsdaten …"; job.percent = 25
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(2)
 
         await _reconcile(prefix)
 
@@ -1470,7 +1470,7 @@ async def export_start_nk(
     async def update_progress(phase: str, percent: int):
         job.phase = phase
         job.percent = min(100, max(0, percent))
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(2)
 
     async def _run():
         try:
@@ -2233,14 +2233,3 @@ async def catch_all(full_path: str, request: Request):
     if full_path in ("campaign", "", "/"):
         return RedirectResponse("/campaign", status_code=302)
     return RedirectResponse("/campaign", status_code=302)
-
-if __name__ == '__main__':
-    import asyncio
-    async def test_stream_orgs():
-        try:
-            async for chunk in stream_organizations_by_filter(1245, 10):
-                print('Test-Chunk:', chunk)
-                break
-        except Exception as e:
-            print('Test fehlgeschlagen:', e)
-    asyncio.run(test_stream_orgs())
