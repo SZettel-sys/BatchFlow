@@ -1,15 +1,4 @@
 import logging
-
-# Hilfsfunktion für sicheren Zugriff auf Dict oder Liste
-def safe_get(obj, key):
-    if obj is None:
-        return ""
-    if isinstance(obj, dict):
-        return obj.get(key, "")
-    if isinstance(obj, list):
-        return safe_get(obj[0], key) if obj else ""
-    return ""
-
 # master_fixed_v2_part1.py — Teil 1/5
 # Basis: BatchFlow (FastAPI + Pipedrive + Neon)
 # Getestet für Render Free Tier (Python 3.12, 512 MB RAM)
@@ -38,7 +27,7 @@ if os.path.isdir("static"):
 # -----------------------------------------------------------------------------
 # Umgebungsvariablen & Konstanten setzen
 # -----------------------------------------------------------------------------
-PD_API_TOKEN = os.getenv("PD_API_TOKEN", "")
+PD_API_PD_API_TOKEN = os.getenv("PD_API_PD_API_TOKEN", "")
 PIPEDRIVE_API = "https://api.pipedrive.com/v1"
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
@@ -369,9 +358,9 @@ def append_token(url: str) -> str:
     """Hängt api_token automatisch an (wenn kein OAuth-Token genutzt wird)."""
     if "api_token=" in url:
         return url
-    if not user_tokens.get("default") and PD_API_TOKEN:
+    if not user_tokens.get("default") and PD_API_PD_API_TOKEN:
         sep = "&" if "?" in url else "?"
-        return f"{url}{sep}api_token={PD_API_TOKEN}"
+        return f"{url}{sep}api_token={PD_API_PD_API_TOKEN}"
     return url
 
 # =============================================================================
@@ -424,7 +413,7 @@ async def stream_organizations_by_filter(filter_id: int, page_limit: int):
     start = 0
 
     while True:
-        url = f"https://api.pipedrive.com/v1/organizations?filter_id={filter_id}&start={start}&limit={page_limit}&api_token={TOKEN}"
+        url = append_token(f"{PIPEDRIVE_API}/organizations?filter_id={filter_id}&start={start}&limit={page_limit}")
 
         r = await client.get(url)
         try:
@@ -1613,7 +1602,7 @@ async def campaign_home():
 # =============================================================================
 @app.get("/neukontakte", response_class=HTMLResponse)
 async def neukontakte_page(request: Request, mode: str = Query("new")):
-    authed = bool(user_tokens.get("default") or PD_API_TOKEN)
+    authed = bool(user_tokens.get("default") or PD_API_PD_API_TOKEN)
     authed_html = "<span class='muted'>angemeldet</span>" if authed else "<a href='/login'>Anmelden</a>"
 
     return HTMLResponse(f"""<!doctype html><html lang="de">
@@ -1700,7 +1689,7 @@ loadOptions();
 # =============================================================================
 @app.get("/nachfass", response_class=HTMLResponse)
 async def nachfass_page(request: Request):
-    authed = bool(user_tokens.get("default") or PD_API_TOKEN)
+    authed = bool(user_tokens.get("default") or PD_API_PD_API_TOKEN)
     auth_info = "<span class='muted'>angemeldet</span>" if authed else "<a href='/login'>Anmelden</a>"
 
     html = """<!doctype html><html lang="de">
