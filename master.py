@@ -400,10 +400,13 @@ async def get_person_field_by_hint(label_hint: str) -> Optional[dict]:
 # =============================================================================
 # STREAMING-FUNKTIONEN (mit Paging)
 # =============================================================================
-
 async def stream_organizations_by_filter(page_limit: int = 500):
-    """Streamt alle Organisationen – OHNE filter_id, OHNE search, stabil."""
+    """
+    Streamt ALLE Organisationen seitenweise.
+    Verwendet KEINEN filter_id und KEIN term → volle API-Kompatibilität.
+    """
     start = 0
+
     while True:
         url = f"{PD_API}/organizations?start={start}&limit={page_limit}"
         r = await http_client().get(url, headers=get_headers())
@@ -412,9 +415,8 @@ async def stream_organizations_by_filter(page_limit: int = 500):
             raise Exception(f"Pipedrive Fehler (orgs): {r.text}")
 
         js = r.json()
-
-        # js ist ein Dict {"success":true,"data":[...], ...}
         data = js.get("data") or []
+
         if not data:
             break
 
@@ -486,11 +488,16 @@ async def stream_person_ids_by_filter(filter_id: int, page_limit: int = PAGE_LIM
 # Organisationen – Bucketing + Kappung (Performanceoptimiert)
 # =============================================================================
 async def _fetch_org_names_for_filter_capped(page_limit: int, cap: int, bucket_cap: int):
+    """
+    Holt Organisationen seitenweise, normalisiert Namen und legt sie in Buckets ab.
+    KEIN filter_id mehr nötig.
+    """
     result = {}
     collected = 0
 
     async for chunk in stream_organizations_by_filter(page_limit):
         for org in chunk:
+
             if collected >= cap:
                 return result
 
@@ -499,9 +506,12 @@ async def _fetch_org_names_for_filter_capped(page_limit: int, cap: int, bucket_c
                 continue
 
             norm = normalize_name(name)
-            key = bucket_key(norm)
+            if not norm:
+                continue
 
+            key = bucket_key(norm)
             bucket = result.setdefault(key, [])
+
             if len(bucket) >= bucket_cap:
                 continue
 
@@ -1069,8 +1079,11 @@ async def _fetch_org_names_for_filter_capped(
 # =============================================================================
 async def _reconcile(prefix: str) -> None:
     """
-    Bereinigte und robuste Version des Nachfass-Abgleichs.
-    Verhindert zuverlässig 'list' object has no attribute 'get'.
+    Finaler stabiler Nachfass-Abgleich:
+    - robustes Clean-Up
+    - fuzzy org matching
+    - keine filter_id-Fehler mehr
+    - keine 'list has no attribute get'
     """
 
     t = tables(prefix)
@@ -1078,12 +1091,10 @@ async def _reconcile(prefix: str) -> None:
 
     if df.empty:
         await save_df_text(pd.DataFrame(), t["ready"])
-        await save_df_text(pd.DataFrame(columns=[
-            "reason", "Kontakt ID", "Name",
-            "Organisation ID", "Organisationsname", "Grund"
-        ]), t["log"])
+        await save_df_text(pd.DataFrame(), t["log"])
         return
 
+    # Spalten
     col_pid = "Person ID"
     col_orgname = "Organisation Name"
     col_orgid = "Organisation ID"
@@ -1091,17 +1102,16 @@ async def _reconcile(prefix: str) -> None:
     delete_rows = []
     drop_idx = []
 
-    # =======================================================
-    # UNIVERSAL SANITIZER – global & sicher
-    # =======================================================
+    # -----------------------------------------------------------
+    # UNIVERSAL SANITIZER
+    # -----------------------------------------------------------
     def sanitize_cell(v):
-        """Konvertiert jede DF-Zelle zu einem stabilen String."""
         if v is None or (isinstance(v, float) and pd.isna(v)):
             return ""
 
-        # JSON-Strings → dekodieren
         if isinstance(v, str):
             s = v.strip()
+            # JSON decode
             if (s.startswith("[") and s.endswith("]")) or (s.startswith("{") and s.endswith("}")):
                 try:
                     parsed = json.loads(s)
@@ -1110,7 +1120,6 @@ async def _reconcile(prefix: str) -> None:
                     return s
             return s
 
-        # dict → value extrahieren
         if isinstance(v, dict):
             return (
                 sanitize_cell(v.get("value")) or
@@ -1120,42 +1129,27 @@ async def _reconcile(prefix: str) -> None:
                 ""
             )
 
-        # list → erstes Element extrahieren
         if isinstance(v, list):
             return sanitize_cell(v[0]) if v else ""
 
         return str(v)
 
-    # =======================================================
-    # Organisationsliste laden (für Fuzzy Matching)
-    # =======================================================
+    # -----------------------------------------------------------
+    # ALLE ORGANISATIONSNAMEN LADEN (mit CAPs)
+    # -----------------------------------------------------------
 
-    filter_ids_org = [1245, 851, 1521]
-    buckets_all = {}
-    total_collected = 0
+    MAX_NAMES = 50000
+    MAX_BUCKET = 200
 
-    for fid in filter_ids_org:
-        caps_left = MAX_ORG_NAMES - total_collected
-        if caps_left <= 0:
-            break
+    buckets_all = await _fetch_org_names_for_filter_capped(
+        PAGE_LIMIT, MAX_NAMES, MAX_BUCKET
+    )
 
-        sub = await _fetch_org_names_for_filter_capped(
-            fid, PAGE_LIMIT, caps_left, MAX_ORG_BUCKET
-        )
-
-        for key, vals in sub.items():
-            b = buckets_all.setdefault(key, [])
-            for v in vals:
-                if v not in b:
-                    b.append(v)
-                    total_collected += 1
-
-    # =======================================================
-    # 1) Fuzzy Matching auf Organisationen
-    # =======================================================
+    # -----------------------------------------------------------
+    # 1) FUZZY ORGANISATIONS-MATCHING
+    # -----------------------------------------------------------
 
     for idx, row in df.iterrows():
-
         name_raw = row.get(col_orgname, "")
         name_clean = sanitize_cell(name_raw)
         norm = normalize_name(name_clean)
@@ -1163,29 +1157,23 @@ async def _reconcile(prefix: str) -> None:
         if not norm:
             continue
 
-        b = bucket_key(norm)
-        bucket = buckets_all.get(b)
+        key = bucket_key(norm)
+        bucket = buckets_all.get(key)
         if not bucket:
             continue
 
-        # Kandidaten für fuzzy
         near = [n for n in bucket if abs(len(n) - len(norm)) <= 4]
         if not near:
             continue
 
         best = process.extractOne(norm, near, scorer=fuzz.token_sort_ratio)
-
         if best and best[1] >= 95:
 
-            # saubere Organisation ID
-            orgid_clean = sanitize_cell(row.get(col_orgid))
-
-            # Logging
             delete_rows.append({
                 "reason": "org_match_95",
                 "Kontakt ID": sanitize_cell(row.get(col_pid)),
-                "Name": sanitize_cell(f"{row.get('Person Vorname','')} {row.get('Person Nachname','')}").strip(),
-                "Organisation ID": orgid_clean,
+                "Name": sanitize_cell(f"{row.get('Person Vorname','')} {row.get('Person Nachname','')}"),
+                "Organisation ID": sanitize_cell(row.get(col_orgid)),
                 "Organisationsname": name_clean,
                 "Grund": f"Ähnlichkeit {best[1]}% mit '{best[0]}'"
             })
@@ -1194,14 +1182,14 @@ async def _reconcile(prefix: str) -> None:
 
     df = df.drop(drop_idx)
 
-    # =======================================================
-    # 2) Personen bereits kontaktiert (Filter 1216/1708)
-    # =======================================================
+    # -----------------------------------------------------------
+    # 2) PERSONEN BEREITS KONTAKTIERT (Filter 1216/1708)
+    # -----------------------------------------------------------
 
     suspect_ids = set()
 
-    for f_id in (1216, 1708):
-        async for ids in stream_person_ids_by_filter(f_id):
+    for fid in (1216, 1708):
+        async for ids in stream_person_ids_by_filter(fid):
             suspect_ids.update(ids)
 
     mask = df[col_pid].astype(str).isin(suspect_ids)
@@ -1214,7 +1202,7 @@ async def _reconcile(prefix: str) -> None:
             "Kontakt ID": sanitize_cell(r.get(col_pid)),
             "Name": sanitize_cell(
                 f"{r.get('Person Vorname','')} {r.get('Person Nachname','')}"
-            ).strip(),
+            ),
             "Organisation ID": sanitize_cell(r.get(col_orgid)),
             "Organisationsname": sanitize_cell(r.get(col_orgname)),
             "Grund": "Bereits in Filter 1216/1708"
@@ -1222,19 +1210,12 @@ async def _reconcile(prefix: str) -> None:
 
     df = df[~mask]
 
-    # =======================================================
-    # 3) Speichern der Ergebnisse
-    # =======================================================
+    # -----------------------------------------------------------
+    # SPEICHERN
+    # -----------------------------------------------------------
 
-    # READY (bereinigt)
-    ready_df = df.applymap(sanitize_cell)
-    await save_df_text(ready_df, t["ready"])
-
-    # LOG (bereinigt)
-    log_df = pd.DataFrame(delete_rows).replace({None: ""})
-    log_df = log_df.applymap(sanitize_cell)
-    await save_df_text(log_df, t["log"])
-
+    await save_df_text(df.applymap(sanitize_cell), t["ready"])
+    await save_df_text(pd.DataFrame(delete_rows).applymap(sanitize_cell), t["log"])
 
 async def run_nachfass_job(job: "Job", job_id: str):
     """
