@@ -26,7 +26,7 @@ if os.path.isdir("static"):
 # -----------------------------------------------------------------------------
 # Umgebungsvariablen & Konstanten setzen
 # -----------------------------------------------------------------------------
-PD_API_PD_API_TOKEN = os.getenv("PD_API_PD_API_TOKEN", "")
+PD_API_TOKEN = os.getenv("PD_API_TOKEN", "")
 PIPEDRIVE_API = "https://api.pipedrive.com/v1"
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
@@ -94,8 +94,7 @@ async def _startup():
     limits = httpx.Limits(max_keepalive_connections=8, max_connections=16)
     app.state.http = httpx.AsyncClient(timeout=60.0, limits=limits)
     app.state.pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=4)
-    import logging
-logging.info("[Startup] BatchFlow initialisiert.")
+    print("[Startup] BatchFlow initialisiert.")
 
 @app.on_event("shutdown")
 async def _shutdown():
@@ -358,9 +357,9 @@ def append_token(url: str) -> str:
     """Hängt api_token automatisch an (wenn kein OAuth-Token genutzt wird)."""
     if "api_token=" in url:
         return url
-    if not user_tokens.get("default") and PD_API_PD_API_TOKEN:
+    if not user_tokens.get("default") and PD_API_TOKEN:
         sep = "&" if "?" in url else "?"
-        return f"{url}{sep}api_token={PD_API_PD_API_TOKEN}"
+        return f"{url}{sep}api_token={PD_API_TOKEN}"
     return url
 
 # =============================================================================
@@ -413,9 +412,9 @@ async def stream_organizations_by_filter(filter_id: int, page_limit: int):
     start = 0
 
     while True:
-        url = f"https://api.pipedrive.com/v1/organizations?filter_id={filter_id}&start={start}&limit={page_limit}&api_token={PD_API_TOKEN}"
+        url = f"https://api.pipedrive.com/v1/organizations?filter_id={filter_id}&start={start}&limit={page_limit}&api_token={TOKEN}"
 
-        r = await http_client().get(url)
+        r = await client.get(url)
         try:
             data = r.json().get("data") or {}
         except Exception:
@@ -454,7 +453,7 @@ async def stream_person_ids_by_filter(filter_id: int, page_limit: int = PAGE_LIM
                 f"{PIPEDRIVE_API}/persons?filter_id={filter_id}&start={start}&limit={page_limit}&sort=id"
             )
 
-            r = await http_client().get(url, headers=get_headers())
+            r = await client.get(url, headers=get_headers())
             if r.status_code != 200:
                 raise Exception(
                     f"Pipedrive Fehler (IDs für Filter {filter_id}): {r.text}"
@@ -578,14 +577,12 @@ async def stream_persons_by_batch_id(
                 r = await http_client().get(url, headers=get_headers())
 
                 if r.status_code == 429:
-                    import logging
-logging.info("[WARN] Rate limit erreicht, warte 2 Sekunden ...")
+                    print("[WARN] Rate limit erreicht, warte 2 Sekunden ...")
                     await asyncio.sleep(2 ** (5 - retries))
                     continue
 
                 if r.status_code != 200:
-                    import logging
-logging.info(f"[WARN] Batch {bid} Fehler: {r.text}")
+                    print(f"[WARN] Batch {bid} Fehler: {r.text}")
                     break
 
                 raw_items = r.json().get("data", {}).get("items", []) or []
@@ -623,13 +620,11 @@ logging.info(f"[WARN] Batch {bid} Fehler: {r.text}")
 
                 await asyncio.sleep(0.1)  # minimale Pause zwischen Seiten
 
-        import logging
-logging.info(f"[DEBUG] Batch {bid}: {total} Personen geladen")
+        print(f"[DEBUG] Batch {bid}: {total} Personen geladen")
         results.extend(local)
 
     await asyncio.gather(*(fetch_one(bid) for bid in batch_ids))
-    import logging
-logging.info(f"[INFO] Alle Batch-IDs geladen: {len(results)} Personen gesamt")
+    print(f"[INFO] Alle Batch-IDs geladen: {len(results)} Personen gesamt")
     return results
 
 
@@ -683,8 +678,7 @@ async def fetch_person_details(person_ids: List[str]) -> List[dict]:
 
     # Personen in stabile Chunks aufteilen
     chunks = [person_ids[i:i+100] for i in range(0, len(person_ids), 100)]
-    import logging
-logging.info("[DEBUG] fetch: Starte mit IDs:", len(person_ids))
+    print("[DEBUG] fetch: Starte mit IDs:", len(person_ids))
 
     for group in chunks:
         await asyncio.gather(*(fetch_one(pid) for pid in group))
@@ -699,17 +693,13 @@ logging.info("[DEBUG] fetch: Starte mit IDs:", len(person_ids))
 
     results = list(unique.values())
 
-    import logging
-logging.info(f"[DEBUG] Vollständige Personendaten geladen (unique): {len(results)}")
+    print(f"[DEBUG] Vollständige Personendaten geladen (unique): {len(results)}")
     loaded_ids = {p["id"] for p in results}
     missing = set(person_ids) - loaded_ids
 
-    import logging
-logging.info("[DEBUG] fetch: Vollständige geladen:", len(results))
-    import logging
-logging.info("[DEBUG] fetch: Fehlende:", len(missing))
-    import logging
-logging.info("[DEBUG] fetch: Fehlende IDs:", missing)
+    print("[DEBUG] fetch: Vollständige geladen:", len(results))
+    print("[DEBUG] fetch: Fehlende:", len(missing))
+    print("[DEBUG] fetch: Fehlende IDs:", missing)
     return results
 
 
@@ -882,7 +872,7 @@ async def _build_nf_master_final(
         job_obj.percent = 10
 
     persons = await stream_persons_by_batch_id(
-        os.getenv('BATCH_FIELD_KEY', ''),   # Batch-ID-CF
+        "5ac34dad3ea917fdef4087caebf77ba275f87eec",   # Batch-ID-CF
         nf_batch_ids
     )
 
@@ -901,12 +891,10 @@ async def _build_nf_master_final(
             continue
 
         # Fall: unbrauchbares Objekt → ignorieren
-        import logging
-logging.info("WARNUNG: Ungültiger Personen-Datensatz erkannt:", p)
+        print("WARNUNG: Ungültiger Personen-Datensatz erkannt:", p)
 
     persons = clean_persons
-    import logging
-logging.info(f"[CLEANUP] Bereinigte Personen: {len(persons)} von {len(clean_persons)}")
+    print(f"[CLEANUP] Bereinigte Personen: {len(persons)} von {len(clean_persons)}")
 
     # =================================================================
     # Filterregeln (Datum + max 2 pro Organisation)
@@ -1242,7 +1230,7 @@ async def run_nachfass_job(job: "Job", job_id: str):
         job.percent = 10
 
         persons = await stream_persons_by_batch_id(
-            os.getenv('BATCH_FIELD_KEY', ''),
+            "5ac34dad3ea917fdef4087caebf77ba275f87eec",
             nf_batch_ids
         )
 
@@ -1300,11 +1288,9 @@ async def run_nachfass_job(job: "Job", job_id: str):
         job.phase = "Fehler"
 
         # Vollständigen Stacktrace ins Log
-        import logging
-logging.info("=========== TRACEBACK ===========")
+        print("=========== TRACEBACK ===========")
         traceback.print_exc()
-        import logging
-logging.info("=========== END TRACEBACK =======")
+        print("=========== END TRACEBACK =======")
 
         job.done = True
         job.percent = 100
@@ -1423,7 +1409,7 @@ async def nachfass_export_download(job_id: str = Query(...)):
 
     except Exception as e:
         import logging
-logging.info(f"[ERROR] /nachfass/export_download: {e}")
+logging.error(print(f"[ERROR] /nachfass/export_download: {e}"))
         raise HTTPException(status_code=500, detail=str(e))
 
 # =============================================================================
@@ -1467,9 +1453,6 @@ async def reconcile_with_progress(job: "Job", prefix: str):
 # EXPORT-START – NEUKONTAKTE
 # =============================================================================
 @app.post("/neukontakte/export_start")
-async def secure_check():
-    if not (user_tokens.get('default') or PD_API_TOKEN):
-        raise HTTPException(status_code=401, detail='Nicht autorisiert')
 async def export_start_nk(
     fachbereich: str = Body(...),
     take_count: Optional[int] = Body(None),
@@ -1545,40 +1528,6 @@ async def neukontakte_export_progress(job_id: str = Query(...)):
 # -------------------------------------------------------------------------
 # Download des erzeugten Nachfass-Exports
 # -------------------------------------------------------------------------
-@app.get("/nachfass/export_download")
-async def nachfass_export_download(job_id: str):
-    """
-    Liefert die exportierte Nachfass-Datei als Download zurück.
-    """
-    try:
-        # DataFrame laden
-        df = await load_df_text(tables("nf")["final"])
-
-        if df is None or df.empty:
-            raise FileNotFoundError("Keine Exportdaten gefunden")
-
-        # Temporäre Excel-Datei erzeugen
-        file_path = f"/tmp/nachfass_{job_id}.xlsx"
-        df.to_excel(file_path, index=False)
-
-        # Datei als Download zurückgeben
-        return FileResponse(
-            file_path,
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            filename=f"nachfass_{job_id}.xlsx"
-        )
-
-    except FileNotFoundError:
-        return JSONResponse({"detail": "Datei nicht gefunden"}, status_code=404)
-
-    except Exception as e:
-        import logging
-logging.info(f"[ERROR] /nachfass/export_download: {e}")
-        return JSONResponse({"error": str(e)}, status_code=500)
-
-# =============================================================================
-# Kampagnenübersicht (Home)
-# =============================================================================
 @app.get("/campaign", response_class=HTMLResponse)
 async def campaign_home():
     return HTMLResponse("""<!doctype html><html lang="de">
@@ -1620,7 +1569,7 @@ async def campaign_home():
 # =============================================================================
 @app.get("/neukontakte", response_class=HTMLResponse)
 async def neukontakte_page(request: Request, mode: str = Query("new")):
-    authed = bool(user_tokens.get("default") or PD_API_PD_API_TOKEN)
+    authed = bool(user_tokens.get("default") or PD_API_TOKEN)
     authed_html = "<span class='muted'>angemeldet</span>" if authed else "<a href='/login'>Anmelden</a>"
 
     return HTMLResponse(f"""<!doctype html><html lang="de">
@@ -1707,7 +1656,7 @@ loadOptions();
 # =============================================================================
 @app.get("/nachfass", response_class=HTMLResponse)
 async def nachfass_page(request: Request):
-    authed = bool(user_tokens.get("default") or PD_API_PD_API_TOKEN)
+    authed = bool(user_tokens.get("default") or PD_API_TOKEN)
     auth_info = "<span class='muted'>angemeldet</span>" if authed else "<a href='/login'>Anmelden</a>"
 
     html = """<!doctype html><html lang="de">
@@ -1961,11 +1910,9 @@ async def nachfass_summary(job_id: str = Query(...)):
     # → sauber machen ALLER Felder in ALLEN Zellen:
     for col in ready.columns:
         ready[col] = ready[col].apply(normalize_cell)
-    import logging
-logging.info("DEBUG READY TYPES:\n", ready.applymap(type).head(20))
+    print("DEBUG READY TYPES:\n", ready.applymap(type).head(20))
     log = await load_df_text("nf_delete_log")
-    import logging
-logging.info("DEBUG LOG TYPES:\n", log.applymap(type).head(20))
+    print("DEBUG LOG TYPES:\n", log.applymap(type).head(20))
     total = len(ready)
     cnt_org = _count_reason(log, ["org_match_95"])
     cnt_pid = _count_reason(log, ["person_id_match"])
@@ -2196,9 +2143,6 @@ async def nachfass_summary(job_id: str = Query(...)):
 from uuid import uuid4
 
 @app.post("/nachfass/export_start")
-async def secure_check():
-    if not (user_tokens.get('default') or PD_API_TOKEN):
-        raise HTTPException(status_code=401, detail='Nicht autorisiert')
 async def nachfass_export_start(req: Request):
     body = await req.json()
 
@@ -2236,18 +2180,12 @@ async def nachfass_export_progress(job_id: str):
     if not job:
         return JSONResponse({"error": "Job nicht gefunden"}, status_code=404)
 
-    import logging
-logging.info("==== JOB.PROGRESS DEBUG ====")
-    import logging
-logging.info("phase:", job.phase, type(job.phase))
-    import logging
-logging.info("percent:", job.percent, type(job.percent))
-    import logging
-logging.info("done:", job.done, type(job.done))
-    import logging
-logging.info("error:", job.error, type(job.error))
-    import logging
-logging.info("================================")
+    print("==== JOB.PROGRESS DEBUG ====")
+    print("phase:", job.phase, type(job.phase))
+    print("percent:", job.percent, type(job.percent))
+    print("done:", job.done, type(job.done))
+    print("error:", job.error, type(job.error))
+    print("================================")
 
     return JSONResponse({
         "phase": str(job.phase),
@@ -2259,7 +2197,9 @@ logging.info("================================")
 # =============================================================================
 # Download
 # =============================================================================
-get(job_id)
+@app.get("/nachfass/export_download")
+async def nachfass_export_download(job_id: str):
+    job = JOBS.get(job_id)
     if not job or not job.path:
         return JSONResponse({"error": "Keine Datei gefunden"}, status_code=404)
 
@@ -2293,3 +2233,14 @@ async def catch_all(full_path: str, request: Request):
     if full_path in ("campaign", "", "/"):
         return RedirectResponse("/campaign", status_code=302)
     return RedirectResponse("/campaign", status_code=302)
+
+if __name__ == '__main__':
+    import asyncio
+    async def test_stream_orgs():
+        try:
+            async for chunk in stream_organizations_by_filter(1245, 10):
+                print('Test-Chunk:', chunk)
+                break
+        except Exception as e:
+            print('Test fehlgeschlagen:', e)
+    asyncio.run(test_stream_orgs())
