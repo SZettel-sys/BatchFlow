@@ -1,7 +1,6 @@
 import logging
 
 # Hilfsfunktion für sicheren Zugriff auf Dict oder Liste
-
 def safe_get(obj, key):
     if obj is None:
         return ""
@@ -39,7 +38,7 @@ if os.path.isdir("static"):
 # -----------------------------------------------------------------------------
 # Umgebungsvariablen & Konstanten setzen
 # -----------------------------------------------------------------------------
-PD_API_PD_API_TOKEN = os.getenv("PD_API_PD_API_TOKEN", "")
+PD_API_TOKEN = os.getenv("PD_API_TOKEN", "")
 PIPEDRIVE_API = "https://api.pipedrive.com/v1"
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
@@ -370,9 +369,9 @@ def append_token(url: str) -> str:
     """Hängt api_token automatisch an (wenn kein OAuth-Token genutzt wird)."""
     if "api_token=" in url:
         return url
-    if not user_tokens.get("default") and PD_API_PD_API_TOKEN:
+    if not user_tokens.get("default") and PD_API_TOKEN:
         sep = "&" if "?" in url else "?"
-        return f"{url}{sep}api_token={PD_API_PD_API_TOKEN}"
+        return f"{url}{sep}api_token={PD_API_TOKEN}"
     return url
 
 # =============================================================================
@@ -425,7 +424,7 @@ async def stream_organizations_by_filter(filter_id: int, page_limit: int):
     start = 0
 
     while True:
-        url = f"https://api.pipedrive.com/v1/organizations?filter_id={filter_id}&start={start}&limit={page_limit}&api_token={PD_API_TOKEN}"
+        url = f"https://api.pipedrive.com/v1/organizations?filter_id={filter_id}&start={start}&limit={page_limit}&api_token={TOKEN}"
 
         r = await client.get(url)
         try:
@@ -939,9 +938,7 @@ async def _build_nf_master_final(
     for p in persons:
 
         # ---------------- Organisation extrahieren ----------------
-        org = p.get('organization');
-    if isinstance(org, list): org = org[0] if org else {};
-    if not isinstance(org, dict): org = {}
+        org = p.get("organization")
 
         if isinstance(org, list):
             org = org[0] if org else {}
@@ -983,9 +980,7 @@ async def _build_nf_master_final(
             last = parts[-1] if len(parts) > 1 else ""
 
         # -------- Organisation --------
-        org = p.get('organization');
-    if isinstance(org, list): org = org[0] if org else {};
-    if not isinstance(org, dict): org = {}
+        org = p.get("organization")
         if isinstance(org, list):
             org = org[0] if org else {}
         if not isinstance(org, dict):
@@ -995,7 +990,7 @@ async def _build_nf_master_final(
         org_name = sanitize(org.get("name"))
 
         # -------- Email flatten --------
-        email_field = p.get('email') or []
+        email_field = p.get("email") or []
         emails_flat = []
 
         def flatten_email(x):
@@ -1425,7 +1420,7 @@ async def nachfass_export_download(job_id: str = Query(...)):
         )
 
     except Exception as e:
-        logging.error(f'[ERROR] Fehler im Export')
+        print(f"[ERROR] /nachfass/export_download: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # =============================================================================
@@ -1571,7 +1566,7 @@ async def nachfass_export_download(job_id: str):
         return JSONResponse({"detail": "Datei nicht gefunden"}, status_code=404)
 
     except Exception as e:
-        logging.error(f'[ERROR] Fehler im Export')
+        print(f"[ERROR] /nachfass/export_download: {e}")
         return JSONResponse({"error": str(e)}, status_code=500)
 
 # =============================================================================
@@ -1618,7 +1613,7 @@ async def campaign_home():
 # =============================================================================
 @app.get("/neukontakte", response_class=HTMLResponse)
 async def neukontakte_page(request: Request, mode: str = Query("new")):
-    authed = bool(user_tokens.get("default") or PD_API_PD_API_TOKEN)
+    authed = bool(user_tokens.get("default") or PD_API_TOKEN)
     authed_html = "<span class='muted'>angemeldet</span>" if authed else "<a href='/login'>Anmelden</a>"
 
     return HTMLResponse(f"""<!doctype html><html lang="de">
@@ -1705,7 +1700,7 @@ loadOptions();
 # =============================================================================
 @app.get("/nachfass", response_class=HTMLResponse)
 async def nachfass_page(request: Request):
-    authed = bool(user_tokens.get("default") or PD_API_PD_API_TOKEN)
+    authed = bool(user_tokens.get("default") or PD_API_TOKEN)
     auth_info = "<span class='muted'>angemeldet</span>" if authed else "<a href='/login'>Anmelden</a>"
 
     html = """<!doctype html><html lang="de">
