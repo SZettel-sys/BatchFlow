@@ -1052,41 +1052,7 @@ def fast_fuzzy(a: str, b: str) -> int:
     """Schnellerer Fuzzy-Matcher."""
     return fuzz.partial_ratio(a, b)
 
-# =============================================================================
-# Fuzzy-Bucket-Ladung (Orga-Dubletten-Abgleich)
-# =============================================================================
-async def _fetch_org_names_for_filter_capped(
-    filter_id: int, page_limit: int, cap_total: int, cap_bucket: int
-) -> Dict[str, List[str]]:
-    """
-    Holt Organisationsnamen aus Pipedrive-Filter.
-    • normalized
-    • alphabetisch gebucket
-    • capped pro Bucket & Gesamtanzahl
-    """
-    buckets: Dict[str, List[str]] = {}
-    total = 0
 
-    async for chunk in stream_organizations_by_filter(filter_id, page_limit):
-        for o in chunk:
-            n = normalize_name(o.get("name") or "")
-            if not n:
-                continue
-
-            b = bucket_key(n)
-            lst = buckets.setdefault(b, [])
-
-            if len(lst) >= cap_bucket:
-                continue
-
-            if not lst or lst[-1] != n:
-                lst.append(n)
-                total += 1
-
-                if total >= cap_total:
-                    return buckets
-
-    return buckets
 # =============================================================================
 # _reconcile_nf
 # =============================================================================
