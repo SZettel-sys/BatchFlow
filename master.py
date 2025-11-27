@@ -890,14 +890,46 @@ async def _build_nf_master_final(
         return str(v)
 
    
-    def cf(p: dict, key: str) -> str:
-        """Custom-/Standardfeld holen – schaut auch in custom_fields rein."""
+
+    def cf(p: dict, key: Optional[str]) -> str:
+        """
+        Custom-/Standardfeld holen – robust:
+        - direkt auf Top-Level (p[key])
+        - aus custom_fields als dict
+        - aus custom_fields als Liste von Dicts (key/id + value/label/name)
+        """
         if not key:
             return ""
+
+        # 1) direkt
         v = p.get(key)
-        if v is None:
-            v = (p.get("custom_fields") or {}).get(key)
-        return sanitize(v)
+        if v is not None:
+            return sanitize(v)
+
+        # 2) custom_fields als dict
+        custom = p.get("custom_fields")
+        if isinstance(custom, dict):
+            v = custom.get(key)
+            if v is not None:
+                return sanitize(v)
+
+        # 3) custom_fields als Liste von Dicts
+        if isinstance(custom, list):
+            for entry in custom:
+                if not isinstance(entry, dict):
+                    continue
+                if entry.get("key") == key or entry.get("id") == key:
+                    v = (
+                        entry.get("value")
+                        or entry.get("label")
+                        or entry.get("name")
+                        or entry.get("id")
+                    )
+                    if v is not None:
+                        return sanitize(v)
+
+        return ""
+
 
 
     # =================================================================
