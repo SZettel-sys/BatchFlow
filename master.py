@@ -27,7 +27,7 @@ if os.path.isdir("static"):
 # -----------------------------------------------------------------------------
 # Umgebungsvariablen & Konstanten setzen
 # -----------------------------------------------------------------------------
-PD_API_PD_API_TOKEN = os.getenv("PD_API_PD_API_TOKEN", "")
+PD_API_TOKEN = os.getenv("PD_API_TOKEN", "")
 PIPEDRIVE_API = "https://api.pipedrive.com/v1"
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
@@ -358,9 +358,9 @@ def append_token(url: str) -> str:
     """Hängt api_token automatisch an (wenn kein OAuth-Token genutzt wird)."""
     if "api_token=" in url:
         return url
-    if not user_tokens.get("default") and PD_API_PD_API_TOKEN:
+    if not user_tokens.get("default") and PD_API_TOKEN:
         sep = "&" if "?" in url else "?"
-        return f"{url}{sep}api_token={PD_API_PD_API_TOKEN}"
+        return f"{url}{sep}api_token={PD_API_TOKEN}"
     return url
 
 # =============================================================================
@@ -404,95 +404,112 @@ async def get_person_field_by_hint(label_hint: str) -> Optional[dict]:
 # =============================================================================
 # stream_organizations_by_filter  (FINAL)
 # =============================================================================
-async def stream_organizations_by_filter(filter_id: int, page_limit: int):
+
+async def stream_organizations_by_filter(
+    filter_id: int,
+    page_limit: int = PAGE_LIMIT,
+) -> AsyncGenerator[List[str], None]:
     """
     Streamt Organisationen eines Pipedrive-Filters seitenweise.
-    Gibt pro Schleifendurchlauf eine Liste von Organisations-Namen zurück.
+    Gibt pro Iteration eine Liste von Organisationsnamen zurück.
+    Nutzt den globalen http_client() und append_token(), daher kein eigener Client
+    und kein harter Verweis auf einen TOKEN.
     """
-
+    client = http_client()
     start = 0
 
     while True:
-        url = append_token(f"{PIPEDRIVE_API}/organizations?filter_id={filter_id}&start={start}&limit={page_limit}")
+        url = append_token(
+            f"{PIPEDRIVE_API}/organizations"
+            f"?filter_id={filter_id}&start={start}&limit={page_limit}&sort=id"
+        )
 
-        r = await client.get(url)
-        try:
-            data = r.json().get("data") or {}
-        except Exception:
-            raise Exception(f"Pipedrive Fehler (orgs filter {filter_id}): {r.text}")
-
-        items = data.get("items") or []
-        if not items:
-            return
-
-        # Jede Seite → eine Liste mit Namen zurückgeben
-        yield [org.get("name", "").strip() for org in items if org.get("name")]
-
-        # Pagination
-        additional = r.json().get("additional_data") or {}
-        pagination = additional.get("pagination") or {}
-
-        if not pagination.get("more_items_in_collection"):
-            return
-
-        start = pagination.get("next_start", 0)
-
-
-
-async def stream_person_ids_by_filter(filter_id: int, page_limit: int = PAGE_LIMIT) -> AsyncGenerator[List[str], None]:
-    """
-    Streamt NUR echte Personen-IDs als Strings.
-    Entfernt alle Listen, Dicts, Nested Values.
-    Macht die gesamte Nachfass-Pipeline STABIL.
-    """
-
-    async with http_client() as client:
-        start = 0
-
-        while True:
-            url = append_token(
-                f"{PIPEDRIVE_API}/persons?filter_id={filter_id}&start={start}&limit={page_limit}&sort=id"
+        r = await client.get(url, headers=get_headers())
+        if r.status_code != 200:
+            raise Exception(
+                f"Pipedrive Fehler (Organisationen aus Filter {filter_id}): {r.text}"
             )
 
-            r = await client.get(url, headers=get_headers())
-            if r.status_code != 200:
-                raise Exception(
-                    f"Pipedrive Fehler (IDs für Filter {filter_id}): {r.text}"
+        payload = r.json() or {}
+        data = payload.get("data") or []
+        if not data:
+            break
+
+        # Nur nicht-leere Namen zurückgeben
+        names: List[str] = []
+        for org in data:
+            name = (org.get("name") or "").strip()
+            if name:
+                names.append(name)
+
+        if names:
+            yield names
+
+        # Paging: wenn weniger als page_limit zurückkommt, sind wir am Ende
+        if len(data) < page_limit:
+            break
+
+        start += len(data)
+
+
+async def stream_person_ids_by_filter(
+    filter_id: int,
+    page_limit: int = PAGE_LIMIT,
+) -> AsyncGenerator[List[str], None]:
+    """
+    Streamt NUR Personen-IDs (als Strings) aus einem Pipedrive-Filter.
+    Robust gegen verschachtelte / seltsame ID-Strukturen.
+    Wichtig: nutzt den globalen http_client() OHNE diesen zu schließen.
+    """
+    client = http_client()
+    start = 0
+
+    while True:
+        url = append_token(
+            f"{PIPEDRIVE_API}/persons"
+            f"?filter_id={filter_id}&start={start}&limit={page_limit}&sort=id"
+        )
+
+        r = await client.get(url, headers=get_headers())
+        if r.status_code != 200:
+            raise Exception(
+                f"Pipedrive Fehler (IDs für Filter {filter_id}): {r.text}"
+            )
+
+        payload = r.json() or {}
+        data = payload.get("data") or []
+        if not data:
+            break
+
+        ids: List[str] = []
+        for person in data:
+            v = person.get("id")
+
+            # eventuell Liste
+            if isinstance(v, list):
+                v = v[0] if v else None
+
+            # eventuell Dict
+            if isinstance(v, dict):
+                v = (
+                    v.get("id")
+                    or v.get("value")
+                    or v.get("label")
+                    or v.get("name")
                 )
 
-            data = r.json().get("data") or []
-            if not data:
-                break
+            if v is None:
+                continue
 
-            # SICHERER EXTRAKTOR
-            ids = []
-            for p in data:
-                v = p.get("id")
+            ids.append(str(v))
 
-                # falls Liste, Dict oder Müll → extrahieren
-                if isinstance(v, list):
-                    if v:
-                        v = v[0]
-
-                if isinstance(v, dict):
-                    v = (
-                        v.get("id")
-                        or v.get("value")
-                        or v.get("label")
-                        or v.get("name")
-                    )
-
-                if v is None:
-                    continue
-
-                ids.append(str(v))
-
+        if ids:
             yield ids
 
-            if len(data) < page_limit:
-                break
+        if len(data) < page_limit:
+            break
 
-            start += len(data)
+        start += len(data)
 
 
 # =============================================================================
@@ -619,7 +636,7 @@ async def stream_persons_by_batch_id(
                 if len(persons) < page_limit:
                     break
 
-                await asyncio.sleep(0.1)  # minimale Pause zwischen Seiten
+                await asyncio.sleep(2)  # minimale Pause zwischen Seiten
 
         print(f"[DEBUG] Batch {bid}: {total} Personen geladen")
         results.extend(local)
@@ -659,7 +676,7 @@ async def fetch_person_details(person_ids: List[str]) -> List[dict]:
 
                     # Rate Limit (429)
                     if r.status_code == 429:
-                        await asyncio.sleep(2)
+                        await asyncio.sleep(2 ** (5 - retries))
                         retries -= 1
                         continue
 
@@ -671,11 +688,11 @@ async def fetch_person_details(person_ids: List[str]) -> List[dict]:
                         break
 
                 # Eventloop kurz freigeben
-                await asyncio.sleep(0.05)
+                await asyncio.sleep(2)
 
             except Exception:
                 retries -= 1
-                await asyncio.sleep(1)
+                await asyncio.sleep(2)
 
     # Personen in stabile Chunks aufteilen
     chunks = [person_ids[i:i+100] for i in range(0, len(person_ids), 100)]
@@ -827,8 +844,15 @@ async def _build_nf_master_final(
     nf_batch_ids: List[str],
     batch_id: str,
     campaign: str,
-    job_obj=None
+    job_obj=None,
 ) -> pd.DataFrame:
+    """
+    Baut den Nachfass-Master (nf_master_final) inkl.:
+      - Laden der Personen zu den angegebenen Batch-IDs
+      - Filter: max. 2 Kontakte pro Organisation
+      - Filter: nächste Aktivität nicht in der Zukunft / letzten 90 Tagen
+      - Schreiben von nf_master_final + nf_excluded in die DB (TEXT-Spalten)
+    """
 
     # =================================================================
     # Universal Sanitizer – wandelt ALLES in Strings ohne Ausnahmen
@@ -862,7 +886,8 @@ async def _build_nf_master_final(
 
         return str(v)
 
-    def cf(p, key):
+    def cf(p: dict, key: str) -> str:
+        """Hilfsfunktion für Custom-Fields an Personen."""
         return sanitize(p.get(key))
 
     # =================================================================
@@ -872,72 +897,73 @@ async def _build_nf_master_final(
         job_obj.phase = "Lade Nachfass-Kandidaten …"
         job_obj.percent = 10
 
-    persons = await stream_persons_by_batch_id(
+    # batch_key wird aktuell nicht ausgewertet, daher hier fest.
+    persons_raw = await stream_persons_by_batch_id(
         "5ac34dad3ea917fdef4087caebf77ba275f87eec",   # Batch-ID-CF
-        nf_batch_ids
+        nf_batch_ids,
     )
 
     # =================================================================
-    # Personen bereinigen — **DER WICHTIGSTE FIX**
+    # Personen bereinigen — nur echte Dicts zulassen
     # =================================================================
-    clean_persons = []
-    for p in persons:
+    persons: List[dict] = []
+    for p in persons_raw:
         if isinstance(p, dict):
-            clean_persons.append(p)
-            continue
+            persons.append(p)
+        elif isinstance(p, list) and p and isinstance(p[0], dict):
+            # Fall: Pipedrive liefert [ {person} ]
+            persons.append(p[0])
+        else:
+            # alles andere ignorieren
+            print("WARNUNG: Ungültiger Personen-Datensatz erkannt:", p)
 
-        # Fall: Pipedrive liefert [ {person} ]
-        if isinstance(p, list) and p and isinstance(p[0], dict):
-            clean_persons.append(p[0])
-            continue
-
-        # Fall: unbrauchbares Objekt → ignorieren
-        print("WARNUNG: Ungültiger Personen-Datensatz erkannt:", p)
-
-    persons = clean_persons
-    print(f"[CLEANUP] Bereinigte Personen: {len(persons)} von {len(clean_persons)}")
+    print(f"[CLEANUP] Bereinigte Personen: {len(persons)} von {len(persons_raw)}")
 
     # =================================================================
     # Filterregeln (Datum + max 2 pro Organisation)
     # =================================================================
     today = datetime.now().date()
 
-    def is_date_valid(raw):
+    def is_date_valid(raw) -> bool:
+        """True = ok, False = rauswerfen."""
         raw = sanitize(raw)
         if not raw:
+            # kein Datum → zulassen
             return True
         try:
+            # nur erstes 10er-Datum YYYY-MM-DD
             dt = datetime.fromisoformat(raw[:10]).date()
-        except:
+        except Exception:
+            # unlesbares Datum → lieber zulassen
             return True
+
+        # in der Zukunft → raus
         if dt > today:
             return False
+
+        # letzte 90 Tage → raus
         if (today - dt).days <= 90:
             return False
+
         return True
 
-    selected = []
-    org_counter = defaultdict(int)
+    selected: List[dict] = []
+    org_counter: Dict[str, int] = defaultdict(int)
     count_org_limit = 0
     count_date_invalid = 0
 
-    # =================================================================
-    # Personen filtern
-    # =================================================================
     for p in persons:
-
         # ---------------- Organisation extrahieren ----------------
-        org = p.get("organization")
+        org_raw = p.get("organization") or p.get("org_id") or {}
+        if isinstance(org_raw, list):
+            org_raw = org_raw[0] if org_raw else {}
+        if not isinstance(org_raw, dict):
+            org_raw = {}
 
-        if isinstance(org, list):
-            org = org[0] if org else {}
+        org_id = sanitize(org_raw.get("id") or org_raw.get("value"))
+        org_name = sanitize(org_raw.get("name") or org_raw.get("label"))
 
-        if not isinstance(org, dict):
-            org = {}
-
-        org_id = sanitize(org.get("id"))
-
-        # ---------------- Datum ----------------
+        # ---------------- Datum prüfen ----------------
         if not is_date_valid(p.get("next_activity_date")):
             count_date_invalid += 1
             continue
@@ -954,10 +980,9 @@ async def _build_nf_master_final(
     # =================================================================
     # Export vorbereiten
     # =================================================================
-    rows = []
+    rows: List[dict] = []
 
     for p in selected:
-
         pid = sanitize(p.get("id"))
         first = sanitize(p.get("first_name"))
         last = sanitize(p.get("last_name"))
@@ -965,65 +990,72 @@ async def _build_nf_master_final(
 
         if not first and not last and fullname:
             parts = fullname.split()
-            first = " ".join(parts[:-1]) if len(parts) > 1 else parts[0]
-            last = parts[-1] if len(parts) > 1 else ""
+            if len(parts) == 1:
+                first, last = parts[0], ""
+            else:
+                first = " ".join(parts[:-1])
+                last = parts[-1]
 
-        # -------- Organisation --------
-        org = p.get("organization")
-        if isinstance(org, list):
-            org = org[0] if org else {}
-        if not isinstance(org, dict):
-            org = {}
+        # Organisation nochmal sauber ziehen (wie oben)
+        org_raw = p.get("organization") or p.get("org_id") or {}
+        if isinstance(org_raw, list):
+            org_raw = org_raw[0] if org_raw else {}
+        if not isinstance(org_raw, dict):
+            org_raw = {}
+        org_id = sanitize(org_raw.get("id") or org_raw.get("value"))
+        org_name = sanitize(org_raw.get("name") or org_raw.get("label"))
 
-        org_id = sanitize(org.get("id"))
-        org_name = sanitize(org.get("name"))
+        # Email-Feld robust flatten
+        email_data = p.get("email") or []
+        emails_flat: List[dict] = []
 
-        # -------- Email flatten --------
-        email_field = p.get("email") or []
-        emails_flat = []
+        def add_email(obj):
+            if obj is None:
+                return
+            if isinstance(obj, dict):
+                emails_flat.append(obj)
+            elif isinstance(obj, list):
+                for sub in obj:
+                    add_email(sub)
+            else:
+                # primitiver Wert
+                emails_flat.append({"value": obj})
 
-        def flatten_email(x):
-            if isinstance(x, dict):
-                emails_flat.append(x)
-            elif isinstance(x, list):
-                for i in x:
-                    flatten_email(i)
-
-        flatten_email(email_field)
+        add_email(email_data)
 
         email = ""
+        # bevorzugt primary
         for e in emails_flat:
             if e.get("primary"):
                 email = sanitize(e.get("value"))
                 break
-
         if not email and emails_flat:
             email = sanitize(emails_flat[0].get("value"))
 
-        # -------- Datensatz hinzufügen --------
-        rows.append({
-            "Batch ID": sanitize(batch_id),
-            "Channel": DEFAULT_CHANNEL,
-            "Cold-Mailing Import": sanitize(campaign),
+        rows.append(
+            {
+                "Batch ID": sanitize(batch_id),
+                "Channel": DEFAULT_CHANNEL,
+                "Cold-Mailing Import": sanitize(campaign),
 
-            "Person ID": pid,
-            "Person Vorname": first,
-            "Person Nachname": last,
-            "Person Titel": cf(p, "0343bc43a91159aaf33a463ca603dc5662422ea5"),
-            "Person Geschlecht": cf(p, "c4f5f434cdb0cfce3f6d62ec7291188fe968ac72"),
-            "Person Position": cf(p, "4585e5de11068a3bccf02d8b93c126bcf5c257ff"),
-            "Person E-Mail": email,
+                "Person ID": pid,
+                "Person Vorname": first,
+                "Person Nachname": last,
+                "Person Titel": cf(p, "0343bc43a91159aaf33a463ca603dc5662422ea5"),
+                "Person Geschlecht": cf(p, "c4f5f434cdb0cfce3f6d62ec7291188fe968ac72"),
+                "Person Position": cf(p, "4585e5de11068a3bccf02d8b93c126bcf5c257ff"),
+                "Person E-Mail": email,
 
-            "Prospect ID": cf(p, "f9138f9040c44622808a4b8afda2b1b75ee5acd0"),
+                "Prospect ID": cf(p, "f9138f9040c44622808a4b8afda2b1b75ee5acd0"),
 
-            "Organisation ID": org_id,
-            "Organisation Name": org_name,
+                "Organisation ID": org_id,
+                "Organisation Name": org_name,
 
-            "XING Profil": cf(p, "44ebb6feae2a670059bc5261001443a2878a2b43"),
-            "LinkedIn URL": cf(p, "25563b12f847a280346bba40deaf527af82038cc"),
-        })
+                "XING Profil": cf(p, "44ebb6feae2a670059bc5261001443a2878a2b43"),
+                "LinkedIn URL": cf(p, "25563b12f847a280346bba40deaf527af82038cc"),
+            }
+        )
 
-   
     # ALLE Werte nochmals deepen-sanitizen
     for r in rows:
         for k, v in r.items():
@@ -1032,13 +1064,19 @@ async def _build_nf_master_final(
     df = pd.DataFrame(rows).replace({None: ""})
 
     # =================================================================
-    # excluded speichern
+    # excluded speichern (für /nachfass/excluded/json)
     # =================================================================
-    excluded = [
-        {"Grund": "Max 2 Kontakte pro Organisation", "Anzahl": count_org_limit},
-        {"Grund": "Datum nächste Aktivität steht an bzw. liegt in naher Vergangenheit", "Anzahl": count_date_invalid},
+    excluded_rows = [
+        {
+            "Grund": "Max 2 Kontakte pro Organisation",
+            "Anzahl": int(count_org_limit),
+        },
+        {
+            "Grund": "Datum nächste Aktivität steht an bzw. liegt in naher Vergangenheit",
+            "Anzahl": int(count_date_invalid),
+        },
     ]
-    await save_df_text(pd.DataFrame(excluded), "nf_excluded")
+    await save_df_text(pd.DataFrame(excluded_rows), "nf_excluded")
 
     # final speichern
     await save_df_text(df, "nf_master_final")
@@ -1069,13 +1107,13 @@ def fast_fuzzy(a: str, b: str) -> int:
 # =============================================================================
 async def _reconcile(prefix: str) -> None:
     """
-    Finaler stabiler Nachfass-Abgleich:
-    - robustes Clean-Up
-    - fuzzy org matching
-    - keine filter_id-Fehler mehr
-    - keine 'list has no attribute get'
+    Gemeinsamer Abgleich für Neukontakte / Nachfass:
+      - fuzzy Orga-Matching (≥95 % Ähnlichkeit) gegen Referenzfilter
+      - Entfernen von Personen, die bereits in bestimmten Filtern sind (1216/1708)
+      - Schreiben von <prefix>_master_ready und <prefix>_delete_log
+    Das Log-Schema ist so gebaut, dass sowohl /summary als auch /nachfass/excluded
+    keine KeyErrors mehr bekommen (id/name/org_name/extra etc. sind vorhanden).
     """
-
     t = tables(prefix)
     df = await load_df_text(t["final"])
 
@@ -1084,13 +1122,13 @@ async def _reconcile(prefix: str) -> None:
         await save_df_text(pd.DataFrame(), t["log"])
         return
 
-    # Spalten
+    # Spalten im Master
     col_pid = "Person ID"
     col_orgname = "Organisation Name"
     col_orgid = "Organisation ID"
 
-    delete_rows = []
-    drop_idx = []
+    delete_rows: List[dict] = []
+    drop_idx: List[int] = []
 
     # -----------------------------------------------------------
     # UNIVERSAL SANITIZER
@@ -1102,7 +1140,9 @@ async def _reconcile(prefix: str) -> None:
         if isinstance(v, str):
             s = v.strip()
             # JSON decode
-            if (s.startswith("[") and s.endswith("]")) or (s.startswith("{") and s.endswith("}")):
+            if (s.startswith("[") and s.endswith("]")) or (
+                s.startswith("{") and s.endswith("}")
+            ):
                 try:
                     parsed = json.loads(s)
                     return sanitize_cell(parsed)
@@ -1112,11 +1152,11 @@ async def _reconcile(prefix: str) -> None:
 
         if isinstance(v, dict):
             return (
-                sanitize_cell(v.get("value")) or
-                sanitize_cell(v.get("label")) or
-                sanitize_cell(v.get("name")) or
-                sanitize_cell(v.get("id")) or
-                ""
+                sanitize_cell(v.get("value"))
+                or sanitize_cell(v.get("label"))
+                or sanitize_cell(v.get("name"))
+                or sanitize_cell(v.get("id"))
+                or ""
             )
 
         if isinstance(v, list):
@@ -1127,7 +1167,6 @@ async def _reconcile(prefix: str) -> None:
     # -----------------------------------------------------------
     # ALLE ORGANISATIONSNAMEN LADEN (mit CAPs)
     # -----------------------------------------------------------
-
     MAX_NAMES = 50000
     MAX_BUCKET = 200
 
@@ -1138,7 +1177,6 @@ async def _reconcile(prefix: str) -> None:
     # -----------------------------------------------------------
     # 1) FUZZY ORGANISATIONS-MATCHING
     # -----------------------------------------------------------
-
     for idx, row in df.iterrows():
         name_raw = row.get(col_orgname, "")
         name_clean = sanitize_cell(name_raw)
@@ -1157,145 +1195,95 @@ async def _reconcile(prefix: str) -> None:
             continue
 
         best = process.extractOne(norm, near, scorer=fuzz.token_sort_ratio)
-        if best and best[1] >= 95:
+        if not best:
+            continue
 
-            delete_rows.append({
+        best_name, score, *_ = best
+        if score < 95:
+            continue
+
+        # Daten für Log
+        kontakt_id = sanitize_cell(row.get(col_pid))
+        full_name = sanitize_cell(
+            f"{row.get('Person Vorname', '')} {row.get('Person Nachname', '')}"
+        )
+        org_id_val = sanitize_cell(row.get(col_orgid))
+        org_name_val = name_clean
+        extra_text = f"Ähnlichkeit {score}% mit '{best_name}'"
+
+        delete_rows.append(
+            {
                 "reason": "org_match_95",
-                "Kontakt ID": sanitize_cell(row.get(col_pid)),
-                "Name": sanitize_cell(f"{row.get('Person Vorname','')} {row.get('Person Nachname','')}"),
-                "Organisation ID": sanitize_cell(row.get(col_orgid)),
-                "Organisationsname": name_clean,
-                "Grund": f"Ähnlichkeit {best[1]}% mit '{best[0]}'"
-            })
+                "Kontakt ID": kontakt_id,
+                "id": kontakt_id,
+                "Name": full_name,
+                "name": full_name,
+                "Organisation ID": org_id_val,
+                "Organisationsname": org_name_val,
+                "org_name": org_name_val,
+                "Grund": extra_text,
+                "extra": extra_text,
+            }
+        )
 
-            drop_idx.append(idx)
+        drop_idx.append(idx)
 
-    df = df.drop(drop_idx)
+    if drop_idx:
+        df = df.drop(drop_idx)
 
     # -----------------------------------------------------------
     # 2) PERSONEN BEREITS KONTAKTIERT (Filter 1216/1708)
     # -----------------------------------------------------------
-
-    suspect_ids = set()
-
+    suspect_ids: set[str] = set()
     for fid in (1216, 1708):
         async for ids in stream_person_ids_by_filter(fid):
             suspect_ids.update(ids)
 
-    mask = df[col_pid].astype(str).isin(suspect_ids)
-    removed = df[mask]
+    if col_pid not in df.columns:
+        # Wenn es keine Person-ID-Spalte gibt, können wir nichts filtern
+        ready_df = df
+    else:
+        mask = df[col_pid].astype(str).isin(suspect_ids)
+        removed = df[mask]
 
-    for _, r in removed.iterrows():
+        for _, r in removed.iterrows():
+            kontakt_id = sanitize_cell(r.get(col_pid))
+            full_name = sanitize_cell(
+                f"{r.get('Person Vorname', '')} {r.get('Person Nachname', '')}"
+            )
+            org_id_val = sanitize_cell(r.get(col_orgid))
+            org_name_val = sanitize_cell(r.get(col_orgname))
+            extra_text = "Bereits in Filter 1216/1708"
 
-        delete_rows.append({
-            "reason": "person_id_match",
-            "Kontakt ID": sanitize_cell(r.get(col_pid)),
-            "Name": sanitize_cell(
-                f"{r.get('Person Vorname','')} {r.get('Person Nachname','')}"
-            ),
-            "Organisation ID": sanitize_cell(r.get(col_orgid)),
-            "Organisationsname": sanitize_cell(r.get(col_orgname)),
-            "Grund": "Bereits in Filter 1216/1708"
-        })
+            delete_rows.append(
+                {
+                    "reason": "person_id_match",
+                    "Kontakt ID": kontakt_id,
+                    "id": kontakt_id,
+                    "Name": full_name,
+                    "name": full_name,
+                    "Organisation ID": org_id_val,
+                    "Organisationsname": org_name_val,
+                    "org_name": org_name_val,
+                    "Grund": extra_text,
+                    "extra": extra_text,
+                }
+            )
 
-    df = df[~mask]
+        ready_df = df[~mask]
 
     # -----------------------------------------------------------
     # SPEICHERN
     # -----------------------------------------------------------
+    if not ready_df.empty:
+        ready_df = ready_df.applymap(sanitize_cell)
+    if delete_rows:
+        log_df = pd.DataFrame(delete_rows).applymap(sanitize_cell)
+    else:
+        log_df = pd.DataFrame()
 
-    await save_df_text(df.applymap(sanitize_cell), t["ready"])
-    await save_df_text(pd.DataFrame(delete_rows).applymap(sanitize_cell), t["log"])
-
-async def run_nachfass_job(job: "Job", job_id: str):
-    """
-    Führt den kompletten Nachfass-Workflow aus:
-    1) Personen nach Batch-IDs laden
-    2) Master erstellen
-    3) Abgleich durchführen
-    4) Excel-Datei erzeugen
-    5) Fortschritt aktualisieren
-    """
-
-    try:
-        # Eingaben aus dem Request holen
-        # (Die Request-Daten stehen im Job-Objekt → passe ich unten an)
-        nf_batch_ids = job.nf_batch_ids
-        batch_id     = job.batch_id
-        campaign     = job.campaign
-
-        # -----------------------------------------------------
-        # 1) Personen laden
-        # -----------------------------------------------------
-        job.phase = "Lade Nachfass-Kandidaten …"
-        job.percent = 10
-
-        persons = await stream_persons_by_batch_id(
-            "5ac34dad3ea917fdef4087caebf77ba275f87eec",
-            nf_batch_ids
-        )
-
-        # -----------------------------------------------------
-        # 2) Master erstellen
-        # -----------------------------------------------------
-        job.phase = "Erstelle Master …"
-        job.percent = 40
-
-        df = await _build_nf_master_final(
-            nf_batch_ids=nf_batch_ids,
-            batch_id=batch_id,
-            campaign=campaign,
-            job_obj=job
-        )
-
-        # -----------------------------------------------------
-        # 3) Abgleich
-        # -----------------------------------------------------
-        job.phase = "Führe Abgleich durch …"
-        job.percent = 70
-
-        await _reconcile("nf")
-
-        # -----------------------------------------------------
-        # 4) Excel erzeugen (aus nf_master_ready)
-        # -----------------------------------------------------
-        job.phase = "Erzeuge Excel-Datei …"
-        job.percent = 90
-
-        ready = await load_df_text("nf_master_ready")
-        export_df = build_nf_export(ready)
-        data = _df_to_excel_bytes_nf(export_df)
-
-        # Temporäre Datei schreiben
-        file_path = f"/tmp/nachfass_{job_id}.xlsx"
-        with open(file_path, "wb") as f:
-            f.write(data)
-
-        job.path = file_path
-        job.total_rows = len(export_df)
-        job.filename_base = campaign or "Nachfass_Export"
-
-        # -----------------------------------------------------
-        # Job finalisieren
-        # -----------------------------------------------------
-        job.phase = f"Fertig – {job.total_rows} Zeilen"
-        job.percent = 100
-        job.done = True
-
-  
-    except Exception as e:
-        import traceback
-        job.error = f"{type(e).__name__}: {e}"
-        job.phase = "Fehler"
-
-        # Vollständigen Stacktrace ins Log
-        print("=========== TRACEBACK ===========")
-        traceback.print_exc()
-        print("=========== END TRACEBACK =======")
-
-        job.done = True
-        job.percent = 100
-
+    await save_df_text(ready_df, t["ready"])
+    await save_df_text(log_df, t["log"])
 
 
 # =============================================================================
@@ -1409,7 +1397,7 @@ async def nachfass_export_download(job_id: str = Query(...)):
         )
 
     except Exception as e:
-        print(f"[ERROR] /nachfass/export_download: {e}")
+        logging.error(f'[ERROR] Fehler im Export')
         raise HTTPException(status_code=500, detail=str(e))
 
 # =============================================================================
@@ -1435,10 +1423,10 @@ async def reconcile_with_progress(job: "Job", prefix: str):
     """Führt _reconcile_generic() mit UI-Fortschritt durch."""
     try:
         job.phase = "Vorbereitung läuft …"; job.percent = 10
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(2)
 
         job.phase = "Lade Vergleichsdaten …"; job.percent = 25
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(2)
 
         await _reconcile(prefix)
 
@@ -1470,7 +1458,7 @@ async def export_start_nk(
     async def update_progress(phase: str, percent: int):
         job.phase = phase
         job.percent = min(100, max(0, percent))
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(2)
 
     async def _run():
         try:
@@ -1528,39 +1516,6 @@ async def neukontakte_export_progress(job_id: str = Query(...)):
 # -------------------------------------------------------------------------
 # Download des erzeugten Nachfass-Exports
 # -------------------------------------------------------------------------
-@app.get("/nachfass/export_download")
-async def nachfass_export_download(job_id: str):
-    """
-    Liefert die exportierte Nachfass-Datei als Download zurück.
-    """
-    try:
-        # DataFrame laden
-        df = await load_df_text(tables("nf")["final"])
-
-        if df is None or df.empty:
-            raise FileNotFoundError("Keine Exportdaten gefunden")
-
-        # Temporäre Excel-Datei erzeugen
-        file_path = f"/tmp/nachfass_{job_id}.xlsx"
-        df.to_excel(file_path, index=False)
-
-        # Datei als Download zurückgeben
-        return FileResponse(
-            file_path,
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            filename=f"nachfass_{job_id}.xlsx"
-        )
-
-    except FileNotFoundError:
-        return JSONResponse({"detail": "Datei nicht gefunden"}, status_code=404)
-
-    except Exception as e:
-        print(f"[ERROR] /nachfass/export_download: {e}")
-        return JSONResponse({"error": str(e)}, status_code=500)
-
-# =============================================================================
-# Kampagnenübersicht (Home)
-# =============================================================================
 @app.get("/campaign", response_class=HTMLResponse)
 async def campaign_home():
     return HTMLResponse("""<!doctype html><html lang="de">
@@ -1602,7 +1557,7 @@ async def campaign_home():
 # =============================================================================
 @app.get("/neukontakte", response_class=HTMLResponse)
 async def neukontakte_page(request: Request, mode: str = Query("new")):
-    authed = bool(user_tokens.get("default") or PD_API_PD_API_TOKEN)
+    authed = bool(user_tokens.get("default") or PD_API_TOKEN)
     authed_html = "<span class='muted'>angemeldet</span>" if authed else "<a href='/login'>Anmelden</a>"
 
     return HTMLResponse(f"""<!doctype html><html lang="de">
@@ -1689,7 +1644,7 @@ loadOptions();
 # =============================================================================
 @app.get("/nachfass", response_class=HTMLResponse)
 async def nachfass_page(request: Request):
-    authed = bool(user_tokens.get("default") or PD_API_PD_API_TOKEN)
+    authed = bool(user_tokens.get("default") or PD_API_TOKEN)
     auth_info = "<span class='muted'>angemeldet</span>" if authed else "<a href='/login'>Anmelden</a>"
 
     html = """<!doctype html><html lang="de">
