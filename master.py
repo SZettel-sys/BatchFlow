@@ -400,32 +400,30 @@ async def get_person_field_by_hint(label_hint: str) -> Optional[dict]:
 # =============================================================================
 # STREAMING-FUNKTIONEN (mit Paging)
 # =============================================================================
-async def stream_organizations_by_filter(page_limit: int = 500):
-    """
-    Streamt ALLE Organisationen seitenweise.
-    Verwendet KEINEN filter_id und KEIN term → volle API-Kompatibilität.
-    """
+# =============================================================================
+# stream_organizations_by_filter  (FINAL)
+# =============================================================================
+async def stream_organizations_by_filter(filter_id: int, page_limit: int):
     start = 0
 
     while True:
-        url = f"{PD_API}/organizations?start={start}&limit={page_limit}"
+        url = append_token(
+            f"{PIPEDRIVE_API}/organizations?"
+            f"filter_id={filter_id}&start={start}&limit={page_limit}"
+        )
+
         r = await http_client().get(url, headers=get_headers())
-
-        if r.status_code != 200:
-            raise Exception(f"Pipedrive Fehler (orgs): {r.text}")
-
-        js = r.json()
-        data = js.get("data") or []
-
+        data = (r.json() or {}).get("data") or []
         if not data:
-            break
+            return
 
-        yield data
+        yield [org.get("name","").strip() for org in data if org.get("name")]
 
         if len(data) < page_limit:
-            break
+            return
 
         start += len(data)
+
 
 
 async def stream_person_ids_by_filter(filter_id: int, page_limit: int = PAGE_LIMIT) -> AsyncGenerator[List[str], None]:
