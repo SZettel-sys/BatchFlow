@@ -1409,7 +1409,7 @@ async def nachfass_export_download(job_id: str = Query(...)):
 
     except Exception as e:
         import logging
-logging.error(print(f"[ERROR] /nachfass/export_download: {e}"))
+        logging.error(print(f"[ERROR] /nachfass/export_download: {e}"))
         raise HTTPException(status_code=500, detail=str(e))
 
 # =============================================================================
