@@ -2424,6 +2424,41 @@ async def nachfass_export_progress(job_id: str):
     })
 
 # =============================================================================
+# Debug-Endpoint für eine Person
+# =============================================================================
+from fastapi.responses import JSONResponse  # falls noch nicht importiert
+
+@app.get("/debug/pd_person/{pid}")
+async def debug_pd_person(pid: int):
+    """
+    Debug-Endpoint: ruft Pipedrive /persons/{pid} einmal direkt auf
+    und zeigt Status + Response an.
+    """
+    client = http_client()
+    url = append_token(
+        f"{PIPEDRIVE_API}/persons/{pid}"
+        "?return_all_custom_fields=1"
+        "&include=organization,organization_fields"
+    )
+
+    r = await client.get(url, headers=get_headers())
+    status = r.status_code
+
+    try:
+        data = r.json()
+    except Exception:
+        data = None
+
+    return JSONResponse(
+        {
+            "status": status,
+            "json": data,
+            "text": r.text[:500],  # erste 500 Zeichen als Fallback
+        }
+    )
+
+
+# =============================================================================
 # Download
 # =============================================================================
 @app.get("/nachfass/export_download")
