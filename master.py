@@ -404,16 +404,14 @@ async def get_person_field_by_hint(label_hint: str) -> Optional[dict]:
 # =============================================================================
 # stream_organizations_by_filter  (FINAL)
 # =============================================================================
-
 async def stream_organizations_by_filter(
     filter_id: int,
     page_limit: int = PAGE_LIMIT,
 ) -> AsyncGenerator[List[str], None]:
     """
     Streamt Organisationen eines Pipedrive-Filters seitenweise.
-    Gibt pro Iteration eine Liste von Organisationsnamen zurück.
-    Nutzt den globalen http_client() und append_token(), daher kein eigener Client
-    und kein harter Verweis auf einen TOKEN.
+    Bei 429 (Too many requests) wird der Orga-Scan abgebrochen,
+    damit der Job weiterlaufen kann (Abgleich dann ohne Fuzzy-Orga-Matching).
     """
     client = http_client()
     start = 0
@@ -425,7 +423,17 @@ async def stream_organizations_by_filter(
         )
 
         r = await client.get(url, headers=get_headers())
+
+        if r.status_code == 429:
+            # Rate Limit erreicht -> Abbrechen, aber KEIN Fehler mehr werfen
+            print(
+                f"[stream_organizations_by_filter] WARN: 429 Too many requests "
+                f"für Filter {filter_id}. Breche Orga-Scan ab."
+            )
+            return
+
         if r.status_code != 200:
+            # andere Fehler weiter hochwerfen
             raise Exception(
                 f"Pipedrive Fehler (Organisationen aus Filter {filter_id}): {r.text}"
             )
@@ -435,7 +443,6 @@ async def stream_organizations_by_filter(
         if not data:
             break
 
-        # Nur nicht-leere Namen zurückgeben
         names: List[str] = []
         for org in data:
             name = (org.get("name") or "").strip()
@@ -445,11 +452,11 @@ async def stream_organizations_by_filter(
         if names:
             yield names
 
-        # Paging: wenn weniger als page_limit zurückkommt, sind wir am Ende
         if len(data) < page_limit:
             break
 
         start += len(data)
+
 
 
 async def stream_person_ids_by_filter(
