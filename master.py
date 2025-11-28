@@ -844,37 +844,37 @@ async def _build_nf_master_final(
     nf_batch_ids: List[str],
     batch_id: str,
     campaign: str,
-    job_obj=None
+    job_obj=None,
 ) -> pd.DataFrame:
     """
     Baut den Nachfass-Master (nf_master_final):
 
-    - lädt Personen zu den angegebenen Batch-IDs
-    - max. 2 Kontakte je Organisation
-    - nächste Aktivität nicht in Zukunft / letzten 90 Tagen
-    - zieht Custom-Felder dynamisch anhand der Feldnamen-Hints
-      (PERSON_FIELD_HINTS_TO_EXPORT), mit Fallback auf alte Keys
-    - speichert nf_master_final + nf_excluded in der DB
+    - findet Personen über Batch-IDs (stream_persons_by_batch_id)
+    - lädt für alle Treffer vollständige Personendetails (fetch_person_details)
+    - filtert:
+        * max. 2 Kontakte pro Organisation
+        * nächste Aktivität nicht in Zukunft / letzten 90 Tagen
+    - schreibt:
+        * nf_master_final
+        * nf_excluded (Zähler pro Ausschlussgrund)
     """
 
-    # =================================================================
-    # Universal Sanitizer – wandelt ALLES in Strings ohne Ausnahmen
-    # =================================================================
-    def sanitize(v):
-        """Konvertiert Pipedrive-Werte (list/dict/json/etc.) sicher zu Strings."""
+    # -------------------------------------------------------------
+    # Hilfsfunktionen
+    # -------------------------------------------------------------
+    def sanitize(v: Any) -> str:
+        """Konvertiert beliebige Werte sicher in einen String."""
         if v is None or (isinstance(v, float) and pd.isna(v)):
             return ""
-
         if isinstance(v, str):
             s = v.strip()
-            # JSON-Strings decodieren
+            # JSON-Strings ggf. dekodieren
             if (s.startswith("[") and s.endswith("]")) or (s.startswith("{") and s.endswith("}")):
                 try:
                     return sanitize(json.loads(s))
                 except Exception:
                     return s
             return s
-
         if isinstance(v, dict):
             return (
                 sanitize(v.get("value"))
@@ -883,13 +883,9 @@ async def _build_nf_master_final(
                 or sanitize(v.get("id"))
                 or ""
             )
-
         if isinstance(v, list):
             return sanitize(v[0]) if v else ""
-
         return str(v)
-
-   
 
     def cf(p: dict, key: Optional[str]) -> str:
         """
@@ -906,8 +902,9 @@ async def _build_nf_master_final(
         if v is not None:
             return sanitize(v)
 
-        # 2) custom_fields als dict
         custom = p.get("custom_fields")
+
+        # 2) custom_fields als dict
         if isinstance(custom, dict):
             v = custom.get(key)
             if v is not None:
@@ -930,74 +927,104 @@ async def _build_nf_master_final(
 
         return ""
 
-
-
-    # =================================================================
-    # 1) Personen laden
-    # =================================================================
-    if job_obj:
-        job_obj.phase = "Lade Nachfass-Kandidaten …"
-        job_obj.percent = 10
-
-    persons = await stream_persons_by_batch_id(
-        "5ac34dad3ea917fdef4087caebf77ba275f87eec",   # Batch-ID-CF
-        nf_batch_ids
-    )
-
-    # =================================================================
-    # 2) Personen bereinigen — nur echte Dicts zulassen
-    # =================================================================
-    clean_persons: List[dict] = []
-    for p in persons:
-        if isinstance(p, dict):
-            clean_persons.append(p)
-        elif isinstance(p, list) and p and isinstance(p[0], dict):
-            clean_persons.append(p[0])
-        else:
-            print("WARNUNG: Ungültiger Personen-Datensatz erkannt:", p)
-
-    persons = clean_persons
-    print(f"[CLEANUP] Bereinigte Personen: {len(persons)}")
-
-    # =================================================================
-    # 3) Custom-Feld-Mapping dynamisch auslesen
-    # =================================================================
-    # Fallback: alte hardcodierte Keys, falls Hint-Suche nichts findet
-    HARDCODED_KEYS = {
+    # Hardcodierte Pipedrive-Feldkeys (bei Bedarf anpassen)
+    PERSON_CF_KEYS = {
         "Prospect ID":       "f9138f9040c44622808a4b8afda2b1b75ee5acd0",
         "Person Titel":      "0343bc43a91159aaf33a463ca603dc5662422ea5",
         "Person Geschlecht": "c4f5f434cdb0cfce3f6d62ec7291188fe968ac72",
         "Person Position":   "4585e5de11068a3bccf02d8b93c126bcf5c257ff",
         "XING Profil":       "44ebb6feae2a670059bc5261001443a2878a2b43",
         "LinkedIn URL":      "25563b12f847a280346bba40deaf527af82038cc",
-        # E-Mail lassen wir über p["email"] laufen
     }
 
-    export_field_keys: Dict[str, str] = {}
+    # -------------------------------------------------------------
+    # 1) Personen über Batch-ID(s) finden (Search)
+    # -------------------------------------------------------------
+    if job_obj:
+        job_obj.phase = "Lade Nachfass-Kandidaten …"
+        job_obj.percent = 10
 
-    try:
-        fields = await get_person_fields()
-        for f in fields:
-            fname = (f.get("name") or "").lower()
-            key = f.get("key")
-            if not key:
-                continue
+    # Pipedrive-Customfield-Key für Batch-ID anpassen, falls nötig
+    BATCH_CF_KEY = "5ac34dad3ea917fdef4087caebf77ba275f87eec"
 
-            for hint, col_name in PERSON_FIELD_HINTS_TO_EXPORT.items():
-                if hint in fname and col_name not in export_field_keys:
-                    export_field_keys[col_name] = key
-    except Exception as e:
-        print("[WARN] get_person_fields fehlgeschlagen:", e)
+    persons_search = await stream_persons_by_batch_id(
+        BATCH_CF_KEY,
+        nf_batch_ids,
+    )
 
-    # Fallbacks ergänzen, falls per Hint nichts gefunden
-    for col, key in HARDCODED_KEYS.items():
-        export_field_keys.setdefault(col, key)
+    clean_search: List[dict] = []
+    person_ids: List[str] = []
 
-    print("[DEBUG] Export-Feldmapping:", export_field_keys)
+    for p in persons_search:
+        if isinstance(p, dict):
+            item = p
+        elif isinstance(p, list) and p and isinstance(p[0], dict):
+            item = p[0]
+        else:
+            print("WARNUNG: Ungültiger Datensatz in persons_search:", p)
+            continue
 
-    # =================================================================
-    # 4) Filterregeln (Datum + max 2 pro Organisation)
-    # =================================================================
+        clean_search.append(item)
+        pid = sanitize(item.get("id"))
+        if pid:
+            person_ids.append(pid)
+
+    person_ids = sorted(set(person_ids))
+    print(f"[NF] Personen aus Suche: {len(person_ids)} IDs")
+
+    if not person_ids:
+        empty_df = pd.DataFrame(
+            columns=[
+                "Batch ID",
+                "Channel",
+                "Cold-Mailing Import",
+                "Prospect ID",
+                "Organisation ID",
+                "Organisation Name",
+                "Person ID",
+                "Person Vorname",
+                "Person Nachname",
+                "Person Titel",
+                "Person Geschlecht",
+                "Person Position",
+                "Person E-Mail",
+                "XING Profil",
+                "LinkedIn URL",
+            ]
+        )
+        await save_df_text(empty_df, "nf_master_final")
+        await save_df_text(
+            pd.DataFrame(
+                [{"Grund": "Keine Personen zur Batch-ID gefunden", "Anzahl": 0}]
+            ),
+            "nf_excluded",
+        )
+        if job_obj:
+            job_obj.phase = "Keine Personen gefunden"
+            job_obj.percent = 100
+            job_obj.done = True
+        return empty_df
+
+    # -------------------------------------------------------------
+    # 2) Vollständige Personendetails laden
+    # -------------------------------------------------------------
+    if job_obj:
+        job_obj.phase = "Lade Personendetails …"
+        job_obj.percent = 25
+
+    persons_full = await fetch_person_details(person_ids)
+    persons: List[dict] = []
+    for p in persons_full:
+        if isinstance(p, dict):
+            persons.append(p)
+        else:
+            print("WARNUNG: Ungültiger Datensatz in fetch_person_details:", p)
+
+    print(f"[NF] Vollständige Personendaten: {len(persons)} Datensätze")
+
+    # -------------------------------------------------------------
+    # 3) Filter: Datum + max. 2 Kontakte pro Organisation
+    # -------------------------------------------------------------
     today = datetime.now().date()
 
     def is_date_valid(raw) -> bool:
@@ -1007,7 +1034,7 @@ async def _build_nf_master_final(
         try:
             dt = datetime.fromisoformat(raw[:10]).date()
         except Exception:
-            # unlesbares Datum → lieber zulassen
+            # unlesbares Datum -> zulassen
             return True
         if dt > today:
             return False
@@ -1021,25 +1048,21 @@ async def _build_nf_master_final(
     count_date_invalid = 0
 
     for p in persons:
-        # Organisation ziehen
-        # ---------------- Organisation extrahieren ----------------
+        # Organisation extrahieren
         org_raw = p.get("organization") or p.get("org_id") or {}
-
         if isinstance(org_raw, list):
             org_raw = org_raw[0] if org_raw else {}
-
         if not isinstance(org_raw, dict):
             org_raw = {}
 
         org_id = sanitize(org_raw.get("id") or org_raw.get("value"))
- 
 
-        # Datum filtern
+        # Datum prüfen
         if not is_date_valid(p.get("next_activity_date")):
             count_date_invalid += 1
             continue
 
-        # max 2 pro Orga
+        # max. 2 Kontakte pro Orga
         if org_id:
             org_counter[org_id] += 1
             if org_counter[org_id] > 2:
@@ -1048,9 +1071,14 @@ async def _build_nf_master_final(
 
         selected.append(p)
 
-    # =================================================================
-    # 5) Export-Zeilen aufbauen
-    # =================================================================
+    print(
+        f"[NF] Nach Filtern: {len(selected)} Datensätze "
+        f"(org_limit={count_org_limit}, date_invalid={count_date_invalid})"
+    )
+
+    # -------------------------------------------------------------
+    # 4) Export-Zeilen aufbauen
+    # -------------------------------------------------------------
     rows: List[dict] = []
 
     for p in selected:
@@ -1061,95 +1089,82 @@ async def _build_nf_master_final(
 
         if not first and not last and fullname:
             parts = fullname.split()
-            first = " ".join(parts[:-1]) if len(parts) > 1 else parts[0]
-            last = parts[-1] if len(parts) > 1 else ""
+            if len(parts) == 1:
+                first, last = parts[0], ""
+            else:
+                first = " ".join(parts[:-1])
+                last = parts[-1]
 
-        # -------- Organisation (robust) --------
         org_raw = p.get("organization") or p.get("org_id") or {}
         if isinstance(org_raw, list):
             org_raw = org_raw[0] if org_raw else {}
         if not isinstance(org_raw, dict):
             org_raw = {}
-
         org_id = sanitize(org_raw.get("id") or org_raw.get("value"))
         org_name = sanitize(org_raw.get("name") or org_raw.get("label"))
 
-
-        # Email-Feld robust flatten
-        # -------- Email flatten (robust) --------
-        email_field = (
-            p.get("email")
-            or p.get("emails")
-            or p.get("email_address")
-            or []
-        )
+        # E-Mail robust flatten
+        email_field = p.get("email") or p.get("emails") or []
         emails_flat: List[dict] = []
 
-        def flatten_email(x):
-            if isinstance(x, dict):
-                emails_flat.append(x)
-            elif isinstance(x, list):
-                for sub in x:
-                    flatten_email(sub)
+        def add_email(obj):
+            if obj is None:
+                return
+            if isinstance(obj, dict):
+                emails_flat.append(obj)
+            elif isinstance(obj, list):
+                for sub in obj:
+                    add_email(sub)
+            else:
+                emails_flat.append({"value": obj})
 
-        flatten_email(email_field)
+        add_email(email_field)
 
         email = ""
-        # bevorzugt primary
         for e in emails_flat:
             if e.get("primary"):
                 email = sanitize(e.get("value"))
                 break
-        # Fallback: erste Adresse
         if not email and emails_flat:
             email = sanitize(emails_flat[0].get("value"))
-
 
         row = {
             "Batch ID": sanitize(batch_id),
             "Channel": DEFAULT_CHANNEL,
             "Cold-Mailing Import": sanitize(campaign),
-
+            "Prospect ID": cf(p, PERSON_CF_KEYS["Prospect ID"]),
+            "Organisation ID": org_id,
+            "Organisation Name": org_name,
             "Person ID": pid,
             "Person Vorname": first,
             "Person Nachname": last,
-            "Organisation ID": org_id,
-            "Organisation Name": org_name,
+            "Person Titel": cf(p, PERSON_CF_KEYS["Person Titel"]),
+            "Person Geschlecht": cf(p, PERSON_CF_KEYS["Person Geschlecht"]),
+            "Person Position": cf(p, PERSON_CF_KEYS["Person Position"]),
             "Person E-Mail": email,
-            "Prospect ID": "",
-            "Person Titel": "",
-            "Person Geschlecht": "",
-            "Person Position": "",
-            "XING Profil": "",
-            "LinkedIn URL": "",
+            "XING Profil": cf(p, PERSON_CF_KEYS["XING Profil"]),
+            "LinkedIn URL": cf(p, PERSON_CF_KEYS["LinkedIn URL"]),
         }
 
-        # Custom-Felder anhand des Mappings setzen
-        for col_name, key in export_field_keys.items():
-            if col_name == "Person E-Mail":
-                # E-Mail kommt aus dem Standardfeld
-                continue
-            row[col_name] = cf(p, key)
-
-        # alles nochmals sanitizen
-        for k, v in list(row.items()):
+        # alles nochmal sanitizen
+        for k, v in row.items():
             row[k] = sanitize(v)
 
         rows.append(row)
 
     df = pd.DataFrame(rows).replace({None: ""})
 
-    # =================================================================
-    # 6) excluded speichern + Master speichern
-    # =================================================================
-    excluded = [
+    # -------------------------------------------------------------
+    # 5) Excluded-Statistik + Speichern
+    # -------------------------------------------------------------
+    excluded_rows = [
         {"Grund": "Max 2 Kontakte pro Organisation", "Anzahl": int(count_org_limit)},
         {
             "Grund": "Datum nächste Aktivität steht an bzw. liegt in naher Vergangenheit",
             "Anzahl": int(count_date_invalid),
         },
     ]
-    await save_df_text(pd.DataFrame(excluded), "nf_excluded")
+    await save_df_text(pd.DataFrame(excluded_rows), "nf_excluded")
     await save_df_text(df, "nf_master_final")
 
     if job_obj:
