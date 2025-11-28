@@ -652,73 +652,137 @@ async def stream_persons_by_batch_id(
 # =============================================================================
 import asyncio
 async def fetch_person_details(person_ids: List[str]) -> List[dict]:
-    """Lädt vollständige Datensätze für Personen-IDs parallel (inkl. 429-Retry, Organisation & Dedup)."""
+    """
+    Lädt vollständige Personendetails für alle übergebenen IDs.
 
-    results = []
-    sem = asyncio.Semaphore(8)   # performant & sicher
+    Strategie:
+    - 1. Durchlauf: parallele Requests (z.B. 5 gleichzeitig), mit Retries bei 429/Fehlern
+    - 2. Durchlauf: nur für fehlende IDs, mit kleinerer Parallelität
+    - Wenn danach immer noch IDs fehlen -> RuntimeError (Job bricht sauber mit Fehler ab)
+    """
 
-    async def fetch_one(pid):
+    import asyncio
+
+    if not person_ids:
+        return []
+
+    client = http_client()
+    # damit wir pro ID nur ein Objekt haben -> dict statt Liste
+    results: Dict[str, dict] = {}
+    failed: set[str] = set()
+
+    # -----------------------------------
+    # Helfer für einen einzelnen Request
+    # -----------------------------------
+    async def fetch_one(pid: str, sem: asyncio.Semaphore, label: str):
         retries = 5
+        delay = 1.0
+
         while retries > 0:
             try:
                 async with sem:
-
-                    # --- WICHTIG ---
-                    # return_all_custom_fields=1     → liefert alle Custom-Felder inkl. Label
-                    # include=organization,organization_fields → liefert vollständige Organisation (id+name)
                     url = append_token(
                         f"{PIPEDRIVE_API}/persons/{pid}"
                         "?return_all_custom_fields=1"
                         "&include=organization,organization_fields"
                     )
+                    r = await client.get(url, headers=get_headers())
 
-                    r = await http_client().get(url, headers=get_headers())
+                status = r.status_code
 
-                    # Rate Limit (429)
-                    if r.status_code == 429:
-                        await asyncio.sleep(2 ** (5 - retries))
-                        retries -= 1
-                        continue
+                if status == 200:
+                    data = (r.json() or {}).get("data")
+                    if data:
+                        rid = str(data.get("id") or pid)
+                        results[rid] = data
+                    return
 
-                    # Erfolg
-                    if r.status_code == 200:
-                        data = r.json().get("data")
-                        if data:
-                            results.append(data)
-                        break
+                if status == 404:
+                    # Person existiert nicht (mehr) -> merken, aber nicht endlos versuchen
+                    print(f"[fetch_person_details] {label} 404 für ID {pid}")
+                    failed.add(str(pid))
+                    return
 
-                # Eventloop kurz freigeben
-                await asyncio.sleep(2)
+                if status == 429:
+                    # Rate Limit -> exponential backoff
+                    print(f"[fetch_person_details] {label} 429 für ID {pid}, retry …")
+                    retries -= 1
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, 30)
+                    continue
 
-            except Exception:
+                # andere HTTP-Fehler
+                print(
+                    f"[fetch_person_details] {label} HTTP {status} für ID {pid}: {r.text}"
+                )
                 retries -= 1
-                await asyncio.sleep(2)
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 30)
 
-    # Personen in stabile Chunks aufteilen
-    chunks = [person_ids[i:i+100] for i in range(0, len(person_ids), 100)]
-    print("[DEBUG] fetch: Starte mit IDs:", len(person_ids))
+            except Exception as e:
+                print(f"[fetch_person_details] {label} Exception für ID {pid}: {e}")
+                retries -= 1
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 30)
 
-    for group in chunks:
-        await asyncio.gather(*(fetch_one(pid) for pid in group))
+        # alle Retries aufgebraucht
+        failed.add(str(pid))
 
+    # -----------------------------------
+    # 1. Runde: normal parallel
+    # -----------------------------------
+    first_sem = asyncio.Semaphore(5)  # ggf. anpassen, wenn du mehr/weniger Last willst
+    tasks = [
+        asyncio.create_task(fetch_one(str(pid), first_sem, "run1"))
+        for pid in person_ids
+    ]
+    await asyncio.gather(*tasks)
 
-    # --------------------------------------------------------------
-    # DUPLIKAT-SCHUTZ → entfernt doppelte Personen-IDs
-    # --------------------------------------------------------------
-    unique = {}
-    for p in results:
-        unique[p["id"]] = p
+    loaded_ids = set(results.keys())
+    expected_ids = {str(pid) for pid in person_ids}
+    missing_after_first = expected_ids - loaded_ids
 
-    results = list(unique.values())
+    print(f"[fetch_person_details] run1: geladen={len(loaded_ids)}, "
+          f"fehlend={len(missing_after_first)}")
 
-    print(f"[DEBUG] Vollständige Personendaten geladen (unique): {len(results)}")
-    loaded_ids = {p["id"] for p in results}
-    missing = set(person_ids) - loaded_ids
+    # -----------------------------------
+    # 2. Runde: nur fehlende, mit kleinerer Parallelität
+    # -----------------------------------
+    if missing_after_first:
+        second_sem = asyncio.Semaphore(2)
+        tasks2 = [
+            asyncio.create_task(fetch_one(pid, second_sem, "run2"))
+            for pid in missing_after_first
+        ]
+        await asyncio.gather(*tasks2)
 
-    print("[DEBUG] fetch: Vollständige geladen:", len(results))
-    print("[DEBUG] fetch: Fehlende:", len(missing))
-    print("[DEBUG] fetch: Fehlende IDs:", missing)
-    return results
+        loaded_ids = set(results.keys())
+        missing_after_second = expected_ids - loaded_ids
+
+        print(f"[fetch_person_details] run2: zusätzlich geladen="
+              f"{len(loaded_ids) - (len(expected_ids) - len(missing_after_first))}, "
+              f"gesamt_fehlend={len(missing_after_second)}")
+
+        if missing_after_second:
+            # an dieser Stelle bewusst abbrechen -> Job zeigt sauberen Fehler
+            sample = list(missing_after_second)[:10]
+            raise RuntimeError(
+                f"Personendetails konnten für {len(missing_after_second)} IDs "
+                f"nicht geladen werden (Beispiele: {sample})"
+            )
+
+    # -----------------------------------
+    # Ergebnis in ursprünglicher Reihenfolge zurückgeben
+    # -----------------------------------
+    ordered: List[dict] = []
+    for pid in person_ids:
+        spid = str(pid)
+        if spid in results:
+            ordered.append(results[spid])
+        else:
+            # sollte wegen obigem RuntimeError eigentlich nicht mehr passieren
+            print(f"[fetch_person_details] WARN: ID {spid} fehlt trotz erfolgreichem Lauf")
+    return ordered
 
 
 # -----------------------------------------------------------------------------
