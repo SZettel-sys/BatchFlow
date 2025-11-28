@@ -731,7 +731,7 @@ async def fetch_person_details(person_ids: List[str]) -> List[dict]:
     # -----------------------------------
     # 1. Runde: normal parallel
     # -----------------------------------
-    first_sem = asyncio.Semaphore(5)  # ggf. anpassen, wenn du mehr/weniger Last willst
+    first_sem = asyncio.Semaphore(1)  # ggf. anpassen, wenn du mehr/weniger Last willst
     tasks = [
         asyncio.create_task(fetch_one(str(pid), first_sem, "run1"))
         for pid in person_ids
@@ -749,7 +749,7 @@ async def fetch_person_details(person_ids: List[str]) -> List[dict]:
     # 2. Runde: nur fehlende, mit kleinerer Parallelität
     # -----------------------------------
     if missing_after_first:
-        second_sem = asyncio.Semaphore(2)
+        second_sem = asyncio.Semaphore(1)
         tasks2 = [
             asyncio.create_task(fetch_one(pid, second_sem, "run2"))
             for pid in missing_after_first
@@ -763,13 +763,15 @@ async def fetch_person_details(person_ids: List[str]) -> List[dict]:
               f"{len(loaded_ids) - (len(expected_ids) - len(missing_after_first))}, "
               f"gesamt_fehlend={len(missing_after_second)}")
 
+      
         if missing_after_second:
-            # an dieser Stelle bewusst abbrechen -> Job zeigt sauberen Fehler
             sample = list(missing_after_second)[:10]
-            raise RuntimeError(
-                f"Personendetails konnten für {len(missing_after_second)} IDs "
-                f"nicht geladen werden (Beispiele: {sample})"
+            print(
+                f"[fetch_person_details] WARN: Personendetails fehlen für "
+                f"{len(missing_after_second)} IDs (Beispiele: {sample})"
             )
+    # Kein raise -> Job läuft mit den geladenen Personen weiter
+
 
     # -----------------------------------
     # Ergebnis in ursprünglicher Reihenfolge zurückgeben
