@@ -457,16 +457,14 @@ async def stream_organizations_by_filter(
 
         start += len(data)
 
-
-
 async def stream_person_ids_by_filter(
     filter_id: int,
     page_limit: int = PAGE_LIMIT,
 ) -> AsyncGenerator[List[str], None]:
     """
     Streamt NUR Personen-IDs (als Strings) aus einem Pipedrive-Filter.
-    Robust gegen verschachtelte / seltsame ID-Strukturen.
-    Wichtig: nutzt den globalen http_client() OHNE diesen zu schließen.
+    Bei 429 (Too many requests) wird der Scan abgebrochen, damit der Job
+    weiterlaufen kann (Abgleich / Ausschluss dann ggf. unvollständig).
     """
     client = http_client()
     start = 0
@@ -478,7 +476,17 @@ async def stream_person_ids_by_filter(
         )
 
         r = await client.get(url, headers=get_headers())
+
+        if r.status_code == 429:
+            # Rate Limit erreicht -> IDs-Scan hier abbrechen, aber keinen Fehler werfen
+            print(
+                f"[stream_person_ids_by_filter] WARN: 429 Too many requests "
+                f"für Filter {filter_id}. Breche ID-Scan ab."
+            )
+            return
+
         if r.status_code != 200:
+            # andere Fehler weiter hochwerfen
             raise Exception(
                 f"Pipedrive Fehler (IDs für Filter {filter_id}): {r.text}"
             )
@@ -492,11 +500,11 @@ async def stream_person_ids_by_filter(
         for person in data:
             v = person.get("id")
 
-            # eventuell Liste
+            # evtl. Liste
             if isinstance(v, list):
                 v = v[0] if v else None
 
-            # eventuell Dict
+            # evtl. Dict
             if isinstance(v, dict):
                 v = (
                     v.get("id")
@@ -517,6 +525,8 @@ async def stream_person_ids_by_filter(
             break
 
         start += len(data)
+
+
 
 
 # =============================================================================
