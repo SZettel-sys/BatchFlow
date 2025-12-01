@@ -1162,101 +1162,101 @@ async def _build_nf_master_final(
     # -------------------------------------------------------------
     # 4) Export-Zeilen aufbauen
     # -------------------------------------------------------------
-        rows: List[dict] = []
+    rows: List[dict] = []
 
-        for p in selected:
-            # ---------------- Basis-Personendaten ----------------
-            pid = sanitize(p.get("id"))
-            first = sanitize(p.get("first_name"))
-            last = sanitize(p.get("last_name"))
-            fullname = sanitize(p.get("name"))
-    
-            # Fallback: Vollname zerlegen
-            if not first and not last and fullname:
-                parts = fullname.split()
-                if len(parts) == 1:
-                    first, last = parts[0], ""
-                else:
-                    first = " ".join(parts[:-1])
-                    last = parts[-1]
-    
-            # ---------------- Organisation ----------------
-            org_raw = p.get("organization") or p.get("org_id") or {}
-            if isinstance(org_raw, list):
-                org_raw = org_raw[0] if org_raw else {}
-            if not isinstance(org_raw, dict):
-                org_raw = {}
-    
-            org_id = sanitize(org_raw.get("id") or org_raw.get("value"))
-            org_name = sanitize(org_raw.get("name") or org_raw.get("label"))
-    
-            # ---------------- E-Mail ermitteln ----------------
-            email_field = p.get("email") or p.get("emails") or []
-            emails_flat: List[dict] = []
-    
-            def add_email(obj):
-                if obj is None:
-                    return
-                if isinstance(obj, dict):
-                    emails_flat.append(obj)
-                elif isinstance(obj, list):
-                    for sub in obj:
-                        add_email(sub)
-                else:
-                    emails_flat.append({"value": obj})
-    
-            add_email(email_field)
-    
-            email = ""
-            for e in emails_flat:
-                if e.get("primary"):
-                    email = sanitize(e.get("value"))
-                    break
-            if not email and emails_flat:
-                email = sanitize(emails_flat[0].get("value"))
-    
-            # ---------------- Prospect-ID (Custom Field) ----------------
-            prospect_id = cf(p, PERSON_CF_KEYS["Prospect ID"])
-    
-            # ============================================================
-            #  FILTER:
-            #    - Organisation = "Freelancer" -> überspringen
-            #    - keine Prospect-ID -> überspringen
-            #    - keine E-Mail -> überspringen
-            # ============================================================
-            if org_name.strip().lower() == "freelancer":
-                continue
-    
-            if not prospect_id:
-                continue
-    
-            if not email:
-                continue
-    
-            # ---------------- Zeile für Export aufbauen ----------------
-            row = {
-                "Batch ID": sanitize(batch_id),
-                "Channel": DEFAULT_CHANNEL,
-                "Cold-Mailing Import": sanitize(campaign),
-                "Prospect ID": prospect_id,
-                "Organisation ID": org_id,
-                "Organisation Name": org_name,
-                "Person ID": pid,
-                "Person Vorname": first,
-                "Person Nachname": last,
-                "Person Titel": cf(p, PERSON_CF_KEYS["Person Titel"]),
-                "Person Geschlecht": cf(p, PERSON_CF_KEYS["Person Geschlecht"]),
-                "Person Position": cf(p, PERSON_CF_KEYS["Person Position"]),
-                "Person E-Mail": email,
-                "XING Profil": cf(p, PERSON_CF_KEYS["XING Profil"]),
-                "LinkedIn URL": cf(p, PERSON_CF_KEYS["LinkedIn URL"]),
-            }
-    
-            # alles nochmal sauber machen
-            for k, v in row.items():
-                row[k] = sanitize(v)
-    
-            rows.append(row)
+    for p in selected:
+        # ---------------- Basis-Personendaten ----------------
+        pid = sanitize(p.get("id"))
+        first = sanitize(p.get("first_name"))
+        last = sanitize(p.get("last_name"))
+        fullname = sanitize(p.get("name"))
+
+        # Fallback: Vollname zerlegen
+        if not first and not last and fullname:
+            parts = fullname.split()
+            if len(parts) == 1:
+                first, last = parts[0], ""
+            else:
+                first = " ".join(parts[:-1])
+                last = parts[-1]
+
+        # ---------------- Organisation ----------------
+        org_raw = p.get("organization") or p.get("org_id") or {}
+        if isinstance(org_raw, list):
+            org_raw = org_raw[0] if org_raw else {}
+        if not isinstance(org_raw, dict):
+            org_raw = {}
+
+        org_id = sanitize(org_raw.get("id") or org_raw.get("value"))
+        org_name = sanitize(org_raw.get("name") or org_raw.get("label"))
+
+        # ---------------- E-Mail ermitteln ----------------
+        email_field = p.get("email") or p.get("emails") or []
+        emails_flat: List[dict] = []
+
+        def add_email(obj):
+            if obj is None:
+                return
+            if isinstance(obj, dict):
+                emails_flat.append(obj)
+            elif isinstance(obj, list):
+                for sub in obj:
+                    add_email(sub)
+            else:
+                emails_flat.append({"value": obj})
+
+        add_email(email_field)
+
+        email = ""
+        for e in emails_flat:
+            if e.get("primary"):
+                email = sanitize(e.get("value"))
+                break
+        if not email and emails_flat:
+            email = sanitize(emails_flat[0].get("value"))
+
+        # ---------------- Prospect-ID (Custom Field) ----------------
+        prospect_id = cf(p, PERSON_CF_KEYS["Prospect ID"])
+
+        # ============================================================
+        #  FILTER:
+        #    - Organisation = "Freelancer" -> überspringen
+        #    - keine Prospect-ID -> überspringen
+        #    - keine E-Mail -> überspringen
+        # ============================================================
+        if org_name.strip().lower() == "freelancer":
+            continue
+
+        if not prospect_id:
+            continue
+
+        if not email:
+            continue
+
+        # ---------------- Zeile für Export aufbauen ----------------
+        row = {
+            "Batch ID": sanitize(batch_id),
+            "Channel": DEFAULT_CHANNEL,
+            "Cold-Mailing Import": sanitize(campaign),
+            "Prospect ID": prospect_id,
+            "Organisation ID": org_id,
+            "Organisation Name": org_name,
+            "Person ID": pid,
+            "Person Vorname": first,
+            "Person Nachname": last,
+            "Person Titel": cf(p, PERSON_CF_KEYS["Person Titel"]),
+            "Person Geschlecht": cf(p, PERSON_CF_KEYS["Person Geschlecht"]),
+            "Person Position": cf(p, PERSON_CF_KEYS["Person Position"]),
+            "Person E-Mail": email,
+            "XING Profil": cf(p, PERSON_CF_KEYS["XING Profil"]),
+            "LinkedIn URL": cf(p, PERSON_CF_KEYS["LinkedIn URL"]),
+        }
+
+        # alles nochmal sauber machen
+        for k, v in row.items():
+            row[k] = sanitize(v)
+
+        rows.append(row)
 
     df = pd.DataFrame(rows).replace({None: ""})
 
