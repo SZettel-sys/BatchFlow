@@ -716,26 +716,28 @@ async def fetch_person_details(person_ids: List[str]) -> List[dict]:
 
                 if status == 404:
                     # Person existiert nicht (mehr) -> merken, aber nicht endlos versuchen
-                    
+                    print(f"[fetch_person_details] {label} 404 für ID {pid}")
                     failed.add(str(pid))
                     return
 
                 if status == 429:
                     # Rate Limit -> exponential backoff
-                  
+                    print(f"[fetch_person_details] {label} 429 für ID {pid}, retry …")
                     retries -= 1
                     await asyncio.sleep(delay)
                     delay = min(delay * 2, 30)
                     continue
 
                 # andere HTTP-Fehler
-                
+                print(
+                    f"[fetch_person_details] {label} HTTP {status} für ID {pid}: {r.text}"
+                )
                 retries -= 1
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, 30)
 
             except Exception as e:
-                
+                print(f"[fetch_person_details] {label} Exception für ID {pid}: {e}")
                 retries -= 1
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, 30)
@@ -757,7 +759,8 @@ async def fetch_person_details(person_ids: List[str]) -> List[dict]:
     expected_ids = {str(pid) for pid in person_ids}
     missing_after_first = expected_ids - loaded_ids
 
-  
+    print(f"[fetch_person_details] run1: geladen={len(loaded_ids)}, "
+          f"fehlend={len(missing_after_first)}")
 
     # -----------------------------------
     # 2. Runde: nur fehlende, mit kleinerer Parallelität
@@ -773,12 +776,17 @@ async def fetch_person_details(person_ids: List[str]) -> List[dict]:
         loaded_ids = set(results.keys())
         missing_after_second = expected_ids - loaded_ids
 
-        
+        print(f"[fetch_person_details] run2: zusätzlich geladen="
+              f"{len(loaded_ids) - (len(expected_ids) - len(missing_after_first))}, "
+              f"gesamt_fehlend={len(missing_after_second)}")
 
       
         if missing_after_second:
             sample = list(missing_after_second)[:10]
-            
+            print(
+                f"[fetch_person_details] WARN: Personendetails fehlen für "
+                f"{len(missing_after_second)} IDs (Beispiele: {sample})"
+            )
     # Kein raise -> Job läuft mit den geladenen Personen weiter
 
 
@@ -792,7 +800,7 @@ async def fetch_person_details(person_ids: List[str]) -> List[dict]:
             ordered.append(results[spid])
         else:
             # sollte wegen obigem RuntimeError eigentlich nicht mehr passieren
-          
+            print(f"[fetch_person_details] WARN: ID {spid} fehlt trotz erfolgreichem Lauf")
     return ordered
 
 
@@ -1045,7 +1053,7 @@ async def _build_nf_master_final(
             person_ids.append(pid)
 
     person_ids = sorted(set(person_ids))
-   
+    print(f"[NF] Personen aus Suche: {len(person_ids)} IDs")
 
     if not person_ids:
         empty_df = pd.DataFrame(
@@ -1095,7 +1103,7 @@ async def _build_nf_master_final(
         else:
             print("WARNUNG: Ungültiger Datensatz in fetch_person_details:", p)
 
-   
+    print(f"[NF] Vollständige Personendaten: {len(persons)} Datensätze")
 
     # -------------------------------------------------------------
     # 3) Filter: Datum + max. 2 Kontakte pro Organisation
@@ -1146,7 +1154,10 @@ async def _build_nf_master_final(
 
         selected.append(p)
 
-   
+    print(
+        f"[NF] Nach Filtern: {len(selected)} Datensätze "
+        f"(org_limit={count_org_limit}, date_invalid={count_date_invalid})"
+    )
 
     # -------------------------------------------------------------
     # 4) Export-Zeilen aufbauen
@@ -1531,9 +1542,9 @@ async def run_nachfass_job(job: "Job", job_id: str) -> None:
         job.percent = 100
         job.done = True
 
-        print("=========== TRACEBACK ===========")
-        traceback.print_exc()
-        print("=========== END TRACEBACK =======")
+        #print("=========== TRACEBACK ===========")
+        #traceback.print_exc()
+        #print("=========== END TRACEBACK =======")
 
 # =============================================================================
 # Excel-Export-Helfer – FINAL MODUL 3
@@ -2147,9 +2158,9 @@ async def nachfass_summary(job_id: str = Query(...)):
     # → sauber machen ALLER Felder in ALLEN Zellen:
     for col in ready.columns:
         ready[col] = ready[col].apply(normalize_cell)
-   
+    print("DEBUG READY TYPES:\n", ready.applymap(type).head(20))
     log = await load_df_text("nf_delete_log")
-   
+    print("DEBUG LOG TYPES:\n", log.applymap(type).head(20))
     total = len(ready)
     cnt_org = _count_reason(log, ["org_match_95"])
     cnt_pid = _count_reason(log, ["person_id_match"])
@@ -2417,12 +2428,12 @@ async def nachfass_export_progress(job_id: str):
     if not job:
         return JSONResponse({"error": "Job nicht gefunden"}, status_code=404)
 
-    print("==== JOB.PROGRESS DEBUG ====")
-    print("phase:", job.phase, type(job.phase))
-    print("percent:", job.percent, type(job.percent))
-    print("done:", job.done, type(job.done))
-    print("error:", job.error, type(job.error))
-    print("================================")
+    #print("==== JOB.PROGRESS DEBUG ====")
+    #print("phase:", job.phase, type(job.phase))
+    #print("percent:", job.percent, type(job.percent))
+    #print("done:", job.done, type(job.done))
+    #print("error:", job.error, type(job.error))
+    #print("================================")
 
     return JSONResponse({
         "phase": str(job.phase),
