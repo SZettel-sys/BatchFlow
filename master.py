@@ -301,47 +301,58 @@ def tables(prefix: str) -> dict:
 
 async def load_df_text(table: str) -> pd.DataFrame:
     """
-    Lädt eine TEXT-Tabelle und sanitizt ALLE Werte:
-    * JSON-Strings
-    * echte Listen
-    * echte Dicts
-    * None / NaN
-    * nested Strukturen
+    Lädt eine TEXT-Tabelle und wandelt ALLE Werte in saubere Strings um:
+    - Listen → erster Eintrag
+    - Dicts → value/label/name/id
+    - JSON-Strings → decodieren
+    - None/NaN → ""
+    - verschachtelte Strukturen → vollständig flatten
+    API-v2-sicher & frontend-sicher.
     """
-    def sanitize_value(v):
+
+    def flatten(v):
         if v is None:
             return ""
-
-        # floats mit NaN
         if isinstance(v, float) and pd.isna(v):
             return ""
-
-        # Strings zuerst trimmen
         if isinstance(v, str):
             s = v.strip()
-            # JSON-Strings entschlüsseln
+            # JSON-Strings deserialisieren
             if (s.startswith("[") and s.endswith("]")) or (s.startswith("{") and s.endswith("}")):
                 try:
-                    return sanitize_value(json.loads(s))
+                    return flatten(json.loads(s))
                 except:
                     return s
             return s
-
-        # Dicts -> wichtigste Felder extrahieren
-        if isinstance(v, dict):
-            for k in ("value", "label", "name", "id"):
-                if k in v:
-                    return sanitize_value(v[k])
-            return ""
-
-        # Listen -> erstes Element
         if isinstance(v, list):
-            if not v:
-                return ""
-            return sanitize_value(v[0])
-
-        # Rest -> String
+            return flatten(v[0]) if v else ""
+        if isinstance(v, dict):
+            return flatten(
+                v.get("value")
+                or v.get("label")
+                or v.get("name")
+                or v.get("id")
+                or ""
+            )
+        # Fallback
         return str(v)
+
+    async with get_pool().acquire() as conn:
+        rows = await conn.fetch(f'SELECT * FROM "{SCHEMA}"."{table}"')
+        if not rows:
+            return pd.DataFrame()
+
+        cols = list(rows[0].keys())
+        clean_rows = []
+
+        for r in rows:
+            clean_rows.append({
+                c: flatten(r[c])  # zentral flatten
+                for c in cols
+            })
+
+        return pd.DataFrame(clean_rows)
+
 
     async with get_pool().acquire() as conn:
         rows = await conn.fetch(f'SELECT * FROM "{SCHEMA}"."{table}"')
@@ -2268,28 +2279,55 @@ async def nachfass_summary(job_id: str = Query(...)):
 @app.get("/nachfass/excluded/json")
 async def nachfass_excluded_json():
 
+    # Universeller Sanitizer – macht JEDE Struktur zu einem sauberen String
+    def flatten(v):
+        if v is None:
+            return ""
+        if isinstance(v, float) and pd.isna(v):
+            return ""
+        if isinstance(v, list):
+            return flatten(v[0] if v else "")
+        if isinstance(v, dict):
+            return flatten(
+                v.get("value")
+                or v.get("label")
+                or v.get("name")
+                or v.get("id")
+                or ""
+            )
+        return str(v)
+
     excluded_df = await load_df_text("nf_excluded")
     deleted_df  = await load_df_text("nf_delete_log")
 
+    # ---------------------------
+    # 1) Summary (Batch-/Filter-Ausschlüsse)
+    # ---------------------------
     excluded_summary = []
     if not excluded_df.empty:
         for _, r in excluded_df.iterrows():
             excluded_summary.append({
-                "Grund": r["Grund"],
-                "Anzahl": int(r["Anzahl"])
+                "Grund": flatten(r.get("Grund")),
+                "Anzahl": int(r.get("Anzahl") or 0)
             })
 
+    # ---------------------------
+    # 2) Abgleich-Ausschlüsse (Fuzzy / ID-Dubletten)
+    # ---------------------------
     rows = []
     if not deleted_df.empty:
         deleted_df = deleted_df.replace({None: "", np.nan: ""})
 
         for _, r in deleted_df.iterrows():
             rows.append({
-                "Kontakt ID": r.get("Kontakt ID") or r.get("id") or "",
-                "Name": r.get("Name") or "",
-                "Organisation ID": r.get("Organisation ID") or "",
-                "Organisationsname": r.get("Organisationsname") or "",
-                "Grund": r.get("Grund") or r.get("reason") or ""
+                "Kontakt ID":     flatten(r.get("Kontakt ID") or r.get("id")),
+                "Name":           flatten(r.get("Name") or r.get("name")),
+                "Organisation ID": flatten(r.get("Organisation ID")),
+                "Organisationsname": flatten(
+                    r.get("Organisationsname")
+                    or r.get("org_name")
+                ),
+                "Grund": flatten(r.get("Grund") or r.get("reason") or r.get("extra")),
             })
 
     return JSONResponse({
@@ -2297,6 +2335,7 @@ async def nachfass_excluded_json():
         "total": len(rows),
         "rows": rows
     })
+
 
 
 # =============================================================================
