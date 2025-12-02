@@ -28,7 +28,11 @@ app = FastAPI(title="BatchFlow")
 app.add_middleware(GZipMiddleware, minimum_size=1024)
 if os.path.isdir("static"):
     app.mount("/static", StaticFiles(directory="static"), name="static")
-
+    
+@app.get("/healthz")
+async def healthz():
+    """Einfacher Healthcheck für Render: immer 200."""
+    return {"status": "ok"}
 # -----------------------------------------------------------------------------
 # Umgebungsvariablen & Konstanten setzen
 # -----------------------------------------------------------------------------
@@ -2577,6 +2581,11 @@ async def overview_redirect():
     """
     return RedirectResponse("/campaign", status_code=302)
 
+
+@app.get("/", response_class=HTMLResponse)
+async def root():
+    # direkt die Campaign-Seite rendern, ohne Redirect
+    return await campaign_home()
 
 @app.get("/{full_path:path}", include_in_schema=False)
 async def catch_all(full_path: str, request: Request):
