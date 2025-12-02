@@ -2035,7 +2035,7 @@ async def nachfass_page(request: Request):
   <div class="hwrap">
     <div><a href='/campaign' style='color:#0a66c2;text-decoration:none'>← Kampagne wählen</a></div>
     <div><b>Nachfass</b></div>
-    <div>""" + auth_info + """</div>
+    <div>{{auth}}</div>
   </div>
 </header>
 
@@ -2059,7 +2059,7 @@ async def nachfass_page(request: Request):
   <section id="excludedSection" style="margin-top:30px;">
     <h3>Nicht berücksichtigte Datensätze</h3>
 
-    <!-- Summary Box wird dynamisch eingefügt -->
+    <div id="excluded-summary-box"></div>
 
     <div id="excludedTable">
       <table>
@@ -2080,6 +2080,7 @@ async def nachfass_page(request: Request):
   </section>
 </main>
 
+<!-- 🔥 WICHTIG: Dieses Element bleibt id="phase" für das JS -->
 <div id="overlay">
   <div id="phase" style="color:#0f172a;font-weight:500"></div>
   <div class="barwrap"><div class="bar" id="bar"></div></div>
@@ -2127,23 +2128,7 @@ async function loadExcludedTable(){
     const body = document.querySelector('#excluded-table-body');
     body.innerHTML = '';
 
-    // ---------------------------
-    // 1) Summary Box (Batch/Filter)
-    // ---------------------------
-    const summaryBoxId = "excluded-summary-box";
-    let summaryBox = document.getElementById(summaryBoxId);
-
-    if (!summaryBox) {
-      summaryBox = document.createElement("div");
-      summaryBox.id = summaryBoxId;
-      summaryBox.style.margin = "15px 0";
-      summaryBox.style.padding = "12px 16px";
-      summaryBox.style.background = "#fff";
-      summaryBox.style.border = "1px solid #e2e8f0";
-      summaryBox.style.borderRadius = "10px";
-      summaryBox.style.boxShadow = "0 2px 8px rgba(2,8,23,.04)";
-      document.querySelector("#excludedSection").prepend(summaryBox);
-    }
+    const summaryBox = document.getElementById("excluded-summary-box");
 
     if (data.summary && data.summary.length > 0) {
       let html = "<b>Batch-/Filter-Ausschlüsse:</b><ul style='margin-top:6px'>";
@@ -2156,9 +2141,6 @@ async function loadExcludedTable(){
       summaryBox.innerHTML = "<b>Keine Batch-/Filter-Ausschlüsse</b>";
     }
 
-    // ---------------------------
-    // 2) Abgleich-Zeilen (Fuzzy/ID)
-    // ---------------------------
     if (!data.rows || data.rows.length === 0){
       body.innerHTML = `
         <tr>
