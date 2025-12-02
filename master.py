@@ -1959,7 +1959,19 @@ async def neukontakte_page(request: Request, mode: str = Query("new")):
 <div class="barwrap"><div class="bar" id="bar"></div></div></div>
 
 <script>
-const el = id => document.getElementById(id);
+
+const el = id => {
+    const n = document.getElementById(id);
+    if (!n) {
+        console.error("Element with ID", id, "not found");
+        return { textContent: "" };
+    }
+    if (n instanceof NodeList || Array.isArray(n)) {
+        console.error("Multiple elements returned for", id, n);
+        return n[0]; // immer erstes Element zurückgeben
+    }
+    return n;
+};
 function showOverlay(msg){{el('phase').textContent=msg;el('overlay').style.display='flex';}}
 function setProgress(p){{el('bar').style.width=Math.min(100,Math.max(0,p))+'%';}}
 async function loadOptions(){{
@@ -2006,6 +2018,7 @@ async def nachfass_page(request: Request):
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>Nachfass – BatchFlow</title>
+
 <style>
   body{margin:0;background:#f6f8fb;color:#0f172a;font:16px/1.6 Inter,sans-serif}
   header{background:#fff;border-bottom:1px solid #e2e8f0}
@@ -2019,27 +2032,40 @@ async def nachfass_page(request: Request):
   .btn{background:#0ea5e9;border:none;color:#fff;border-radius:10px;
         padding:12px 16px;cursor:pointer;font-weight:600}
   .btn:hover{background:#0284c7}
-  #overlay{display:none;position:fixed;inset:0;background:rgba(255,255,255,.7);
-            backdrop-filter:blur(2px);z-index:9999;align-items:center;justify-content:center;flex-direction:column;gap:10px}
+
+  #overlay{
+    display:none;position:fixed;inset:0;background:rgba(255,255,255,.7);
+    backdrop-filter:blur(2px);
+    z-index:9999;align-items:center;justify-content:center;flex-direction:column;gap:10px
+  }
+
   .barwrap{width:min(520px,90vw);height:10px;border-radius:999px;background:#e2e8f0;overflow:hidden}
   .bar{height:100%;width:0%;background:#0ea5e9;transition:width .25s linear}
+
   table{width:100%;border-collapse:collapse;margin-top:20px;
-         border:1px solid #e2e8f0;border-radius:10px;box-shadow:0 2px 8px rgba(2,8,23,.04);background:#fff}
+         border:1px solid #e2e8f0;border-radius:10px;
+         box-shadow:0 2px 8px rgba(2,8,23,.04);background:#fff}
   th,td{padding:8px 10px;border-bottom:1px solid #e2e8f0;text-align:left}
   th{background:#f8fafc;font-weight:600}
   tr:hover{background:#f1f5f9}
 </style>
+
 </head>
 <body>
+
 <header>
   <div class="hwrap">
-    <div><a href='/campaign' style='color:#0a66c2;text-decoration:none'>← Kampagne wählen</a></div>
+    <div><a href='/campaign' style='color:#0a66c2;text-decoration:none'>
+      ← Kampagne wählen
+    </a></div>
     <div><b>Nachfass</b></div>
-    <div>{{auth}}</div>
+    <div>""" + auth_info + """</div>
   </div>
 </header>
 
 <main>
+
+  <!-- Eingabe-Karte -->
   <section class="card">
     <label>Batch IDs (1–2 Werte)</label>
     <textarea id="nf_batch_ids" rows="3" placeholder="z. B. B111, B222"></textarea>
@@ -2056,8 +2082,9 @@ async def nachfass_page(request: Request):
     </div>
   </section>
 
+  <!-- Excluded Section -->
   <section id="excludedSection" style="margin-top:30px;">
-    <h3>Nicht berücksichtigte Datensätze</h3>
+    <h3> Nicht berücksichtigte Datensätze </h3>
 
     <div id="excluded-summary-box"></div>
 
@@ -2073,70 +2100,84 @@ async def nachfass_page(request: Request):
           </tr>
         </thead>
         <tbody id="excluded-table-body">
-          <tr><td colspan="5" style="text-align:center;color:#888">Noch keine Daten geladen</td></tr>
+          <tr>
+            <td colspan="5" style="text-align:center;color:#888">
+              Noch keine Daten geladen
+            </td>
+          </tr>
         </tbody>
       </table>
     </div>
   </section>
+
 </main>
 
-<!-- 🔥 WICHTIG: Dieses Element bleibt id="phase" für das JS -->
+<!-- EINDEUTIGES Overlay -->
 <div id="overlay">
-  <div id="phase" style="color:#0f172a;font-weight:500"></div>
-  <div class="barwrap"><div class="bar" id="bar"></div></div>
+  <div id="overlay-phase" style="color:#0f172a;font-weight:500"></div>
+  <div class="barwrap"><div class="bar" id="overlay-bar"></div></div>
 </div>
 
 <script>
-const el = id => document.getElementById(id);
-function showOverlay(m){el('phase').textContent=m||'';el('overlay').style.display='flex';}
-function hideOverlay(){el('overlay').style.display='none';}
-function setProgress(p){el('bar').style.width=Math.max(0,Math.min(100,p))+'%';}
-
-function _parseIDs(raw){
-  return raw.split(/[\\n,;]/).map(s=>s.trim()).filter(Boolean).slice(0,2);
-}
-
-async function startExportNf(){
-  const ids=_parseIDs(el('nf_batch_ids').value);
-  if(ids.length===0)return alert('Bitte mindestens eine Batch ID angeben.');
-  const bid=el('batch_id').value||'';
-  const camp=el('campaign').value||'';
-
-  showOverlay('Starte Abgleich …');
-  setProgress(5);
-
-  try{
-    const r=await fetch('/nachfass/export_start',{
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({nf_batch_ids:ids,batch_id:bid,campaign:camp})
-    });
-    if(!r.ok)throw new Error('Start fehlgeschlagen.');
-    const {job_id}=await r.json();
-    await poll(job_id);
-  }catch(err){
-    alert(err.message||'Fehler beim Starten.');
-    hideOverlay();
+// ============================================================
+// SICHERE Hilfsfunktion → verhindert NodeList-Probleme
+// ============================================================
+const el = id => {
+  const node = document.getElementById(id);
+  if (!node) {
+    console.warn("Element not found:", id);
+    return { textContent:"", style:{}, value:"" };
   }
+  return node;
+};
+
+// ============================================================
+// Overlay-Steuerung
+// ============================================================
+function showOverlay(msg){
+  el('overlay-phase').textContent = msg || '';
+  el('overlay').style.display = 'flex';
 }
 
+function hideOverlay(){
+  el('overlay').style.display = 'none';
+}
+
+function setProgress(p){
+  el('overlay-bar').style.width = Math.min(100, Math.max(0, p)) + "%";
+}
+
+// ============================================================
+// ID Parsing für Batch IDs
+// ============================================================
+function _parseIDs(raw){
+  return raw.split(/[\\n,;]/)
+            .map(s => s.trim())
+            .filter(Boolean)
+            .slice(0,2);
+}
+
+// ============================================================
+// Excluded Table Loader
+// ============================================================
 async function loadExcludedTable(){
   try{
     const r = await fetch('/nachfass/excluded/json');
     const data = await r.json();
 
-    const body = document.querySelector('#excluded-table-body');
+    const body = el('excluded-table-body');
     body.innerHTML = '';
 
-    const summaryBox = document.getElementById("excluded-summary-box");
+    const summaryBox = el('excluded-summary-box');
 
-    if (data.summary && data.summary.length > 0) {
+    if (data.summary && data.summary.length > 0){
       let html = "<b>Batch-/Filter-Ausschlüsse:</b><ul style='margin-top:6px'>";
-      for (const s of data.summary) {
+      for (const s of data.summary){
         html += `<li>${s.Grund}: <b>${s.Anzahl}</b></li>`;
       }
       html += "</ul>";
       summaryBox.innerHTML = html;
+
     } else {
       summaryBox.innerHTML = "<b>Keine Batch-/Filter-Ausschlüsse</b>";
     }
@@ -2164,37 +2205,86 @@ async function loadExcludedTable(){
     }
 
   } catch(err){
-    const body = document.querySelector('#excluded-table-body');
-    body.innerHTML = `
-      <tr><td colspan="5" style="text-align:center;color:red">
-        Fehler beim Laden (${err.message})
-      </td></tr>`;
+    el('excluded-table-body').innerHTML =
+      `<tr><td colspan="5" style="text-align:center;color:red">Fehler beim Laden</td></tr>`;
   }
 }
 
+// ============================================================
+// Job-Polling
+// ============================================================
 async function poll(job_id){
-  let done=false;
+  let done = false;
+
   while(!done){
-    await new Promise(r=>setTimeout(r,600));
-    const r=await fetch('/nachfass/export_progress?job_id='+encodeURIComponent(job_id));
-    if(!r.ok)break;
-    const s=await r.json();
-    el('phase').textContent=s.phase+' ('+(s.percent||0)+'%)';
+    await new Promise(r => setTimeout(r,600));
+    const r = await fetch('/nachfass/export_progress?job_id=' + encodeURIComponent(job_id));
+
+    if(!r.ok) break;
+    const s = await r.json();
+
+    // Fortschrittsanzeige
+    el('overlay-phase').textContent = s.phase + " (" + (s.percent||0) + "%)";
     setProgress(s.percent||0);
-    if(s.error){alert(s.error);hideOverlay();return;}
-    done=s.done;
+
+    if (s.error){
+      alert(s.error);
+      hideOverlay();
+      return;
+    }
+
+    done = s.done;
   }
-  el('phase').textContent='Download startet …';
+
+  el('overlay-phase').textContent = "Download startet …";
   setProgress(100);
-  window.location.href='/nachfass/export_download?job_id='+encodeURIComponent(job_id);
+
+  window.location.href = '/nachfass/export_download?job_id=' + encodeURIComponent(job_id);
+
   await loadExcludedTable();
   hideOverlay();
+}
+
+// ============================================================
+// Export-Start
+// ============================================================
+async function startExportNf(){
+  const ids = _parseIDs(el('nf_batch_ids').value);
+  if(ids.length === 0){
+    alert('Bitte mindestens eine Batch ID angeben.');
+    return;
+  }
+
+  const bid = el('batch_id').value || '';
+  const camp = el('campaign').value || '';
+
+  showOverlay("Starte Abgleich …");
+  setProgress(5);
+
+  try{
+    const r=await fetch('/nachfass/export_start',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({nf_batch_ids:ids,batch_id:bid,campaign:camp})
+    });
+
+    if(!r.ok) throw new Error("Start fehlgeschlagen");
+    const {job_id} = await r.json();
+
+    await poll(job_id);
+
+  } catch(err){
+    alert(err.message || "Fehler beim Starten.");
+    hideOverlay();
+  }
 }
 
 el('btnExportNf').addEventListener('click', startExportNf);
 </script>
 
-</body></html>"""
+</body>
+</html>"""
+
     return HTMLResponse(html)
 
 
