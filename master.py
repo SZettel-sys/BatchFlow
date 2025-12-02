@@ -2556,13 +2556,19 @@ async def nachfass_export_progress(job_id: str):
     #print("done:", job.done, type(job.done))
     #print("error:", job.error, type(job.error))
     #print("================================")
-
+    print("DEBUG JOB PHASE:", job.phase, type(job.phase))
     return JSONResponse({
         "phase": str(job.phase),
         "percent": int(job.percent),
         "done": bool(job.done),
         "error": str(job.error) if job.error else None
-    })
+    })    
+    #return JSONResponse({
+    #    "phase": str(job.phase),
+    #    "percent": int(job.percent),
+    #    "done": bool(job.done),
+    #    "error": str(job.error) if job.error else None
+    #})
 
 # =============================================================================
 # Debug-Endpoint für eine Person
