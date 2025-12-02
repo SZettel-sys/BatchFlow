@@ -1,7 +1,5 @@
 import logging
-# master_fixed_v2_part1.py — Teil 1/5
-# Basis: BatchFlow (FastAPI + Pipedrive + Neon)
-# Getestet für Render Free Tier (Python 3.12, 512 MB RAM)
+
 
 import os, re, io, uuid, time, asyncio
 from datetime import datetime, timedelta, timezone
@@ -28,7 +26,7 @@ if os.path.isdir("static"):
 # Umgebungsvariablen & Konstanten setzen
 # -----------------------------------------------------------------------------
 PD_API_TOKEN = os.getenv("PD_API_TOKEN", "")
-PIPEDRIVE_API = "https://api.pipedrive.com/v1"
+PIPEDRIVE_API = "https://api.pipedrive.com/api/v2"
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise ValueError("DATABASE_URL fehlt (Neon-DSN).")
@@ -364,18 +362,11 @@ def append_token(url: str) -> str:
     return url
 
 # =============================================================================
-# PERSONENFELDER (Cache)
+# PERSONENFELDER (Cache) Leer aufgrund von Umstellung auf API v2
 # =============================================================================
 async def get_person_fields() -> List[dict]:
-    """Lädt Personenfelder aus Pipedrive (Cache wird genutzt)."""
-    global _PERSON_FIELDS_CACHE
-    if _PERSON_FIELDS_CACHE is not None:
-        return _PERSON_FIELDS_CACHE
-    url = append_token(f"{PIPEDRIVE_API}/personFields")
-    r = await http_client().get(url, headers=get_headers())
-    r.raise_for_status()
-    _PERSON_FIELDS_CACHE = r.json().get("data") or []
-    return _PERSON_FIELDS_CACHE
+   
+    return []
 
 def field_options_id_to_label_map(field: dict) -> Dict[str, str]:
     """Erstellt ein Mapping von ID → Label für Dropdown-Optionen eines Pipedrive-Feldes."""
@@ -409,23 +400,28 @@ async def stream_organizations_by_filter(
     page_limit: int = PAGE_LIMIT,
 ) -> AsyncGenerator[List[str], None]:
     """
-    Streamt Organisationen eines Pipedrive-Filters seitenweise.
-    Bei 429 (Too many requests) wird der Orga-Scan abgebrochen,
-    damit der Job weiterlaufen kann (Abgleich dann ohne Fuzzy-Orga-Matching).
+    Streamt Organisationen eines Pipedrive-Filters seitenweise (v2).
+    - Pagination: limit + cursor
+    - Bei 429 (Too many requests) wird der Orga-Scan abgebrochen,
+      damit der Job weiterlaufen kann (Abgleich dann ohne Fuzzy-Orga-Matching).
     """
     client = http_client()
-    start = 0
+    cursor: Optional[str] = None
 
     while True:
-        url = append_token(
+        base = (
             f"{PIPEDRIVE_API}/organizations"
-            f"?filter_id={filter_id}&start={start}&limit={page_limit}&sort=id"
+            f"?filter_id={filter_id}&limit={page_limit}"
+            f"&sort_by=id&sort_direction=asc"
         )
+        if cursor:
+            url = append_token(f"{base}&cursor={cursor}")
+        else:
+            url = append_token(base)
 
         r = await client.get(url, headers=get_headers())
 
         if r.status_code == 429:
-            # Rate Limit erreicht -> Abbrechen, aber KEIN Fehler mehr werfen
             print(
                 f"[stream_organizations_by_filter] WARN: 429 Too many requests "
                 f"für Filter {filter_id}. Breche Orga-Scan ab."
@@ -433,7 +429,6 @@ async def stream_organizations_by_filter(
             return
 
         if r.status_code != 200:
-            # andere Fehler weiter hochwerfen
             raise Exception(
                 f"Pipedrive Fehler (Organisationen aus Filter {filter_id}): {r.text}"
             )
@@ -452,10 +447,12 @@ async def stream_organizations_by_filter(
         if names:
             yield names
 
-        if len(data) < page_limit:
+        # v2-Pagination: additional_data.pagination.cursor
+        additional = payload.get("additional_data") or {}
+        cursor = additional.get("next_cursor")
+        
+        if not cursor:
             break
-
-        start += len(data)
 
 async def stream_person_ids_by_filter(
     filter_id: int,
@@ -467,18 +464,22 @@ async def stream_person_ids_by_filter(
     weiterlaufen kann (Abgleich / Ausschluss dann ggf. unvollständig).
     """
     client = http_client()
-    start = 0
+    cursor: Optional[str] = None
 
     while True:
-        url = append_token(
+        base_url = (
             f"{PIPEDRIVE_API}/persons"
-            f"?filter_id={filter_id}&start={start}&limit={page_limit}&sort=id"
+            f"?filter_id={filter_id}"
+            f"&limit={page_limit}"
+            f"&sort_by=id&sort_direction=asc"
         )
+        url = append_token(base_url)
+        if cursor:
+            url += f"&cursor={cursor}"
 
         r = await client.get(url, headers=get_headers())
 
         if r.status_code == 429:
-            # Rate Limit erreicht -> IDs-Scan hier abbrechen, aber keinen Fehler werfen
             print(
                 f"[stream_person_ids_by_filter] WARN: 429 Too many requests "
                 f"für Filter {filter_id}. Breche ID-Scan ab."
@@ -486,7 +487,6 @@ async def stream_person_ids_by_filter(
             return
 
         if r.status_code != 200:
-            # andere Fehler weiter hochwerfen
             raise Exception(
                 f"Pipedrive Fehler (IDs für Filter {filter_id}): {r.text}"
             )
@@ -500,11 +500,9 @@ async def stream_person_ids_by_filter(
         for person in data:
             v = person.get("id")
 
-            # evtl. Liste
             if isinstance(v, list):
                 v = v[0] if v else None
 
-            # evtl. Dict
             if isinstance(v, dict):
                 v = (
                     v.get("id")
@@ -521,10 +519,10 @@ async def stream_person_ids_by_filter(
         if ids:
             yield ids
 
-        if len(data) < page_limit:
+        cursor = (payload.get("additional_data") or {}).get("next_cursor")
+        if not cursor:
             break
 
-        start += len(data)
 
 
 
@@ -599,36 +597,40 @@ async def stream_persons_by_batch_id(
     sem = asyncio.Semaphore(6)  # gedrosselt, um 429 zu vermeiden
 
     async def fetch_one(bid: str):
-        start = 0
+        cursor: Optional[str] = None
         total = 0
         local: List[dict] = []
-
+    
         async with sem:
             while True:
-                url = append_token(
+                base_url = (
                     f"{PIPEDRIVE_API}/persons/search?"
-                    f"term={bid}&fields=custom_fields&start={start}&limit={page_limit}"
+                    f"term={bid}&fields=custom_fields&limit={page_limit}"
                 )
+                url = append_token(base_url)
+                if cursor:
+                    url += f"&cursor={cursor}"
+    
                 r = await http_client().get(url, headers=get_headers())
-
+    
                 if r.status_code == 429:
                     print("[WARN] Rate limit erreicht, warte 2 Sekunden ...")
                     await asyncio.sleep(2)
                     continue
-
+    
                 if r.status_code != 200:
                     print(f"[WARN] Batch {bid} Fehler: {r.text}")
                     break
-
-                raw_items = r.json().get("data", {}).get("items", []) or []
+    
+                payload = r.json() or {}
+                raw_items = (payload.get("data") or {}).get("items") or []
                 if not raw_items:
                     break
-
-                # ---------- ROBUSTE ITEMS-EXTRAKTION (FIX) ----------
+    
+                # v2: data.items[*].item → Person
                 persons: List[dict] = []
-
+    
                 def add_item(obj):
-                    # rekursiv durch Listen/Dicts laufen und "item" einsammeln
                     if obj is None:
                         return
                     if isinstance(obj, dict):
@@ -638,22 +640,28 @@ async def stream_persons_by_batch_id(
                     elif isinstance(obj, list):
                         for sub in obj:
                             add_item(sub)
-
+    
                 for it in raw_items:
                     add_item(it)
-                # ---------------------------------------------------
-
+    
                 if not persons:
                     break
-
+    
                 local.extend(persons)
                 total += len(persons)
-                start += len(persons)
-
-                if len(persons) < page_limit:
+    
+                cursor = (payload.get("additional_data") or {}).get("next_cursor")
+                if not cursor:
                     break
+    
+        if local:
+            print(f"[Batch {bid}] {total} Personen gefunden.")
+            # Batch-Key zur Person mitschreiben
+            for p in local:
+                p.setdefault("custom_fields", {})[batch_key] = bid
+            results.extend(local)
 
-                await asyncio.sleep(2)  # minimale Pause zwischen Seiten
+    
 
         print(f"[DEBUG] Batch {bid}: {total} Personen geladen")
         results.extend(local)
@@ -700,8 +708,8 @@ async def fetch_person_details(person_ids: List[str]) -> List[dict]:
                 async with sem:
                     url = append_token(
                         f"{PIPEDRIVE_API}/persons/{pid}"
-                        "?return_all_custom_fields=1"
-                        "&include=organization,organization_fields"
+                        #"?return_all_custom_fields=1"
+                        #"&include=organization,organization_fields"
                     )
                     r = await client.get(url, headers=get_headers())
 
@@ -901,24 +909,37 @@ async def stream_persons_by_filter(
     page_limit: int = NF_PAGE_LIMIT
 ) -> AsyncGenerator[List[dict], None]:
     """
-    Liefert Personen seitenweise (Paging) aus einem Pipedrive-Filter.
-    Verwendung: async for chunk in stream_persons_by_filter(...): ...
+    Liefert Personen seitenweise (Paging) aus einem Pipedrive-Filter
+    über die v2-API mit Cursor-Pagination.
     """
-    start = 0
+    cursor: Optional[str] = None
+
     while True:
-        url = append_token(
-            f"{PIPEDRIVE_API}/persons?filter_id={filter_id}&start={start}&limit={page_limit}&sort=id"
+        base_url = (
+            f"{PIPEDRIVE_API}/persons"
+            f"?filter_id={filter_id}"
+            f"&limit={page_limit}"
+            f"&sort_by=id&sort_direction=asc"
         )
+        url = append_token(base_url)
+        if cursor:
+            url += f"&cursor={cursor}"
+
         r = await http_client().get(url, headers=get_headers())
         if r.status_code != 200:
             raise Exception(f"Pipedrive Fehler: {r.text}")
-        data = (r.json() or {}).get("data") or []
+
+        payload = r.json() or {}
+        data = payload.get("data") or []
         if not data:
             break
+
         yield data
-        if len(data) < page_limit:
+
+        cursor = (payload.get("additional_data") or {}).get("next_cursor")
+        if not cursor:
             break
-        start += len(data)
+
 
 # -----------------------------------------------------------------------------
 # build_nf_master
@@ -973,27 +994,47 @@ async def _build_nf_master_final(
     def cf(p: dict, key: Optional[str]) -> str:
         """
         Custom-/Standardfeld holen – robust:
-        - direkt auf Top-Level (p[key])
-        - aus custom_fields als dict
-        - aus custom_fields als Liste von Dicts (key/id + value/label/name)
+        - bevorzugt aus custom_fields (v2)
+        - Fallback: direkt auf Top-Level (v1)
+        - Fallback: custom_fields als Liste von Dicts (ältere/abweichende Shapes)
         """
         if not key:
             return ""
 
-        # 1) direkt
+        # 1) v2: custom_fields-Objekt (empfohlen)
+        custom = p.get("custom_fields")
+
+        if isinstance(custom, dict):
+            v = custom.get(key)
+            if v is not None:
+                # v kann z.B. sein:
+                # - einfacher Wert (Text, Zahl, Datum, Single-/Multi-Option als IDs)
+                # - Objekt mit "value", "currency", "until", "timezone_name", ...
+                if isinstance(v, dict):
+                    # sinnvolle Reihenfolge: value -> label -> name -> id -> erster Listeneintrag
+                    v_value = (
+                        v.get("value")
+                        or v.get("label")
+                        or v.get("name")
+                        or v.get("id")
+                    )
+                    if v_value is None and isinstance(v.get("value"), list):
+                        # Mehrfach-Option o.ä.: nimm erstes Element der Liste
+                        lst = v.get("value") or []
+                        v_value = lst[0] if lst else None
+                    if v_value is not None:
+                        return sanitize(v_value)
+                    # als Fallback das ganze Dict serialisieren
+                    return sanitize(v)
+                # einfacher Wert (z.B. Text, Zahl, Datum oder Liste von IDs)
+                return sanitize(v)
+
+        # 2) v1-kompatibel: direkt auf Root-Level
         v = p.get(key)
         if v is not None:
             return sanitize(v)
 
-        custom = p.get("custom_fields")
-
-        # 2) custom_fields als dict
-        if isinstance(custom, dict):
-            v = custom.get(key)
-            if v is not None:
-                return sanitize(v)
-
-        # 3) custom_fields als Liste von Dicts
+        # 3) custom_fields als Liste von Dicts (ältere / Search-Shapes)
         if isinstance(custom, list):
             for entry in custom:
                 if not isinstance(entry, dict):
@@ -1131,14 +1172,22 @@ async def _build_nf_master_final(
     count_date_invalid = 0
 
     for p in persons:
-        # Organisation extrahieren
-        org_raw = p.get("organization") or p.get("org_id") or {}
-        if isinstance(org_raw, list):
-            org_raw = org_raw[0] if org_raw else {}
-        if not isinstance(org_raw, dict):
-            org_raw = {}
+        # Organisation extrahieren (v2: meist nur org_id als int)
+        org_obj = p.get("organization")
+        org_id_raw = None
 
-        org_id = sanitize(org_raw.get("id") or org_raw.get("value"))
+        if isinstance(org_obj, dict):
+            org_id_raw = org_obj.get("id") or org_obj.get("value")
+        elif isinstance(org_obj, list) and org_obj:
+            first = org_obj[0]
+            if isinstance(first, dict):
+                org_id_raw = first.get("id") or first.get("value")
+
+        if org_id_raw is None:
+            org_id_raw = p.get("org_id")
+
+        org_id = sanitize(org_id_raw)
+
 
         # Datum prüfen
         if not is_date_valid(p.get("next_activity_date")):
@@ -2472,16 +2521,8 @@ from fastapi.responses import JSONResponse  # falls noch nicht importiert
 
 @app.get("/debug/pd_person/{pid}")
 async def debug_pd_person(pid: int):
-    """
-    Debug-Endpoint: ruft Pipedrive /persons/{pid} einmal direkt auf
-    und zeigt Status + Response an.
-    """
     client = http_client()
-    url = append_token(
-        f"{PIPEDRIVE_API}/persons/{pid}"
-        "?return_all_custom_fields=1"
-        "&include=organization,organization_fields"
-    )
+    url = append_token(f"{PIPEDRIVE_API}/persons/{pid}")
 
     r = await client.get(url, headers=get_headers())
     status = r.status_code
@@ -2495,9 +2536,10 @@ async def debug_pd_person(pid: int):
         {
             "status": status,
             "json": data,
-            "text": r.text[:500],  # erste 500 Zeichen als Fallback
+            "text": r.text[:500],
         }
     )
+
 
 
 # =============================================================================
