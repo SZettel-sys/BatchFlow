@@ -15,7 +15,14 @@ from collections import defaultdict
 fuzz.default_processor = lambda s: s  # kein Vor-Preprocessing
 
 # -----------------------------------------------------------------------------
-# App-Grundkonfiguration allgemein (start) --CHATGPT-Version (Fehlerbehebung)
+# 
+# -----------------------------------------------------------------------------# 
+# PIPEDRIVE API - V2
+# -----------------------------------------------------------------------------# 
+# 
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# App-Grundkonfiguration allgemein (start) 
 # -----------------------------------------------------------------------------
 app = FastAPI(title="BatchFlow")
 app.add_middleware(GZipMiddleware, minimum_size=1024)
