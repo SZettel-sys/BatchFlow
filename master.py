@@ -1632,6 +1632,8 @@ async def run_nachfass_job(job: "Job", job_id: str) -> None:
 
     except Exception as e:
         # Fehler sauber im Job-Objekt vermerken + Log
+        import traceback
+        traceback.print_exc()
         job.error = f"{type(e).__name__}: {e}"
         job.phase = "Fehler"
         job.percent = 100
