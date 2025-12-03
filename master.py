@@ -1,3 +1,52 @@
+
+# =============================================================================
+# UNIVERSAL SANITIZER + HELFER
+# =============================================================================
+import json
+import pandas as pd
+from typing import Any, Optional
+
+def sanitize(v: Any) -> str:
+    """Robuster Sanitizer: konvertiert beliebige Werte in einen String.
+    - None / NaN -> ""
+    - JSON-Strings -> dekodieren
+    - Dict -> value/label/name/id
+    - Liste -> erstes Element
+    """
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return ""
+    if isinstance(v, str):
+        s = v.strip()
+        if (s.startswith('[') and s.endswith(']')) or (s.startswith('{') and s.endswith('}')):
+            try:
+                return sanitize(json.loads(s))
+            except Exception:
+                return s
+        return s
+    if isinstance(v, dict):
+        return (
+            sanitize(v.get('value'))
+            or sanitize(v.get('label'))
+            or sanitize(v.get('name'))
+            or sanitize(v.get('id'))
+            or ''
+        )
+    if isinstance(v, list):
+        return sanitize(v[0]) if v else ''
+    return str(v)
+
+def extract_field_date(p: dict, key: Optional[str]) -> Optional[str]:
+    """Extrahiert ein Datumsfeld aus einer Person und säubert es."""
+    if not key:
+        return None
+    raw = p.get(key)
+    return sanitize(raw) or None
+
+def flatten(v: Any) -> str:
+    """Flacht verschachtelte Strukturen ab und nutzt sanitize."""
+    return sanitize(v)
+
+
 import logging
 
 
