@@ -51,6 +51,19 @@ def cf(p: dict, key: Optional[str]) -> str:
                 return sanitize(entry.get('value') or entry.get('label') or entry.get('name') or entry.get('id'))
     return sanitize(p.get(key))
 
+# Fix für add_item: rekursiv Listen verarbeiten
+# Diese Funktion wird später im Workflow überschrieben, aber wir definieren sie hier als Referenz.
+def add_item(obj, persons):
+    if obj is None:
+        return
+    if isinstance(obj, dict):
+        item = obj.get('item')
+        if isinstance(item, dict):
+            persons.append(item)
+    elif isinstance(obj, list):
+        for sub in obj:
+            add_item(sub, persons)
+
 
 import logging
 
