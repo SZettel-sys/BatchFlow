@@ -1,18 +1,13 @@
 
 # =============================================================================
-# UNIVERSAL SANITIZER + HELFER
+# UNIVERSAL SANITIZER + HELFER (API v2-sicher)
 # =============================================================================
 import json
 import pandas as pd
 from typing import Any, Optional
 
 def sanitize(v: Any) -> str:
-    """Robuster Sanitizer: konvertiert beliebige Werte in einen String.
-    - None / NaN -> ""
-    - JSON-Strings -> dekodieren
-    - Dict -> value/label/name/id
-    - Liste -> erstes Element
-    """
+    """Robuster Sanitizer: konvertiert beliebige Werte in einen String."""
     if v is None or (isinstance(v, float) and pd.isna(v)):
         return ""
     if isinstance(v, str):
@@ -36,15 +31,25 @@ def sanitize(v: Any) -> str:
     return str(v)
 
 def extract_field_date(p: dict, key: Optional[str]) -> Optional[str]:
-    """Extrahiert ein Datumsfeld aus einer Person und säubert es."""
     if not key:
         return None
-    raw = p.get(key)
-    return sanitize(raw) or None
+    return sanitize(p.get(key)) or None
 
 def flatten(v: Any) -> str:
-    """Flacht verschachtelte Strukturen ab und nutzt sanitize."""
     return sanitize(v)
+
+def cf(p: dict, key: Optional[str]) -> str:
+    """Custom-/Standardfeld holen (API v2-sicher)."""
+    if not key:
+        return ''
+    custom = p.get('custom_fields')
+    if isinstance(custom, dict):
+        return sanitize(custom.get(key))
+    if isinstance(custom, list):
+        for entry in custom:
+            if isinstance(entry, dict) and (entry.get('key') == key or entry.get('id') == key):
+                return sanitize(entry.get('value') or entry.get('label') or entry.get('name') or entry.get('id'))
+    return sanitize(p.get(key))
 
 
 import logging
