@@ -1,70 +1,4 @@
 
-# =============================================================================
-# UNIVERSAL SANITIZER + HELFER (API v2-sicher)
-# =============================================================================
-import json
-import pandas as pd
-from typing import Any, Optional
-
-def sanitize(v: Any) -> str:
-    """Robuster Sanitizer: konvertiert beliebige Werte in einen String."""
-    if v is None or (isinstance(v, float) and pd.isna(v)):
-        return ""
-    if isinstance(v, str):
-        s = v.strip()
-        if (s.startswith('[') and s.endswith(']')) or (s.startswith('{') and s.endswith('}')):
-            try:
-                return sanitize(json.loads(s))
-            except Exception:
-                return s
-        return s
-    if isinstance(v, dict):
-        return (
-            sanitize(v.get('value'))
-            or sanitize(v.get('label'))
-            or sanitize(v.get('name'))
-            or sanitize(v.get('id'))
-            or ''
-        )
-    if isinstance(v, list):
-        return sanitize(v[0]) if v else ''
-    return str(v)
-
-def extract_field_date(p: dict, key: Optional[str]) -> Optional[str]:
-    if not key:
-        return None
-    return sanitize(p.get(key)) or None
-
-def flatten(v: Any) -> str:
-    return sanitize(v)
-
-def cf(p: dict, key: Optional[str]) -> str:
-    """Custom-/Standardfeld holen (API v2-sicher)."""
-    if not key:
-        return ''
-    custom = p.get('custom_fields')
-    if isinstance(custom, dict):
-        return sanitize(custom.get(key))
-    if isinstance(custom, list):
-        for entry in custom:
-            if isinstance(entry, dict) and (entry.get('key') == key or entry.get('id') == key):
-                return sanitize(entry.get('value') or entry.get('label') or entry.get('name') or entry.get('id'))
-    return sanitize(p.get(key))
-
-# Fix für add_item: rekursiv Listen verarbeiten
-# Diese Funktion wird später im Workflow überschrieben, aber wir definieren sie hier als Referenz.
-def add_item(obj, persons):
-    if obj is None:
-        return
-    if isinstance(obj, dict):
-        item = obj.get('item')
-        if isinstance(item, dict):
-            persons.append(item)
-    elif isinstance(obj, list):
-        for sub in obj:
-            add_item(sub, persons)
-
-
 import logging
 
 
@@ -2811,3 +2745,270 @@ async def catch_all(full_path: str, request: Request):
     if full_path in ("campaign", "", "/"):
         return RedirectResponse("/campaign", status_code=302)
     return RedirectResponse("/campaign", status_code=302)
+
+
+# =============================================================================
+# V2-CLEAN OVERRIDES (strictly aligned to v2 docs)
+# =============================================================================
+import json
+from typing import Optional, List, Dict, Any
+import pandas as pd
+
+# --- universal helpers ---
+def _sanitize(v: Any) -> str:
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return ""
+    if isinstance(v, str):
+        s = v.strip()
+        if (s.startswith('[') and s.endswith(']')) or (s.startswith('{') and s.endswith('}')):
+            try:
+                return _sanitize(json.loads(s))
+            except Exception:
+                return s
+        return s
+    if isinstance(v, dict):
+        return (
+            _sanitize(v.get('value'))
+            or _sanitize(v.get('label'))
+            or _sanitize(v.get('name'))
+            or _sanitize(v.get('id'))
+            or ''
+        )
+    if isinstance(v, list):
+        return _sanitize(v[0]) if v else ''
+    return str(v)
+
+# override flatten to use _sanitize consistently
+async def load_df_text(table: str) -> pd.DataFrame:  # placeholder to avoid name clash if imported elsewhere
+    return await load_df_text(table)  # type: ignore
+
+# --- v2-safe field access ---
+def cf_v2(p: dict, key: Optional[str]) -> str:
+    """Return value of a person custom field by key from v2 'custom_fields' object."""
+    if not key:
+        return ''
+    custom = p.get('custom_fields') or {}
+    if isinstance(custom, dict):
+        return _sanitize(custom.get(key))
+    # v2 should not return list here; fallback just in case
+    if isinstance(custom, list):
+        for entry in custom:
+            if isinstance(entry, dict) and (entry.get('key') == key or entry.get('id') == key):
+                return _sanitize(entry.get('value') or entry.get('label') or entry.get('name') or entry.get('id'))
+    return ''
+
+# choose primary email from v2 shape
+def get_primary_email_v2(p: dict) -> str:
+    emails = p.get('email') or p.get('emails') or []
+    flat: List[dict] = []
+    def add(obj):
+        if obj is None:
+            return
+        if isinstance(obj, dict):
+            flat.append(obj)
+        elif isinstance(obj, list):
+            for sub in obj:
+                add(sub)
+        else:
+            flat.append({'value': obj})
+    add(emails)
+    for e in flat:
+        if e.get('primary'):
+            val = e.get('value')
+            if val:
+                return _sanitize(val)
+    if flat:
+        return _sanitize(flat[0].get('value'))
+    return ''
+
+# --- stream persons by batch id (search API v2) ---
+async def stream_persons_by_batch_id(batch_key: str, batch_ids: List[str], page_limit: int = 100, job_obj=None) -> List[dict]:
+    """
+    Strict v2: GET /persons/search?term=<BID>&fields=custom_fields&limit=<n>
+    Response: data.items[*].item is the person. Pagination via additional_data.next_cursor.
+    """
+    client = http_client()
+    results: List[dict] = []
+    sem = asyncio.Semaphore(6)
+
+    async def fetch_one(bid: str):
+        cursor: Optional[str] = None
+        local: List[dict] = []
+        while True:
+            base = f"{PIPEDRIVE_API}/persons/search?term={bid}&fields=custom_fields&limit={page_limit}"
+            url = append_token(base)
+            if cursor:
+                url += f"&cursor={cursor}"
+            r = await client.get(url, headers=get_headers())
+            if r.status_code == 429:
+                await asyncio.sleep(2)
+                continue
+            if r.status_code != 200:
+                break
+            payload = r.json() or {}
+            items = (payload.get('data') or {}).get('items') or []
+            for it in items:
+                if isinstance(it, dict):
+                    person = it.get('item')
+                    if isinstance(person, dict):
+                        # ensure batch tag is kept
+                        person.setdefault('custom_fields', {})[batch_key] = bid
+                        local.append(person)
+            # pagination: next_cursor or additional_data.pagination.next_cursor
+            additional = payload.get('additional_data') or {}
+            cursor = additional.get('next_cursor') or (additional.get('pagination') or {}).get('next_cursor')
+            if not cursor:
+                break
+        if local and job_obj:
+            print(f"[Batch {bid}] {len(local)} Personen gefunden.")
+        results.extend(local)
+
+    await asyncio.gather(*(fetch_one(b) for b in batch_ids))
+    print(f"[INFO] Alle Batch-IDs geladen: {len(results)} Personen gesamt")
+    return results
+
+# --- build nf master final override ---
+async def _build_nf_master_final(
+    nf_batch_ids: List[str],
+    batch_id: str,
+    campaign: str,
+    job_obj=None,
+) -> pd.DataFrame:
+    if job_obj:
+        job_obj.phase = "Lade Nachfass-Kandidaten …"
+        job_obj.percent = 10
+
+    # use v2 custom field key (provided by caller)
+    BATCH_CF_KEY = "5ac34dad3ea917fdef4087caebf77ba275f87eec"
+
+    persons_search = await stream_persons_by_batch_id(BATCH_CF_KEY, nf_batch_ids)
+    person_ids: List[str] = []
+    clean_search: List[dict] = []
+    for p in persons_search:
+        if isinstance(p, dict):
+            clean_search.append(p)
+            pid = _sanitize(p.get('id'))
+            if pid:
+                person_ids.append(pid)
+    person_ids = sorted(set(person_ids))
+    print(f"[NF] Personen aus Suche: {len(person_ids)} IDs")
+
+    if not person_ids:
+        empty_df = pd.DataFrame(columns=[
+            "Batch ID","Channel","Cold-Mailing Import","Prospect ID","Organisation ID","Organisation Name",
+            "Person ID","Person Vorname","Person Nachname","Person Titel","Person Geschlecht","Person Position",
+            "Person E-Mail","XING Profil","LinkedIn URL",
+        ])
+        await save_df_text(empty_df, "nf_master_final")
+        await save_df_text(pd.DataFrame([{"Grund":"Keine Personen zur Batch-ID gefunden","Anzahl":0}]), "nf_excluded")
+        if job_obj:
+            job_obj.phase = "Keine Personen gefunden"; job_obj.percent = 100; job_obj.done = True
+        return empty_df
+
+    if job_obj:
+        job_obj.phase = "Lade Personendetails …"; job_obj.percent = 25
+    persons_full = await fetch_person_details(person_ids)
+    persons: List[dict] = [p for p in persons_full if isinstance(p, dict)]
+    print(f"[NF] Vollständige Personendaten: {len(persons)} Datensätze")
+
+    # filter: date validity and max 2 per org
+    today = pd.Timestamp.utcnow().date()
+    def is_date_valid(raw: Any) -> bool:
+        s = _sanitize(raw)
+        if not s:
+            return True
+        try:
+            dt = pd.to_datetime(s).date()
+        except Exception:
+            return True
+        if dt > today:
+            return False
+        return (today - dt).days > 90
+
+    selected: List[dict] = []
+    org_counter: Dict[str,int] = {}
+    count_org_limit = 0
+    count_date_invalid = 0
+
+    for p in persons:
+        org = p.get('organization') or {}
+        if isinstance(org, list):
+            org = org[0] if org else {}
+        org_id = _sanitize(org.get('id'))
+        org_name = _sanitize(org.get('name'))
+
+        if not is_date_valid(p.get('next_activity_date')):
+            count_date_invalid += 1
+            continue
+        if org_name.strip().lower() == 'freelancer':
+            continue
+        org_counter[org_id] = org_counter.get(org_id, 0) + 1
+        if org_id and org_counter[org_id] > 2:
+            count_org_limit += 1
+            continue
+        selected.append(p)
+
+    print(f"[NF] Nach Filtern: {len(selected)} Datensätze (org_limit={count_org_limit}, date_invalid={count_date_invalid})")
+
+    PERSON_CF_KEYS = {
+        "Prospect ID": "f9138f9040c44622808a4b8afda2b1b75ee5acd0",
+        "Person Titel": "0343bc43a91159aaf33a463ca603dc5662422ea5",
+        "Person Geschlecht": "c4f5f434cdb0cfce3f6d62ec7291188fe968ac72",
+        "Person Position": "4585e5de11068a3bccf02d8b93c126bcf5c257ff",
+        "XING Profil": "44ebb6feae2a670059bc5261001443a2878a2b43",
+        "LinkedIn URL": "25563b12f847a280346bba40deaf527af82038cc",
+    }
+
+    rows: List[dict] = []
+    for p in selected:
+        pid = _sanitize(p.get('id'))
+        first = _sanitize(p.get('first_name'))
+        last = _sanitize(p.get('last_name'))
+        fullname = _sanitize(p.get('name'))
+        if not first and not last and fullname:
+            parts = fullname.split()
+            if len(parts) == 1:
+                first, last = parts[0], ''
+            else:
+                first = ' '.join(parts[:-1]); last = parts[-1]
+        org = p.get('organization') or {}
+        if isinstance(org, list):
+            org = org[0] if org else {}
+        org_id = _sanitize(org.get('id'))
+        org_name = _sanitize(org.get('name'))
+        email = get_primary_email_v2(p)
+        prospect_id = cf_v2(p, PERSON_CF_KEYS["Prospect ID"]) or ''
+        if not prospect_id or not email:
+            continue
+        row = {
+            "Batch ID": _sanitize(batch_id),
+            "Channel": DEFAULT_CHANNEL,
+            "Cold-Mailing Import": _sanitize(campaign),
+            "Prospect ID": prospect_id,
+            "Organisation ID": org_id,
+            "Organisation Name": org_name,
+            "Person ID": pid,
+            "Person Vorname": first,
+            "Person Nachname": last,
+            "Person Titel": cf_v2(p, PERSON_CF_KEYS["Person Titel"]),
+            "Person Geschlecht": cf_v2(p, PERSON_CF_KEYS["Person Geschlecht"]),
+            "Person Position": cf_v2(p, PERSON_CF_KEYS["Person Position"]),
+            "Person E-Mail": email,
+            "XING Profil": cf_v2(p, PERSON_CF_KEYS["XING Profil"]),
+            "LinkedIn URL": cf_v2(p, PERSON_CF_KEYS["LinkedIn URL"]),
+        }
+        for k,v in list(row.items()):
+            row[k] = _sanitize(v)
+        rows.append(row)
+
+    df = pd.DataFrame(rows).replace({None: ""})
+
+    excluded_rows = [
+        {"Grund":"Max 2 Kontakte pro Organisation","Anzahl": int(count_org_limit)},
+        {"Grund":"Datum nächste Aktivität steht an bzw. liegt in naher Vergangenheit","Anzahl": int(count_date_invalid)},
+    ]
+    await save_df_text(pd.DataFrame(excluded_rows), "nf_excluded")
+    await save_df_text(df, "nf_master_final")
+    if job_obj:
+        job_obj.phase = "Nachfass-Master erstellt"; job_obj.percent = 80
+    return df
