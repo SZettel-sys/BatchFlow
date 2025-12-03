@@ -2093,260 +2093,241 @@ loadOptions();
 async def nachfass_page(request: Request):
     authed = bool(user_tokens.get("default") or PD_API_TOKEN)
     auth_info = "<span class='muted'>angemeldet</span>" if authed else "<a href='/login'>Anmelden</a>"
-    html = r"""<!doctype html><html lang="de">
-    <head>
-    <meta charset="utf-8"/>
-    <meta name="viewport" content="width=device-width,initial-scale=1"/>
-    <title>Nachfass – BatchFlow</title>
-    
-    <style>
-      body{margin:0;background:#f6f8fb;color:#0f172a;font:16px/1.6 Inter,sans-serif}
-      header{background:#fff;border-bottom:1px solid #e2e8f0}
-      .hwrap{max-width:1120px;margin:0 auto;padding:14px 20px;display:flex;
-              align-items:center;justify-content:space-between}
-      main{max-width:1120px;margin:28px auto;padding:0 20px}
-      .card{background:#fff;border:1px solid #e2e8f0;border-radius:14px;padding:20px;
-             box-shadow:0 2px 8px rgba(2,8,23,.04)}
-      label{display:block;font-weight:600;margin:8px 0 6px}
-      textarea,input{width:100%;padding:10px 12px;border:1px solid #cbd5e1;border-radius:10px}
-      .btn{background:#0ea5e9;border:none;color:#fff;border-radius:10px;
-            padding:12px 16px;cursor:pointer;font-weight:600}
-      .btn:hover{background:#0284c7}
-    
-      #overlay{
-        display:none;position:fixed;inset:0;background:rgba(255,255,255,.7);
-        backdrop-filter:blur(2px);
-        z-index:9999;align-items:center;justify-content:center;flex-direction:column;gap:10px
-      }
-    
-      .barwrap{width:min(520px,90vw);height:10px;border-radius:999px;background:#e2e8f0;overflow:hidden}
-      .bar{height:100%;width:0%;background:#0ea5e9;transition:width .25s linear}
-    
-      table{width:100%;border-collapse:collapse;margin-top:20px;
-             border:1px solid #e2e8f0;border-radius:10px;
-             box-shadow:0 2px 8px rgba(2,8,23,.04);background:#fff}
-      th,td{padding:8px 10px;border-bottom:1px solid #e2e8f0;text-align:left}
-      th{background:#f8fafc;font-weight:600}
-      tr:hover{background:#f1f5f9}
-    </style>
-    
-    </head>
-    <body>
-    
-    <header>
-      <div class="hwrap">
-        <div><a href='/campaign' style='color:#0a66c2;text-decoration:none'>
-          ← Kampagne wählen
-        </a></div>
-        <div><b>Nachfass</b></div>
-        <div>""" + auth_info + r"""</div>
-      </div>
-    </header>
-    
-    <main>
-    
-      <!-- Eingabe-Karte -->
-      <section class="card">
-        <label>Batch IDs (1–2 Werte)</label>
-        <textarea id="nf_batch_ids" rows="3" placeholder="z. B. B111, B222"></textarea>
-        <small style="color:#64748b">Komma oder Zeilenumbruch. Max. 2 IDs werden berücksichtigt.</small>
-    
-        <label style="margin-top:12px">Batch ID (Export)</label>
-        <input id="batch_id" placeholder="B999"/>
-    
-        <label style="margin-top:12px">Kampagnenname</label>
-        <input id="campaign" placeholder="z. B. Nachfass KW45"/>
-    
-        <div style="margin-top:20px;text-align:right">
-          <button class="btn" id="btnExportNf">Abgleich & Download</button>
-        </div>
-      </section>
-    
-      <!-- Excluded Section -->
-      <section id="excludedSection" style="margin-top:30px;">
-        <h3> Nicht berücksichtigte Datensätze </h3>
-    
-        <div id="excluded-summary-box"></div>
-    
-        <div id="excludedTable">
-          <table>
-            <thead>
-              <tr>
-                <th>Kontakt ID</th>
-                <th>Name</th>
-                <th>Organisation ID</th>
-                <th>Organisationsname</th>
-                <th>Grund</th>
-              </tr>
-            </thead>
-            <tbody id="excluded-table-body">
-              <tr>
-                <td colspan="5" style="text-align:center;color:#888">
-                  Noch keine Daten geladen
-                </td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-      </section>
-    
-    </main>
-    
-    <!-- EINDEUTIGES Overlay -->
-    <div id="overlay">
-      <div id="overlay-phase" style="color:#0f172a;font-weight:500"></div>
-      <div class="barwrap"><div class="bar" id="overlay-bar"></div></div>
+
+    return HTMLResponse(
+        r"""<!doctype html><html lang="de">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Nachfass – BatchFlow</title>
+
+<style>
+  body{margin:0;background:#f6f8fb;color:#0f172a;font:16px/1.6 Inter,sans-serif}
+  header{background:#fff;border-bottom:1px solid #e2e8f0}
+  .hwrap{max-width:1120px;margin:0 auto;padding:14px 20px;display:flex;
+         align-items:center;justify-content:space-between}
+  main{max-width:1120px;margin:28px auto;padding:0 20px}
+  .card{background:#fff;border:1px solid #e2e8f0;border-radius:14px;padding:20px;
+         box-shadow:0 2px 8px rgba(2,8,23,.04)}
+  label{display:block;font-weight:600;margin:8px 0 6px}
+  textarea,input{width:100%;padding:10px;border:1px solid #cbd5e1;border-radius:10px}
+  .btn{background:#0ea5e9;border:none;color:#fff;border-radius:10px;
+       padding:12px 16px;cursor:pointer;font-weight:600}
+  .btn:hover{background:#0284c7}
+
+  #overlay{
+    display:none;position:fixed;inset:0;background:rgba(255,255,255,.75);
+    backdrop-filter:blur(2px);z-index:9999;align-items:center;
+    justify-content:center;flex-direction:column;gap:12px;
+  }
+
+  .barwrap{width:min(520px,90vw);height:10px;border-radius:999px;background:#e2e8f0;overflow:hidden}
+  .bar{height:100%;width:0%;background:#0ea5e9;transition:width .2s linear}
+
+  table{width:100%;border-collapse:collapse;margin-top:20px;border:1px solid #e2e8f0;
+        border-radius:10px;background:#fff;box-shadow:0 2px 8px rgba(2,8,23,.04)}
+  th,td{padding:8px 10px;border-bottom:1px solid #e2e8f0;text-align:left}
+  th{background:#f8fafc;font-weight:600}
+</style>
+
+</head>
+<body>
+
+<header>
+  <div class="hwrap">
+    <div><a href="/campaign" style="color:#0a66c2;text-decoration:none">← Kampagne wählen</a></div>
+    <div><b>Nachfass</b></div>
+    <div>""" + auth_info + r"""</div>
+  </div>
+</header>
+
+<main>
+
+  <section class="card">
+    <label>Batch IDs (1–2 Werte)</label>
+    <textarea id="nf_batch_ids" rows="3" placeholder="B111, B222"></textarea>
+    <small style="color:#64748b">Komma oder Zeilenumbruch. Max. 2 IDs.</small>
+
+    <label style="margin-top:12px">Export-Batch-ID</label>
+    <input id="batch_id" placeholder="B999"/>
+
+    <label style="margin-top:12px">Kampagnenname</label>
+    <input id="campaign" placeholder="z. B. Nachfass KW45"/>
+
+    <div style="margin-top:20px;text-align:right">
+      <button class="btn" id="btnExportNf">Abgleich & Download</button>
     </div>
-    
-    <script>
-    
-    const el = id => {
-      const node = document.getElementById(id);
-      if (!node) {
-        console.warn("Element not found:", id);
-        return { textContent:"", style:{}, value:"" };
-      }
-      return node;
-    };
-    
-    function showOverlay(msg){
-      el('overlay-phase').textContent = msg || '';
-      el('overlay').style.display = 'flex';
-    }
-    
-    function hideOverlay(){
-      el('overlay').style.display = 'none';
-    }
-    
-    function setProgress(p){
-      el('overlay-bar').style.width = Math.min(100, Math.max(0, p)) + "%";
-    }
-    
-    function _parseIDs(raw){
-      return raw.split(/[\\n,;]/).map(s=>s.trim()).filter(Boolean).slice(0,2);
-    }
-    
-    async function loadExcludedTable(){
-      try{
-        const r = await fetch('/nachfass/excluded/json');
-        const data = await r.json();
-    
-        const body = el('excluded-table-body');
-        body.innerHTML = '';
-    
-        const summaryBox = el('excluded-summary-box');
-    
-        if (data.summary && data.summary.length > 0){
-          let html = "<b>Batch-/Filter-Ausschlüsse:</b><ul style='margin-top:6px'>";
-          for (const s of data.summary){
+  </section>
+
+  <section style="margin-top:30px;">
+    <h3>Entfernte Datensätze</h3>
+    <div id="excluded-summary-box"></div>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Kontakt ID</th>
+          <th>Name</th>
+          <th>Organisation ID</th>
+          <th>Organisationsname</th>
+          <th>Grund</th>
+        </tr>
+      </thead>
+      <tbody id="excluded-table-body">
+        <tr><td colspan="5" style="text-align:center;color:#999">Noch keine Daten geladen</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+</main>
+
+<div id="overlay">
+  <div id="overlay-phase" style="font-weight:600"></div>
+  <div class="barwrap"><div class="bar" id="overlay-bar"></div></div>
+</div>
+
+<script>
+// ---------------------------------------------------------------------------
+// Safe Element Getter
+// ---------------------------------------------------------------------------
+const el = id => {
+    const n = document.getElementById(id);
+    if (!n) return { textContent:"", style:{} };
+    return n;
+};
+
+// ---------------------------------------------------------------------------
+// Overlay
+// ---------------------------------------------------------------------------
+function showOverlay(msg){
+    el('overlay-phase').textContent = msg;
+    el('overlay').style.display = 'flex';
+}
+function hideOverlay(){ el('overlay').style.display = 'none'; }
+function setProgress(p){ el('overlay-bar').style.width = p + '%'; }
+
+// ---------------------------------------------------------------------------
+// ID Parsing
+// ---------------------------------------------------------------------------
+function parseIDs(raw){
+    return raw.split(/[,\n;]/).map(s => s.trim()).filter(Boolean).slice(0,2);
+}
+
+// ---------------------------------------------------------------------------
+// Excluded Table Loading
+// ---------------------------------------------------------------------------
+async function loadExcludedTable(){
+    const r = await fetch('/nachfass/excluded/json');
+    const data = await r.json();
+
+    const body = el('excluded-table-body');
+    body.innerHTML = '';
+
+    const summaryBox = el('excluded-summary-box');
+    summaryBox.innerHTML = '';
+
+    if (data.summary && data.summary.length){
+        let html = "<ul>";
+        data.summary.forEach(s => {
             html += `<li>${s.Grund}: <b>${s.Anzahl}</b></li>`;
-          }
-          html += "</ul>";
-          summaryBox.innerHTML = html;
-        } else {
-          summaryBox.innerHTML = "<b>Keine Batch-/Filter-Ausschlüsse</b>";
-        }
-    
-        if (!data.rows || data.rows.length === 0){
-          body.innerHTML = `
-            <tr>
-              <td colspan="5" style="text-align:center;color:#888">
-                Keine Datensätze durch Abgleich entfernt
-              </td>
-            </tr>`;
-          return;
-        }
-    
-        for (const row of data.rows){
-          const tr = document.createElement('tr');
-          tr.innerHTML = `
-            <td>${row["Kontakt ID"] || ""}</td>
-            <td>${row["Name"] || ""}</td>
-            <td>${row["Organisation ID"] || ""}</td>
-            <td>${row["Organisationsname"] || ""}</td>
-            <td>${row["Grund"] || ""}</td>
-          `;
-          body.appendChild(tr);
-        }
-    
-      } catch(err){
-        el('excluded-table-body').innerHTML =
-          `<tr><td colspan="5" style="text-align:center;color:red">Fehler beim Laden</td></tr>`;
-      }
-    }
-    
-    async function poll(job_id){
-      let done = false;
-    
-      while(!done){
-        await new Promise(r => setTimeout(r,600));
-        const r = await fetch('/nachfass/export_progress?job_id=' + encodeURIComponent(job_id));
-    
-        if(!r.ok) break;
-        const s = await r.json();
-    
-        el('overlay-phase').textContent = s.phase + " (" + (s.percent||0) + "%)";
-        setProgress(s.percent||0);
-    
-        if (s.error){
-          alert(s.error);
-          hideOverlay();
-          return;
-        }
-    
-        done = s.done;
-      }
-    
-      el('overlay-phase').textContent = "Download startet …";
-      setProgress(100);
-    
-      window.location.href = '/nachfass/export_download?job_id=' + encodeURIComponent(job_id);
-    
-      await loadExcludedTable();
-      hideOverlay();
-    }
-    
-    async function startExportNf(){
-      const ids = _parseIDs(el('nf_batch_ids').value);
-      if(ids.length === 0){
-        alert('Bitte mindestens eine Batch ID angeben.');
-        return;
-      }
-    
-      const bid = el('batch_id').value || '';
-      const camp = el('campaign').value || '';
-    
-      showOverlay("Starte Abgleich …");
-      setProgress(5);
-    
-      try{
-        const r=await fetch('/nachfass/export_start',{
-          method:'POST',
-          headers:{'Content-Type':'application/json'},
-          body:JSON.stringify({nf_batch_ids:ids,batch_id:bid,campaign:camp})
         });
-    
-        if(!r.ok) throw new Error("Start fehlgeschlagen");
-        const {job_id} = await r.json();
-    
-        await poll(job_id);
-    
-      } catch(err){
-        alert(err.message || "Fehler beim Starten.");
-        hideOverlay();
-      }
+        html += "</ul>";
+        summaryBox.innerHTML = html;
     }
-    
-    el('btnExportNf').addEventListener('click', startExportNf);
-    
-    </script>
-    </body>
-    </html>
-    """
 
-    
+    if (!data.rows || data.rows.length === 0){
+        body.innerHTML = '<tr><td colspan="5" style="text-align:center;color:#999">Keine Treffer</td></tr>';
+        return;
+    }
 
-    return HTMLResponse(html)
+    data.rows.forEach(row => {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td>${row["Kontakt ID"] || ""}</td>
+          <td>${row["Name"] || ""}</td>
+          <td>${row["Organisation ID"] || ""}</td>
+          <td>${row["Organisationsname"] || ""}</td>
+          <td>${row["Grund"] || ""}</td>
+        `;
+        body.appendChild(tr);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Export Polling
+// ---------------------------------------------------------------------------
+async function poll(job_id){
+    let done = false;
+
+    while (!done){
+        await new Promise(r => setTimeout(r, 500));
+
+        const res = await fetch('/nachfass/export_progress?job_id=' + job_id);
+        const s = await res.json();
+
+        el('overlay-phase').textContent = `${s.phase} (${s.percent}%)`;
+        setProgress(s.percent);
+
+        if (s.error){
+            alert(s.error);
+            hideOverlay();
+            return;
+        }
+
+        done = s.done;
+    }
+
+    showOverlay("Download startet …");
+    setProgress(100);
+
+    window.location.href = '/nachfass/export_download?job_id=' + job_id;
+
+    await loadExcludedTable();
+    hideOverlay();
+}
+
+// ---------------------------------------------------------------------------
+// Export Start
+// ---------------------------------------------------------------------------
+async function startExport(){
+    const ids = parseIDs(el('nf_batch_ids').value);
+    if (ids.length === 0){
+        alert("Bitte mindestens eine Batch ID eingeben");
+        return;
+    }
+
+    showOverlay("Starte Abgleich …");
+    setProgress(10);
+
+    const r = await fetch('/nachfass/export_start', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({
+            nf_batch_ids: ids,
+            batch_id: el('batch_id').value,
+            campaign: el('campaign').value
+        })
+    });
+
+    if (!r.ok){
+        alert("Fehler beim Start");
+        hideOverlay();
+        return;
+    }
+
+    const {job_id} = await r.json();
+    await poll(job_id);
+}
+
+el('btnExportNf').onclick = startExport;
+
+</script>
+</body>
+</html>
+"""
+    )
+
+
 
 
 # =============================================================================
