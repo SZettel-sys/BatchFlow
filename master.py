@@ -1,6 +1,7 @@
 
 import logging
 
+
 import os, re, io, uuid, time, asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, List, AsyncGenerator, Any
@@ -138,6 +139,7 @@ def _contains_any_text(val, wanted: List[str]) -> bool:
     s = str(val).lower().strip()
     return any(k.lower() in s for k in wanted if k)
 
+
 def parse_pd_date(d: Optional[str]) -> Optional[datetime]:
     try: return datetime.strptime(d, "%Y-%m-%d").replace(tzinfo=timezone.utc)
     except Exception: return None
@@ -161,7 +163,10 @@ def _as_list_email(value) -> List[str]:
         return out
     return [str(value)]
 
+def slugify_filename(name: str, fallback="BatchFlow_Export") -> str:
     s = re.sub(r"[^\w\-. ]+", "", (name or "").strip())
+    return re.sub(r"\s+", "_", s) or fallback
+
 
 def _df_to_excel_bytes(df: pd.DataFrame) -> bytes:
     """
@@ -171,6 +176,7 @@ def _df_to_excel_bytes(df: pd.DataFrame) -> bytes:
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         df.to_excel(writer, index=False, sheet_name="Export")
     return output.getvalue()
+
 
 def _build_export_from_ready(filename: str):
     """
@@ -234,6 +240,7 @@ async def save_df_text(df: pd.DataFrame, table: str):
             for k in ("value", "label", "name", "id"):
                 if k in v:
                     return sanitize_value(v[k])
+            # fallback
             return ""
 
         # Listen => erstes Element nehmen
@@ -276,6 +283,7 @@ async def save_df_text(df: pd.DataFrame, table: str):
             if batch:
                 await conn.executemany(sql, batch)
 
+
 # =============================================================================
 # Tabellen-Namenszuordnung (einheitlich für Nachfass / Neukontakte)
 # =============================================================================
@@ -290,6 +298,7 @@ def tables(prefix: str) -> dict:
         "ready": f"{prefix}_master_ready",
         "log":   f"{prefix}_delete_log",
     }
+
 
 async def load_df_text(table: str) -> pd.DataFrame:
     """
@@ -326,6 +335,7 @@ async def load_df_text(table: str) -> pd.DataFrame:
                 or v.get("id")
                 or ""
             )
+        # Fallback
         return str(v)
 
     async with get_pool().acquire() as conn:
@@ -343,6 +353,7 @@ async def load_df_text(table: str) -> pd.DataFrame:
             })
 
         return pd.DataFrame(clean_rows)
+
 
     async with get_pool().acquire() as conn:
         rows = await conn.fetch(f'SELECT * FROM "{SCHEMA}"."{table}"')
@@ -389,6 +400,7 @@ def field_options_id_to_label_map(field: dict) -> Dict[str, str]:
         lab = str(o.get("label") or o.get("name") or oid)
         mp[oid] = lab
     return mp
+
 
 async def get_person_field_by_hint(label_hint: str) -> Optional[dict]:
     """Findet ein Personenfeld anhand eines Text-Hints (z. B. 'fachbereich')."""
@@ -534,6 +546,10 @@ async def stream_person_ids_by_filter(
         if not cursor:
             break
 
+
+
+
+
 # =============================================================================
 # Organisationen – Bucketing + Kappung (Performanceoptimiert)
 # =============================================================================
@@ -581,6 +597,7 @@ async def _fetch_org_names_for_filter_capped(
                         return buckets_all
 
     return buckets_all
+
 
 def _pretty_reason(reason: str, extra: str = "") -> str:
     """Liefert verständlichen Grundtext für entfernte Zeilen."""
@@ -675,6 +692,8 @@ async def stream_persons_by_batch_id(
     await asyncio.gather(*(fetch_one(bid) for bid in batch_ids))
     print(f"[INFO] Alle Batch-IDs geladen: {len(results)} Personen gesamt")
     return results
+
+
 
 # =============================================================================
 # Nachfass – Aufbau Master (robust, progressiv & vollständig)
@@ -801,6 +820,7 @@ async def fetch_person_details(person_ids: List[str]) -> List[dict]:
             )
     # Kein raise -> Job läuft mit den geladenen Personen weiter
 
+
     # -----------------------------------
     # Ergebnis in ursprünglicher Reihenfolge zurückgeben
     # -----------------------------------
@@ -813,6 +833,7 @@ async def fetch_person_details(person_ids: List[str]) -> List[dict]:
             # sollte wegen obigem RuntimeError eigentlich nicht mehr passieren
             print(f"[fetch_person_details] WARN: ID {spid} fehlt trotz erfolgreichem Lauf")
     return ordered
+
 
 # -----------------------------------------------------------------------------
 # INTERNER CACHE
@@ -841,6 +862,7 @@ async def get_next_activity_key() -> Optional[str]:
         pass
     return _NEXT_ACTIVITY_KEY
 
+
 async def get_last_activity_key() -> Optional[str]:
     """Ermittelt das Feld für 'Letzte Aktivität'."""
     global _LAST_ACTIVITY_KEY
@@ -858,6 +880,7 @@ async def get_last_activity_key() -> Optional[str]:
         pass
     return _LAST_ACTIVITY_KEY
 
+
 async def get_batch_field_key() -> Optional[str]:
     """Sucht das Personenfeld in Pipedrive, das die Batch-ID enthält."""
     global _BATCH_FIELD_KEY
@@ -872,6 +895,7 @@ async def get_batch_field_key() -> Optional[str]:
             break
     return _BATCH_FIELD_KEY
 
+
 def extract_field_date(p: dict, key: Optional[str]) -> Optional[str]:
     """Extrahiert ein Datumsfeld aus einer Person."""
     if not key:
@@ -885,6 +909,7 @@ def extract_field_date(p: dict, key: Optional[str]) -> Optional[str]:
         return None
     return str(v)
 
+
 def split_name(first: Optional[str], last: Optional[str], full: Optional[str]) -> tuple[str, str]:
     """Zerlegt Namen in Vor- und Nachname."""
     if first or last:
@@ -895,6 +920,7 @@ def split_name(first: Optional[str], last: Optional[str], full: Optional[str]) -
     if len(parts) == 1:
         return parts[0], ""
     return " ".join(parts[:-1]), parts[-1]
+
 
 from typing import AsyncGenerator  # oben bereits importiert; sonst hinzufügen
 
@@ -936,6 +962,7 @@ async def stream_persons_by_filter(
         cursor = (payload.get("additional_data") or {}).get("next_cursor")
         if not cursor:
             break
+
 
 # -----------------------------------------------------------------------------
 # build_nf_master
@@ -991,6 +1018,8 @@ async def _build_nf_master_final(
         """
         Custom-/Standardfeld holen – robust:
         - bevorzugt aus custom_fields (v2)
+        - Fallback: direkt auf Top-Level (v1)
+        - Fallback: custom_fields als Liste von Dicts (ältere/abweichende Shapes)
         """
         if not key:
             return ""
@@ -1018,10 +1047,12 @@ async def _build_nf_master_final(
                         v_value = lst[0] if lst else None
                     if v_value is not None:
                         return sanitize(v_value)
+                    # als Fallback das ganze Dict serialisieren
                     return sanitize(v)
                 # einfacher Wert (z.B. Text, Zahl, Datum oder Liste von IDs)
                 return sanitize(v)
 
+        # 2) v1-kompatibel: direkt auf Root-Level
         v = p.get(key)
         if v is not None:
             return sanitize(v)
@@ -1180,6 +1211,7 @@ async def _build_nf_master_final(
 
         org_id = sanitize(org_id_raw)
 
+
         # Datum prüfen
         if not is_date_valid(p.get("next_activity_date")):
             count_date_invalid += 1
@@ -1211,6 +1243,7 @@ async def _build_nf_master_final(
         last = sanitize(p.get("last_name"))
         fullname = sanitize(p.get("name"))
 
+        # Fallback: Vollname zerlegen
         if not first and not last and fullname:
             parts = fullname.split()
             if len(parts) == 1:
@@ -1330,6 +1363,7 @@ def bucket_key(name: str) -> str:
 def fast_fuzzy(a: str, b: str) -> int:
     """Schnellerer Fuzzy-Matcher."""
     return fuzz.partial_ratio(a, b)
+
 
 # =============================================================================
 # _reconcile_nf
@@ -1630,6 +1664,7 @@ NF_EXPORT_COLUMNS = [
     "LinkedIn URL",
 ]
 
+
 def build_nf_export(df: pd.DataFrame) -> pd.DataFrame:
     """
     Baut den finalen Excel-Export in exakt definierter Spaltenreihenfolge.
@@ -1680,6 +1715,7 @@ def _df_to_excel_bytes_nf(df: pd.DataFrame) -> bytes:
 
     buf.seek(0)
     return buf.getvalue()
+
 
 # =============================================================================
 # /nachfass/export_download – FINAL (mit Kampagnennamen!)
@@ -1813,6 +1849,8 @@ async def export_start_nk(
     asyncio.create_task(_run())
     return JSONResponse({"job_id": job_id})
 
+
+
 # =============================================================================
 # EXPORT-FORTSCHRITT & DOWNLOAD-ENDPUNKTE
 # =============================================================================
@@ -1827,6 +1865,8 @@ async def neukontakte_export_progress(job_id: str = Query(...)):
         "note_org_limit": job.get("note_org_limit", 0),
         "note_date_invalid": job.get("note_date_invalid", 0)
     })
+
+
 
 # -------------------------------------------------------------------------
 # Download des erzeugten Nachfass-Exports
@@ -2045,6 +2085,7 @@ loadOptions();
 </html>
 """
     )
+
 
 # =============================================================================
 # Frontend – Nachfass (stabil, modern, sauber)
@@ -2287,6 +2328,9 @@ el('btnExportNf').onclick = startExport;
 """
     )
 
+
+
+
 # =============================================================================
 # Summary-Seiten
 # =============================================================================
@@ -2407,6 +2451,8 @@ async def nachfass_excluded_json():
         "rows": rows
     })
 
+
+
 # =============================================================================
 # HTML-Seite (Excluded Viewer)
 # =============================================================================
@@ -2509,6 +2555,7 @@ async def nachfass_excluded():
     """
     return HTMLResponse(html)
 
+
 # =============================================================================
 # SUMMARY-SEITE – Überblick nach Export
 # =============================================================================
@@ -2608,6 +2655,7 @@ async def nachfass_export_start(req: Request):
 
     return {"job_id": job_id}
 
+
 # =============================================================================
 # Fortschritt abfragen
 # =============================================================================
@@ -2623,6 +2671,7 @@ async def nachfass_export_progress(job_id: str):
         "done": bool(job.done),
         "error": str(job.error) if job.error else None
     })
+
 
 # =============================================================================
 # Debug-Endpoint für eine Person
@@ -2650,6 +2699,8 @@ async def debug_pd_person(pid: int):
         }
     )
 
+
+
 # =============================================================================
 # Download
 # =============================================================================
@@ -2666,6 +2717,7 @@ async def nachfass_export_download(job_id: str):
     )
 
 # =============================================================================
+# Redirects & Fallbacks (fix für /overview & ungültige Pfade)
 # =============================================================================
 
 @app.get("/overview", response_class=HTMLResponse)
@@ -2677,6 +2729,7 @@ async def overview_redirect():
     """
     return RedirectResponse("/campaign", status_code=302)
 
+
 @app.get("/", response_class=HTMLResponse)
 async def root():
     # direkt die Campaign-Seite rendern, ohne Redirect
@@ -2685,6 +2738,7 @@ async def root():
 @app.get("/{full_path:path}", include_in_schema=False)
 async def catch_all(full_path: str, request: Request):
     """
+    Sauberer Fallback für alle unbekannten URLs:
     - /overview    → wird separat abgefangen
     - /irgendwas   → leitet automatisch auf /campaign
     """
