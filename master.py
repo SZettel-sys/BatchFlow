@@ -1,7 +1,6 @@
 
 import logging
 
-
 import os, re, io, uuid, time, asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, List, AsyncGenerator, Any
@@ -139,7 +138,6 @@ def _contains_any_text(val, wanted: List[str]) -> bool:
     s = str(val).lower().strip()
     return any(k.lower() in s for k in wanted if k)
 
-
 def parse_pd_date(d: Optional[str]) -> Optional[datetime]:
     try: return datetime.strptime(d, "%Y-%m-%d").replace(tzinfo=timezone.utc)
     except Exception: return None
@@ -163,10 +161,7 @@ def _as_list_email(value) -> List[str]:
         return out
     return [str(value)]
 
-def slugify_filename(name: str, fallback="BatchFlow_Export") -> str:
     s = re.sub(r"[^\w\-. ]+", "", (name or "").strip())
-    return re.sub(r"\s+", "_", s) or fallback
-
 
 def _df_to_excel_bytes(df: pd.DataFrame) -> bytes:
     """
@@ -176,7 +171,6 @@ def _df_to_excel_bytes(df: pd.DataFrame) -> bytes:
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         df.to_excel(writer, index=False, sheet_name="Export")
     return output.getvalue()
-
 
 def _build_export_from_ready(filename: str):
     """
@@ -240,7 +234,6 @@ async def save_df_text(df: pd.DataFrame, table: str):
             for k in ("value", "label", "name", "id"):
                 if k in v:
                     return sanitize_value(v[k])
-            # fallback
             return ""
 
         # Listen => erstes Element nehmen
@@ -283,7 +276,6 @@ async def save_df_text(df: pd.DataFrame, table: str):
             if batch:
                 await conn.executemany(sql, batch)
 
-
 # =============================================================================
 # Tabellen-Namenszuordnung (einheitlich für Nachfass / Neukontakte)
 # =============================================================================
@@ -298,7 +290,6 @@ def tables(prefix: str) -> dict:
         "ready": f"{prefix}_master_ready",
         "log":   f"{prefix}_delete_log",
     }
-
 
 async def load_df_text(table: str) -> pd.DataFrame:
     """
@@ -335,7 +326,6 @@ async def load_df_text(table: str) -> pd.DataFrame:
                 or v.get("id")
                 or ""
             )
-        # Fallback
         return str(v)
 
     async with get_pool().acquire() as conn:
@@ -353,7 +343,6 @@ async def load_df_text(table: str) -> pd.DataFrame:
             })
 
         return pd.DataFrame(clean_rows)
-
 
     async with get_pool().acquire() as conn:
         rows = await conn.fetch(f'SELECT * FROM "{SCHEMA}"."{table}"')
@@ -400,7 +389,6 @@ def field_options_id_to_label_map(field: dict) -> Dict[str, str]:
         lab = str(o.get("label") or o.get("name") or oid)
         mp[oid] = lab
     return mp
-
 
 async def get_person_field_by_hint(label_hint: str) -> Optional[dict]:
     """Findet ein Personenfeld anhand eines Text-Hints (z. B. 'fachbereich')."""
@@ -546,10 +534,6 @@ async def stream_person_ids_by_filter(
         if not cursor:
             break
 
-
-
-
-
 # =============================================================================
 # Organisationen – Bucketing + Kappung (Performanceoptimiert)
 # =============================================================================
@@ -597,7 +581,6 @@ async def _fetch_org_names_for_filter_capped(
                         return buckets_all
 
     return buckets_all
-
 
 def _pretty_reason(reason: str, extra: str = "") -> str:
     """Liefert verständlichen Grundtext für entfernte Zeilen."""
@@ -692,8 +675,6 @@ async def stream_persons_by_batch_id(
     await asyncio.gather(*(fetch_one(bid) for bid in batch_ids))
     print(f"[INFO] Alle Batch-IDs geladen: {len(results)} Personen gesamt")
     return results
-
-
 
 # =============================================================================
 # Nachfass – Aufbau Master (robust, progressiv & vollständig)
@@ -820,7 +801,6 @@ async def fetch_person_details(person_ids: List[str]) -> List[dict]:
             )
     # Kein raise -> Job läuft mit den geladenen Personen weiter
 
-
     # -----------------------------------
     # Ergebnis in ursprünglicher Reihenfolge zurückgeben
     # -----------------------------------
@@ -833,7 +813,6 @@ async def fetch_person_details(person_ids: List[str]) -> List[dict]:
             # sollte wegen obigem RuntimeError eigentlich nicht mehr passieren
             print(f"[fetch_person_details] WARN: ID {spid} fehlt trotz erfolgreichem Lauf")
     return ordered
-
 
 # -----------------------------------------------------------------------------
 # INTERNER CACHE
@@ -862,7 +841,6 @@ async def get_next_activity_key() -> Optional[str]:
         pass
     return _NEXT_ACTIVITY_KEY
 
-
 async def get_last_activity_key() -> Optional[str]:
     """Ermittelt das Feld für 'Letzte Aktivität'."""
     global _LAST_ACTIVITY_KEY
@@ -880,7 +858,6 @@ async def get_last_activity_key() -> Optional[str]:
         pass
     return _LAST_ACTIVITY_KEY
 
-
 async def get_batch_field_key() -> Optional[str]:
     """Sucht das Personenfeld in Pipedrive, das die Batch-ID enthält."""
     global _BATCH_FIELD_KEY
@@ -895,7 +872,6 @@ async def get_batch_field_key() -> Optional[str]:
             break
     return _BATCH_FIELD_KEY
 
-
 def extract_field_date(p: dict, key: Optional[str]) -> Optional[str]:
     """Extrahiert ein Datumsfeld aus einer Person."""
     if not key:
@@ -909,7 +885,6 @@ def extract_field_date(p: dict, key: Optional[str]) -> Optional[str]:
         return None
     return str(v)
 
-
 def split_name(first: Optional[str], last: Optional[str], full: Optional[str]) -> tuple[str, str]:
     """Zerlegt Namen in Vor- und Nachname."""
     if first or last:
@@ -920,7 +895,6 @@ def split_name(first: Optional[str], last: Optional[str], full: Optional[str]) -
     if len(parts) == 1:
         return parts[0], ""
     return " ".join(parts[:-1]), parts[-1]
-
 
 from typing import AsyncGenerator  # oben bereits importiert; sonst hinzufügen
 
@@ -962,7 +936,6 @@ async def stream_persons_by_filter(
         cursor = (payload.get("additional_data") or {}).get("next_cursor")
         if not cursor:
             break
-
 
 # -----------------------------------------------------------------------------
 # build_nf_master
@@ -1018,8 +991,6 @@ async def _build_nf_master_final(
         """
         Custom-/Standardfeld holen – robust:
         - bevorzugt aus custom_fields (v2)
-        - Fallback: direkt auf Top-Level (v1)
-        - Fallback: custom_fields als Liste von Dicts (ältere/abweichende Shapes)
         """
         if not key:
             return ""
@@ -1047,12 +1018,10 @@ async def _build_nf_master_final(
                         v_value = lst[0] if lst else None
                     if v_value is not None:
                         return sanitize(v_value)
-                    # als Fallback das ganze Dict serialisieren
                     return sanitize(v)
                 # einfacher Wert (z.B. Text, Zahl, Datum oder Liste von IDs)
                 return sanitize(v)
 
-        # 2) v1-kompatibel: direkt auf Root-Level
         v = p.get(key)
         if v is not None:
             return sanitize(v)
@@ -1211,7 +1180,6 @@ async def _build_nf_master_final(
 
         org_id = sanitize(org_id_raw)
 
-
         # Datum prüfen
         if not is_date_valid(p.get("next_activity_date")):
             count_date_invalid += 1
@@ -1243,7 +1211,6 @@ async def _build_nf_master_final(
         last = sanitize(p.get("last_name"))
         fullname = sanitize(p.get("name"))
 
-        # Fallback: Vollname zerlegen
         if not first and not last and fullname:
             parts = fullname.split()
             if len(parts) == 1:
@@ -1363,7 +1330,6 @@ def bucket_key(name: str) -> str:
 def fast_fuzzy(a: str, b: str) -> int:
     """Schnellerer Fuzzy-Matcher."""
     return fuzz.partial_ratio(a, b)
-
 
 # =============================================================================
 # _reconcile_nf
@@ -1664,7 +1630,6 @@ NF_EXPORT_COLUMNS = [
     "LinkedIn URL",
 ]
 
-
 def build_nf_export(df: pd.DataFrame) -> pd.DataFrame:
     """
     Baut den finalen Excel-Export in exakt definierter Spaltenreihenfolge.
@@ -1715,7 +1680,6 @@ def _df_to_excel_bytes_nf(df: pd.DataFrame) -> bytes:
 
     buf.seek(0)
     return buf.getvalue()
-
 
 # =============================================================================
 # /nachfass/export_download – FINAL (mit Kampagnennamen!)
@@ -1849,8 +1813,6 @@ async def export_start_nk(
     asyncio.create_task(_run())
     return JSONResponse({"job_id": job_id})
 
-
-
 # =============================================================================
 # EXPORT-FORTSCHRITT & DOWNLOAD-ENDPUNKTE
 # =============================================================================
@@ -1865,8 +1827,6 @@ async def neukontakte_export_progress(job_id: str = Query(...)):
         "note_org_limit": job.get("note_org_limit", 0),
         "note_date_invalid": job.get("note_date_invalid", 0)
     })
-
-
 
 # -------------------------------------------------------------------------
 # Download des erzeugten Nachfass-Exports
@@ -2085,7 +2045,6 @@ loadOptions();
 </html>
 """
     )
-
 
 # =============================================================================
 # Frontend – Nachfass (stabil, modern, sauber)
@@ -2328,9 +2287,6 @@ el('btnExportNf').onclick = startExport;
 """
     )
 
-
-
-
 # =============================================================================
 # Summary-Seiten
 # =============================================================================
@@ -2451,8 +2407,6 @@ async def nachfass_excluded_json():
         "rows": rows
     })
 
-
-
 # =============================================================================
 # HTML-Seite (Excluded Viewer)
 # =============================================================================
@@ -2555,7 +2509,6 @@ async def nachfass_excluded():
     """
     return HTMLResponse(html)
 
-
 # =============================================================================
 # SUMMARY-SEITE – Überblick nach Export
 # =============================================================================
@@ -2655,7 +2608,6 @@ async def nachfass_export_start(req: Request):
 
     return {"job_id": job_id}
 
-
 # =============================================================================
 # Fortschritt abfragen
 # =============================================================================
@@ -2671,7 +2623,6 @@ async def nachfass_export_progress(job_id: str):
         "done": bool(job.done),
         "error": str(job.error) if job.error else None
     })
-
 
 # =============================================================================
 # Debug-Endpoint für eine Person
@@ -2699,8 +2650,6 @@ async def debug_pd_person(pid: int):
         }
     )
 
-
-
 # =============================================================================
 # Download
 # =============================================================================
@@ -2717,7 +2666,6 @@ async def nachfass_export_download(job_id: str):
     )
 
 # =============================================================================
-# Redirects & Fallbacks (fix für /overview & ungültige Pfade)
 # =============================================================================
 
 @app.get("/overview", response_class=HTMLResponse)
@@ -2729,7 +2677,6 @@ async def overview_redirect():
     """
     return RedirectResponse("/campaign", status_code=302)
 
-
 @app.get("/", response_class=HTMLResponse)
 async def root():
     # direkt die Campaign-Seite rendern, ohne Redirect
@@ -2738,277 +2685,9 @@ async def root():
 @app.get("/{full_path:path}", include_in_schema=False)
 async def catch_all(full_path: str, request: Request):
     """
-    Sauberer Fallback für alle unbekannten URLs:
     - /overview    → wird separat abgefangen
     - /irgendwas   → leitet automatisch auf /campaign
     """
     if full_path in ("campaign", "", "/"):
         return RedirectResponse("/campaign", status_code=302)
     return RedirectResponse("/campaign", status_code=302)
-
-
-# =============================================================================
-# V2-CLEAN OVERRIDES (strictly aligned to v2 docs)
-# =============================================================================
-import json
-from typing import Optional, List, Dict, Any
-import pandas as pd
-
-# --- universal helpers ---
-def _sanitize(v: Any) -> str:
-    if v is None or (isinstance(v, float) and pd.isna(v)):
-        return ""
-    if isinstance(v, str):
-        s = v.strip()
-        if (s.startswith('[') and s.endswith(']')) or (s.startswith('{') and s.endswith('}')):
-            try:
-                return _sanitize(json.loads(s))
-            except Exception:
-                return s
-        return s
-    if isinstance(v, dict):
-        return (
-            _sanitize(v.get('value'))
-            or _sanitize(v.get('label'))
-            or _sanitize(v.get('name'))
-            or _sanitize(v.get('id'))
-            or ''
-        )
-    if isinstance(v, list):
-        return _sanitize(v[0]) if v else ''
-    return str(v)
-
-# override flatten to use _sanitize consistently
-async def load_df_text(table: str) -> pd.DataFrame:  # placeholder to avoid name clash if imported elsewhere
-    return await load_df_text(table)  # type: ignore
-
-# --- v2-safe field access ---
-def cf_v2(p: dict, key: Optional[str]) -> str:
-    """Return value of a person custom field by key from v2 'custom_fields' object."""
-    if not key:
-        return ''
-    custom = p.get('custom_fields') or {}
-    if isinstance(custom, dict):
-        return _sanitize(custom.get(key))
-    # v2 should not return list here; fallback just in case
-    if isinstance(custom, list):
-        for entry in custom:
-            if isinstance(entry, dict) and (entry.get('key') == key or entry.get('id') == key):
-                return _sanitize(entry.get('value') or entry.get('label') or entry.get('name') or entry.get('id'))
-    return ''
-
-# choose primary email from v2 shape
-def get_primary_email_v2(p: dict) -> str:
-    emails = p.get('email') or p.get('emails') or []
-    flat: List[dict] = []
-    def add(obj):
-        if obj is None:
-            return
-        if isinstance(obj, dict):
-            flat.append(obj)
-        elif isinstance(obj, list):
-            for sub in obj:
-                add(sub)
-        else:
-            flat.append({'value': obj})
-    add(emails)
-    for e in flat:
-        if e.get('primary'):
-            val = e.get('value')
-            if val:
-                return _sanitize(val)
-    if flat:
-        return _sanitize(flat[0].get('value'))
-    return ''
-
-# --- stream persons by batch id (search API v2) ---
-async def stream_persons_by_batch_id(batch_key: str, batch_ids: List[str], page_limit: int = 100, job_obj=None) -> List[dict]:
-    """
-    Strict v2: GET /persons/search?term=<BID>&fields=custom_fields&limit=<n>
-    Response: data.items[*].item is the person. Pagination via additional_data.next_cursor.
-    """
-    client = http_client()
-    results: List[dict] = []
-    sem = asyncio.Semaphore(6)
-
-    async def fetch_one(bid: str):
-        cursor: Optional[str] = None
-        local: List[dict] = []
-        while True:
-            base = f"{PIPEDRIVE_API}/persons/search?term={bid}&fields=custom_fields&limit={page_limit}"
-            url = append_token(base)
-            if cursor:
-                url += f"&cursor={cursor}"
-            r = await client.get(url, headers=get_headers())
-            if r.status_code == 429:
-                await asyncio.sleep(2)
-                continue
-            if r.status_code != 200:
-                break
-            payload = r.json() or {}
-            items = (payload.get('data') or {}).get('items') or []
-            for it in items:
-                if isinstance(it, dict):
-                    person = it.get('item')
-                    if isinstance(person, dict):
-                        # ensure batch tag is kept
-                        person.setdefault('custom_fields', {})[batch_key] = bid
-                        local.append(person)
-            # pagination: next_cursor or additional_data.pagination.next_cursor
-            additional = payload.get('additional_data') or {}
-            cursor = additional.get('next_cursor') or (additional.get('pagination') or {}).get('next_cursor')
-            if not cursor:
-                break
-        if local and job_obj:
-            print(f"[Batch {bid}] {len(local)} Personen gefunden.")
-        results.extend(local)
-
-    await asyncio.gather(*(fetch_one(b) for b in batch_ids))
-    print(f"[INFO] Alle Batch-IDs geladen: {len(results)} Personen gesamt")
-    return results
-
-# --- build nf master final override ---
-async def _build_nf_master_final(
-    nf_batch_ids: List[str],
-    batch_id: str,
-    campaign: str,
-    job_obj=None,
-) -> pd.DataFrame:
-    if job_obj:
-        job_obj.phase = "Lade Nachfass-Kandidaten …"
-        job_obj.percent = 10
-
-    # use v2 custom field key (provided by caller)
-    BATCH_CF_KEY = "5ac34dad3ea917fdef4087caebf77ba275f87eec"
-
-    persons_search = await stream_persons_by_batch_id(BATCH_CF_KEY, nf_batch_ids)
-    person_ids: List[str] = []
-    clean_search: List[dict] = []
-    for p in persons_search:
-        if isinstance(p, dict):
-            clean_search.append(p)
-            pid = _sanitize(p.get('id'))
-            if pid:
-                person_ids.append(pid)
-    person_ids = sorted(set(person_ids))
-    print(f"[NF] Personen aus Suche: {len(person_ids)} IDs")
-
-    if not person_ids:
-        empty_df = pd.DataFrame(columns=[
-            "Batch ID","Channel","Cold-Mailing Import","Prospect ID","Organisation ID","Organisation Name",
-            "Person ID","Person Vorname","Person Nachname","Person Titel","Person Geschlecht","Person Position",
-            "Person E-Mail","XING Profil","LinkedIn URL",
-        ])
-        await save_df_text(empty_df, "nf_master_final")
-        await save_df_text(pd.DataFrame([{"Grund":"Keine Personen zur Batch-ID gefunden","Anzahl":0}]), "nf_excluded")
-        if job_obj:
-            job_obj.phase = "Keine Personen gefunden"; job_obj.percent = 100; job_obj.done = True
-        return empty_df
-
-    if job_obj:
-        job_obj.phase = "Lade Personendetails …"; job_obj.percent = 25
-    persons_full = await fetch_person_details(person_ids)
-    persons: List[dict] = [p for p in persons_full if isinstance(p, dict)]
-    print(f"[NF] Vollständige Personendaten: {len(persons)} Datensätze")
-
-    # filter: date validity and max 2 per org
-    today = pd.Timestamp.utcnow().date()
-    def is_date_valid(raw: Any) -> bool:
-        s = _sanitize(raw)
-        if not s:
-            return True
-        try:
-            dt = pd.to_datetime(s).date()
-        except Exception:
-            return True
-        if dt > today:
-            return False
-        return (today - dt).days > 90
-
-    selected: List[dict] = []
-    org_counter: Dict[str,int] = {}
-    count_org_limit = 0
-    count_date_invalid = 0
-
-    for p in persons:
-        org = p.get('organization') or {}
-        if isinstance(org, list):
-            org = org[0] if org else {}
-        org_id = _sanitize(org.get('id'))
-        org_name = _sanitize(org.get('name'))
-
-        if not is_date_valid(p.get('next_activity_date')):
-            count_date_invalid += 1
-            continue
-        if org_name.strip().lower() == 'freelancer':
-            continue
-        org_counter[org_id] = org_counter.get(org_id, 0) + 1
-        if org_id and org_counter[org_id] > 2:
-            count_org_limit += 1
-            continue
-        selected.append(p)
-
-    print(f"[NF] Nach Filtern: {len(selected)} Datensätze (org_limit={count_org_limit}, date_invalid={count_date_invalid})")
-
-    PERSON_CF_KEYS = {
-        "Prospect ID": "f9138f9040c44622808a4b8afda2b1b75ee5acd0",
-        "Person Titel": "0343bc43a91159aaf33a463ca603dc5662422ea5",
-        "Person Geschlecht": "c4f5f434cdb0cfce3f6d62ec7291188fe968ac72",
-        "Person Position": "4585e5de11068a3bccf02d8b93c126bcf5c257ff",
-        "XING Profil": "44ebb6feae2a670059bc5261001443a2878a2b43",
-        "LinkedIn URL": "25563b12f847a280346bba40deaf527af82038cc",
-    }
-
-    rows: List[dict] = []
-    for p in selected:
-        pid = _sanitize(p.get('id'))
-        first = _sanitize(p.get('first_name'))
-        last = _sanitize(p.get('last_name'))
-        fullname = _sanitize(p.get('name'))
-        if not first and not last and fullname:
-            parts = fullname.split()
-            if len(parts) == 1:
-                first, last = parts[0], ''
-            else:
-                first = ' '.join(parts[:-1]); last = parts[-1]
-        org = p.get('organization') or {}
-        if isinstance(org, list):
-            org = org[0] if org else {}
-        org_id = _sanitize(org.get('id'))
-        org_name = _sanitize(org.get('name'))
-        email = get_primary_email_v2(p)
-        prospect_id = cf_v2(p, PERSON_CF_KEYS["Prospect ID"]) or ''
-        if not prospect_id or not email:
-            continue
-        row = {
-            "Batch ID": _sanitize(batch_id),
-            "Channel": DEFAULT_CHANNEL,
-            "Cold-Mailing Import": _sanitize(campaign),
-            "Prospect ID": prospect_id,
-            "Organisation ID": org_id,
-            "Organisation Name": org_name,
-            "Person ID": pid,
-            "Person Vorname": first,
-            "Person Nachname": last,
-            "Person Titel": cf_v2(p, PERSON_CF_KEYS["Person Titel"]),
-            "Person Geschlecht": cf_v2(p, PERSON_CF_KEYS["Person Geschlecht"]),
-            "Person Position": cf_v2(p, PERSON_CF_KEYS["Person Position"]),
-            "Person E-Mail": email,
-            "XING Profil": cf_v2(p, PERSON_CF_KEYS["XING Profil"]),
-            "LinkedIn URL": cf_v2(p, PERSON_CF_KEYS["LinkedIn URL"]),
-        }
-        for k,v in list(row.items()):
-            row[k] = _sanitize(v)
-        rows.append(row)
-
-    df = pd.DataFrame(rows).replace({None: ""})
-
-    excluded_rows = [
-        {"Grund":"Max 2 Kontakte pro Organisation","Anzahl": int(count_org_limit)},
-        {"Grund":"Datum nächste Aktivität steht an bzw. liegt in naher Vergangenheit","Anzahl": int(count_date_invalid)},
-    ]
-    await save_df_text(pd.DataFrame(excluded_rows), "nf_excluded")
-    await save_df_text(df, "nf_master_final")
-    if job_obj:
-        job_obj.phase = "Nachfass-Master erstellt"; job_obj.percent = 80
-    return df
