@@ -633,26 +633,26 @@ async def stream_persons_by_batch_id(
                 url = append_token(base_url)
                 if cursor:
                     url += f"&cursor={cursor}"
-    
+
                 r = await http_client().get(url, headers=get_headers())
-    
+
                 if r.status_code == 429:
                     print("[WARN] Rate limit erreicht, warte 2 Sekunden ...")
                     await asyncio.sleep(2)
                     continue
-    
+
                 if r.status_code != 200:
                     print(f"[WARN] Batch {bid} Fehler: {r.text}")
                     break
-    
+
                 payload = r.json() or {}
                 raw_items = (payload.get("data") or {}).get("items") or []
                 if not raw_items:
                     break
-    
+
                 # v2: data.items[*].item → Person
                 persons: List[dict] = []
-    
+
                 def add_item(obj):
                     if obj is None:
                         return
@@ -663,33 +663,28 @@ async def stream_persons_by_batch_id(
                     elif isinstance(obj, list):
                         for sub in obj:
                             add_item(sub)
-    
+
                 for it in raw_items:
                     add_item(it)
-    
+
                 if not persons:
                     break
-    
+
                 local.extend(persons)
                 total += len(persons)
-    
+
                 cursor = (payload.get("additional_data") or {}).get("next_cursor")
                 if not cursor:
                     break
-    
+
         if local:
             print(f"[Batch {bid}] {total} Personen gefunden.")
-            # Batch-Key zur Person mitschreiben
-            for p in local:
-                if not isinstance(p.get("custom_fields"), dict):
-                    p["custom_fields"] = {}
-                p.setdefault("custom_fields", {})[batch_key] = bid
+            # KEIN custom_fields-Mutieren mehr – v2 liefert hier eine Liste!
             results.extend(local)
 
-    
-
         print(f"[DEBUG] Batch {bid}: {total} Personen geladen")
-        results.extend(local)
+        # wichtig: hier **nicht** nochmal extend, sonst doppelte Einträge
+        # results.extend(local)  # <- diese Zeile entfernen
 
     await asyncio.gather(*(fetch_one(bid) for bid in batch_ids))
     print(f"[INFO] Alle Batch-IDs geladen: {len(results)} Personen gesamt")
