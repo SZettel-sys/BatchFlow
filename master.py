@@ -852,7 +852,10 @@ _BATCH_FIELD_KEY: Optional[str] = None
 # -----------------------------------------------------------------------------
 # PIPEDRIVE HILFSFUNKTIONEN
 # -----------------------------------------------------------------------------
- def sanitize(v: Any) -> str:
+# -----------------------------------------------------------------------------
+# PIPEDRIVE HILFSFUNKTIONEN
+# -----------------------------------------------------------------------------
+def sanitize(v: Any) -> str:
     """Konvertiert beliebige Werte sicher in einen String."""
     if v is None or (isinstance(v, float) and pd.isna(v)):
         return ""
@@ -876,16 +879,6 @@ _BATCH_FIELD_KEY: Optional[str] = None
     if isinstance(v, list):
         return sanitize(v[0]) if v else ""
     return str(v)
-    try:
-        sanitize  # noqa: B018
-    except NameError:
-        # sollte nie passieren, dient nur als Sicherheit
-        def sanitize(v: Any) -> str:
-            return "" if v is None else str(v)
-    
-    # Einheitlicher Name in allen Codepfaden:
-    sanitize_cell = sanitize
-    normalize_cell = sanitize
 
 async def get_next_activity_key() -> Optional[str]:
     """Ermittelt das Feld für 'Nächste Aktivität'."""
