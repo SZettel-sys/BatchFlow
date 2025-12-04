@@ -681,8 +681,9 @@ async def stream_persons_by_batch_id(
             print(f"[Batch {bid}] {total} Personen gefunden.")
             # Batch-Key zur Person mitschreiben
             for p in local:
-                if not isinstance(p.get("custom_fields"), dict): p["custom_fields"] = {}
-        p.setdefault("custom_fields", {})[batch_key] = bid
+                if not isinstance(p.get("custom_fields"), dict):
+                    p["custom_fields"] = {}
+                p.setdefault("custom_fields", {})[batch_key] = bid
             results.extend(local)
 
     
