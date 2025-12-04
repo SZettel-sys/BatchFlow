@@ -74,6 +74,16 @@ TEMPLATE_COLUMNS = [
     "Person E-Mail","XING Profil","LinkedIn URL"
 ]
 
+# -----------------------------------------------------------------------------
+# Geschlecht
+# -----------------------------------------------------------------------------
+GENDER_OPTION_MAP = {
+    "19": "männlich",
+    "20": "weiblich",
+    "21": "divers",
+    # "22": "keine Angabe",
+}
+
 # -----------------------------------------------------------------------------  
 # Feldzuordnung (Personenfelder → Excel-Spalten)  
 # -----------------------------------------------------------------------------  
@@ -960,6 +970,54 @@ async def stream_persons_by_filter(
         if not cursor:
             break
 
+# -----------------------------------------------------------------------------
+# Organisationsdaten v2 - only
+# -----------------------------------------------------------------------------
+def extract_org_id_from_person(p: dict) -> str:
+    org_obj = p.get("organization")
+
+    # Falls organization als dict kommt
+    if isinstance(org_obj, dict):
+        return sanitize(org_obj.get("id") or org_obj.get("value"))
+
+    # Falls organization als list kommt
+    if isinstance(org_obj, list) and org_obj:
+        first = org_obj[0]
+        if isinstance(first, dict):
+            return sanitize(first.get("id") or first.get("value"))
+
+    # Normalfall in v2: org_id ist Zahl
+    return sanitize(p.get("org_id"))
+# -----------------------------------------------------------------------------
+# Organisationsnamen per Bulk-Call nachladen
+# -----------------------------------------------------------------------------
+async def fetch_orgs_bulk(ids: list[str]) -> dict[str, dict]:
+    if not ids:
+        return {}
+
+    client = http_client()
+    uniq = sorted({str(i) for i in ids if i})
+    out: dict[str, dict] = {}
+    batch_size = 100
+
+    for i in range(0, len(uniq), batch_size):
+        chunk = uniq[i:i+batch_size]
+        base_url = f"{PIPEDRIVE_API}/organizations?ids={','.join(chunk)}&limit={len(chunk)}"
+        url = append_token(base_url)
+
+        r = await client.get(url, headers=get_headers())
+        if r.status_code != 200:
+            print(f"[WARN] organizations bulk HTTP {r.status_code}: {r.text[:200]}")
+            continue
+
+        payload = r.json() or {}
+        data = payload.get("data") or []
+        for org in data:
+            oid = org.get("id")
+            if oid is not None:
+                out[str(oid)] = org
+
+    return out
 
 # -----------------------------------------------------------------------------
 # build_nf_master
@@ -1227,6 +1285,16 @@ async def _build_nf_master_final(
         f"[NF] Nach Filtern: {len(selected)} Datensätze "
         f"(org_limit={count_org_limit}, date_invalid={count_date_invalid})"
     )
+    
+    unique_org_ids = []
+    seen = set()
+    for p in selected:
+        oid = extract_org_id_from_person(p)
+        if oid and oid not in seen:
+            seen.add(oid)
+            unique_org_ids.append(oid)
+    
+    org_lookup = await fetch_orgs_bulk(unique_org_ids)
 
     # -------------------------------------------------------------
     # 4) Export-Zeilen aufbauen
@@ -1250,14 +1318,12 @@ async def _build_nf_master_final(
                 last = parts[-1]
 
         # ---------------- Organisation ----------------
-        org_raw = p.get("organization") or p.get("org_id") or {}
-        if isinstance(org_raw, list):
-            org_raw = org_raw[0] if org_raw else {}
-        if not isinstance(org_raw, dict):
-            org_raw = {}
+        org_id = extract_org_id_from_person(p)
+        org_name = ""
+        if org_id:
+            org = org_lookup.get(org_id) or {}
+            org_name = sanitize(org.get("name"))
 
-        org_id = sanitize(org_raw.get("id") or org_raw.get("value"))
-        org_name = sanitize(org_raw.get("name") or org_raw.get("label"))
 
         # ---------------- E-Mail ermitteln ----------------
         email_field = p.get("email") or p.get("emails") or []
@@ -1286,7 +1352,11 @@ async def _build_nf_master_final(
 
         # ---------------- Prospect-ID (Custom Field) ----------------
         prospect_id = cf(p, PERSON_CF_KEYS["Prospect ID"])
-
+        
+        # ---------------- Geschlecht ----------------
+        gender_id = str(cf(p, PERSON_CF_KEYS["Person Geschlecht"]) or "").strip()
+        gender_label = GENDER_OPTION_MAP.get(gender_id, gender_id)  # fallback = ID
+        
         # ============================================================
         #  FILTER:
         #    - Organisation = "Freelancer" -> überspringen
@@ -1314,7 +1384,7 @@ async def _build_nf_master_final(
             "Person Vorname": first,
             "Person Nachname": last,
             "Person Titel": cf(p, PERSON_CF_KEYS["Person Titel"]),
-            "Person Geschlecht": cf(p, PERSON_CF_KEYS["Person Geschlecht"]),
+            "Person Geschlecht": gender_label,
             "Person Position": cf(p, PERSON_CF_KEYS["Person Position"]),
             "Person E-Mail": email,
             "XING Profil": cf(p, PERSON_CF_KEYS["XING Profil"]),
