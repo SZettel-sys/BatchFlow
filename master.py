@@ -1020,27 +1020,53 @@ def extract_org_id_from_person(p: dict) -> str:
 # Organisationsnamen per Bulk-Call nachladen
 # -----------------------------------------------------------------------------
 async def fetch_orgs_bulk(ids: list[str]) -> dict[str, dict]:
+    """
+    v2 bulk organizations lookup.
+    Robust gegen unterschiedliche Response-Shapes:
+    - data: [ {...}, {...} ]
+    - data.items: [ {item:{...}}, ... ]
+    """
     if not ids:
         return {}
 
     client = http_client()
-    uniq = sorted({str(i) for i in ids if i})
+    uniq = sorted({str(i) for i in ids if str(i).strip()})
     out: dict[str, dict] = {}
     batch_size = 100
 
     for i in range(0, len(uniq), batch_size):
-        chunk = uniq[i:i+batch_size]
+        chunk = uniq[i:i + batch_size]
         base_url = f"{PIPEDRIVE_API}/organizations?ids={','.join(chunk)}&limit={len(chunk)}"
         url = append_token(base_url)
 
         r = await client.get(url, headers=get_headers())
         if r.status_code != 200:
-            print(f"[WARN] organizations bulk HTTP {r.status_code}: {r.text[:200]}")
+            print(f"[WARN] organizations bulk HTTP {r.status_code}: {r.text[:300]}")
             continue
 
         payload = r.json() or {}
-        data = payload.get("data") or []
-        for org in data:
+
+        data = payload.get("data")
+
+        # Shape A: data ist direkt eine Liste von Orgas
+        org_list: list[dict] = []
+        if isinstance(data, list):
+            org_list = data
+
+        # Shape B: data.items[*].item
+        elif isinstance(data, dict) and isinstance(data.get("items"), list):
+            for it in data.get("items") or []:
+                if isinstance(it, dict) and isinstance(it.get("item"), dict):
+                    org_list.append(it["item"])
+
+        # Fallback: nix gefunden
+        else:
+            print(f"[WARN] organizations bulk: unerwartetes payload-shape keys={list(payload.keys())}")
+            continue
+
+        for org in org_list:
+            if not isinstance(org, dict):
+                continue
             oid = org.get("id")
             if oid is not None:
                 out[str(oid)] = org
@@ -1255,20 +1281,7 @@ async def _build_nf_master_final(
 
     for p in persons:
         # Organisation extrahieren (v2: meist nur org_id als int)
-        org_obj = p.get("organization")
-        org_id_raw = None
-
-        if isinstance(org_obj, dict):
-            org_id_raw = org_obj.get("id") or org_obj.get("value")
-        elif isinstance(org_obj, list) and org_obj:
-            first = org_obj[0]
-            if isinstance(first, dict):
-                org_id_raw = first.get("id") or first.get("value")
-
-        if org_id_raw is None:
-            org_id_raw = p.get("org_id")
-
-        org_id = sanitize(org_id_raw)
+        org_id = extract_org_id_from_person(p)
 
 
         # Datum prüfen
@@ -1299,6 +1312,11 @@ async def _build_nf_master_final(
             unique_org_ids.append(oid)
     
     org_lookup = await fetch_orgs_bulk(unique_org_ids)
+    print(f"[NF] org_lookup: {len(org_lookup)} orgs für {len(unique_org_ids)} org_ids")
+    if unique_org_ids:
+        sample_missing = [oid for oid in unique_org_ids[:20] if oid not in org_lookup]
+        if sample_missing:
+            print(f"[WARN] org_ids nicht im lookup (Beispiel): {sample_missing}")
 
     # -------------------------------------------------------------
     # 4) Export-Zeilen aufbauen
@@ -1326,7 +1344,14 @@ async def _build_nf_master_final(
         org_name = ""
         if org_id:
             org = org_lookup.get(org_id) or {}
-            org_name = sanitize(org.get("name"))
+            org_name = ""
+            if org_id:
+                org = org_lookup.get(org_id) or {}
+                org_name = sanitize(org.get("name"))
+                if not org_name:
+                    org_name = sanitize(org.get("label"))
+                if not org_name:
+                    org_name = sanitize(org.get("org_name"))
 
 
         # ---------------- E-Mail ermitteln ----------------
