@@ -852,6 +852,40 @@ _BATCH_FIELD_KEY: Optional[str] = None
 # -----------------------------------------------------------------------------
 # PIPEDRIVE HILFSFUNKTIONEN
 # -----------------------------------------------------------------------------
+ def sanitize(v: Any) -> str:
+        """Konvertiert beliebige Werte sicher in einen String."""
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return ""
+        if isinstance(v, str):
+            s = v.strip()
+            # JSON-Strings ggf. dekodieren
+            if (s.startswith("[") and s.endswith("]")) or (s.startswith("{") and s.endswith("}")):
+                try:
+                    return sanitize(json.loads(s))
+                except Exception:
+                    return s
+            return s
+        if isinstance(v, dict):
+            return (
+                sanitize(v.get("value"))
+                or sanitize(v.get("label"))
+                or sanitize(v.get("name"))
+                or sanitize(v.get("id"))
+                or ""
+            )
+        if isinstance(v, list):
+            return sanitize(v[0]) if v else ""
+        return str(v)
+        try:
+            sanitize  # noqa: B018
+        except NameError:
+            # sollte nie passieren, dient nur als Sicherheit
+            def sanitize(v: Any) -> str:
+                return "" if v is None else str(v)
+
+        # Einheitlicher Name in allen Codepfaden:
+        sanitize_cell = sanitize
+        normalize_cell = sanitize
 async def get_next_activity_key() -> Optional[str]:
     """Ermittelt das Feld für 'Nächste Aktivität'."""
     global _NEXT_ACTIVITY_KEY
@@ -1044,31 +1078,7 @@ async def _build_nf_master_final(
     # -------------------------------------------------------------
     # Hilfsfunktionen
     # -------------------------------------------------------------
-    def sanitize(v: Any) -> str:
-        """Konvertiert beliebige Werte sicher in einen String."""
-        if v is None or (isinstance(v, float) and pd.isna(v)):
-            return ""
-        if isinstance(v, str):
-            s = v.strip()
-            # JSON-Strings ggf. dekodieren
-            if (s.startswith("[") and s.endswith("]")) or (s.startswith("{") and s.endswith("}")):
-                try:
-                    return sanitize(json.loads(s))
-                except Exception:
-                    return s
-            return s
-        if isinstance(v, dict):
-            return (
-                sanitize(v.get("value"))
-                or sanitize(v.get("label"))
-                or sanitize(v.get("name"))
-                or sanitize(v.get("id"))
-                or ""
-            )
-        if isinstance(v, list):
-            return sanitize(v[0]) if v else ""
-        return str(v)
-
+   
     def cf(p: dict, key: Optional[str]) -> str:
         """
         Custom-/Standardfeld holen – robust:
