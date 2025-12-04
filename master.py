@@ -1002,20 +1002,49 @@ async def stream_persons_by_filter(
 # Organisationsdaten v2 - only
 # -----------------------------------------------------------------------------
 def extract_org_id_from_person(p: dict) -> str:
+    """
+    Robust v2/v1:
+    - organization: {id, name, ...} oder {value:...}
+    - org_id / organization_id / orgId / orgid
+    """
+    # 1) "organization" Objekt (v2 häufig)
     org_obj = p.get("organization")
-
-    # Falls organization als dict kommt
     if isinstance(org_obj, dict):
-        return sanitize(org_obj.get("id") or org_obj.get("value"))
+        return sanitize(
+            org_obj.get("id")
+            or org_obj.get("value")
+            or org_obj.get("org_id")
+            or org_obj.get("organization_id")
+        )
 
-    # Falls organization als list kommt
+    # 2) organization Liste (manche Search-Shapes)
     if isinstance(org_obj, list) and org_obj:
         first = org_obj[0]
         if isinstance(first, dict):
             return sanitize(first.get("id") or first.get("value"))
 
-    # Normalfall in v2: org_id ist Zahl
-    return sanitize(p.get("org_id"))
+    # 3) direkte Felder (v2/v1)
+    return sanitize(
+        p.get("org_id")
+        or p.get("organization_id")
+        or p.get("orgId")
+        or p.get("orgid")
+    )
+
+def extract_org_name(org: dict) -> str:
+    """
+    Robust aus Orga-Objekt den Namen holen – verschiedene Shapes abfangen.
+    """
+    if not isinstance(org, dict):
+        return ""
+    return sanitize(
+        org.get("name")
+        or org.get("label")
+        or org.get("org_name")
+        or (org.get("item") or {}).get("name")  # falls irgendwo item-shape reinsickert
+        or ""
+    )
+
 # -----------------------------------------------------------------------------
 # Organisationsnamen per Bulk-Call nachladen
 # -----------------------------------------------------------------------------
@@ -1026,6 +1055,7 @@ async def fetch_orgs_bulk(ids: list[str]) -> dict[str, dict]:
     - data: [ {...}, {...} ]
     - data.items: [ {item:{...}}, ... ]
     """
+    ids = [str(i).strip() for i in ids if str(i).strip() and str(i).strip().lower() != "nan"]
     if not ids:
         return {}
 
@@ -1341,17 +1371,19 @@ async def _build_nf_master_final(
 
         # ---------------- Organisation ----------------
         org_id = extract_org_id_from_person(p)
+
         org_name = ""
         if org_id:
             org = org_lookup.get(org_id) or {}
-            org_name = ""
-            if org_id:
-                org = org_lookup.get(org_id) or {}
-                org_name = sanitize(org.get("name"))
-                if not org_name:
-                    org_name = sanitize(org.get("label"))
-                if not org_name:
-                    org_name = sanitize(org.get("org_name"))
+
+            # robust: mehrere mögliche Keys
+            org_name = sanitize(
+                org.get("name")
+                or org.get("label")
+                or org.get("org_name")
+                or org.get("title")
+            )
+
 
 
         # ---------------- E-Mail ermitteln ----------------
