@@ -171,6 +171,75 @@ async def _get_with_retries(client, url: str, sem: asyncio.Semaphore, label: str
             delay = min(delay * 2, max_delay)
 
     return None, last_err
+import random
+import asyncio
+from typing import Optional, Tuple
+
+# Global: eine Bremse für alle Requests (Pipedrive mag keine parallelen Bursts)
+PD_SEM = asyncio.Semaphore(1)
+
+def _retry_after_seconds(resp) -> float:
+    ra = (resp.headers or {}).get("Retry-After")
+    if not ra:
+        return 0.0
+    try:
+        return float(ra)
+    except Exception:
+        return 0.0
+
+async def pd_get_with_retry(
+    client,
+    url: str,
+    headers: dict,
+    label: str = "",
+    retries: int = 8,
+    base_delay: float = 0.8,
+    sem: asyncio.Semaphore = PD_SEM,
+):
+    """
+    Einheitlicher GET mit Retries (429/5xx/Netzwerk).
+    Wichtig: respektiert Retry-After und macht Jitter -> weniger 429.
+    """
+    delay = base_delay
+    last_err = None
+
+    for attempt in range(1, retries + 1):
+        try:
+            async with sem:
+                r = await client.get(url, headers=headers)
+
+            # OK
+            if r.status_code == 200:
+                return r
+
+            # Nicht retrybar
+            if r.status_code in (400, 401, 403, 404):
+                return r
+
+            # 429 / 5xx -> retry
+            if r.status_code == 429 or (500 <= r.status_code <= 599):
+                ra = _retry_after_seconds(r)
+                sleep_s = max(delay, ra)
+                sleep_s = min(sleep_s, 30.0)
+                sleep_s = sleep_s + random.uniform(0, 0.35)  # jitter
+                print(f"[pd_get_with_retry] {label} HTTP {r.status_code} attempt={attempt}/{retries}, sleep={sleep_s:.2f}s")
+                await asyncio.sleep(sleep_s)
+                delay = min(delay * 1.8, 30.0)
+                continue
+
+            # Sonstige Fehler -> retry konservativ
+            print(f"[pd_get_with_retry] {label} HTTP {r.status_code}, retry attempt={attempt}/{retries}")
+            await asyncio.sleep(delay)
+            delay = min(delay * 1.8, 30.0)
+
+        except Exception as e:
+            last_err = e
+            sleep_s = delay + random.uniform(0, 0.35)
+            print(f"[pd_get_with_retry] {label} EXC {e}, retry attempt={attempt}/{retries}, sleep={sleep_s:.2f}s")
+            await asyncio.sleep(sleep_s)
+            delay = min(delay * 1.8, 30.0)
+
+    raise RuntimeError(f"[pd_get_with_retry] FAILED {label} after {retries} retries. last_err={last_err}")
 
 # -----------------------------------------------------------------------------
 # Hilfsfunktionen
@@ -538,10 +607,8 @@ async def stream_organizations_by_filter(
     page_limit: int = PAGE_LIMIT,
 ) -> AsyncGenerator[List[str], None]:
     """
-    Streamt Organisationen eines Pipedrive-Filters seitenweise (v2).
-    - Pagination: limit + cursor
-    - 429 wird NICHT zum Abbruch führen -> pd_get_with_retry regelt Backoff/Retry
-    - Bei anderen dauerhaften Fehlern: RuntimeError (damit du nicht "silent" zu wenige Orgas hast)
+    Streamt Orgas seitenweise (v2). Bei 429 wird NICHT abgebrochen,
+    sondern mit Backoff weitergemacht -> dadurch fehlen weniger Datensätze.
     """
     client = http_client()
     cursor: Optional[str] = None
@@ -554,15 +621,10 @@ async def stream_organizations_by_filter(
         )
         url = append_token(f"{base}&cursor={cursor}") if cursor else append_token(base)
 
-        # WICHTIG: pd_get_with_retry muss 429 retryen. Diese Funktion darf NICHT bei 429 breaken.
-        r = await pd_get_with_retry(client, url, get_headers(), label=f"orgs filter={filter_id} cursor={cursor or 'NONE'}")
-        status = r.status_code
-
-        if status != 200:
-            # Nicht still abbrechen -> sonst fehlen dir später Orga-Namen und du filterst zu viel weg
-            raise RuntimeError(
-                f"[stream_organizations_by_filter] HTTP {status} für Filter {filter_id}: {r.text}"
-            )
+        r = await pd_get_with_retry(client, url, get_headers(), label=f"orgs filter={filter_id}")
+        if r.status_code != 200:
+            print(f"[stream_organizations_by_filter] HTTP {r.status_code} für Filter {filter_id}: {r.text}")
+            break
 
         payload = r.json() or {}
         data = payload.get("data") or []
@@ -578,12 +640,12 @@ async def stream_organizations_by_filter(
         if names:
             yield names
 
-        # v2-Pagination: oft additional_data.next_cursor oder additional_data.pagination.next_cursor (je nach API)
         additional = payload.get("additional_data") or {}
+        # je nach API-Shape:
         cursor = additional.get("next_cursor") or (additional.get("pagination") or {}).get("next_cursor")
-
         if not cursor:
             break
+
 
 async def stream_person_ids_by_filter(
     filter_id: int,
@@ -798,148 +860,24 @@ async def stream_persons_by_batch_id(
 # =============================================================================
 # Nachfass – Aufbau Master (robust, progressiv & vollständig)
 # =============================================================================
-import asyncio
+from typing import List
+
 async def fetch_person_details(person_ids: List[str]) -> List[dict]:
-    """
-    Lädt vollständige Personendetails für alle übergebenen IDs.
-
-    Strategie:
-    - 1. Durchlauf: parallele Requests (z.B. 5 gleichzeitig), mit Retries bei 429/Fehlern
-    - 2. Durchlauf: nur für fehlende IDs, mit kleinerer Parallelität
-    - Wenn danach immer noch IDs fehlen -> RuntimeError (Job bricht sauber mit Fehler ab)
-    """
-
-    import asyncio
-
     if not person_ids:
         return []
 
-    client = http_client()
-    # damit wir pro ID nur ein Objekt haben -> dict statt Liste
-    results: Dict[str, dict] = {}
-    failed: set[str] = set()
+    lookup = await fetch_persons_bulk(person_ids, chunk_size=50)
 
-    # -----------------------------------
-    # Helfer für einen einzelnen Request
-    # -----------------------------------
-    async def fetch_one(pid: str, sem: asyncio.Semaphore, label: str):
-        retries = 5
-        delay = 1.0
+    missing = [str(pid) for pid in person_ids if str(pid) not in lookup]
+    if missing:
+        print(f"[fetch_person_details] WARN: fehlende Personendetails: {len(missing)} (Beispiele: {missing[:10]})")
 
-        while retries > 0:
-            try:
-                async with sem:
-                    url = append_token(
-                        f"{PIPEDRIVE_API}/persons/{pid}"
-                        #"?return_all_custom_fields=1"
-                        #"&include=organization,organization_fields"
-                    )
-                    r = await client.get(url, headers=get_headers())
-
-                status = r.status_code
-
-                if status == 200:
-                    payload = r.json() or {}
-                    data = payload.get("data")
-                    if not data:
-                        # IMPORTANT: 200 ohne data soll NICHT als Erfolg gelten -> retry
-                        print(f"[fetch_person_details] {label} 200 aber data fehlt für ID {pid}, retry …")
-                        retries -= 1
-                        await asyncio.sleep(delay)
-                        delay = min(delay * 2, 30)
-                        continue
-                
-                    rid = str(data.get("id") or pid)
-                    results[rid] = data
-                    return
-
-                if status == 404:
-                    # Person existiert nicht (mehr) -> merken, aber nicht endlos versuchen
-                    print(f"[fetch_person_details] {label} 404 für ID {pid}")
-                    failed.add(str(pid))
-                    return
-
-                if status == 429:
-                    # Rate Limit -> exponential backoff
-                    print(f"[fetch_person_details] {label} 429 für ID {pid}, retry …")
-                    retries -= 1
-                    await asyncio.sleep(delay)
-                    delay = min(delay * 2, 30)
-                    continue
-
-                # andere HTTP-Fehler
-                print(
-                    f"[fetch_person_details] {label} HTTP {status} für ID {pid}: {r.text}"
-                )
-                retries -= 1
-                await asyncio.sleep(delay)
-                delay = min(delay * 2, 30)
-
-            except Exception as e:
-                print(f"[fetch_person_details] {label} Exception für ID {pid}: {e}")
-                retries -= 1
-                await asyncio.sleep(delay)
-                delay = min(delay * 2, 30)
-
-        # alle Retries aufgebraucht
-        failed.add(str(pid))
-
-    # -----------------------------------
-    # 1. Runde: normal parallel
-    # -----------------------------------
-    first_sem = asyncio.Semaphore(5)  # ggf. anpassen, wenn du mehr/weniger Last willst
-    tasks = [
-        asyncio.create_task(fetch_one(str(pid), first_sem, "run1"))
-        for pid in person_ids
-    ]
-    await asyncio.gather(*tasks)
-
-    loaded_ids = set(results.keys())
-    expected_ids = {str(pid) for pid in person_ids}
-    missing_after_first = expected_ids - loaded_ids
-
-    print(f"[fetch_person_details] run1: geladen={len(loaded_ids)}, "
-          f"fehlend={len(missing_after_first)}")
-
-    # -----------------------------------
-    # 2. Runde: nur fehlende, mit kleinerer Parallelität
-    # -----------------------------------
-    if missing_after_first:
-        second_sem = asyncio.Semaphore(2)
-        tasks2 = [
-            asyncio.create_task(fetch_one(pid, second_sem, "run2"))
-            for pid in missing_after_first
-        ]
-        await asyncio.gather(*tasks2)
-
-        loaded_ids = set(results.keys())
-        missing_after_second = expected_ids - loaded_ids
-
-        print(f"[fetch_person_details] run2: zusätzlich geladen="
-              f"{len(loaded_ids) - (len(expected_ids) - len(missing_after_first))}, "
-              f"gesamt_fehlend={len(missing_after_second)}")
-
-      
-        if missing_after_second:
-            sample = list(missing_after_second)[:10]
-            print(
-                f"[fetch_person_details] WARN: Personendetails fehlen für "
-                f"{len(missing_after_second)} IDs (Beispiele: {sample})"
-            )
-    # Kein raise -> Job läuft mit den geladenen Personen weiter
-
-
-    # -----------------------------------
-    # Ergebnis in ursprünglicher Reihenfolge zurückgeben
-    # -----------------------------------
     ordered: List[dict] = []
     for pid in person_ids:
-        spid = str(pid)
-        if spid in results:
-            ordered.append(results[spid])
-        else:
-            # sollte wegen obigem RuntimeError eigentlich nicht mehr passieren
-            print(f"[fetch_person_details] WARN: ID {spid} fehlt trotz erfolgreichem Lauf")
+        p = lookup.get(str(pid))
+        if p:
+            ordered.append(p)
+
     return ordered
 
 
@@ -1152,7 +1090,60 @@ def extract_org_name(org: dict) -> str:
         or (org.get("item") or {}).get("name")  # falls irgendwo item-shape reinsickert
         or ""
     )
+# -----------------------------------------------------------------------------
+# Personen per Bulk laden
+# -----------------------------------------------------------------------------
+from typing import Dict, List
 
+async def fetch_persons_bulk(person_ids: List[str], chunk_size: int = 50) -> Dict[str, dict]:
+    """
+    Lädt Personendetails per /persons/collection?ids=...
+    -> drastisch weniger Requests als /persons/{id}.
+    """
+    if not person_ids:
+        return {}
+
+    client = http_client()
+
+    # de-dupe stable
+    seen = set()
+    deduped = []
+    for pid in person_ids:
+        spid = str(pid)
+        if spid not in seen:
+            seen.add(spid)
+            deduped.append(spid)
+
+    results: Dict[str, dict] = {}
+
+    for i in range(0, len(deduped), chunk_size):
+        chunk = deduped[i:i + chunk_size]
+        ids_csv = ",".join(chunk)
+
+        url = append_token(f"{PIPEDRIVE_API}/persons/collection?ids={ids_csv}")
+        r = await pd_get_with_retry(client, url, get_headers(), label=f"persons_bulk[{i//chunk_size+1}]")
+
+        if r.status_code != 200:
+            print(f"[fetch_persons_bulk] WARN HTTP {r.status_code}: {r.text}")
+            continue
+
+        payload = r.json() or {}
+        data = payload.get("data") or {}
+        items = data.get("items") or []
+
+        for it in items:
+            person = (it or {}).get("item") or {}
+            if not person:
+                continue
+            pid = str(person.get("id") or "")
+            if pid:
+                results[pid] = person
+
+        # kleine Pause -> weniger 429
+        await asyncio.sleep(0.10)
+
+    return results
+    
 # -----------------------------------------------------------------------------
 # Organisationsnamen per Bulk-Call nachladen
 # -----------------------------------------------------------------------------
@@ -1187,12 +1178,7 @@ async def fetch_orgs_bulk(org_ids: List[str], chunk_size: int = 50) -> Dict[str,
         ids_csv = ",".join(ids)
         url = append_token(f"{PIPEDRIVE_API}/organizations/collection?ids={ids_csv}")
 
-        r, err = await _get_with_retries(
-            client, url, sem,
-            label=label,
-            retries=7,
-            base_delay=1.0
-        )
+        r = await pd_get_with_retry(client, url, get_headers(), label=f"orgs_bulk[{i//chunk_size+1}]")
 
         if not r:
             print(f"[fetch_orgs_bulk] WARN: request failed ({err}) ids={len(ids)}")
@@ -1537,7 +1523,7 @@ async def _build_nf_master_final(
             seen.add(oid)
             unique_org_ids.append(oid)
     
-    org_lookup = await fetch_orgs_bulk(unique_org_ids)
+    org_lookup = await fetch_orgs_bulk(unique_org_ids, chuck_size=25)
     print(f"[NF] org_lookup: {len(org_lookup)} orgs für {len(unique_org_ids)} org_ids")
     # ------------------------------------------------------------------
     # Fallback: fehlende Orgas einzeln nachladen (robuster bei 429/bulk=leer)
@@ -1582,6 +1568,7 @@ async def _build_nf_master_final(
                 first = " ".join(parts[:-1])
                 last = parts[-1]
 
+    
         # ---------------- Organisation ----------------
         # ---------------- Organisation ----------------
         org_id_raw = extract_org_id_from_person(p)
@@ -1591,7 +1578,7 @@ async def _build_nf_master_final(
         
         # (1) Primär: aus org_lookup (API Organization Details)
         if org_id:
-            org = org_lookup.get(org_id) or {}
+            org = org_lookup.get(str(org_id)) or {}   # <- 2a) das ist der Fix: str(org_id)
             org_name = sanitize(
                 org.get("name")
                 or org.get("label")
@@ -1599,21 +1586,17 @@ async def _build_nf_master_final(
                 or org.get("title")
             )
         
-        # (2) Fallback: steckt oft schon in der Person
+        # (2) Fallback: steckt oft schon in der Person (v2: "organization": {id,name...})
         if not org_name:
-            # häufige Pipedrive-Formate:
-            # p["org_id"] kann dict sein {"value": 123, "name": "Firma"} oder int
-            org_obj = p.get("org_id") or p.get("organization") or {}
+            org_obj = p.get("organization") or p.get("org_id") or {}
             if isinstance(org_obj, dict):
-                org_name = sanitize(org_obj.get("name") or org_obj.get("value", ""))
+                # org_obj kann {id,name} ODER {value:<id>} sein
+                org_name = sanitize(org_obj.get("name") or org_obj.get("label") or "")
             else:
                 # manchmal gibt es org_name direkt
                 org_name = sanitize(p.get("org_name") or p.get("organization_name") or "")
         
-        # (3) optional: wenn org_name immer noch leer ist, wenigstens sichtbar loggen
-        #     (nur wenn du debug brauchst)
-        # if org_id and not org_name:
-        #     print(f"[WARN] org_name leer trotz org_id={org_id} person_id={pid}")
+
 
 
 
