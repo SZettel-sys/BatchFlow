@@ -517,56 +517,6 @@ def append_token(url: str) -> str:
 # GET Retry/Backoff
 # =============================================================================
 
-async def pd_get_with_retry(client, url: str, headers: dict, label: str = "", max_retries: int = 8):
-    """
-    Robust GET:
-    - 429 => warten (Retry-After wenn vorhanden) + exponentielles Backoff mit Jitter
-    - 5xx/Netzwerk => retry
-    - 4xx (außer 429) => kein retry
-    """
-    delay = 1.0
-
-    for attempt in range(1, max_retries + 1):
-        try:
-            r = await client.get(url, headers=headers)
-            status = r.status_code
-
-            if status == 200:
-                return r
-
-            if status == 429:
-                retry_after = 0
-                try:
-                    retry_after = int(r.headers.get("Retry-After", "0") or "0")
-                except Exception:
-                    retry_after = 0
-
-                wait_s = retry_after if retry_after > 0 else delay
-                # Jitter, damit parallele Requests nicht synchron wieder anklopfen
-                wait_s = min(wait_s, 30) + random.uniform(0, 0.5)
-
-                print(f"[pd_get_with_retry] 429 {label} attempt={attempt}/{max_retries}, wait={wait_s:.2f}s")
-                await asyncio.sleep(wait_s)
-                delay = min(delay * 2, 30)
-                continue
-
-            if 500 <= status < 600:
-                print(f"[pd_get_with_retry] {status} {label} attempt={attempt}/{max_retries}, retry in {delay:.1f}s")
-                await asyncio.sleep(delay)
-                delay = min(delay * 2, 30)
-                continue
-
-            # andere 4xx -> nicht endlos probieren
-            print(f"[pd_get_with_retry] HTTP {status} {label}: {getattr(r, 'text', '')}")
-            return r
-
-        except Exception as e:
-            print(f"[pd_get_with_retry] EXC {label} attempt={attempt}/{max_retries}: {e}, retry in {delay:.1f}s")
-            await asyncio.sleep(delay)
-            delay = min(delay * 2, 30)
-
-    # nach max_retries immer noch nix
-    raise RuntimeError(f"pd_get_with_retry: failed after {max_retries} retries: {label} url={url}")
 
 # =============================================================================
 # PERSONENFELDER (Cache) Leer aufgrund von Umstellung auf API v2
@@ -782,7 +732,7 @@ async def stream_persons_by_batch_id(
     job_obj=None
 ) -> List[dict]:
     results: List[dict] = []
-    sem = asyncio.Semaphore(6)  # gedrosselt, um 429 zu vermeiden
+    sem = asyncio.Semaphore(2)  # gedrosselt, um 429 zu vermeiden
 
     async def fetch_one(bid: str):
         cursor: Optional[str] = None
@@ -799,13 +749,11 @@ async def stream_persons_by_batch_id(
                 if cursor:
                     url += f"&cursor={cursor}"
 
-                r = await http_client().get(url, headers=get_headers())
+            
+                r = await pd_get_with_retry(http_client(), url, get_headers(), label=f"persons_search bid={bid}", sem=PD_SEM)
 
-                if r.status_code == 429:
-                    print("[WARN] Rate limit erreicht, warte 2 Sekunden ...")
-                    await asyncio.sleep(2)
-                    continue
 
+                
                 if r.status_code != 200:
                     print(f"[WARN] Batch {bid} Fehler: {r.text}")
                     break
@@ -866,7 +814,7 @@ async def fetch_person_details(person_ids: List[str]) -> List[dict]:
     if not person_ids:
         return []
 
-    lookup = await fetch_persons_bulk(person_ids, chunk_size=50)
+    lookup = await fetch_persons_bulk(person_ids, chunk_size=25)
 
     missing = [str(pid) for pid in person_ids if str(pid) not in lookup]
     if missing:
@@ -1140,26 +1088,25 @@ async def fetch_persons_bulk(person_ids: List[str], chunk_size: int = 50) -> Dic
                 results[pid] = person
 
         # kleine Pause -> weniger 429
-        await asyncio.sleep(0.10)
+        await asyncio.sleep(0.15)
 
     return results
     
 # -----------------------------------------------------------------------------
 # Organisationsnamen per Bulk-Call nachladen
 # -----------------------------------------------------------------------------
-async def fetch_orgs_bulk(org_ids: List[str], chunk_size: int = 50) -> Dict[str, dict]:
+async def fetch_orgs_bulk(org_ids: List[str], chunk_size: int = 25) -> Dict[str, dict]:
     """
     Lädt Organisationsdetails über /organizations/collection?ids=...
-    Progressiv & robust:
-    - Chunk normal
-    - Bei Fehler: Chunk halbieren
-    - Wenn sehr klein: IDs einzeln
+    Robust & schnell:
+    - kleine Chunks (25) gegen 429
+    - bei Fehler: Chunk splitten (progressiv)
+    - respektiert pd_get_with_retry (Retry-After + Backoff)
     """
     if not org_ids:
         return {}
 
     client = http_client()
-    sem = asyncio.Semaphore(1)  # klein halten wegen RateLimit
 
     # de-dupe, stable order, remove empties
     seen = set()
@@ -1178,24 +1125,21 @@ async def fetch_orgs_bulk(org_ids: List[str], chunk_size: int = 50) -> Dict[str,
         ids_csv = ",".join(ids)
         url = append_token(f"{PIPEDRIVE_API}/organizations/collection?ids={ids_csv}")
 
-        r = await pd_get_with_retry(client, url, get_headers(), label=f"orgs_bulk[{i//chunk_size+1}]")
-
-        if not r:
-            print(f"[fetch_orgs_bulk] WARN: request failed ({err}) ids={len(ids)}")
+        try:
+            r = await pd_get_with_retry(client, url, get_headers(), label=label)
+        except Exception as e:
+            print(f"[fetch_orgs_bulk] WARN: {label} failed: {e}")
             return False
 
         if r.status_code == 404:
-            # collection kann 404 liefern wenn IDs komplett unbrauchbar sind
-            print(f"[fetch_orgs_bulk] WARN: 404 for chunk ids={len(ids)} sample={ids[:5]}")
+            print(f"[fetch_orgs_bulk] WARN: {label} got 404 ids={len(ids)} sample={ids[:5]}")
             return False
 
         if r.status_code != 200:
-            print(f"[fetch_orgs_bulk] WARN: HTTP {r.status_code} for chunk ids={len(ids)}: {r.text}")
+            print(f"[fetch_orgs_bulk] WARN: {label} HTTP {r.status_code}: {r.text[:200]}")
             return False
 
         payload = r.json() or {}
-
-        # häufiges Shape: data: {items:[{item:{...}}]}
         data = payload.get("data") or {}
         items = data.get("items") or []
 
@@ -1209,33 +1153,29 @@ async def fetch_orgs_bulk(org_ids: List[str], chunk_size: int = 50) -> Dict[str,
 
         return True
 
-    async def _fetch_progressive(ids: List[str], base_label: str):
+    async def _fetch_progressive(ids: List[str], label: str):
         if not ids:
             return
 
-        ok = await _fetch_chunk(ids, base_label)
+        ok = await _fetch_chunk(ids, label)
         if ok:
-            await asyncio.sleep(0.15)  # entschärft 429
+            await asyncio.sleep(0.15)  # entlastet stark
             return
 
-        # progressive fallback: split -> smaller chunks -> singletons
         if len(ids) == 1:
-            # letzter Versuch war schon singleton -> geben wir auf
-            return
+            return  # singleton auch kaputt -> aufgeben
 
         mid = max(1, len(ids) // 2)
-        left = ids[:mid]
-        right = ids[mid:]
+        await _fetch_progressive(ids[:mid], label + "a")
+        await _fetch_progressive(ids[mid:], label + "b")
 
-        await _fetch_progressive(left, base_label + "a")
-        await _fetch_progressive(right, base_label + "b")
-
-    # Start: in festen chunk_size “Paketen” und dann progressiv pro Paket
-    for i in range(0, len(deduped), chunk_size):
-        chunk = deduped[i:i + chunk_size]
-        await _fetch_progressive(chunk, base_label=f"orgs_bulk[{i//chunk_size+1}]")
+    # start in chunk_size paketweise, dann pro paket progressiv
+    for idx in range(0, len(deduped), chunk_size):
+        chunk = deduped[idx:idx + chunk_size]
+        await _fetch_progressive(chunk, label=f"orgs_bulk[{idx//chunk_size + 1}]")
 
     return results
+
 
 # -----------------------------------------------------------------------------
 # fehlende Organisation-IDs einzeln nachladen
@@ -1523,7 +1463,7 @@ async def _build_nf_master_final(
             seen.add(oid)
             unique_org_ids.append(oid)
     
-    org_lookup = await fetch_orgs_bulk(unique_org_ids, chuck_size=25)
+    org_lookup = await fetch_orgs_bulk(unique_org_ids, chunk_size=25)
     print(f"[NF] org_lookup: {len(org_lookup)} orgs für {len(unique_org_ids)} org_ids")
     # ------------------------------------------------------------------
     # Fallback: fehlende Orgas einzeln nachladen (robuster bei 429/bulk=leer)
@@ -1569,37 +1509,32 @@ async def _build_nf_master_final(
                 last = parts[-1]
 
     
+       
+
+
+
         # ---------------- Organisation ----------------
-        # ---------------- Organisation ----------------
-        org_id_raw = extract_org_id_from_person(p)
-        org_id = str(org_id_raw).strip() if org_id_raw is not None and str(org_id_raw).strip() else ""
-        
+        org_id = sanitize(extract_org_id_from_person(p))
         org_name = ""
         
-        # (1) Primär: aus org_lookup (API Organization Details)
+        # (1) Primär: Orga-Details aus org_lookup (collection)
         if org_id:
-            org = org_lookup.get(str(org_id)) or {}   # <- 2a) das ist der Fix: str(org_id)
-            org_name = sanitize(
-                org.get("name")
-                or org.get("label")
-                or org.get("org_name")
-                or org.get("title")
-            )
+            org = org_lookup.get(org_id) or {}
+            org_name = extract_org_name(org)  # nutzt deine helper-funktion
         
-        # (2) Fallback: steckt oft schon in der Person (v2: "organization": {id,name...})
+        # (2) Fallback: steckt oft schon in der Person (v2 shape: organization={id,name})
         if not org_name:
-            org_obj = p.get("organization") or p.get("org_id") or {}
+            org_obj = p.get("organization")
             if isinstance(org_obj, dict):
-                # org_obj kann {id,name} ODER {value:<id>} sein
                 org_name = sanitize(org_obj.get("name") or org_obj.get("label") or "")
             else:
-                # manchmal gibt es org_name direkt
+                # manchmal gibt es es direkt
                 org_name = sanitize(p.get("org_name") or p.get("organization_name") or "")
         
-
-
-
-
+        # (3) Hard fallback: wenn nur org_id da ist, aber lookup leer war
+        # -> damit du es in Logs siehst (nicht still leer)
+        if org_id and not org_name:
+            org_name = ""
 
         # ---------------- E-Mail ermitteln ----------------
         email_field = p.get("email") or p.get("emails") or []
