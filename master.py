@@ -786,7 +786,7 @@ async def fetch_person_details(person_ids: List[str]) -> List[dict]:
     # -----------------------------------
     # 1. Runde: normal parallel
     # -----------------------------------
-    first_sem = asyncio.Semaphore(1)  # ggf. anpassen, wenn du mehr/weniger Last willst
+    first_sem = asyncio.Semaphore(5)  # ggf. anpassen, wenn du mehr/weniger Last willst
     tasks = [
         asyncio.create_task(fetch_one(str(pid), first_sem, "run1"))
         for pid in person_ids
@@ -804,7 +804,7 @@ async def fetch_person_details(person_ids: List[str]) -> List[dict]:
     # 2. Runde: nur fehlende, mit kleinerer Parallelität
     # -----------------------------------
     if missing_after_first:
-        second_sem = asyncio.Semaphore(1)
+        second_sem = asyncio.Semaphore(2)
         tasks2 = [
             asyncio.create_task(fetch_one(pid, second_sem, "run2"))
             for pid in missing_after_first
@@ -1703,13 +1703,6 @@ async def run_nachfass_job(job: "Job", job_id: str) -> None:
         job.phase = "Lade Nachfass-Kandidaten …"
         job.percent = 10
 
-        # Der Rückgabewert wird nicht direkt verwendet – die eigentliche
-        # Selektion passiert in _build_nf_master_final.
-        _ = await stream_persons_by_batch_id(
-            "5ac34dad3ea917fdef4087caebf77ba275f87eec",
-            nf_batch_ids
-        )
-
         # ------------------------------------------------------------------
         # 2) Nachfass-Master bauen
         # ------------------------------------------------------------------
@@ -1845,43 +1838,6 @@ def _df_to_excel_bytes_nf(df: pd.DataFrame) -> bytes:
     return buf.getvalue()
 
 
-# =============================================================================
-# /nachfass/export_download – FINAL (mit Kampagnennamen!)
-# =============================================================================
-
-@app.get("/nachfass/export_download")
-async def nachfass_export_download(job_id: str = Query(...)):
-    """
-    Liefert den finalen Nachfass-Export als Excel-Download.
-    Der Dateiname = Kampagnenname.xlsx
-    """
-    job = JOBS.get(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job nicht gefunden")
-
-    try:
-        # finalen Master laden
-        df = await load_df_text("nf_master_final")
-
-        if df.empty:
-            raise FileNotFoundError("Keine Exportdaten vorhanden")
-
-        # Export bauen
-        export_df = build_nf_export(df)
-        excel_bytes = _df_to_excel_bytes_nf(export_df)
-
-        # Kampagnennamen als Dateiname
-        filename = slugify_filename(job.filename_base or "Nachfass_Export") + ".xlsx"
-
-        return StreamingResponse(
-            io.BytesIO(excel_bytes),
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={"Content-Disposition": f"attachment; filename={filename}"}
-        )
-
-    except Exception as e:
-        logging.error(f'[ERROR] Fehler im Export')
-        raise HTTPException(status_code=500, detail=str(e))
 
 # =============================================================================
 # JOB-VERWALTUNG & FORTSCHRITT
@@ -2841,7 +2797,7 @@ async def nachfass_export_download(job_id: str):
     return FileResponse(
         job.path,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        filename=f"{job.filename_base}.xlsx"
+        filename=f"{slugify_filename(job.filename_base or 'Nachfass_Export')}.xlsx"
     )
 
 # =============================================================================
