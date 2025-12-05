@@ -550,6 +550,7 @@ async def get_person_field_by_hint(label_hint: str) -> Optional[dict]:
 # =============================================================================
 # stream_organizations_by_filter  (FINAL)
 # =============================================================================
+
 from typing import AsyncGenerator, List, Optional
 
 async def stream_organizations_by_filter(
@@ -557,8 +558,9 @@ async def stream_organizations_by_filter(
     page_limit: int = PAGE_LIMIT,
 ) -> AsyncGenerator[List[str], None]:
     """
-    Streamt Orgas seitenweise (v2). Bei 429 wird NICHT abgebrochen,
-    sondern mit Backoff weitergemacht -> dadurch fehlen weniger Datensätze.
+    Streamt Organisationen eines Pipedrive-Filters seitenweise.
+    - Pagination: limit + cursor
+    - 429: NICHT abbrechen, sondern warten+weiter (mit Retry)
     """
     client = http_client()
     cursor: Optional[str] = None
@@ -571,12 +573,15 @@ async def stream_organizations_by_filter(
         )
         url = append_token(f"{base}&cursor={cursor}") if cursor else append_token(base)
 
-        r = await pd_get_with_retry(client, url, get_headers(), label=f"orgs filter={filter_id}")
-        if r.status_code != 200:
-            print(f"[stream_organizations_by_filter] HTTP {r.status_code} für Filter {filter_id}: {r.text}")
+        payload, status, err = await pd_get_json_with_retry(
+            client, url, get_headers(), label=f"orgs_filter[{filter_id}]",
+            retries=10, base_delay=0.8
+        )
+
+        if status != 200 or not payload:
+            print(f"[stream_organizations_by_filter] WARN status={status} filter={filter_id} err={err}")
             break
 
-        payload = r.json() or {}
         data = payload.get("data") or []
         if not data:
             break
@@ -591,11 +596,9 @@ async def stream_organizations_by_filter(
             yield names
 
         additional = payload.get("additional_data") or {}
-        # je nach API-Shape:
-        cursor = additional.get("next_cursor") or (additional.get("pagination") or {}).get("next_cursor")
+        cursor = additional.get("next_cursor")
         if not cursor:
             break
-
 
 async def stream_person_ids_by_filter(
     filter_id: int,
@@ -1041,141 +1044,127 @@ def extract_org_name(org: dict) -> str:
 # -----------------------------------------------------------------------------
 # Personen per Bulk laden
 # -----------------------------------------------------------------------------
-from typing import Dict, List
+import asyncio
+from typing import Dict, List, Optional, Tuple
 
-async def fetch_persons_bulk(person_ids: List[str], chunk_size: int = 50) -> Dict[str, dict]:
+# ---------- global throttle (sehr wichtig gegen 429) ----------
+_GLOBAL_PD_LOCK = asyncio.Lock()
+_GLOBAL_PD_NEXT_TS = 0.0
+
+async def pd_throttle(min_interval: float = 0.25):
     """
-    Lädt Personendetails per /persons/collection?ids=...
-    -> drastisch weniger Requests als /persons/{id}.
+    Globale Drosselung: max ~4 Requests/Sek über den ganzen Job.
+    (min_interval=0.25 => 4/s)
+    """
+    import time
+    global _GLOBAL_PD_NEXT_TS
+    async with _GLOBAL_PD_LOCK:
+        now = time.monotonic()
+        wait = _GLOBAL_PD_NEXT_TS - now
+        if wait > 0:
+            await asyncio.sleep(wait)
+        _GLOBAL_PD_NEXT_TS = time.monotonic() + min_interval
+
+
+async def pd_get_json_with_retry(
+    client,
+    url: str,
+    headers: dict,
+    label: str,
+    retries: int = 8,
+    base_delay: float = 0.8,
+) -> Tuple[Optional[dict], Optional[int], Optional[str]]:
+    """
+    GET JSON + Retry auf 429/5xx.
+    Rückgabe: (payload_json, status_code, error_text)
+    """
+    import random
+
+    delay = base_delay
+    for attempt in range(1, retries + 1):
+        await pd_throttle(0.25)  # <= wichtig
+
+        try:
+            r = await client.get(url, headers=headers)
+            status = r.status_code
+
+            if status == 200:
+                return (r.json() or {}), status, None
+
+            if status == 404:
+                return None, status, r.text
+
+            if status == 429 or (500 <= status <= 599):
+                # Retry-After wenn vorhanden
+                ra = 0
+                try:
+                    ra = int(r.headers.get("Retry-After") or 0)
+                except Exception:
+                    ra = 0
+
+                sleep_for = ra if ra > 0 else delay + random.uniform(0, 0.25)
+                print(f"[{label}] HTTP {status} attempt {attempt}/{retries} -> sleep {sleep_for:.2f}s")
+                await asyncio.sleep(sleep_for)
+                delay = min(delay * 1.6, 8.0)
+                continue
+
+            # andere Fehler -> begrenzt retry
+            print(f"[{label}] HTTP {status}: {r.text}")
+            await asyncio.sleep(delay)
+            delay = min(delay * 1.6, 8.0)
+
+        except Exception as e:
+            print(f"[{label}] Exception attempt {attempt}/{retries}: {e}")
+            await asyncio.sleep(delay)
+            delay = min(delay * 1.6, 8.0)
+
+    return None, None, f"retries_exhausted ({label})"
+
+async def fetch_person_details_many(person_ids: List[str]) -> Dict[str, dict]:
+    """
+    Stabiler Load von Persondetails über /persons/{id}
+    - dedupe
+    - throttling + retries
+    - Rückgabe als lookup: {person_id(str): person_dict}
     """
     if not person_ids:
         return {}
 
     client = http_client()
 
-    # de-dupe stable
+    # dedupe stable
     seen = set()
     deduped = []
     for pid in person_ids:
-        spid = str(pid)
-        if spid not in seen:
+        spid = str(pid).strip()
+        if spid and spid not in seen:
             seen.add(spid)
             deduped.append(spid)
 
-    results: Dict[str, dict] = {}
+    out: Dict[str, dict] = {}
 
-    for i in range(0, len(deduped), chunk_size):
-        chunk = deduped[i:i + chunk_size]
-        ids_csv = ",".join(chunk)
+    # bewusst kleine Parallelität (sonst 429)
+    sem = asyncio.Semaphore(3)
 
-        url = append_token(f"{PIPEDRIVE_API}/persons/collection?ids={ids_csv}")
-        r = await pd_get_with_retry(client, url, get_headers(), label=f"persons_bulk[{i//chunk_size+1}]")
+    async def one(pid: str):
+        async with sem:
+            url = append_token(f"{PIPEDRIVE_API}/persons/{pid}")
+            payload, status, err = await pd_get_json_with_retry(
+                client, url, get_headers(), label=f"person[{pid}]"
+            )
+            if status == 200 and payload:
+                data = (payload.get("data") or {})
+                rid = str(data.get("id") or pid)
+                out[rid] = data
+            elif status == 404:
+                # ok: Person gelöscht/ungültig
+                return
+            else:
+                # bei Problemen: nicht crashen, aber loggen
+                print(f"[fetch_person_details_many] WARN pid={pid} status={status} err={err}")
 
-        if r.status_code != 200:
-            print(f"[fetch_persons_bulk] WARN HTTP {r.status_code}: {r.text}")
-            continue
-
-        payload = r.json() or {}
-        data = payload.get("data") or {}
-        items = data.get("items") or []
-
-        for it in items:
-            person = (it or {}).get("item") or {}
-            if not person:
-                continue
-            pid = str(person.get("id") or "")
-            if pid:
-                results[pid] = person
-
-        # kleine Pause -> weniger 429
-        await asyncio.sleep(0.15)
-
-    return results
-    
-# -----------------------------------------------------------------------------
-# Organisationsnamen per Bulk-Call nachladen
-# -----------------------------------------------------------------------------
-async def fetch_orgs_bulk(org_ids: List[str], chunk_size: int = 25) -> Dict[str, dict]:
-    """
-    Lädt Organisationsdetails über /organizations/collection?ids=...
-    Robust & schnell:
-    - kleine Chunks (25) gegen 429
-    - bei Fehler: Chunk splitten (progressiv)
-    - respektiert pd_get_with_retry (Retry-After + Backoff)
-    """
-    if not org_ids:
-        return {}
-
-    client = http_client()
-
-    # de-dupe, stable order, remove empties
-    seen = set()
-    deduped: List[str] = []
-    for oid in org_ids:
-        soid = sanitize(oid)
-        if not soid:
-            continue
-        if soid not in seen:
-            seen.add(soid)
-            deduped.append(soid)
-
-    results: Dict[str, dict] = {}
-
-    async def _fetch_chunk(ids: List[str], label: str) -> bool:
-        ids_csv = ",".join(ids)
-        url = append_token(f"{PIPEDRIVE_API}/organizations/collection?ids={ids_csv}")
-
-        try:
-            r = await pd_get_with_retry(client, url, get_headers(), label=label)
-        except Exception as e:
-            print(f"[fetch_orgs_bulk] WARN: {label} failed: {e}")
-            return False
-
-        if r.status_code == 404:
-            print(f"[fetch_orgs_bulk] WARN: {label} got 404 ids={len(ids)} sample={ids[:5]}")
-            return False
-
-        if r.status_code != 200:
-            print(f"[fetch_orgs_bulk] WARN: {label} HTTP {r.status_code}: {r.text[:200]}")
-            return False
-
-        payload = r.json() or {}
-        data = payload.get("data") or {}
-        items = data.get("items") or []
-
-        for it in items:
-            org = (it or {}).get("item") or {}
-            if not org:
-                continue
-            oid = sanitize(org.get("id"))
-            if oid:
-                results[oid] = org
-
-        return True
-
-    async def _fetch_progressive(ids: List[str], label: str):
-        if not ids:
-            return
-
-        ok = await _fetch_chunk(ids, label)
-        if ok:
-            await asyncio.sleep(0.15)  # entlastet stark
-            return
-
-        if len(ids) == 1:
-            return  # singleton auch kaputt -> aufgeben
-
-        mid = max(1, len(ids) // 2)
-        await _fetch_progressive(ids[:mid], label + "a")
-        await _fetch_progressive(ids[mid:], label + "b")
-
-    # start in chunk_size paketweise, dann pro paket progressiv
-    for idx in range(0, len(deduped), chunk_size):
-        chunk = deduped[idx:idx + chunk_size]
-        await _fetch_progressive(chunk, label=f"orgs_bulk[{idx//chunk_size + 1}]")
-
-    return results
-
+    await asyncio.gather(*(one(pid) for pid in deduped))
+    return out
 
 # -----------------------------------------------------------------------------
 # fehlende Organisation-IDs einzeln nachladen
