@@ -1655,51 +1655,126 @@ async def _reconcile(prefix: str) -> None:
     await save_df_text(log_df, t["log"])
 
 import traceback  # falls oben noch nicht importiert
-
 async def run_nachfass_job(
+    job: "Job",
     job_id: str,
-    batch_id: str,
-    campaign: str,
-    filters: List[int],
-    nf_batch_ids: List[str],
+    campaign: str = "",
+    filters: list | None = None,
+    nf_batch_ids: list | None = None,
 ):
     """
-    Orchestrierung:
-    - Fortschritt updaten
-    - KEIN /persons/collection verwenden (404)
-    - RateLimit wird in pd_get_with_retry gehandhabt
+    Robust runner:
+    - kompatibel mit alten create_task-Aufrufen (nur job, job_id)
+    - nimmt Inputs bevorzugt aus Parametern, sonst aus job.*
+    - setzt Progress/Phase sauber
+    - bricht bei Fehlern sauber ab und setzt job.error
     """
-    job = JOBS.get(job_id)
-    if not job:
-        return
+    # ---------- Fallback Inputs ----------
+    if not campaign:
+        campaign = getattr(job, "campaign", "") or ""
+    if filters is None:
+        filters = getattr(job, "filters", None) or []
+    if nf_batch_ids is None:
+        nf_batch_ids = getattr(job, "nf_batch_ids", None) or []
+
+    # optional: weitere Felder, falls du sie am Job gespeichert hast
+    batch_id = getattr(job, "batch_id", "") or ""
+
+    def _set_progress(phase: str, percent: int):
+        job.phase = phase
+        job.percent = int(max(0, min(100, percent)))
 
     try:
-        job.phase = "Starte Nachfass-Export"
-        job.percent = 1
         job.done = False
         job.error = None
+        _set_progress("Starte Abgleich ...", 1)
 
-        job.phase = "Initialisiere"
-        job.percent = 3
+        # -------------------------------------------------------------
+        # 1) Person-IDs einsammeln (Filter -> IDs)
+        #    Erwartet: stream_person_ids_by_filter(filter_id, ...)
+        # -------------------------------------------------------------
+        _set_progress("Personen-IDs sammeln ...", 5)
 
-        job.phase = "Erstelle Nachfass-Master"
-        job.percent = 5
-        await _build_nf_master_final(
+        all_person_ids: list[str] = []
+        seen: set[str] = set()
+
+        # filters kann z.B. [1245, 851, ...] oder [{"id":1245}, ...] sein
+        filter_ids: list[int] = []
+        for f in (filters or []):
+            if isinstance(f, dict):
+                fid = f.get("id") or f.get("filter_id")
+            else:
+                fid = f
+            try:
+                if fid is not None and str(fid).strip():
+                    filter_ids.append(int(fid))
+            except Exception:
+                pass
+
+        # Wenn keine Filter übergeben wurden, aber nf_batch_ids existieren:
+        # du kannst hier ggf. alternative Logik einsetzen. Wir lassen es bewusst leer.
+        if not filter_ids and not nf_batch_ids:
+            raise RuntimeError("Keine Filter und keine Batch-IDs übergeben.")
+
+        # IDs pro Filter streamen (robust gegen 429)
+        # HINWEIS: nutzt DEINE Funktion stream_person_ids_by_filter(...)
+        for idx, fid in enumerate(filter_ids, start=1):
+            _set_progress(f"Personen-IDs aus Filter {fid} ...", 5 + min(20, idx))
+            async for chunk_ids in stream_person_ids_by_filter(fid):
+                for pid in chunk_ids:
+                    spid = str(pid).strip()
+                    if not spid or spid in seen:
+                        continue
+                    seen.add(spid)
+                    all_person_ids.append(spid)
+
+        _set_progress(f"Personen-IDs gesammelt: {len(all_person_ids)}", 25)
+
+        # -------------------------------------------------------------
+        # 2) Personendetails laden (v1 persons/{id})
+        #    Erwartet: fetch_person_details(list[str]) -> list[dict]
+        # -------------------------------------------------------------
+        _set_progress("Personendetails laden ...", 30)
+
+        persons = await fetch_person_details(all_person_ids)
+
+        # persons kann kleiner sein (404/429) -> wir arbeiten mit dem, was da ist
+        if not persons:
+            raise RuntimeError("Keine Personendetails geladen (0 Datensätze).")
+
+        _set_progress(f"Personendetails geladen: {len(persons)}", 45)
+
+        # -------------------------------------------------------------
+        # 3) Master bauen (inkl. Orga-Name Filling)
+        #    Erwartet: _build_nf_master_final(selected, batch_id, campaign, job_obj)
+        # -------------------------------------------------------------
+        _set_progress("Baue Nachfass-Master ...", 55)
+
+        df = await _build_nf_master_final(
+            selected=persons,
             batch_id=batch_id,
             campaign=campaign,
-            nf_batch_ids=nf_batch_ids,
             job_obj=job,
         )
 
-        job.phase = "Fertig"
-        job.percent = 100
+        # -------------------------------------------------------------
+        # 4) Finalisieren
+        # -------------------------------------------------------------
+        _set_progress("Fertig", 100)
         job.done = True
+        job.error = None
+        return df
 
     except Exception as e:
+        # Job sauber als fehlgeschlagen markieren
         job.error = str(e)
         job.done = True
         job.phase = "Fehler"
-        print(f"[run_nachfass_job] ERROR: {e}")
+        # optional: percent auf 100 lassen oder auf aktuellen Stand
+        if not getattr(job, "percent", None):
+            job.percent = 100
+        raise
+
 
 # =============================================================================
 # Excel-Export-Helfer – FINAL MODUL 3
@@ -2649,7 +2724,6 @@ async def nachfass_summary(job_id: str = Query(...)):
 # MODUL 6 – FINALER JOB-/WORKFLOW FÜR NACHFASS (EXPORT/PROGRESS/DOWNLOAD)
 # =============================================================================
 from uuid import uuid4
-
 @app.post("/nachfass/export_start")
 async def nachfass_export_start(req: Request):
     body = await req.json()
@@ -2657,6 +2731,7 @@ async def nachfass_export_start(req: Request):
     nf_batch_ids = body.get("nf_batch_ids") or []
     batch_id     = body.get("batch_id") or ""
     campaign     = body.get("campaign") or ""
+    filters      = body.get("filters") or []   # <--- WICHTIG: neu
 
     job_id = str(uuid4())
     job = Job()
@@ -2666,17 +2741,20 @@ async def nachfass_export_start(req: Request):
     job.nf_batch_ids = nf_batch_ids
     job.batch_id     = batch_id
     job.campaign     = campaign
+    job.filters      = filters                # <--- WICHTIG: neu
 
-    # Reset
-    job.error = None
-    job.done = False
-    job.percent = 0
-    job.phase = "Starte …"
+    # Job starten (kompatibel mit beiden Varianten von run_nachfass_job)
+    asyncio.create_task(
+        run_nachfass_job(
+            job=job,
+            job_id=job_id,
+            campaign=campaign,
+            filters=filters,
+            nf_batch_ids=nf_batch_ids,
+        )
+    )
 
-    # Hintergrundprozess starten
-    asyncio.create_task(run_nachfass_job(job, job_id))
-
-    return {"job_id": job_id}
+    return JSONResponse({"job_id": job_id})
 
 
 # =============================================================================
