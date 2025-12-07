@@ -640,86 +640,97 @@ async def stream_organizations_by_filter(
         if not cursor:
             break
 
-
-import asyncio
 from typing import AsyncGenerator, List, Optional, Set
+import asyncio
+import time
 
 async def stream_person_ids_by_filter(
     filter_id: int,
     page_limit: int = PAGE_LIMIT,
-    max_pages: int = 500,          # <-- Schutz: max 500 Seiten
-    request_timeout: float = 45.0, # <-- Schutz: Request darf nicht "ewig" hängen
+    *,
+    max_pages: int = 2000,            # Notbremse gegen Endlosschleifen
+    max_total_time: float = 180.0,    # Notbremse (Sekunden) pro Filter-Scan
 ) -> AsyncGenerator[List[str], None]:
     """
-    Streamt Person-IDs eines Pipedrive-Filters seitenweise.
-    Schutz gegen "Hängen":
-      - max_pages
-      - cursor-loop-guard (wenn cursor sich nicht ändert)
-      - asyncio.wait_for Timeout
+    Streamt Person-IDs eines Pipedrive-Filters seitenweise (v2 organizations/persons listing style).
+    Fix gegen "Hängen":
+      - bricht ab wenn cursor sich wiederholt
+      - bricht ab nach max_total_time / max_pages
+      - liefert immer wieder chunks (damit Job Fortschritt machen kann)
     """
     client = http_client()
     cursor: Optional[str] = None
     seen_cursors: Set[str] = set()
+
+    started = time.monotonic()
     page = 0
 
     while True:
+        # Notbremse Zeit
+        if (time.monotonic() - started) > max_total_time:
+            print(f"[stream_person_ids_by_filter] ABORT: max_total_time={max_total_time}s reached for filter={filter_id}")
+            break
+
+        # Notbremse Seiten
         page += 1
         if page > max_pages:
-            print(f"[stream_person_ids_by_filter] ABORT: max_pages erreicht ({max_pages}) für Filter {filter_id}")
+            print(f"[stream_person_ids_by_filter] ABORT: max_pages={max_pages} reached for filter={filter_id}")
             break
 
         base = (
             f"{PIPEDRIVE_API}/persons"
-            f"?filter_id={int(filter_id)}&limit={int(page_limit)}"
+            f"?filter_id={filter_id}&limit={page_limit}"
             f"&sort_by=id&sort_direction=asc"
         )
         url = append_token(f"{base}&cursor={cursor}") if cursor else append_token(base)
 
-        try:
-            r = await asyncio.wait_for(
-                pd_get_with_retry(client, url, get_headers(), label=f"persons filter={filter_id}"),
-                timeout=request_timeout
-            )
-        except asyncio.TimeoutError:
-            print(f"[stream_person_ids_by_filter] TIMEOUT nach {request_timeout}s (Filter {filter_id}) -> Abbruch")
-            break
+        r = await pd_get_with_retry(client, url, get_headers(), label=f"persons filter={filter_id} page={page}")
+        status = r.status_code
 
-        status = getattr(r, "status_code", None)
         if status != 200:
-            print(f"[stream_person_ids_by_filter] HTTP {status} für Filter {filter_id}: {getattr(r, 'text', '')}")
+            print(f"[stream_person_ids_by_filter] HTTP {status} for filter={filter_id}: {r.text}")
             break
 
         payload = r.json() or {}
         data = payload.get("data") or []
         if not data:
+            print(f"[stream_person_ids_by_filter] DONE: no data for filter={filter_id} page={page}")
             break
 
+        # IDs extrahieren
         ids: List[str] = []
         for p in data:
-            pid = str((p or {}).get("id") or "").strip()
-            if pid:
-                ids.append(pid)
+            pid = p.get("id")
+            if pid is not None:
+                ids.append(str(pid))
 
         if ids:
+            # Heartbeat (damit man sieht: es läuft)
+            if page == 1 or page % 10 == 0:
+                print(f"[stream_person_ids_by_filter] filter={filter_id} page={page} ids_in_page={len(ids)} cursor={cursor}")
             yield ids
 
+        # Pagination cursor lesen (Pipedrive v2-style: additional_data.next_cursor)
         additional = payload.get("additional_data") or {}
-        next_cursor = additional.get("next_cursor") or additional.get("cursor")
+        next_cursor = additional.get("next_cursor") or additional.get("pagination", {}).get("next_cursor")
 
-        # --- Loop-Guard: cursor muss sich ändern ---
         if not next_cursor:
+            print(f"[stream_person_ids_by_filter] DONE: no next_cursor for filter={filter_id} page={page}")
             break
 
         next_cursor = str(next_cursor)
-        if next_cursor == (cursor or ""):
-            print(f"[stream_person_ids_by_filter] ABORT: cursor hat sich nicht geändert (Filter {filter_id})")
-            break
+
+        # Endlosschleife verhindern: cursor wiederholt sich
         if next_cursor in seen_cursors:
-            print(f"[stream_person_ids_by_filter] ABORT: cursor wiederholt sich (Filter {filter_id})")
+            print(f"[stream_person_ids_by_filter] ABORT: cursor repeated for filter={filter_id}. next_cursor={next_cursor}")
             break
 
         seen_cursors.add(next_cursor)
         cursor = next_cursor
+
+        # kleine Pause -> weniger 429 (super wichtig bei Filter-Scans)
+        await asyncio.sleep(0.05)
+
 
 # =============================================================================
 # Organisationen – Bucketing + Kappung (Performanceoptimiert)
