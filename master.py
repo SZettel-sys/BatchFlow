@@ -600,15 +600,16 @@ async def stream_organizations_by_filter(
         if not cursor:
             break
 
+
 async def stream_person_ids_by_filter(
     filter_id: int,
     page_limit: int = PAGE_LIMIT,
 ) -> AsyncGenerator[List[str], None]:
     """
     Streamt Person-IDs eines Pipedrive-Filters seitenweise (v2).
-    - Endpoint: GET /persons?filter_id=...&limit=...&cursor=...
-    - Pagination: additional_data.next_cursor
-    - Robust gegen RateLimit (429): wir retryen via pd_get_with_retry
+    - Pagination: limit + cursor
+    - Bei 429 (Too many requests) wird der ID-Scan abgebrochen,
+      damit der Job weiterlaufen kann (dann ggf. weniger Datensätze).
     """
     client = http_client()
     cursor: Optional[str] = None
@@ -621,9 +622,11 @@ async def stream_person_ids_by_filter(
         )
         url = append_token(f"{base}&cursor={cursor}") if cursor else append_token(base)
 
-        r = await pd_get_with_retry(client, url, get_headers(), label=f"person_ids filter={filter_id}")
-        if r.status_code != 200:
-            print(f"[stream_person_ids_by_filter] HTTP {r.status_code} für Filter {filter_id}: {r.text}")
+        r = await pd_get_with_retry(client, url, get_headers(), label=f"persons filter={filter_id}")
+        status = r.status_code
+
+        if status != 200:
+            print(f"[stream_person_ids_by_filter] HTTP {status} für Filter {filter_id}: {r.text}")
             break
 
         payload = r.json() or {}
@@ -633,7 +636,7 @@ async def stream_person_ids_by_filter(
 
         ids: List[str] = []
         for p in data:
-            pid = sanitize((p or {}).get("id"))
+            pid = str((p or {}).get("id") or "").strip()
             if pid:
                 ids.append(pid)
 
@@ -641,12 +644,10 @@ async def stream_person_ids_by_filter(
             yield ids
 
         additional = payload.get("additional_data") or {}
-        cursor = additional.get("next_cursor") or additional.get("nextCursor")
+        cursor = additional.get("next_cursor")
+
         if not cursor:
             break
-
-
-
 
 # =============================================================================
 # Organisationen – Bucketing + Kappung (Performanceoptimiert)
@@ -1212,128 +1213,25 @@ async def fetch_org_details(org_ids: list[str]) -> dict[str, dict]:
 # build_nf_master
 # -----------------------------------------------------------------------------
 async def _build_nf_master_final(
+    selected: List[dict],
+    org_lookup: Dict[str, dict],
     batch_id: str,
     campaign: str,
-    nf_batch_ids: List[str],
-    job_obj=None,
+    job_obj: Optional["JobState"] = None,
 ) -> pd.DataFrame:
     """
-    Baut den Nachfass-Master:
-    - Persons: über Batch-IDs (stream_persons_by_batch_id) -> IDs -> Details per /persons/{id}
-    - Orgs: org_ids aus Persons -> fetch_orgs_bulk -> org_lookup
-    - Export-Zeilen + Filter
+    Baut den finalen Nachfass-Master (DataFrame) aus geladenen Personendetails.
+    - org_name wird bevorzugt aus org_lookup gezogen, mit robusten Fallbacks
+    - Filter: org_name == "Freelancer", keine Prospect-ID, keine E-Mail -> skip
     """
 
-    # -------------------------------------------------------------
-    # Mini-Helper: Personen-Details schnell & robust laden (statt /persons/collection)
-    # -------------------------------------------------------------
-    async def fetch_person_details_fast(person_ids: List[str]) -> Dict[str, dict]:
-        if not person_ids:
-            return {}
-
-        client = http_client()
-        sem = asyncio.Semaphore(2)  # bewusst klein (RateLimit)
-
-        results: Dict[str, dict] = {}
-
-        async def fetch_one(pid: str):
-            url = append_token(f"{PIPEDRIVE_API}/persons/{pid}")
-            r = await pd_get_with_retry(client, url, get_headers(), label=f"person={pid}")
-            if r.status_code == 200:
-                data = (r.json() or {}).get("data") or {}
-                rid = sanitize(data.get("id") or pid)
-                if rid:
-                    results[rid] = data
-            elif r.status_code == 404:
-                print(f"[fetch_person_details_fast] 404 für Person {pid}")
-            else:
-                print(f"[fetch_person_details_fast] HTTP {r.status_code} für Person {pid}: {r.text}")
-
-        # dedupe + stable order
-        seen = set()
-        deduped = []
-        for pid in person_ids:
-            spid = str(pid).strip()
-            if spid and spid not in seen:
-                seen.add(spid)
-                deduped.append(spid)
-
-        async def worker(pid: str):
-            async with sem:
-                await fetch_one(pid)
-
-        tasks = [asyncio.create_task(worker(pid)) for pid in deduped]
-        await asyncio.gather(*tasks)
-
-        return results
-
-    # -------------------------------------------------------------
-    # 1) Personen aus Batch-IDs sammeln (IDs, später Details)
-    # -------------------------------------------------------------
     if job_obj:
-        job_obj.phase = "Personen aus Batch-IDs sammeln"
-        job_obj.percent = 5
-
-    person_ids_all: List[str] = []
-    seen_pids = set()
-
-    for nf_batch_id in nf_batch_ids:
-        async for chunk in stream_persons_by_batch_id(nf_batch_id):
-            for p in chunk:
-                pid = sanitize((p or {}).get("id"))
-                if pid and pid not in seen_pids:
-                    seen_pids.add(pid)
-                    person_ids_all.append(pid)
-
-    print(f"[NF] Personen aus Suche: {len(person_ids_all)} IDs")
-
-    # -------------------------------------------------------------
-    # 2) Personendetails laden (v2 /persons/{id})
-    # -------------------------------------------------------------
-    if job_obj:
-        job_obj.phase = "Lade Personendetails"
-        job_obj.percent = 10
-
-    person_lookup = await fetch_person_details_fast(person_ids_all)
-
-    missing_p = [pid for pid in person_ids_all if pid not in person_lookup]
-    if missing_p:
-        print(f"[NF] WARN: fehlende Personendetails: {len(missing_p)} (Beispiele: {missing_p[:10]})")
-
-    selected: List[dict] = [person_lookup[pid] for pid in person_ids_all if pid in person_lookup]
-    print(f"[NF] Vollständige Personendaten: {len(selected)} Datensätze")
-
-    # -------------------------------------------------------------
-    # 3) Organisations-Details (Bulk) + org_lookup
-    # -------------------------------------------------------------
-    if job_obj:
-        job_obj.phase = "Lade Organisationsdetails"
-        job_obj.percent = 25
-
-    unique_org_ids: List[str] = []
-    seen_oids = set()
-    for p in selected:
-        oid = extract_org_id_from_person(p)
-        if oid and oid not in seen_oids:
-            seen_oids.add(oid)
-            unique_org_ids.append(oid)
-
-    # WICHTIG: chunk_size kleiner -> weniger 429
-    org_lookup = await fetch_orgs_bulk(unique_org_ids, chunk_size=25)
-    print(f"[NF] org_lookup: {len(org_lookup)} orgs für {len(unique_org_ids)} org_ids")
-
-    if unique_org_ids:
-        sample_missing = [oid for oid in unique_org_ids[:30] if oid not in org_lookup]
-        if sample_missing:
-            print(f"[NF] WARN: org_ids nicht im lookup (Beispiel): {sample_missing[:10]}")
+        job_obj.phase = "Baue Nachfass-Master (Final)"
+        job_obj.percent = 60
 
     # -------------------------------------------------------------
     # 4) Export-Zeilen aufbauen
     # -------------------------------------------------------------
-    if job_obj:
-        job_obj.phase = "Baue Export-Zeilen"
-        job_obj.percent = 55
-
     rows: List[dict] = []
 
     for p in selected:
@@ -1343,6 +1241,7 @@ async def _build_nf_master_final(
         last = sanitize(p.get("last_name"))
         fullname = sanitize(p.get("name"))
 
+        # Fallback: Vollname zerlegen
         if not first and not last and fullname:
             parts = fullname.split()
             if len(parts) == 1:
@@ -1352,12 +1251,14 @@ async def _build_nf_master_final(
                 last = parts[-1]
 
         # ---------------- Organisation ----------------
-        org_id = extract_org_id_from_person(p)
+        org_id_raw = extract_org_id_from_person(p)
+        org_id = str(org_id_raw).strip() if org_id_raw is not None and str(org_id_raw).strip() else ""
 
-        # (1) Primär: aus org_lookup
         org_name = ""
+
+        # (1) Primär: aus org_lookup (API Organization Details)
         if org_id:
-            org = org_lookup.get(str(org_id)) or {}
+            org = org_lookup.get(org_id) or {}
             org_name = sanitize(
                 org.get("name")
                 or org.get("label")
@@ -1365,15 +1266,22 @@ async def _build_nf_master_final(
                 or org.get("title")
             )
 
-        # (2) Fallback: häufig steckt der Name schon in der Person (v2: organization:{id,name})
+        # (2) Fallback: steckt oft schon in der Person (Search-Shapes / v1/v2)
         if not org_name:
-            org_obj = p.get("organization") or {}
+            # häufige Pipedrive-Formate:
+            # p["organization"] kann dict sein {"id": 123, "name": "Firma"} oder {"value": 123, "name": "Firma"}
+            org_obj = p.get("organization") or p.get("org_id") or {}
             if isinstance(org_obj, dict):
-                org_name = sanitize(org_obj.get("name") or "")
+                org_name = sanitize(
+                    org_obj.get("name")
+                    or org_obj.get("org_name")
+                    or org_obj.get("label")
+                )
             else:
+                # manchmal gibt es org_name direkt
                 org_name = sanitize(p.get("org_name") or p.get("organization_name") or "")
 
-        # ---------------- E-Mail ----------------
+        # ---------------- E-Mail ermitteln ----------------
         email_field = p.get("email") or p.get("emails") or []
         emails_flat: List[dict] = []
 
@@ -1398,26 +1306,36 @@ async def _build_nf_master_final(
         if not email and emails_flat:
             email = sanitize(emails_flat[0].get("value"))
 
-        # ---------------- Prospect-ID etc. ----------------
+        # ---------------- Prospect-ID (Custom Field) ----------------
         prospect_id = cf(p, PERSON_CF_KEYS["Prospect ID"])
-        gender_id = str(cf(p, PERSON_CF_KEYS["Person Geschlecht"]) or "").strip()
-        gender_label = GENDER_OPTION_MAP.get(gender_id, gender_id)
 
-        # ---------------- Filter ----------------
+        # ---------------- Geschlecht ----------------
+        gender_id = str(cf(p, PERSON_CF_KEYS["Person Geschlecht"]) or "").strip()
+        gender_label = GENDER_OPTION_MAP.get(gender_id, gender_id)  # fallback = ID
+
+        # ============================================================
+        #  FILTER:
+        #    - Organisation = "Freelancer" -> überspringen
+        #    - keine Prospect-ID -> überspringen
+        #    - keine E-Mail -> überspringen
+        # ============================================================
         if org_name.strip().lower() == "freelancer":
             continue
+
         if not prospect_id:
             continue
+
         if not email:
             continue
 
+        # ---------------- Zeile für Export aufbauen ----------------
         row = {
             "Batch ID": sanitize(batch_id),
             "Channel": DEFAULT_CHANNEL,
             "Cold-Mailing Import": sanitize(campaign),
             "Prospect ID": prospect_id,
-            "Organisation ID": sanitize(org_id),
-            "Organisation Name": sanitize(org_name),
+            "Organisation ID": org_id,
+            "Organisation Name": org_name,
             "Person ID": pid,
             "Person Vorname": first,
             "Person Nachname": last,
@@ -1429,6 +1347,7 @@ async def _build_nf_master_final(
             "LinkedIn URL": cf(p, PERSON_CF_KEYS["LinkedIn URL"]),
         }
 
+        # alles nochmal sauber machen
         for k, v in row.items():
             row[k] = sanitize(v)
 
@@ -1437,24 +1356,24 @@ async def _build_nf_master_final(
     df = pd.DataFrame(rows).replace({None: ""})
 
     # -------------------------------------------------------------
-    # 5) Speichern
+    # 5) Excluded-Statistik + Speichern
     # -------------------------------------------------------------
-    if job_obj:
-        job_obj.phase = "Speichere Dateien"
-        job_obj.percent = 80
-
     excluded_rows = [
         {"Grund": "Max 2 Kontakte pro Organisation", "Anzahl": int(0)},
-        {"Grund": "Datum nächste Aktivität steht an bzw. liegt in naher Vergangenheit", "Anzahl": int(0)},
+        {
+            "Grund": "Datum nächste Aktivität steht an bzw. liegt in naher Vergangenheit",
+            "Anzahl": int(0),
+        },
     ]
     await save_df_text(pd.DataFrame(excluded_rows), "nf_excluded")
     await save_df_text(df, "nf_master_final")
 
     if job_obj:
         job_obj.phase = "Nachfass-Master erstellt"
-        job_obj.percent = 95
+        job_obj.percent = 80
 
     return df
+
 
 
 # =============================================================================
@@ -1656,125 +1575,95 @@ async def _reconcile(prefix: str) -> None:
 
 import traceback  # falls oben noch nicht importiert
 async def run_nachfass_job(
-    job: "Job",
+    job_obj: "JobState",
     job_id: str,
-    campaign: str = "",
-    filters: list | None = None,
-    nf_batch_ids: list | None = None,
+    campaign: str,
+    filters: List[int],
+    nf_batch_ids: List[str],
 ):
     """
-    Robust runner:
-    - kompatibel mit alten create_task-Aufrufen (nur job, job_id)
-    - nimmt Inputs bevorzugt aus Parametern, sonst aus job.*
-    - setzt Progress/Phase sauber
-    - bricht bei Fehlern sauber ab und setzt job.error
+    Gesamt-Job:
+    1) Person-IDs aus Filtern streamen
+    2) Personendetails laden
+    3) Organisationen bulk laden
+    4) Finalen Nachfass-Master bauen & speichern
     """
-    # ---------- Fallback Inputs ----------
-    if not campaign:
-        campaign = getattr(job, "campaign", "") or ""
-    if filters is None:
-        filters = getattr(job, "filters", None) or []
-    if nf_batch_ids is None:
-        nf_batch_ids = getattr(job, "nf_batch_ids", None) or []
-
-    # optional: weitere Felder, falls du sie am Job gespeichert hast
-    batch_id = getattr(job, "batch_id", "") or ""
-
-    def _set_progress(phase: str, percent: int):
-        job.phase = phase
-        job.percent = int(max(0, min(100, percent)))
-
     try:
-        job.done = False
-        job.error = None
-        _set_progress("Starte Abgleich ...", 1)
+        job_obj.phase = "Starte Abgleich"
+        job_obj.percent = 5
 
-        # -------------------------------------------------------------
-        # 1) Person-IDs einsammeln (Filter -> IDs)
-        #    Erwartet: stream_person_ids_by_filter(filter_id, ...)
-        # -------------------------------------------------------------
-        _set_progress("Personen-IDs sammeln ...", 5)
+        # ----------------------------
+        # 1) Person-IDs aus Filtern
+        # ----------------------------
+        all_ids: List[str] = []
+        seen = set()
 
-        all_person_ids: list[str] = []
-        seen: set[str] = set()
-
-        # filters kann z.B. [1245, 851, ...] oder [{"id":1245}, ...] sein
-        filter_ids: list[int] = []
-        for f in (filters or []):
-            if isinstance(f, dict):
-                fid = f.get("id") or f.get("filter_id")
-            else:
-                fid = f
-            try:
-                if fid is not None and str(fid).strip():
-                    filter_ids.append(int(fid))
-            except Exception:
-                pass
-
-        # Wenn keine Filter übergeben wurden, aber nf_batch_ids existieren:
-        # du kannst hier ggf. alternative Logik einsetzen. Wir lassen es bewusst leer.
-        if not filter_ids and not nf_batch_ids:
-            raise RuntimeError("Keine Filter und keine Batch-IDs übergeben.")
-
-        # IDs pro Filter streamen (robust gegen 429)
-        # HINWEIS: nutzt DEINE Funktion stream_person_ids_by_filter(...)
-        for idx, fid in enumerate(filter_ids, start=1):
-            _set_progress(f"Personen-IDs aus Filter {fid} ...", 5 + min(20, idx))
-            async for chunk_ids in stream_person_ids_by_filter(fid):
-                for pid in chunk_ids:
+        for fid in filters:
+            async for chunk in stream_person_ids_by_filter(fid, page_limit=PAGE_LIMIT):
+                for pid in chunk:
                     spid = str(pid).strip()
-                    if not spid or spid in seen:
-                        continue
-                    seen.add(spid)
-                    all_person_ids.append(spid)
+                    if spid and spid not in seen:
+                        seen.add(spid)
+                        all_ids.append(spid)
 
-        _set_progress(f"Personen-IDs gesammelt: {len(all_person_ids)}", 25)
+        print(f"[NF] Personen aus Suche: {len(all_ids)} IDs")
 
-        # -------------------------------------------------------------
-        # 2) Personendetails laden (v1 persons/{id})
-        #    Erwartet: fetch_person_details(list[str]) -> list[dict]
-        # -------------------------------------------------------------
-        _set_progress("Personendetails laden ...", 30)
+        job_obj.phase = "Lade Personendetails"
+        job_obj.percent = 25
 
-        persons = await fetch_person_details(all_person_ids)
+        # ----------------------------
+        # 2) Personendetails laden
+        # ----------------------------
+        selected = await fetch_person_details(all_ids)
 
-        # persons kann kleiner sein (404/429) -> wir arbeiten mit dem, was da ist
-        if not persons:
+        if not selected:
             raise RuntimeError("Keine Personendetails geladen (0 Datensätze).")
 
-        _set_progress(f"Personendetails geladen: {len(persons)}", 45)
+        print(f"[NF] Vollständige Personendaten: {len(selected)} Datensätze")
 
-        # -------------------------------------------------------------
-        # 3) Master bauen (inkl. Orga-Name Filling)
-        #    Erwartet: _build_nf_master_final(selected, batch_id, campaign, job_obj)
-        # -------------------------------------------------------------
-        _set_progress("Baue Nachfass-Master ...", 55)
+        job_obj.phase = "Lade Organisationen"
+        job_obj.percent = 45
 
+        # ----------------------------
+        # 3) Organisationen bulk laden
+        # ----------------------------
+        unique_org_ids = []
+        seen_org = set()
+        for p in selected:
+            oid = extract_org_id_from_person(p)
+            if oid and oid not in seen_org:
+                seen_org.add(oid)
+                unique_org_ids.append(oid)
+
+        org_lookup = await fetch_orgs_bulk(unique_org_ids)
+        print(f"[NF] org_lookup: {len(org_lookup)} orgs für {len(unique_org_ids)} org_ids")
+        print(f"[export] org_lookup size={len(org_lookup)}")
+
+        # ----------------------------
+        # 4) Master bauen
+        # ----------------------------
+        batch_id = (nf_batch_ids or [""])[0] if nf_batch_ids else ""
         df = await _build_nf_master_final(
-            selected=persons,
+            selected=selected,
+            org_lookup=org_lookup,
             batch_id=batch_id,
             campaign=campaign,
-            job_obj=job,
+            job_obj=job_obj,
         )
 
-        # -------------------------------------------------------------
-        # 4) Finalisieren
-        # -------------------------------------------------------------
-        _set_progress("Fertig", 100)
-        job.done = True
-        job.error = None
+        job_obj.phase = "Fertig"
+        job_obj.percent = 100
+        job_obj.done = True
+        job_obj.error = None
+
         return df
 
     except Exception as e:
-        # Job sauber als fehlgeschlagen markieren
-        job.error = str(e)
-        job.done = True
-        job.phase = "Fehler"
-        # optional: percent auf 100 lassen oder auf aktuellen Stand
-        if not getattr(job, "percent", None):
-            job.percent = 100
+        job_obj.done = True
+        job_obj.error = str(e)
+        job_obj.phase = "Fehler"
+        job_obj.percent = 100
         raise
-
 
 # =============================================================================
 # Excel-Export-Helfer – FINAL MODUL 3
