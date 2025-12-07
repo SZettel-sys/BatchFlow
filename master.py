@@ -1573,47 +1573,83 @@ async def _reconcile(prefix: str) -> None:
     await save_df_text(ready_df, t["ready"])
     await save_df_text(log_df, t["log"])
 
-import traceback  # falls oben noch nicht importiert
+import traceback
+from typing import List
+
 async def run_nachfass_job(
-    job_obj: "JobState",
+    job_obj: "Job",
     job_id: str,
     campaign: str,
     filters: List[int],
     nf_batch_ids: List[str],
 ):
     """
-    Gesamt-Job:
-    1) Person-IDs aus Filtern streamen
-    2) Personendetails laden
-    3) Organisationen bulk laden
-    4) Finalen Nachfass-Master bauen & speichern
+    Gesamt-Job Nachfass:
+    A) Personen primär über Batch-IDs laden (persons/search)
+    B) Fallback: IDs über Filter (persons?filter_id=...)
+    C) Personendetails laden (/persons/{id})
+    D) Organisationen bulk laden + fehlende einzeln nachladen
+    E) Finalen Nachfass-Master bauen & speichern
     """
     try:
         job_obj.phase = "Starte Abgleich"
         job_obj.percent = 5
+        job_obj.done = False
+        job_obj.error = None
 
-        # ----------------------------
-        # 1) Person-IDs aus Filtern
-        # ----------------------------
+        # ---------------------------------------------------------
+        # A) Personen PRIMÄR über Batch IDs laden
+        # ---------------------------------------------------------
+        selected_raw: List[dict] = []
+
+        if nf_batch_ids:
+            job_obj.phase = "Suche Personen über Batch IDs"
+            job_obj.percent = 10
+
+            # persons/search via custom_fields term=BatchId
+            # gibt schon Person-Objekte zurück (items[].item)
+            selected_raw = await stream_persons_by_batch_id(
+                batch_key="batch_ids",
+                batch_ids=nf_batch_ids,
+                page_limit=100,
+                job_obj=job_obj
+            )
+
+        # ---------------------------------------------------------
+        # B) FALLBACK: Person-IDs über Filter streamen
+        # ---------------------------------------------------------
         all_ids: List[str] = []
-        seen = set()
+        if not selected_raw:
+            job_obj.phase = "Suche Personen über Filter"
+            job_obj.percent = 15
 
-        for fid in filters:
-            async for chunk in stream_person_ids_by_filter(fid, page_limit=PAGE_LIMIT):
-                for pid in chunk:
-                    spid = str(pid).strip()
-                    if spid and spid not in seen:
-                        seen.add(spid)
-                        all_ids.append(spid)
+            seen = set()
+            for fid in (filters or []):
+                async for chunk in stream_person_ids_by_filter(fid, page_limit=PAGE_LIMIT):
+                    for pid in chunk:
+                        spid = str(pid).strip()
+                        if spid and spid not in seen:
+                            seen.add(spid)
+                            all_ids.append(spid)
 
-        print(f"[NF] Personen aus Suche: {len(all_ids)} IDs")
+            print(f"[NF] Personen aus Filter-Suche: {len(all_ids)} IDs")
 
+        # Wenn wir Personen über Batch bekommen haben, IDs daraus ziehen
+        if selected_raw and not all_ids:
+            seen = set()
+            for p in selected_raw:
+                pid = str((p or {}).get("id") or "").strip()
+                if pid and pid not in seen:
+                    seen.add(pid)
+                    all_ids.append(pid)
+            print(f"[NF] Personen aus Batch-Suche: {len(all_ids)} IDs")
+
+        # ---------------------------------------------------------
+        # C) Personendetails laden
+        # ---------------------------------------------------------
         job_obj.phase = "Lade Personendetails"
         job_obj.percent = 25
 
-        # ----------------------------
-        # 2) Personendetails laden
-        # ----------------------------
         selected = await fetch_person_details(all_ids)
 
         if not selected:
@@ -1621,35 +1657,51 @@ async def run_nachfass_job(
 
         print(f"[NF] Vollständige Personendaten: {len(selected)} Datensätze")
 
+        # ---------------------------------------------------------
+        # D) Organisationen laden (bulk + fehlende einzeln)
+        # ---------------------------------------------------------
         job_obj.phase = "Lade Organisationen"
         job_obj.percent = 45
 
-        # ----------------------------
-        # 3) Organisationen bulk laden
-        # ----------------------------
-        unique_org_ids = []
+        unique_org_ids: List[str] = []
         seen_org = set()
         for p in selected:
-            oid = extract_org_id_from_person(p)
+            oid = str(extract_org_id_from_person(p) or "").strip()
             if oid and oid not in seen_org:
                 seen_org.add(oid)
                 unique_org_ids.append(oid)
 
         org_lookup = await fetch_orgs_bulk(unique_org_ids)
-        print(f"[NF] org_lookup: {len(org_lookup)} orgs für {len(unique_org_ids)} org_ids")
-        print(f"[export] org_lookup size={len(org_lookup)}")
 
-        # ----------------------------
-        # 4) Master bauen
-        # ----------------------------
-        batch_id = (nf_batch_ids or [""])[0] if nf_batch_ids else ""
+        # fehlende Org-IDs einzeln nachladen (damit org_name nicht leer bleibt)
+        missing_orgs = [oid for oid in unique_org_ids if str(oid) not in org_lookup]
+        if missing_orgs:
+            # kleine Kappung optional, falls riesig:
+            # missing_orgs = missing_orgs[:2000]
+            extra_lookup = await fetch_org_details(missing_orgs)
+            org_lookup.update(extra_lookup)
+
+        print(f"[NF] org_lookup: {len(org_lookup)} orgs für {len(unique_org_ids)} org_ids")
+
+        # ---------------------------------------------------------
+        # E) Master bauen
+        # ---------------------------------------------------------
+        job_obj.phase = "Baue Nachfass-Master"
+        job_obj.percent = 60
+
+        export_batch_id = (nf_batch_ids or [""])[0] if nf_batch_ids else ""
         df = await _build_nf_master_final(
             selected=selected,
             org_lookup=org_lookup,
-            batch_id=batch_id,
+            batch_id=export_batch_id,
             campaign=campaign,
             job_obj=job_obj,
         )
+
+        # Optional: Abgleich/Reconciling hier starten, wenn gewünscht:
+        # job_obj.phase = "Führe Abgleich durch"
+        # job_obj.percent = 85
+        # await _reconcile("nf")
 
         job_obj.phase = "Fertig"
         job_obj.percent = 100
@@ -1663,6 +1715,8 @@ async def run_nachfass_job(
         job_obj.error = str(e)
         job_obj.phase = "Fehler"
         job_obj.percent = 100
+        print("[run_nachfass_job] ERROR:", e)
+        traceback.print_exc()
         raise
 
 # =============================================================================
@@ -2613,6 +2667,10 @@ async def nachfass_summary(job_id: str = Query(...)):
 # MODUL 6 – FINALER JOB-/WORKFLOW FÜR NACHFASS (EXPORT/PROGRESS/DOWNLOAD)
 # =============================================================================
 from uuid import uuid4
+from fastapi import Request
+from fastapi.responses import JSONResponse
+import asyncio
+
 @app.post("/nachfass/export_start")
 async def nachfass_export_start(req: Request):
     body = await req.json()
@@ -2620,22 +2678,24 @@ async def nachfass_export_start(req: Request):
     nf_batch_ids = body.get("nf_batch_ids") or []
     batch_id     = body.get("batch_id") or ""
     campaign     = body.get("campaign") or ""
-    filters      = body.get("filters") or []   # <--- WICHTIG: neu
+
+    # optional: falls Frontend keine Filter sendet -> Default auf FILTER_NACHFASS
+    filters = body.get("filters") or [FILTER_NACHFASS]
 
     job_id = str(uuid4())
     job = Job()
     JOBS[job_id] = job
 
-    # Job-Inputs speichern
+    # Job-Inputs speichern (optional, aber ok)
     job.nf_batch_ids = nf_batch_ids
     job.batch_id     = batch_id
     job.campaign     = campaign
-    job.filters      = filters                # <--- WICHTIG: neu
+    job.filters      = filters
 
-    # Job starten (kompatibel mit beiden Varianten von run_nachfass_job)
+    # WICHTIG: richtiger Aufruf (job_obj statt job=)
     asyncio.create_task(
         run_nachfass_job(
-            job=job,
+            job_obj=job,
             job_id=job_id,
             campaign=campaign,
             filters=filters,
