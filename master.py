@@ -187,6 +187,11 @@ def _retry_after_seconds(resp) -> float:
     except Exception:
         return 0.0
 
+
+import asyncio
+import random
+import time
+
 async def pd_get_with_retry(
     client,
     url: str,
@@ -195,18 +200,37 @@ async def pd_get_with_retry(
     retries: int = 8,
     base_delay: float = 0.8,
     sem: asyncio.Semaphore = PD_SEM,
+    request_timeout: float = 30.0,     # <-- NEU: Timeout für EINEN Request
+    max_total_time: float = 120.0,     # <-- NEU: Notbremse für alle Retries zusammen
 ):
     """
     Einheitlicher GET mit Retries (429/5xx/Netzwerk).
-    Wichtig: respektiert Retry-After und macht Jitter -> weniger 429.
+    Fix gegen "Hängen":
+      - request_timeout: Request darf nicht endlos hängen
+      - max_total_time: gesamte Retry-Zeit wird begrenzt
     """
     delay = base_delay
     last_err = None
+    t0 = time.monotonic()
+
+    def _short(u: str, n: int = 140) -> str:
+        return u if len(u) <= n else (u[:n] + "...")
 
     for attempt in range(1, retries + 1):
+        # Notbremse Gesamtzeit
+        if (time.monotonic() - t0) > max_total_time:
+            raise RuntimeError(
+                f"[pd_get_with_retry] TIMEOUT(total) {label} after {attempt-1} attempts "
+                f"({max_total_time}s). url={_short(url)} last_err={last_err}"
+            )
+
         try:
             async with sem:
-                r = await client.get(url, headers=headers)
+                # Timeout pro Request
+                r = await asyncio.wait_for(
+                    client.get(url, headers=headers),
+                    timeout=request_timeout
+                )
 
             # OK
             if r.status_code == 200:
@@ -222,7 +246,10 @@ async def pd_get_with_retry(
                 sleep_s = max(delay, ra)
                 sleep_s = min(sleep_s, 30.0)
                 sleep_s = sleep_s + random.uniform(0, 0.35)  # jitter
-                print(f"[pd_get_with_retry] {label} HTTP {r.status_code} attempt={attempt}/{retries}, sleep={sleep_s:.2f}s")
+                print(
+                    f"[pd_get_with_retry] {label} HTTP {r.status_code} "
+                    f"attempt={attempt}/{retries}, sleep={sleep_s:.2f}s"
+                )
                 await asyncio.sleep(sleep_s)
                 delay = min(delay * 1.8, 30.0)
                 continue
@@ -232,6 +259,16 @@ async def pd_get_with_retry(
             await asyncio.sleep(delay)
             delay = min(delay * 1.8, 30.0)
 
+        except asyncio.TimeoutError as e:
+            last_err = e
+            sleep_s = delay + random.uniform(0, 0.35)
+            print(
+                f"[pd_get_with_retry] {label} REQ_TIMEOUT {request_timeout}s, "
+                f"retry attempt={attempt}/{retries}, sleep={sleep_s:.2f}s"
+            )
+            await asyncio.sleep(sleep_s)
+            delay = min(delay * 1.8, 30.0)
+
         except Exception as e:
             last_err = e
             sleep_s = delay + random.uniform(0, 0.35)
@@ -239,7 +276,10 @@ async def pd_get_with_retry(
             await asyncio.sleep(sleep_s)
             delay = min(delay * 1.8, 30.0)
 
-    raise RuntimeError(f"[pd_get_with_retry] FAILED {label} after {retries} retries. last_err={last_err}")
+    raise RuntimeError(
+        f"[pd_get_with_retry] FAILED {label} after {retries} retries "
+        f"(total<= {max_total_time}s). url={_short(url)} last_err={last_err}"
+    )
 
 # -----------------------------------------------------------------------------
 # Hilfsfunktionen
@@ -601,21 +641,33 @@ async def stream_organizations_by_filter(
             break
 
 
-from typing import AsyncGenerator, List, Optional
+import asyncio
+from typing import AsyncGenerator, List, Optional, Set
 
 async def stream_person_ids_by_filter(
     filter_id: int,
     page_limit: int = PAGE_LIMIT,
+    max_pages: int = 500,          # <-- Schutz: max 500 Seiten
+    request_timeout: float = 45.0, # <-- Schutz: Request darf nicht "ewig" hängen
 ) -> AsyncGenerator[List[str], None]:
     """
     Streamt Person-IDs eines Pipedrive-Filters seitenweise.
-    - Nutzt cursor-Pagination (v2-style) sofern vorhanden.
-    - pd_get_with_retry soll 429/5xx already abfedern; wir brechen nur bei harten Fehlern ab.
+    Schutz gegen "Hängen":
+      - max_pages
+      - cursor-loop-guard (wenn cursor sich nicht ändert)
+      - asyncio.wait_for Timeout
     """
     client = http_client()
     cursor: Optional[str] = None
+    seen_cursors: Set[str] = set()
+    page = 0
 
     while True:
+        page += 1
+        if page > max_pages:
+            print(f"[stream_person_ids_by_filter] ABORT: max_pages erreicht ({max_pages}) für Filter {filter_id}")
+            break
+
         base = (
             f"{PIPEDRIVE_API}/persons"
             f"?filter_id={int(filter_id)}&limit={int(page_limit)}"
@@ -623,9 +675,16 @@ async def stream_person_ids_by_filter(
         )
         url = append_token(f"{base}&cursor={cursor}") if cursor else append_token(base)
 
-        r = await pd_get_with_retry(client, url, get_headers(), label=f"persons filter={filter_id}")
-        status = getattr(r, "status_code", None)
+        try:
+            r = await asyncio.wait_for(
+                pd_get_with_retry(client, url, get_headers(), label=f"persons filter={filter_id}"),
+                timeout=request_timeout
+            )
+        except asyncio.TimeoutError:
+            print(f"[stream_person_ids_by_filter] TIMEOUT nach {request_timeout}s (Filter {filter_id}) -> Abbruch")
+            break
 
+        status = getattr(r, "status_code", None)
         if status != 200:
             print(f"[stream_person_ids_by_filter] HTTP {status} für Filter {filter_id}: {getattr(r, 'text', '')}")
             break
@@ -645,10 +704,22 @@ async def stream_person_ids_by_filter(
             yield ids
 
         additional = payload.get("additional_data") or {}
-        cursor = additional.get("next_cursor") or additional.get("cursor")
-        if not cursor:
+        next_cursor = additional.get("next_cursor") or additional.get("cursor")
+
+        # --- Loop-Guard: cursor muss sich ändern ---
+        if not next_cursor:
             break
 
+        next_cursor = str(next_cursor)
+        if next_cursor == (cursor or ""):
+            print(f"[stream_person_ids_by_filter] ABORT: cursor hat sich nicht geändert (Filter {filter_id})")
+            break
+        if next_cursor in seen_cursors:
+            print(f"[stream_person_ids_by_filter] ABORT: cursor wiederholt sich (Filter {filter_id})")
+            break
+
+        seen_cursors.add(next_cursor)
+        cursor = next_cursor
 
 # =============================================================================
 # Organisationen – Bucketing + Kappung (Performanceoptimiert)
@@ -1618,28 +1689,39 @@ async def run_nachfass_job(
         job_obj.done = False
         job_obj.error = None
 
+  
         # ---------------------------------------------------------
-        # A) Person-IDs aus Filtern sammeln
+        # A) Person-IDs aus Filtern sammeln (mit Progress)
         # ---------------------------------------------------------
         all_ids_set = set()
-
+        
         if filters:
             job_obj.phase = "Suche Personen (Filter)"
             job_obj.percent = 10
-
-            for fid in filters:
+        
+            # progress budget: 10% -> 22% während scan
+            start_pct = 10
+            end_pct = 22
+            total_filters = max(1, len(filters))
+        
+            for idx, fid in enumerate(filters, start=1):
+                pages = 0
                 async for chunk in stream_person_ids_by_filter(int(fid), page_limit=PAGE_LIMIT):
+                    pages += 1
                     for pid in chunk:
                         all_ids_set.add(str(pid))
-
+        
+                    # Progress: pro Filter langsam hochziehen, plus pro Seiten-Chunk minimal
+                    base = start_pct + int((end_pct - start_pct) * (idx - 1) / total_filters)
+                    bump = min(3, pages // 10)  # alle 10 Seiten +1% bis max +3%
+                    job_obj.percent = min(end_pct, base + bump)
+        
+                # Filter fertig -> mindestens auf "base for this filter done"
+                job_obj.percent = max(job_obj.percent, start_pct + int((end_pct - start_pct) * idx / total_filters))
+        
         person_ids = list(all_ids_set)
         print(f"[NF] Personen aus Suche: {len(person_ids)} IDs")
 
-        # (Optional) Wenn du Batches anders reinholst: hier anreichern.
-        # Hinweis: du hast in deinem Code/Logs bereits Batch-Personen-Laden,
-        # also NICHT doppelt machen, außer du willst es.
-        # -> Wenn du Batch-Personen bereits als "selected persons" hast,
-        # dann passt du run_nachfass_job so an, dass du diese Persons direkt nutzt.
 
         # ---------------------------------------------------------
         # B) Personendetails laden
