@@ -216,10 +216,10 @@ import asyncio
 import random
 import time
 
+
 async def pd_get_with_retry(
     client: httpx.AsyncClient,
     url: str,
-    headers: dict,
     label: str = "",
     retries: int = 8,
     base_delay: float = 0.8,
@@ -227,13 +227,6 @@ async def pd_get_with_retry(
     request_timeout: float = 30.0,
     max_total_time: float = 120.0,
 ) -> httpx.Response:
-    """
-    Einheitlicher GET mit Retries (429/5xx/Netzwerk).
-    Fix gegen "Hängen":
-      - request_timeout: Timeout pro Request
-      - max_total_time: Notbremse Gesamtzeit
-      - sem: globale Drosselung (aber >1!)
-    """
     delay = base_delay
     last_err = None
     t0 = time.monotonic()
@@ -249,19 +242,22 @@ async def pd_get_with_retry(
             )
 
         try:
+            real_url, headers = pd_auth(url)
+
             async with sem:
-                # Timeout pro Request: einmal via httpx, plus harte Kappe via wait_for
                 r = await asyncio.wait_for(
-                    client.get(url, headers=headers, timeout=request_timeout),
-                    timeout=request_timeout + 2.0
+                    client.get(real_url, headers=headers, timeout=request_timeout),
+                    timeout=request_timeout + 2.0,
                 )
 
             if r.status_code == 200:
                 return r
 
+            # Nicht retrybar
             if r.status_code in (400, 401, 403, 404):
                 return r
 
+            # Retrybar
             if r.status_code == 429 or (500 <= r.status_code <= 599):
                 ra = _retry_after_seconds(r)
                 sleep_s = max(delay, ra)
@@ -275,7 +271,7 @@ async def pd_get_with_retry(
                 delay = min(delay * 1.8, 30.0)
                 continue
 
-            # Sonstige Fehler: retry konservativ
+            # Sonstige Fehler -> retry konservativ
             print(f"[pd_get_with_retry] {label} HTTP {r.status_code}, retry attempt={attempt}/{retries}")
             await asyncio.sleep(delay + random.uniform(0, 0.2))
             delay = min(delay * 1.8, 30.0)
@@ -301,7 +297,6 @@ async def pd_get_with_retry(
         f"[pd_get_with_retry] FAILED {label} after {retries} retries "
         f"(total<= {max_total_time}s). url={_short(url)} last_err={last_err}"
     )
-
 
 # -----------------------------------------------------------------------------
 # Hilfsfunktionen
@@ -563,17 +558,35 @@ async def load_df_text(table: str) -> pd.DataFrame:
 # PIPEDRIVE API-HELPERS
 # =============================================================================
 def get_headers() -> Dict[str, str]:
-    token = user_tokens.get("default", "")
+    token = (user_tokens.get("default") or "").strip()
     return {"Authorization": f"Bearer {token}"} if token else {}
 
 def append_token(url: str) -> str:
     """Hängt api_token automatisch an (wenn kein OAuth-Token genutzt wird)."""
+    # Wenn OAuth-Token vorhanden ist, NICHT mit api_token mischen
+    token = (user_tokens.get("default") or "").strip()
+    if token:
+        return url
+
     if "api_token=" in url:
         return url
-    if not user_tokens.get("default") and PD_API_TOKEN:
+
+    if PD_API_TOKEN:
         sep = "&" if "?" in url else "?"
         return f"{url}{sep}api_token={PD_API_TOKEN}"
+
     return url
+
+def pd_auth(url: str) -> tuple[str, Dict[str, str]]:
+    """
+    Liefert (url, headers) mit korrekter Auth.
+    OAuth -> Bearer Header
+    sonst -> api_token Query Param
+    """
+    headers = get_headers()
+    if headers.get("Authorization"):
+        return url, headers
+    return append_token(url), {}
     
 # =============================================================================
 # GET Retry/Backoff
@@ -1218,17 +1231,14 @@ async def pd_get_json_with_retry(
 
     return None, None, f"retries_exhausted ({label})"
 
+
 async def fetch_person_details_many(
     person_ids: List[str],
     *,
     job_obj=None,
-    concurrency: int = 8,           # zusätzlicher per-call limiter
+    concurrency: int = 8,
     request_timeout: float = 25.0,
 ) -> Dict[str, dict]:
-    """
-    Lädt viele Personen über /persons/{id} parallel,
-    nutzt pd_get_with_retry (mit globaler PD_SEM Drossel).
-    """
     if not person_ids:
         return {}
 
@@ -1253,14 +1263,13 @@ async def fetch_person_details_many(
         nonlocal done
 
         async with local_sem:
-            url = f"{PD_BASE}/persons/{pid}"
+            url = f"{PIPEDRIVE_API}/persons/{pid}"
             label = f"person:{pid}"
 
             try:
                 r = await pd_get_with_retry(
                     client=client,
                     url=url,
-                    headers=get_headers(),
                     label=label,
                     request_timeout=request_timeout,
                     max_total_time=90.0,
@@ -1271,9 +1280,12 @@ async def fetch_person_details_many(
                     data = payload.get("data")
                     if data:
                         results[str(pid)] = data
+                else:
+                    # log nur sparsam
+                    if done < 5 or done % 50 == 0:
+                        print(f"[fetch_person_details_many] pid={pid} HTTP {r.status_code}")
 
             except Exception as e:
-                # sparsam loggen
                 if done < 5 or done % 50 == 0:
                     print(f"[fetch_person_details_many] pid={pid} ERROR: {type(e).__name__}: {e}")
 
@@ -1289,6 +1301,7 @@ async def fetch_person_details_many(
         job_obj.phase = f"Lade Personendetails ({total}/{total})"
 
     return results
+
 
 # -----------------------------------------------------------------------------
 # fehlende Organisation-IDs einzeln nachladen
