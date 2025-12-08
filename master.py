@@ -633,6 +633,63 @@ async def get_person_field_by_hint(label_hint: str) -> Optional[dict]:
             return f
     return None
 
+# =============================================================================
+# org_BULK
+# =============================================================================
+async def fetch_orgs_bulk(
+    org_ids: List[str],
+    *,
+    concurrency: int = 6,
+    request_timeout: float = 25.0,
+) -> Dict[str, dict]:
+    """
+    Bulk-Loader für Organisationsdaten über /organizations/{id}.
+    Gibt Dict[str, dict] zurück: org_id -> org_data
+    """
+    if not org_ids:
+        return {}
+
+    client = http_client()
+    local_sem = asyncio.Semaphore(concurrency)
+
+    results: Dict[str, dict] = {}
+    total = len(org_ids)
+    done = 0
+
+    async def fetch_one(oid: str) -> None:
+        nonlocal done
+        async with local_sem:
+            url = f"{PIPEDRIVE_API}/organizations/{oid}"
+            try:
+                r = await pd_get_with_retry(
+                    client,
+                    url,
+                    None,
+                    label=f"org:{oid}",
+                    request_timeout=request_timeout,
+                    max_total_time=90.0,
+                )
+                if r.status_code == 200:
+                    payload = r.json() or {}
+                    data = payload.get("data")
+                    if data:
+                        results[str(oid)] = data
+                else:
+                    # sparsames logging
+                    if done < 5 or done % 100 == 0:
+                        print(f"[fetch_orgs_bulk] oid={oid} HTTP {r.status_code}")
+
+            except Exception as e:
+                if done < 5 or done % 100 == 0:
+                    print(f"[fetch_orgs_bulk] oid={oid} ERROR: {type(e).__name__}: {e}")
+
+            done += 1
+            if done % 100 == 0 or done == total:
+                print(f"[fetch_orgs_bulk] progress {done}/{total}")
+
+    await asyncio.gather(*(fetch_one(str(oid)) for oid in org_ids))
+    return results
+
 
 # =============================================================================
 # stream_organizations_by_filter  (FINAL)
