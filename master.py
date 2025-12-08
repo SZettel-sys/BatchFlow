@@ -233,7 +233,7 @@ async def pd_get_with_retry(
       - alt: pd_get_with_retry(client, url, headers, label="x")
       - neu: pd_get_with_retry(client, url, label="x")
 
-    Wichtig: label ist KEYWORD-ONLY (wegen '*'), damit "multiple values for label" nie wieder passiert.
+    Wichtig: label ist KEYWORD-ONLY (wegen '*'), damit "multiple values for label" nicht mehr passieren kann.
     """
     delay = base_delay
     last_err = None
@@ -250,12 +250,10 @@ async def pd_get_with_retry(
             )
 
         try:
-            # 1) headers wurden explizit übergeben (alter Code) -> respektieren
             if headers and headers.get("Authorization"):
                 real_url = url
                 real_headers = headers
             else:
-                # 2) sonst zentral entscheiden (OAuth oder api_token)
                 real_url, real_headers = pd_auth(url)
 
             async with sem:
@@ -272,9 +270,7 @@ async def pd_get_with_retry(
 
             if r.status_code == 429 or (500 <= r.status_code <= 599):
                 ra = _retry_after_seconds(r)
-                sleep_s = max(delay, ra)
-                sleep_s = min(sleep_s, 30.0)
-                sleep_s = sleep_s + random.uniform(0, 0.35)
+                sleep_s = min(max(delay, ra) + random.uniform(0, 0.35), 30.0)
                 print(
                     f"[pd_get_with_retry] {label} HTTP {r.status_code} "
                     f"attempt={attempt}/{retries}, sleep={sleep_s:.2f}s"
