@@ -197,7 +197,7 @@ import asyncio
 from typing import Optional, Tuple
 
 # Global: eine Bremse für alle Requests (Pipedrive mag keine parallelen Bursts)
-PD_SEM = asyncio.Semaphore(4)
+PD_SEM = asyncio.Semaphore(3)
 
 def _retry_after_seconds(resp) -> float:
     try:
@@ -1004,15 +1004,30 @@ async def fetch_person_details(person_ids: List[str], job_obj=None) -> List[dict
         job_obj.phase = f"Lade Personendetails (0/{len(person_ids)})"
         job_obj.percent = 25
 
-    lookup = await fetch_person_details_many(person_ids, job_obj=job_obj)
+    # 1. Pass (parallel)
+    lookup = await fetch_person_details_many(person_ids, job_obj=job_obj, concurrency=4)
 
+    # Missing bestimmen
     missing = [str(pid) for pid in person_ids if str(pid) not in lookup]
-    if missing:
-        print(
-            f"[fetch_person_details] WARN: fehlende Personendetails: {len(missing)} "
-            f"(Beispiele: {missing[:10]})"
-        )
+    print(f"[fetch_person_details] Pass1: got={len(lookup)} missing={len(missing)}")
 
+    # 2. Pass: missing nochmal langsamer/konservativer laden (reduziert Zufall durch 429)
+    if missing:
+        if job_obj:
+            job_obj.phase = f"Nachladen fehlender Personendetails ({len(missing)})"
+            job_obj.percent = max(job_obj.percent, 66)
+
+        lookup2 = await fetch_person_details_many(missing, job_obj=job_obj, concurrency=2)
+        lookup.update(lookup2)
+
+        missing2 = [str(pid) for pid in person_ids if str(pid) not in lookup]
+        print(f"[fetch_person_details] Pass2: added={len(lookup2)} still_missing={len(missing2)}")
+
+        # Optional: am Ende eine Liste loggen (nur Beispiele)
+        if missing2:
+            print(f"[fetch_person_details] STILL missing examples: {missing2[:20]}")
+
+    # Ordered output
     ordered: List[dict] = []
     for pid in person_ids:
         p = lookup.get(str(pid))
@@ -1020,6 +1035,7 @@ async def fetch_person_details(person_ids: List[str], job_obj=None) -> List[dict
             ordered.append(p)
 
     return ordered
+
 
 
 # -----------------------------------------------------------------------------
@@ -1874,6 +1890,10 @@ async def run_nachfass_job(
             job_obj.percent = 100
             return
 
+        loaded_ids = {str(p.get("id")) for p in details if p.get("id") is not None}
+        missing_details = [pid for pid in person_ids if str(pid) not in loaded_ids]
+        print(f"[NF] requested_ids={len(person_ids)} loaded_details={len(details)} missing_details={len(missing_details)}")
+
         # ---------------------------------------------------------
         # C) Master bauen  (ASYNC!)
         # ---------------------------------------------------------
@@ -1894,8 +1914,10 @@ async def run_nachfass_job(
         job_obj.percent = 90
 
         out_path = export_to_excel(master_df, prefix="nachfass_export", job_id=job_id)
+        
         job_obj.result_path = out_path
-
+        job_obj.filename_base = job_obj.filename_base or "Nachfass_Export"
+        
         job_obj.phase = "Fertig"
         job_obj.percent = 100
         job_obj.done = True
@@ -1985,6 +2007,23 @@ def _df_to_excel_bytes_nf(df: pd.DataFrame) -> bytes:
     return buf.getvalue()
 
 
+def export_to_excel(df: pd.DataFrame, prefix: str, job_id: str) -> str:
+    """
+    Schreibt den Nachfass-Excel Export nach ./exports und gibt den Dateipfad zurück.
+    Nutzt eure bestehende Bytes-Funktion _df_to_excel_bytes_nf(df).
+    """
+    os.makedirs("exports", exist_ok=True)
+
+    safe_prefix = "".join(c for c in (prefix or "export") if c.isalnum() or c in ("_", "-")).strip() or "export"
+    safe_job = "".join(c for c in (job_id or "") if c.isalnum() or c in ("_", "-")).strip() or uuid.uuid4().hex[:8]
+    out_path = os.path.join("exports", f"{safe_prefix}_{safe_job}.xlsx")
+
+    data = _df_to_excel_bytes_nf(df)
+    with open(out_path, "wb") as f:
+        f.write(data)
+
+    print(f"[export_to_excel] wrote: {out_path} bytes={len(data)} rows={len(df)} cols={len(df.columns)}")
+    return out_path
 
 # =============================================================================
 # JOB-VERWALTUNG & FORTSCHRITT
