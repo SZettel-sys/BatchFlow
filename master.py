@@ -657,18 +657,20 @@ async def stream_person_ids_by_filter(
       - bricht ab wenn cursor sich wiederholt
       - bricht ab nach max_total_time / max_pages
       - liefert immer wieder chunks (damit Job Fortschritt machen kann)
+      - häufigeres Heartbeat-Logging + elapsed time
     """
     client = http_client()
     cursor: Optional[str] = None
-    seen_cursors: Set[str] = set()
-
-    started = time.monotonic()
+    seen_cursors = set()
     page = 0
+    started = time.monotonic()
 
     while True:
         # Notbremse Zeit
         if (time.monotonic() - started) > max_total_time:
-            print(f"[stream_person_ids_by_filter] ABORT: max_total_time={max_total_time}s reached for filter={filter_id}")
+            print(
+                f"[stream_person_ids_by_filter] ABORT: max_total_time={max_total_time}s reached for filter={filter_id}"
+            )
             break
 
         # Notbremse Seiten
@@ -677,17 +679,18 @@ async def stream_person_ids_by_filter(
             print(f"[stream_person_ids_by_filter] ABORT: max_pages={max_pages} reached for filter={filter_id}")
             break
 
-        base = (
-            f"{PIPEDRIVE_API}/persons"
-            f"?filter_id={filter_id}&limit={page_limit}"
-            f"&sort_by=id&sort_direction=asc"
-        )
-        url = append_token(f"{base}&cursor={cursor}") if cursor else append_token(base)
+        base = f"{PD_BASE}/persons"
+        params = {
+            "filter_id": int(filter_id),
+            "limit": int(page_limit),
+        }
+        if cursor:
+            params["cursor"] = cursor
 
-        r = await pd_get_with_retry(client, url, get_headers(), label=f"persons filter={filter_id} page={page}")
+        r = await client.get(base, params=params)
         status = r.status_code
 
-        if status != 200:
+        if status >= 400:
             print(f"[stream_person_ids_by_filter] HTTP {status} for filter={filter_id}: {r.text}")
             break
 
@@ -697,7 +700,6 @@ async def stream_person_ids_by_filter(
             print(f"[stream_person_ids_by_filter] DONE: no data for filter={filter_id} page={page}")
             break
 
-        # IDs extrahieren
         ids: List[str] = []
         for p in data:
             pid = p.get("id")
@@ -705,9 +707,13 @@ async def stream_person_ids_by_filter(
                 ids.append(str(pid))
 
         if ids:
-            # Heartbeat (damit man sieht: es läuft)
-            if page == 1 or page % 10 == 0:
-                print(f"[stream_person_ids_by_filter] filter={filter_id} page={page} ids_in_page={len(ids)} cursor={cursor}")
+            # Heartbeat (damit man sieht: es läuft) — häufiger + elapsed
+            if page == 1 or page % 2 == 0:
+                elapsed = time.monotonic() - started
+                print(
+                    f"[stream_person_ids_by_filter] filter={filter_id} page={page} "
+                    f"ids_in_page={len(ids)} cursor={cursor} elapsed={elapsed:.1f}s"
+                )
             yield ids
 
         # Pagination cursor lesen (Pipedrive v2-style: additional_data.next_cursor)
@@ -718,19 +724,15 @@ async def stream_person_ids_by_filter(
             print(f"[stream_person_ids_by_filter] DONE: no next_cursor for filter={filter_id} page={page}")
             break
 
-        next_cursor = str(next_cursor)
-
-        # Endlosschleife verhindern: cursor wiederholt sich
+        # Schutz: Cursor darf sich nicht wiederholen
         if next_cursor in seen_cursors:
-            print(f"[stream_person_ids_by_filter] ABORT: cursor repeated for filter={filter_id}. next_cursor={next_cursor}")
+            print(
+                f"[stream_person_ids_by_filter] ABORT: cursor repeated for filter={filter_id}. next_cursor={next_cursor}"
+            )
             break
 
         seen_cursors.add(next_cursor)
         cursor = next_cursor
-
-        # kleine Pause -> weniger 429 (super wichtig bei Filter-Scans)
-        await asyncio.sleep(0.05)
-
 
 # =============================================================================
 # Organisationen – Bucketing + Kappung (Performanceoptimiert)
@@ -1683,56 +1685,77 @@ async def run_nachfass_job(
 ):
     """
     Orchestriert den Export-Job:
-    - IDs sammeln (Filter + optional Batch-IDs wenn du die schon vorher als Persons lädst)
+    - IDs sammeln (Batch-IDs bevorzugt, Filter als Fallback)
     - Personendetails laden (fetch_person_details)
     - Master bauen (_build_nf_master_final)
     - Jobstatus sauber setzen (done/error), damit UI nicht "hängt"
     """
 
     try:
-        if not filters:
-            filters = []
-        if nf_batch_ids is None:
-            nf_batch_ids = []
-
-        job_obj.phase = "Starte Abgleich"
-        job_obj.percent = 5
-        job_obj.done = False
-        job_obj.error = None
-
-  
         # ---------------------------------------------------------
-        # A) Person-IDs aus Filtern sammeln (mit Progress)
+        # A) Person-IDs sammeln
+        #    Wichtig: Wenn nf_batch_ids gesetzt sind, nutze sie WIRKLICH,
+        #    sonst scannt er riesige Filter und wirkt "hängend".
         # ---------------------------------------------------------
-        all_ids_set = set()
-        
-        if filters:
+        job_obj.phase = "Suche Personen"
+        job_obj.percent = 10
+
+        all_ids_set: set[str] = set()
+
+        # A1) Batch-IDs bevorzugen (schneller / gezielter)
+        if nf_batch_ids:
+            job_obj.phase = "Suche Personen (Batch IDs)"
+            job_obj.percent = 12
+
+            # stream_persons_by_batch_id liefert Persons (dicts). Daraus IDs ziehen.
+            persons = await stream_persons_by_batch_id(
+                batch_key="batch",  # wird in deiner Funktion nicht wirklich genutzt, aber lassen wir kompatibel
+                batch_ids=[str(x) for x in nf_batch_ids],
+                page_limit=100,
+                job_obj=job_obj,
+            )
+
+            for p in persons:
+                pid = p.get("id")
+                if pid is not None:
+                    all_ids_set.add(str(pid))
+
+            print(f"[NF] Personen aus Batch-IDs: {len(all_ids_set)} IDs")
+
+        # A2) Filter nur als Fallback (oder wenn explizit gewünscht UND batch leer/nix gefunden)
+        #     Falls filters nicht übergeben wurden, nimm Default.
+        if (not all_ids_set) and (filters is None or len(filters) == 0):
+            filters = [FILTER_NACHFASS]
+
+        if (not all_ids_set) and filters:
             job_obj.phase = "Suche Personen (Filter)"
-            job_obj.percent = 10
-        
-            # progress budget: 10% -> 22% während scan
-            start_pct = 10
+            job_obj.percent = 15
+
+            start_pct = 15
             end_pct = 22
+
             total_filters = max(1, len(filters))
-        
-            for idx, fid in enumerate(filters, start=1):
+
+            for fidx, fid in enumerate(filters, start=1):
                 pages = 0
                 async for chunk in stream_person_ids_by_filter(int(fid), page_limit=PAGE_LIMIT):
                     pages += 1
                     for pid in chunk:
                         all_ids_set.add(str(pid))
-        
+
                     # Progress: pro Filter langsam hochziehen, plus pro Seiten-Chunk minimal
-                    base = start_pct + int((end_pct - start_pct) * (idx - 1) / total_filters)
+                    base = start_pct + int((end_pct - start_pct) * (fidx - 1) / total_filters)
                     bump = min(3, pages // 10)  # alle 10 Seiten +1% bis max +3%
                     job_obj.percent = min(end_pct, base + bump)
-        
+
                 # Filter fertig -> mindestens auf "base for this filter done"
-                job_obj.percent = max(job_obj.percent, start_pct + int((end_pct - start_pct) * idx / total_filters))
-        
+                job_obj.percent = max(
+                    job_obj.percent,
+                    start_pct + int((end_pct - start_pct) * fidx / total_filters),
+                )
+
         person_ids = list(all_ids_set)
         print(f"[NF] Personen aus Suche: {len(person_ids)} IDs")
-
 
         # ---------------------------------------------------------
         # B) Personendetails laden
@@ -1744,38 +1767,44 @@ async def run_nachfass_job(
         print(f"[NF] Vollständige Personendaten: {len(details)} Datensätze")
 
         if not details:
-            raise RuntimeError("Keine Personendetails geladen (0 Datensätze).")
+            job_obj.done = True
+            job_obj.error = "Keine Personendetails gefunden."
+            job_obj.phase = "Fertig (leer)"
+            job_obj.percent = 100
+            return
 
         # ---------------------------------------------------------
-        # C) Master bauen + speichern
+        # C) Master bauen
         # ---------------------------------------------------------
-        job_obj.phase = "Erstelle Master"
-        job_obj.percent = 50
+        job_obj.phase = "Baue Export"
+        job_obj.percent = 70
 
-        # Batch-ID fürs Export-Feld: wenn du mehrere nf_batch_ids hast -> join,
-        # ansonsten leer. (Du kannst hier auch deinen echten Batch-Namen setzen.)
-        batch_id_label = ",".join([str(x) for x in nf_batch_ids if str(x).strip()]) if nf_batch_ids else ""
-
-        df = await _build_nf_master_final(
-            selected=details,
+        # nf_batch_ids ist hier ein Label fürs Export/Anzeige — OK.
+        master_df = _build_nf_master_final(
+            details,
             campaign=campaign,
-            batch_id=batch_id_label,
-            job_obj=job_obj,
+            batch_id_label=",".join([str(x) for x in (nf_batch_ids or [])]) if nf_batch_ids else "",
         )
+
+        # ---------------------------------------------------------
+        # D) Excel schreiben
+        # ---------------------------------------------------------
+        job_obj.phase = "Schreibe Excel"
+        job_obj.percent = 90
+
+        out_path = export_to_excel(master_df, prefix="nachfass_export", job_id=job_id)
+        job_obj.result_path = out_path
 
         job_obj.phase = "Fertig"
         job_obj.percent = 100
         job_obj.done = True
         job_obj.error = None
-        return df
 
     except Exception as e:
-        # WICHTIG: UI/Progress darf nicht hängen -> immer done/error setzen
         job_obj.done = True
-        job_obj.error = str(e)
+        job_obj.error = f"{type(e).__name__}: {e}"
         job_obj.phase = "Fehler"
         job_obj.percent = 100
-        print(f"[run_nachfass_job] ERROR: {e}")
         raise
 
 # =============================================================================
