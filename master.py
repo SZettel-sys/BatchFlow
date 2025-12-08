@@ -216,11 +216,11 @@ import asyncio
 import random
 import time
 
-
 async def pd_get_with_retry(
     client: httpx.AsyncClient,
     url: str,
-    headers: Optional[dict] = None,   # <-- optional, damit alte Calls weiter gehen
+    headers: Optional[dict] = None,
+    *,
     label: str = "",
     retries: int = 8,
     base_delay: float = 0.8,
@@ -231,10 +231,9 @@ async def pd_get_with_retry(
     """
     Backward compatible:
       - alt: pd_get_with_retry(client, url, headers, label="x")
-      - neu: pd_get_with_retry(client, url, label="x")  (headers None)
-    Auth-Handling:
-      - wenn headers mit Authorization übergeben -> nutze die (OAuth)
-      - sonst -> pd_auth(url) entscheidet (Bearer oder api_token)
+      - neu: pd_get_with_retry(client, url, label="x")
+
+    Wichtig: label ist KEYWORD-ONLY (wegen '*'), damit "multiple values for label" nie wieder passiert.
     """
     delay = base_delay
     last_err = None
@@ -309,6 +308,7 @@ async def pd_get_with_retry(
         f"[pd_get_with_retry] FAILED {label} after {retries} retries "
         f"(total<= {max_total_time}s). url={_short(url)} last_err={last_err}"
     )
+
 
 # -----------------------------------------------------------------------------
 # Hilfsfunktionen
@@ -866,6 +866,9 @@ def _pretty_reason(reason: str, extra: str = "") -> str:
 # =============================================================================
 # Nachfass – Personen laden nach Batch-ID (mit Paging & Fortschritt)
 # =============================================================================
+from typing import List, Optional
+import asyncio
+
 async def stream_persons_by_batch_id(
     batch_key: str,
     batch_ids: List[str],
@@ -873,76 +876,68 @@ async def stream_persons_by_batch_id(
     job_obj=None
 ) -> List[dict]:
     results: List[dict] = []
-    sem = asyncio.Semaphore(2)  # gedrosselt, um 429 zu vermeiden
+    sem = asyncio.Semaphore(1)  # <= lieber 1, search ist extrem 429-anfällig
 
     async def fetch_one(bid: str):
         cursor: Optional[str] = None
         total = 0
         local: List[dict] = []
-    
-        async with sem:
-            while True:
-                base_url = (
-                    f"{PIPEDRIVE_API}/persons/search?"
-                    f"term={bid}&fields=custom_fields&limit={page_limit}"
+
+        while True:
+            base_url = (
+                f"{PIPEDRIVE_API}/persons/search?"
+                f"term={bid}&fields=custom_fields&limit={page_limit}"
+            )
+            url = append_token(base_url)
+            if cursor:
+                url += f"&cursor={cursor}"
+
+            async with sem:
+                r = await pd_get_with_retry(
+                    http_client(),
+                    url,
+                    None,
+                    label=f"persons_search bid={bid}",
+                    request_timeout=30.0,
+                    max_total_time=180.0,
                 )
-                url = append_token(base_url)
-                if cursor:
-                    url += f"&cursor={cursor}"
 
-            
-                r = await pd_get_with_retry(http_client(), url, get_headers(), label=f"persons_search bid={bid}", sem=PD_SEM)
+            if r.status_code != 200:
+                print(f"[WARN] Batch {bid} Fehler: HTTP {r.status_code} {r.text[:200]}")
+                break
 
+            payload = r.json() or {}
+            raw_items = (payload.get("data") or {}).get("items") or []
+            if not raw_items:
+                break
 
-                
-                if r.status_code != 200:
-                    print(f"[WARN] Batch {bid} Fehler: {r.text}")
-                    break
+            persons: List[dict] = []
+            for it in raw_items:
+                if isinstance(it, dict):
+                    item = it.get("item")
+                    if isinstance(item, dict):
+                        persons.append(item)
 
-                payload = r.json() or {}
-                raw_items = (payload.get("data") or {}).get("items") or []
-                if not raw_items:
-                    break
+            if not persons:
+                break
 
-                # v2: data.items[*].item → Person
-                persons: List[dict] = []
+            local.extend(persons)
+            total += len(persons)
 
-                def add_item(obj):
-                    if obj is None:
-                        return
-                    if isinstance(obj, dict):
-                        item = obj.get("item")
-                        if isinstance(item, dict):
-                            persons.append(item)
-                    elif isinstance(obj, list):
-                        for sub in obj:
-                            add_item(sub)
-
-                for it in raw_items:
-                    add_item(it)
-
-                if not persons:
-                    break
-
-                local.extend(persons)
-                total += len(persons)
-
-                cursor = (payload.get("additional_data") or {}).get("next_cursor")
-                if not cursor:
-                    break
+            cursor = (payload.get("additional_data") or {}).get("next_cursor")
+            if not cursor:
+                break
 
         if local:
             print(f"[Batch {bid}] {total} Personen gefunden.")
-            # KEIN custom_fields-Mutieren mehr – v2 liefert hier eine Liste!
             results.extend(local)
 
         print(f"[DEBUG] Batch {bid}: {total} Personen geladen")
-        # wichtig: hier **nicht** nochmal extend, sonst doppelte Einträge
-        # results.extend(local)  # <- diese Zeile entfernen
 
-    await asyncio.gather(*(fetch_one(bid) for bid in batch_ids))
+    await asyncio.gather(*(fetch_one(str(bid)) for bid in batch_ids))
     print(f"[INFO] Alle Batch-IDs geladen: {len(results)} Personen gesamt")
     return results
+
 
 
 
@@ -1305,12 +1300,14 @@ async def pd_get_json_with_retry(
 
     return None, 0, f"FAILED {label}: {last_err}"
 
+from typing import Dict, List, Optional, Tuple
+import asyncio
 
 async def fetch_person_details_many(
     person_ids: List[str],
     *,
     job_obj=None,
-    concurrency: int = 6,
+    concurrency: int = 2,          # <= runter! (4/6 führt oft zu 429 Lotterie)
     request_timeout: float = 25.0,
 ) -> Dict[str, dict]:
     if not person_ids:
@@ -1336,27 +1333,22 @@ async def fetch_person_details_many(
     async def fetch_one(pid: str) -> None:
         nonlocal done
         async with local_sem:
-            url = append_token(f"{PIPEDRIVE_API}/persons/{pid}")
+            url = f"{PIPEDRIVE_API}/persons/{pid}"
 
-            payload, status, err = await pd_get_json_with_retry(
+            r = await pd_get_with_retry(
                 client,
                 url,
-                get_headers(),
+                None,  # Auth entscheidet pd_get_with_retry via pd_auth()
                 label=f"person:{pid}",
-                retries=10,
-                base_delay=0.8,
                 request_timeout=request_timeout,
                 max_total_time=120.0
             )
 
-            if status == 200 and payload:
+            if r.status_code == 200:
+                payload = r.json() or {}
                 data = payload.get("data")
                 if data:
                     results[str(pid)] = data
-            else:
-                # sparsam loggen
-                if done < 5 or done % 100 == 0:
-                    print(f"[fetch_person_details_many] pid={pid} status={status} err={err}")
 
             done += 1
             if done % 10 == 0 or done == total:
@@ -1364,39 +1356,52 @@ async def fetch_person_details_many(
 
     bump_progress()
     await asyncio.gather(*(fetch_one(str(pid)) for pid in person_ids))
+
     if job_obj:
         job_obj.percent = max(job_obj.percent, end_pct)
         job_obj.phase = f"Lade Personendetails ({total}/{total})"
+
     return results
 
+
+from typing import List
 
 async def fetch_person_details(person_ids: List[str], job_obj=None) -> List[dict]:
     if not person_ids:
         return []
 
-    lookup = await fetch_person_details_many(person_ids, job_obj=job_obj, concurrency=6)
+    if job_obj:
+        job_obj.phase = f"Lade Personendetails (0/{len(person_ids)})"
+        job_obj.percent = 25
+
+    # Pass 1 (konservativ)
+    lookup = await fetch_person_details_many(person_ids, job_obj=job_obj, concurrency=2)
 
     missing = [str(pid) for pid in person_ids if str(pid) not in lookup]
     print(f"[fetch_person_details] pass1 got={len(lookup)} missing={len(missing)}")
 
-    # 2. Pass: missing nochmal langsam (reduziert Zufall durch 429)
+    # Pass 2 (noch konservativer)
     if missing:
         if job_obj:
             job_obj.phase = f"Nachladen fehlender Personendetails ({len(missing)})"
             job_obj.percent = max(job_obj.percent, 66)
-        lookup2 = await fetch_person_details_many(missing, job_obj=job_obj, concurrency=2)
+
+        lookup2 = await fetch_person_details_many(missing, job_obj=job_obj, concurrency=1)
         lookup.update(lookup2)
 
         missing2 = [str(pid) for pid in person_ids if str(pid) not in lookup]
         print(f"[fetch_person_details] pass2 added={len(lookup2)} still_missing={len(missing2)}")
+        if missing2:
+            print(f"[fetch_person_details] STILL missing examples: {missing2[:30]}")
 
+    # Ordered output
     ordered: List[dict] = []
     for pid in person_ids:
         p = lookup.get(str(pid))
         if p:
             ordered.append(p)
-    return ordered
 
+    return ordered
 
 
 
@@ -1956,8 +1961,8 @@ async def run_nachfass_job(
 # =============================================================================
 # Excel-Export-Helfer – FINAL MODUL 3
 # =============================================================================
+import pandas as pd
 
-# 1) Reihenfolge der Exportspalten (Final)
 NF_EXPORT_COLUMNS = [
     "Batch ID",
     "Channel",
@@ -1976,26 +1981,22 @@ NF_EXPORT_COLUMNS = [
     "LinkedIn URL",
 ]
 
-
 def build_nf_export(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Baut den finalen Excel-Export in exakt definierter Spaltenreihenfolge.
-    Fehlende Spalten werden automatisch erzeugt.
+    Erzwingt die finale Export-Struktur (Spalten + Reihenfolge).
+    Fehlende Spalten werden angelegt.
     """
-    out = pd.DataFrame(columns=NF_EXPORT_COLUMNS)
+    out = pd.DataFrame()
 
     for col in NF_EXPORT_COLUMNS:
-        if col in df.columns:
-            out[col] = df[col]
-        else:
-            out[col] = ""
+        out[col] = df[col] if col in df.columns else ""
 
-    # String-Säuberung
+    # IDs als string, nan raus
     for c in ("Person ID", "Organisation ID"):
-        if c in out.columns:
-            out[c] = out[c].astype(str).replace("nan", "").fillna("")
+        out[c] = out[c].astype(str).replace("nan", "").fillna("")
 
     return out
+
 
 # ------------------------------------------------------------
 # HINWEIS: Nicht berücksichtigte Datensätze (nur Zähler)
