@@ -750,12 +750,6 @@ async def stream_person_ids_by_filter(
     max_pages: int = 5000,
     max_total_time: float = 600.0,
 ) -> AsyncGenerator[List[str], None]:
-    """
-    Streamt Person-IDs eines Pipedrive-Filters seitenweise (API v2, cursor).
-    Robust gegen 429/5xx + Auth + Schutz gegen Endlosschleifen.
-
-    Yield: List[str] von Person-IDs pro Seite.
-    """
     client = http_client()
     cursor: Optional[str] = None
     seen_cursors: set[str] = set()
@@ -763,23 +757,16 @@ async def stream_person_ids_by_filter(
     started = time.monotonic()
 
     while True:
-        # Notbremse Zeit
         if (time.monotonic() - started) > max_total_time:
             print(f"[stream_person_ids_by_filter] ABORT max_total_time={max_total_time}s filter={filter_id}")
             break
 
-        # Notbremse Seiten
         page += 1
         if page > max_pages:
             print(f"[stream_person_ids_by_filter] ABORT max_pages={max_pages} filter={filter_id}")
             break
 
-        base = (
-            f"{PIPEDRIVE_API}/persons"
-            f"?filter_id={int(filter_id)}"
-            f"&limit={int(page_limit)}"
-            f"&sort_by=id&sort_direction=asc"
-        )
+        base = f"{PIPEDRIVE_API}/persons?filter_id={int(filter_id)}&limit={int(page_limit)}&sort_by=id&sort_direction=asc"
         url = append_token(base)
         if cursor:
             url += f"&cursor={cursor}"
@@ -787,10 +774,11 @@ async def stream_person_ids_by_filter(
         payload, status, err = await pd_get_json_with_retry(
             client,
             url,
-            get_headers(),                    # wird bei OAuth gesetzt, sonst {} (append_token übernimmt)
-            label=f"person_ids_filter[{filter_id}]",
+            get_headers(),
+            label=f"persons_filter[{filter_id}]",
             retries=12,
             base_delay=0.8,
+            max_total_time=180.0,
         )
 
         if status != 200 or not payload:
@@ -799,37 +787,24 @@ async def stream_person_ids_by_filter(
 
         data = payload.get("data") or []
         if not data:
-            print(f"[stream_person_ids_by_filter] DONE no data filter={filter_id} page={page}")
             break
 
-        ids: List[str] = []
-        for p in data:
-            pid = p.get("id")
-            if pid is not None:
-                ids.append(str(pid))
-
+        ids = [str(p.get("id")) for p in data if p.get("id") is not None]
         if ids:
-            if page == 1 or page % 2 == 0:
-                elapsed = time.monotonic() - started
-                print(
-                    f"[stream_person_ids_by_filter] filter={filter_id} page={page} "
-                    f"ids_in_page={len(ids)} cursor={cursor} elapsed={elapsed:.1f}s"
-                )
             yield ids
 
         additional = payload.get("additional_data") or {}
         next_cursor = additional.get("next_cursor") or (additional.get("pagination") or {}).get("next_cursor")
 
         if not next_cursor:
-            print(f"[stream_person_ids_by_filter] DONE no next_cursor filter={filter_id} page={page}")
             break
-
         if next_cursor in seen_cursors:
             print(f"[stream_person_ids_by_filter] ABORT cursor repeated filter={filter_id} cursor={next_cursor}")
             break
 
         seen_cursors.add(next_cursor)
         cursor = next_cursor
+
 
 # =============================================================================
 # Organisationen – Bucketing + Kappung (Performanceoptimiert)
@@ -1254,68 +1229,88 @@ async def pd_throttle(min_interval: float = 0.25):
             await asyncio.sleep(wait)
         _GLOBAL_PD_NEXT_TS = time.monotonic() + min_interval
 
+PD_SEM = asyncio.Semaphore(2)  # wenn du sehr viele 429 bekommst -> 1
+
+def _retry_after_seconds(resp: httpx.Response) -> float:
+    ra = (resp.headers or {}).get("Retry-After")
+    if not ra:
+        return 0.0
+    try:
+        return float(ra)
+    except Exception:
+        return 0.0
 
 async def pd_get_json_with_retry(
-    client,
+    client: httpx.AsyncClient,
     url: str,
     headers: dict,
-    label: str,
-    retries: int = 8,
+    *,
+    label: str = "",
+    retries: int = 10,
     base_delay: float = 0.8,
-) -> Tuple[Optional[dict], Optional[int], Optional[str]]:
+    request_timeout: float = 30.0,
+    max_total_time: float = 180.0,
+    sem: asyncio.Semaphore = PD_SEM,
+) -> Tuple[Optional[dict], int, Optional[str]]:
     """
-    GET JSON + Retry auf 429/5xx.
-    Rückgabe: (payload_json, status_code, error_text)
+    Liefert (json_payload|None, http_status|0, error|None).
     """
-    import random
-
     delay = base_delay
+    t0 = time.monotonic()
+    last_err = None
+
     for attempt in range(1, retries + 1):
-        await pd_throttle(0.25)  # <= wichtig
+        if (time.monotonic() - t0) > max_total_time:
+            return None, 0, f"TIMEOUT(total) {label} after {attempt-1} attempts"
 
         try:
-            r = await client.get(url, headers=headers)
+            async with sem:
+                r = await asyncio.wait_for(
+                    client.get(url, headers=headers, timeout=request_timeout),
+                    timeout=request_timeout + 2.0,
+                )
+
             status = r.status_code
 
             if status == 200:
-                return (r.json() or {}), status, None
+                try:
+                    return r.json() or {}, status, None
+                except Exception as e:
+                    return None, status, f"JSON decode error: {e}"
 
-            if status == 404:
-                return None, status, r.text
+            if status in (400, 401, 403, 404):
+                return None, status, (r.text[:200] if r.text else f"HTTP {status}")
 
             if status == 429 or (500 <= status <= 599):
-                # Retry-After wenn vorhanden
-                ra = 0
-                try:
-                    ra = int(r.headers.get("Retry-After") or 0)
-                except Exception:
-                    ra = 0
-
-                sleep_for = ra if ra > 0 else delay + random.uniform(0, 0.25)
-                print(f"[{label}] HTTP {status} attempt {attempt}/{retries} -> sleep {sleep_for:.2f}s")
-                await asyncio.sleep(sleep_for)
-                delay = min(delay * 1.6, 8.0)
+                ra = _retry_after_seconds(r)
+                sleep_s = min(max(delay, ra) + random.uniform(0, 0.35), 30.0)
+                print(f"[pd_get_json_with_retry] {label} HTTP {status} attempt={attempt}/{retries} sleep={sleep_s:.2f}s")
+                await asyncio.sleep(sleep_s)
+                delay = min(delay * 1.8, 30.0)
                 continue
 
-            # andere Fehler -> begrenzt retry
-            print(f"[{label}] HTTP {status}: {r.text}")
-            await asyncio.sleep(delay)
-            delay = min(delay * 1.6, 8.0)
+            # sonstiger status -> konservativ retry
+            last_err = f"HTTP {status}: {(r.text or '')[:200]}"
+            await asyncio.sleep(min(delay + random.uniform(0, 0.2), 10.0))
+            delay = min(delay * 1.6, 30.0)
 
+        except asyncio.TimeoutError:
+            last_err = f"REQ_TIMEOUT({request_timeout}s)"
+            await asyncio.sleep(min(delay + random.uniform(0, 0.35), 10.0))
+            delay = min(delay * 1.8, 30.0)
         except Exception as e:
-            print(f"[{label}] Exception attempt {attempt}/{retries}: {e}")
-            await asyncio.sleep(delay)
-            delay = min(delay * 1.6, 8.0)
+            last_err = f"EXC: {e}"
+            await asyncio.sleep(min(delay + random.uniform(0, 0.35), 10.0))
+            delay = min(delay * 1.8, 30.0)
 
-    return None, None, f"retries_exhausted ({label})"
-
+    return None, 0, f"FAILED {label}: {last_err}"
 
 
 async def fetch_person_details_many(
     person_ids: List[str],
     *,
     job_obj=None,
-    concurrency: int = 8,
+    concurrency: int = 6,
     request_timeout: float = 25.0,
 ) -> Dict[str, dict]:
     if not person_ids:
@@ -1324,9 +1319,9 @@ async def fetch_person_details_many(
     client = http_client()
     local_sem = asyncio.Semaphore(concurrency)
 
+    results: Dict[str, dict] = {}
     total = len(person_ids)
     done = 0
-    results: Dict[str, dict] = {}
 
     start_pct = 25
     end_pct = 65
@@ -1340,29 +1335,28 @@ async def fetch_person_details_many(
 
     async def fetch_one(pid: str) -> None:
         nonlocal done
-
         async with local_sem:
-            url = f"{PIPEDRIVE_API}/persons/{pid}"
+            url = append_token(f"{PIPEDRIVE_API}/persons/{pid}")
 
-            try:
-                r = await pd_get_with_retry(
-                    client,
-                    url,
-                    None,                 # headers optional (alt kompatibel)
-                    label=f"person:{pid}",
-                    request_timeout=request_timeout,
-                    max_total_time=90.0,
-                )
+            payload, status, err = await pd_get_json_with_retry(
+                client,
+                url,
+                get_headers(),
+                label=f"person:{pid}",
+                retries=10,
+                base_delay=0.8,
+                request_timeout=request_timeout,
+                max_total_time=120.0
+            )
 
-                if r.status_code == 200:
-                    payload = r.json() or {}
-                    data = payload.get("data")
-                    if data:
-                        results[str(pid)] = data
-
-            except Exception as e:
-                if done < 5 or done % 50 == 0:
-                    print(f"[fetch_person_details_many] pid={pid} ERROR: {type(e).__name__}: {e}")
+            if status == 200 and payload:
+                data = payload.get("data")
+                if data:
+                    results[str(pid)] = data
+            else:
+                # sparsam loggen
+                if done < 5 or done % 100 == 0:
+                    print(f"[fetch_person_details_many] pid={pid} status={status} err={err}")
 
             done += 1
             if done % 10 == 0 or done == total:
@@ -1370,12 +1364,42 @@ async def fetch_person_details_many(
 
     bump_progress()
     await asyncio.gather(*(fetch_one(str(pid)) for pid in person_ids))
-
     if job_obj:
         job_obj.percent = max(job_obj.percent, end_pct)
         job_obj.phase = f"Lade Personendetails ({total}/{total})"
-
     return results
+
+
+async def fetch_person_details(person_ids: List[str], job_obj=None) -> List[dict]:
+    if not person_ids:
+        return []
+
+    lookup = await fetch_person_details_many(person_ids, job_obj=job_obj, concurrency=6)
+
+    missing = [str(pid) for pid in person_ids if str(pid) not in lookup]
+    print(f"[fetch_person_details] pass1 got={len(lookup)} missing={len(missing)}")
+
+    # 2. Pass: missing nochmal langsam (reduziert Zufall durch 429)
+    if missing:
+        if job_obj:
+            job_obj.phase = f"Nachladen fehlender Personendetails ({len(missing)})"
+            job_obj.percent = max(job_obj.percent, 66)
+        lookup2 = await fetch_person_details_many(missing, job_obj=job_obj, concurrency=2)
+        lookup.update(lookup2)
+
+        missing2 = [str(pid) for pid in person_ids if str(pid) not in lookup]
+        print(f"[fetch_person_details] pass2 added={len(lookup2)} still_missing={len(missing2)}")
+
+    ordered: List[dict] = []
+    for pid in person_ids:
+        p = lookup.get(str(pid))
+        if p:
+            ordered.append(p)
+    return ordered
+
+
+
+
 
 # -----------------------------------------------------------------------------
 # fehlende Organisation-IDs einzeln nachladen
@@ -1430,6 +1454,70 @@ async def fetch_org_details(org_ids: list[str]) -> dict[str, dict]:
 # -----------------------------------------------------------------------------
 import pandas as pd
 from typing import Dict, List
+NF_EXPORT_COLUMNS = [
+    "Batch ID",
+    "Channel",
+    "Cold-Mailing Import",
+    "Prospect ID",
+    "Organisation ID",
+    "Organisation Name",
+    "Person ID",
+    "Person Vorname",
+    "Person Nachname",
+    "Person Titel",
+    "Person Geschlecht",
+    "Person Position",
+    "Person E-Mail",
+    "XING Profil",
+    "LinkedIn URL",
+]
+
+def sanitize(v) -> str:
+    if v is None:
+        return ""
+    s = str(v)
+    return "" if s.lower() == "nan" else s.strip()
+
+def split_name(first: Optional[str], last: Optional[str], full: Optional[str]) -> tuple[str, str]:
+    first = (first or "").strip()
+    last = (last or "").strip()
+    if first or last:
+        return first, last
+    parts = (full or "").strip().split()
+    if not parts:
+        return "", ""
+    if len(parts) == 1:
+        return parts[0], ""
+    return parts[0], " ".join(parts[1:])
+
+def extract_org_id_from_person(p: dict) -> str:
+    org = p.get("org_id")
+    if isinstance(org, dict):
+        return sanitize(org.get("value") or org.get("id") or "")
+    return sanitize(org or "")
+
+async def fetch_orgs_bulk(org_ids: List[str], *, concurrency: int = 2) -> Dict[str, dict]:
+    if not org_ids:
+        return {}
+    client = http_client()
+    local_sem = asyncio.Semaphore(concurrency)
+    out: Dict[str, dict] = {}
+
+    async def one(oid: str):
+        async with local_sem:
+            url = append_token(f"{PIPEDRIVE_API}/organizations/{oid}")
+            payload, status, err = await pd_get_json_with_retry(client, url, get_headers(), label=f"org:{oid}", retries=10)
+            if status == 200 and payload:
+                data = payload.get("data")
+                if data:
+                    out[str(oid)] = data
+            elif status not in (404,):
+                # 404 ok (deleted)
+                pass
+
+    await asyncio.gather(*(one(str(x)) for x in org_ids))
+    return out
+
 async def _build_nf_master_final(
     selected: List[dict],
     campaign: str,
@@ -1437,27 +1525,18 @@ async def _build_nf_master_final(
     batch_id: Optional[str] = None,
     job_obj=None,
 ) -> pd.DataFrame:
-    """
-    Baut nf_master_final als DataFrame in einer Struktur, die später sauber in
-    NF_EXPORT_COLUMNS gemappt werden kann.
-
-    WICHTIG:
-    - Cold-Mailing Import = Kampagnenname (campaign)
-    - Prospect ID kommt aus Pipedrive (best effort: prospect_id/prospect/Custom-Field-Keys)
-    """
     if (not batch_id_label) and batch_id:
         batch_id_label = batch_id
 
-    # 1) Org IDs sammeln (für Lookup)
-    unique_org_ids: List[str] = []
-    seen: set[str] = set()
+    # Org Lookup (best effort)
+    unique_org_ids = []
+    seen = set()
     for p in selected:
         oid = extract_org_id_from_person(p)
         if oid and oid not in seen:
             seen.add(oid)
             unique_org_ids.append(oid)
 
-    # 2) Org Lookup (best effort, NICHT fatal)
     org_lookup: Dict[str, dict] = {}
     if unique_org_ids:
         try:
@@ -1469,18 +1548,13 @@ async def _build_nf_master_final(
             print(f"[NF][WARN] fetch_orgs_bulk failed: {type(e).__name__}: {e}")
             org_lookup = {}
 
-    def org_name_for_person(p: dict) -> str:
+    def org_name(p: dict) -> str:
         oid = extract_org_id_from_person(p)
         if oid and oid in org_lookup:
-            return sanitize(org_lookup[oid].get("name") or "")
-        # fallback (manchmal steckt name in org_id dict)
+            return sanitize(org_lookup[oid].get("name"))
         org = p.get("org_id")
         if isinstance(org, dict):
-            return sanitize(org.get("name") or "")
-        # fallback (manchmal steckt org als "organization")
-        org2 = p.get("organization")
-        if isinstance(org2, dict):
-            return sanitize(org2.get("name") or "")
+            return sanitize(org.get("name"))
         return ""
 
     def primary_email(p: dict) -> str:
@@ -1491,46 +1565,37 @@ async def _build_nf_master_final(
         return ""
 
     def best_effort_prospect_id(p: dict) -> str:
-        """
-        Prospect ID: kommt aus Pipedrive. Da Custom-Field-Keys je Setup anders sind,
-        versuchen wir mehrere Varianten.
-        """
-        # häufige Kandidaten
-        for k in ("prospect_id", "prospect", "Prospect ID", "prospectId", "prospectID"):
+        # 1) direkte keys
+        for k in ("prospect_id", "Prospect ID", "prospectId", "prospectID"):
             if k in p and p.get(k) not in (None, ""):
                 return sanitize(p.get(k))
-
-        # Custom fields: irgendwas, das "prospect" enthält
+        # 2) custom field keys enthalten oft "prospect"
         for k, v in (p or {}).items():
             if isinstance(k, str) and "prospect" in k.lower():
                 s = sanitize(v)
                 if s:
                     return s
-
         return ""
 
     rows: List[dict] = []
     for p in selected:
-        # Namen
-        first = sanitize(p.get("first_name") or "")
-        last = sanitize(p.get("last_name") or "")
-        full = sanitize(p.get("name") or "")
-        if (not first) and (not last):
-            first, last = split_name(None, None, full)
-
+        first, last = split_name(p.get("first_name"), p.get("last_name"), p.get("name"))
         rows.append({
-            # Template/Export-Felder
             "Batch ID": sanitize(batch_id_label),
             "Channel": sanitize(DEFAULT_CHANNEL),
-            "Cold-Mailing Import": sanitize(campaign),          # <- Kampagnenname
-            "Prospect ID": best_effort_prospect_id(p),          # <- aus Pipedrive
+
+            # ✅ so wie du willst
+            "Cold-Mailing Import": sanitize(campaign),
+
+            # ✅ aus Pipedrive Person
+            "Prospect ID": best_effort_prospect_id(p),
 
             "Organisation ID": extract_org_id_from_person(p),
-            "Organisation Name": org_name_for_person(p),
+            "Organisation Name": org_name(p),
 
             "Person ID": sanitize(p.get("id")),
-            "Person Vorname": first,
-            "Person Nachname": last,
+            "Person Vorname": sanitize(first),
+            "Person Nachname": sanitize(last),
             "Person Titel": sanitize(p.get("title") or ""),
             "Person Geschlecht": sanitize(p.get("gender") or ""),
             "Person Position": sanitize(p.get("job_title") or p.get("position") or ""),
@@ -1539,8 +1604,7 @@ async def _build_nf_master_final(
             "LinkedIn URL": sanitize(p.get("linkedin") or p.get("linkedin_url") or ""),
         })
 
-    df_final = pd.DataFrame(rows)
-    return df_final
+    return pd.DataFrame(rows)
 
 
 # =============================================================================
