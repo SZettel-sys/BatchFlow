@@ -639,13 +639,9 @@ async def get_person_field_by_hint(label_hint: str) -> Optional[dict]:
 async def fetch_orgs_bulk(
     org_ids: List[str],
     *,
-    concurrency: int = 6,
+    concurrency: int = 2,          # << wichtig runter
     request_timeout: float = 25.0,
 ) -> Dict[str, dict]:
-    """
-    Bulk-Loader für Organisationsdaten über /organizations/{id}.
-    Gibt Dict[str, dict] zurück: org_id -> org_data
-    """
     if not org_ids:
         return {}
 
@@ -667,24 +663,23 @@ async def fetch_orgs_bulk(
                     None,
                     label=f"org:{oid}",
                     request_timeout=request_timeout,
-                    max_total_time=90.0,
+                    max_total_time=180.0,   # org calls können zäher sein
                 )
                 if r.status_code == 200:
                     payload = r.json() or {}
                     data = payload.get("data")
                     if data:
                         results[str(oid)] = data
-                else:
-                    # sparsames logging
-                    if done < 5 or done % 100 == 0:
-                        print(f"[fetch_orgs_bulk] oid={oid} HTTP {r.status_code}")
+                elif r.status_code in (401, 403):
+                    print(f"[fetch_orgs_bulk] AUTH problem for org {oid}: HTTP {r.status_code}")
+                # 404 ok (org deleted), einfach überspringen
 
             except Exception as e:
-                if done < 5 or done % 100 == 0:
-                    print(f"[fetch_orgs_bulk] oid={oid} ERROR: {type(e).__name__}: {e}")
+                # Nicht crashen lassen, nur loggen
+                print(f"[fetch_orgs_bulk] oid={oid} ERROR: {type(e).__name__}: {e}")
 
             done += 1
-            if done % 100 == 0 or done == total:
+            if done % 50 == 0 or done == total:
                 print(f"[fetch_orgs_bulk] progress {done}/{total}")
 
     await asyncio.gather(*(fetch_one(str(oid)) for oid in org_ids))
@@ -1442,28 +1437,17 @@ async def _build_nf_master_final(
     selected: List[dict],
     campaign: str,
     batch_id_label: str = "",
-    batch_id: Optional[str] = None,   # backwards compatible
+    batch_id: Optional[str] = None,
     job_obj=None,
 ) -> pd.DataFrame:
-    """
-    Baut den finalen Nachfass-Master aus bereits geladenen Personendetails.
-    Füllt Organisation Name robust über org_lookup (bulk) + Fallback aus Person.
-    Speichert zusätzlich nf_excluded + nf_master_final.
-    """
-
-    # Backwards compatibility: allow old param name batch_id=
     if (not batch_id_label) and batch_id:
         batch_id_label = batch_id
 
-    # -------------------------------------------------------------
-    # Org-Lookup vorbereiten (bulk)
-    # -------------------------------------------------------------
+    # --- Org IDs sammeln
     unique_org_ids: List[str] = []
     seen = set()
     for p in selected:
         org_id = None
-
-        # Org ID robust suchen
         org = p.get("org_id")
         if isinstance(org, dict):
             org_id = org.get("value") or org.get("id")
@@ -1475,26 +1459,25 @@ async def _build_nf_master_final(
             seen.add(oid)
             unique_org_ids.append(oid)
 
+    # --- Org Lookup (best effort)
     org_lookup: Dict[str, dict] = {}
     if unique_org_ids:
-        if job_obj:
-            job_obj.phase = "Lade Organisationsdetails"
-            job_obj.percent = 55
-        org_lookup = await fetch_orgs_bulk(unique_org_ids)
+        try:
+            if job_obj:
+                job_obj.phase = f"Lade Organisationsdetails ({len(unique_org_ids)})"
+                job_obj.percent = max(job_obj.percent, 55)
 
-    print(f"[NF] org_lookup: {len(org_lookup)} orgs für {len(unique_org_ids)} org_ids")
-    if unique_org_ids:
-        sample_missing = [oid for oid in unique_org_ids[:30] if oid not in org_lookup]
-        if sample_missing:
-            print(f"[NF][DEBUG] Beispiel fehlende org_ids: {sample_missing[:10]}")
+            org_lookup = await fetch_orgs_bulk(unique_org_ids, concurrency=2)
 
-    # -------------------------------------------------------------
-    # Hilfsfunktionen
-    # -------------------------------------------------------------
+        except Exception as e:
+            # NICHT fatal
+            print(f"[NF][WARN] fetch_orgs_bulk failed: {type(e).__name__}: {e}")
+            org_lookup = {}
+
     def org_name_from_person(p: dict) -> str:
         org = p.get("org_id")
         if isinstance(org, dict):
-            return sanitize(org.get("name") or org.get("value") or "")
+            return sanitize(org.get("name") or "")
         return ""
 
     def org_name_from_lookup(p: dict) -> str:
@@ -1508,98 +1491,43 @@ async def _build_nf_master_final(
         oid = str(org_id).strip() if org_id is not None else ""
         if not oid:
             return ""
-
         o = org_lookup.get(oid)
-        if not o:
-            return ""
-        return sanitize(o.get("name") or "")
+        return sanitize(o.get("name") or "") if o else ""
 
     def primary_email(p: dict) -> str:
         emails = p.get("email") or []
         if isinstance(emails, list) and emails:
             e0 = emails[0]
-            if isinstance(e0, dict):
-                return sanitize(e0.get("value") or "")
-            return sanitize(str(e0))
+            return sanitize(e0.get("value") if isinstance(e0, dict) else str(e0))
         return ""
 
     def primary_phone(p: dict) -> str:
         phones = p.get("phone") or []
         if isinstance(phones, list) and phones:
             p0 = phones[0]
-            if isinstance(p0, dict):
-                return sanitize(p0.get("value") or "")
-            return sanitize(str(p0))
+            return sanitize(p0.get("value") if isinstance(p0, dict) else str(p0))
         return ""
 
-    # -------------------------------------------------------------
-    # Exclude-Logik (falls vorhanden)
-    # -------------------------------------------------------------
-    excluded_rows = []
-    included_rows = []
-
+    rows = []
     for p in selected:
-        # Flags / Kriterien (wie im Original)
-        nf_excluded = False
-        nf_excluded_reason = ""
-
-        # Beispiel: falls es in deinen Personendaten ein exclude-Flag gibt:
-        if p.get("nf_excluded") is True:
-            nf_excluded = True
-            nf_excluded_reason = sanitize(p.get("nf_excluded_reason") or "excluded")
-
-        # Organisation Name robust:
         org_name = org_name_from_lookup(p) or org_name_from_person(p)
 
-        row = {
+        rows.append({
             "Person ID": sanitize(p.get("id")),
             "Name": sanitize(p.get("name") or ""),
-            "Org Name": org_name,
-            "Org ID": sanitize(
+            "Organisation ID": sanitize(
                 (p.get("org_id") or {}).get("value")
                 if isinstance(p.get("org_id"), dict)
                 else p.get("org_id")
             ),
+            "Organisationsname": org_name,
             "Email": primary_email(p),
             "Phone": primary_phone(p),
-            "Owner ID": sanitize(
-                (p.get("owner_id") or {}).get("value")
-                if isinstance(p.get("owner_id"), dict)
-                else p.get("owner_id")
-            ),
             "Campaign": sanitize(campaign),
             "Batch ID": sanitize(batch_id_label),
-            "NF Excluded": nf_excluded,
-            "NF Excluded Reason": nf_excluded_reason,
-        }
+        })
 
-        if nf_excluded:
-            excluded_rows.append(row)
-        else:
-            included_rows.append(row)
-
-    df_excluded = pd.DataFrame(excluded_rows)
-    df_final = pd.DataFrame(included_rows)
-
-    # -------------------------------------------------------------
-    # Speichern (wie bei dir)
-    # -------------------------------------------------------------
-    try:
-        os.makedirs("exports", exist_ok=True)
-        excluded_path = os.path.join("exports", f"nf_excluded_{uuid.uuid4().hex[:8]}.xlsx")
-        final_path = os.path.join("exports", f"nf_master_final_{uuid.uuid4().hex[:8]}.xlsx")
-
-        if not df_excluded.empty:
-            df_excluded.to_excel(excluded_path, index=False)
-            print(f"[NF] Excluded gespeichert: {excluded_path}")
-
-        if not df_final.empty:
-            df_final.to_excel(final_path, index=False)
-            print(f"[NF] Master final gespeichert: {final_path}")
-
-    except Exception as e:
-        print(f"[NF][WARN] Konnte Debug-Exports nicht schreiben: {type(e).__name__}: {e}")
-
+    df_final = pd.DataFrame(rows)
     return df_final
 
 
@@ -1928,6 +1856,7 @@ async def run_nachfass_job(
         job_obj.error = f"{type(e).__name__}: {e}"
         job_obj.phase = "Fehler"
         job_obj.percent = 100
+        print(f"[NF][ERROR] Job failed: {job_obj.error}")
         raise
 
 
@@ -2545,7 +2474,16 @@ async function poll(job_id){
             return;
         }
 
-        done = s.done;
+        done = !!s.done;
+    }
+
+    // Defensive: final check
+    const res2 = await fetch('/nachfass/export_progress?job_id=' + job_id);
+    const s2 = await res2.json();
+    if (s2.error){
+        alert(s2.error);
+        hideOverlay();
+        return;
     }
 
     showOverlay("Download startet …");
@@ -2556,6 +2494,7 @@ async function poll(job_id){
     await loadExcludedTable();
     hideOverlay();
 }
+
 
 // ---------------------------------------------------------------------------
 // Export Start
@@ -2944,12 +2883,17 @@ async def nachfass_export_progress(job_id: str):
     if not job:
         return JSONResponse({"error": "Job nicht gefunden"}, status_code=404)
 
+    has_file = bool(getattr(job, "path", None))
+
     return JSONResponse({
         "phase": str(job.phase),
         "percent": int(job.percent),
         "done": bool(job.done),
-        "error": str(job.error) if job.error else None
+        "error": str(job.error) if job.error else None,
+        "has_file": has_file,
+        "download_ready": bool(job.done) and (job.error is None) and has_file
     })
+
 
 
 # =============================================================================
@@ -2986,7 +2930,13 @@ async def debug_pd_person(pid: int):
 @app.get("/nachfass/export_download")
 async def nachfass_export_download(job_id: str):
     job = JOBS.get(job_id)
-    if not job or not job.path:
+    if not job:
+        return JSONResponse({"error": "Job nicht gefunden"}, status_code=404)
+
+    if job.error:
+        return JSONResponse({"error": job.error}, status_code=400)
+
+    if not getattr(job, "path", None):
         return JSONResponse({"error": "Keine Datei gefunden"}, status_code=404)
 
     return FileResponse(
