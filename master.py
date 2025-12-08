@@ -747,56 +747,59 @@ async def stream_person_ids_by_filter(
     filter_id: int,
     page_limit: int = PAGE_LIMIT,
     *,
-    max_pages: int = 2000,            # Notbremse gegen Endlosschleifen
-    max_total_time: float = 180.0,    # Notbremse (Sekunden) pro Filter-Scan
+    max_pages: int = 5000,
+    max_total_time: float = 600.0,
 ) -> AsyncGenerator[List[str], None]:
     """
-    Streamt Person-IDs eines Pipedrive-Filters seitenweise (v2 organizations/persons listing style).
-    Fix gegen "Hängen":
-      - bricht ab wenn cursor sich wiederholt
-      - bricht ab nach max_total_time / max_pages
-      - liefert immer wieder chunks (damit Job Fortschritt machen kann)
-      - häufigeres Heartbeat-Logging + elapsed time
+    Streamt Person-IDs eines Pipedrive-Filters seitenweise (API v2, cursor).
+    Robust gegen 429/5xx + Auth + Schutz gegen Endlosschleifen.
+
+    Yield: List[str] von Person-IDs pro Seite.
     """
     client = http_client()
     cursor: Optional[str] = None
-    seen_cursors = set()
+    seen_cursors: set[str] = set()
     page = 0
     started = time.monotonic()
 
     while True:
         # Notbremse Zeit
         if (time.monotonic() - started) > max_total_time:
-            print(
-                f"[stream_person_ids_by_filter] ABORT: max_total_time={max_total_time}s reached for filter={filter_id}"
-            )
+            print(f"[stream_person_ids_by_filter] ABORT max_total_time={max_total_time}s filter={filter_id}")
             break
 
         # Notbremse Seiten
         page += 1
         if page > max_pages:
-            print(f"[stream_person_ids_by_filter] ABORT: max_pages={max_pages} reached for filter={filter_id}")
+            print(f"[stream_person_ids_by_filter] ABORT max_pages={max_pages} filter={filter_id}")
             break
 
-        base = f"{PD_BASE}/persons"
-        params = {
-            "filter_id": int(filter_id),
-            "limit": int(page_limit),
-        }
+        base = (
+            f"{PIPEDRIVE_API}/persons"
+            f"?filter_id={int(filter_id)}"
+            f"&limit={int(page_limit)}"
+            f"&sort_by=id&sort_direction=asc"
+        )
+        url = append_token(base)
         if cursor:
-            params["cursor"] = cursor
+            url += f"&cursor={cursor}"
 
-        r = await client.get(base, params=params)
-        status = r.status_code
+        payload, status, err = await pd_get_json_with_retry(
+            client,
+            url,
+            get_headers(),                    # wird bei OAuth gesetzt, sonst {} (append_token übernimmt)
+            label=f"person_ids_filter[{filter_id}]",
+            retries=12,
+            base_delay=0.8,
+        )
 
-        if status >= 400:
-            print(f"[stream_person_ids_by_filter] HTTP {status} for filter={filter_id}: {r.text}")
+        if status != 200 or not payload:
+            print(f"[stream_person_ids_by_filter] WARN status={status} filter={filter_id} err={err}")
             break
 
-        payload = r.json() or {}
         data = payload.get("data") or []
         if not data:
-            print(f"[stream_person_ids_by_filter] DONE: no data for filter={filter_id} page={page}")
+            print(f"[stream_person_ids_by_filter] DONE no data filter={filter_id} page={page}")
             break
 
         ids: List[str] = []
@@ -806,7 +809,6 @@ async def stream_person_ids_by_filter(
                 ids.append(str(pid))
 
         if ids:
-            # Heartbeat (damit man sieht: es läuft) — häufiger + elapsed
             if page == 1 or page % 2 == 0:
                 elapsed = time.monotonic() - started
                 print(
@@ -815,19 +817,15 @@ async def stream_person_ids_by_filter(
                 )
             yield ids
 
-        # Pagination cursor lesen (Pipedrive v2-style: additional_data.next_cursor)
         additional = payload.get("additional_data") or {}
-        next_cursor = additional.get("next_cursor") or additional.get("pagination", {}).get("next_cursor")
+        next_cursor = additional.get("next_cursor") or (additional.get("pagination") or {}).get("next_cursor")
 
         if not next_cursor:
-            print(f"[stream_person_ids_by_filter] DONE: no next_cursor for filter={filter_id} page={page}")
+            print(f"[stream_person_ids_by_filter] DONE no next_cursor filter={filter_id} page={page}")
             break
 
-        # Schutz: Cursor darf sich nicht wiederholen
         if next_cursor in seen_cursors:
-            print(
-                f"[stream_person_ids_by_filter] ABORT: cursor repeated for filter={filter_id}. next_cursor={next_cursor}"
-            )
+            print(f"[stream_person_ids_by_filter] ABORT cursor repeated filter={filter_id} cursor={next_cursor}")
             break
 
         seen_cursors.add(next_cursor)
@@ -1439,126 +1437,110 @@ async def _build_nf_master_final(
     batch_id: Optional[str] = None,
     job_obj=None,
 ) -> pd.DataFrame:
+    """
+    Baut nf_master_final als DataFrame in einer Struktur, die später sauber in
+    NF_EXPORT_COLUMNS gemappt werden kann.
+
+    WICHTIG:
+    - Cold-Mailing Import = Kampagnenname (campaign)
+    - Prospect ID kommt aus Pipedrive (best effort: prospect_id/prospect/Custom-Field-Keys)
+    """
     if (not batch_id_label) and batch_id:
         batch_id_label = batch_id
 
-    # --- Org IDs sammeln (robust)
+    # 1) Org IDs sammeln (für Lookup)
     unique_org_ids: List[str] = []
-    seen = set()
+    seen: set[str] = set()
     for p in selected:
-        org_id = None
-        org = p.get("org_id")
-        if isinstance(org, dict):
-            org_id = org.get("value") or org.get("id")
-        elif org is not None:
-            org_id = org
-
-        oid = str(org_id).strip() if org_id is not None else ""
+        oid = extract_org_id_from_person(p)
         if oid and oid not in seen:
             seen.add(oid)
             unique_org_ids.append(oid)
 
-    # --- Org Lookup (best effort)
+    # 2) Org Lookup (best effort, NICHT fatal)
     org_lookup: Dict[str, dict] = {}
     if unique_org_ids:
         try:
             if job_obj:
                 job_obj.phase = f"Lade Organisationsdetails ({len(unique_org_ids)})"
                 job_obj.percent = max(job_obj.percent, 55)
-
             org_lookup = await fetch_orgs_bulk(unique_org_ids, concurrency=2)
-
         except Exception as e:
             print(f"[NF][WARN] fetch_orgs_bulk failed: {type(e).__name__}: {e}")
             org_lookup = {}
 
-    def org_id_from_person(p: dict) -> str:
-        org = p.get("org_id")
-        if isinstance(org, dict):
-            return sanitize(org.get("value") or org.get("id") or "")
-        return sanitize(org or "")
-
-    def org_name_from_person(p: dict) -> str:
+    def org_name_for_person(p: dict) -> str:
+        oid = extract_org_id_from_person(p)
+        if oid and oid in org_lookup:
+            return sanitize(org_lookup[oid].get("name") or "")
+        # fallback (manchmal steckt name in org_id dict)
         org = p.get("org_id")
         if isinstance(org, dict):
             return sanitize(org.get("name") or "")
+        # fallback (manchmal steckt org als "organization")
+        org2 = p.get("organization")
+        if isinstance(org2, dict):
+            return sanitize(org2.get("name") or "")
         return ""
-
-    def org_name_from_lookup(p: dict) -> str:
-        oid = org_id_from_person(p)
-        if not oid:
-            return ""
-        o = org_lookup.get(oid)
-        return sanitize(o.get("name") or "") if o else ""
 
     def primary_email(p: dict) -> str:
         emails = p.get("email") or []
         if isinstance(emails, list) and emails:
             e0 = emails[0]
-            return sanitize(e0.get("value") if isinstance(e0, dict) else str(e0))
+            return sanitize(e0.get("value") if isinstance(e0, dict) else e0)
         return ""
 
-    def split_first_last(p: dict) -> tuple[str, str]:
-        first = p.get("first_name")
-        last = p.get("last_name")
-        full = p.get("name")
-        return split_name(first, last, full)
-
-    def gender_label(p: dict) -> str:
-        # wenn du ein Feld hast, das direkt "gender" liefert:
-        v = p.get("gender")
-        if isinstance(v, dict):
-            v = v.get("value")
-        v = sanitize(v)
-        # falls numerisch (custom option id), mappe:
-        return GENDER_OPTION_MAP.get(v, v)
-
-    def xing(p: dict) -> str:
-        # v2: häufig custom field; hier best effort anhand vorhandener keys
-        for k in ("xing", "xing_url", "xing profil", "xing profile"):
-            if k in p:
+    def best_effort_prospect_id(p: dict) -> str:
+        """
+        Prospect ID: kommt aus Pipedrive. Da Custom-Field-Keys je Setup anders sind,
+        versuchen wir mehrere Varianten.
+        """
+        # häufige Kandidaten
+        for k in ("prospect_id", "prospect", "Prospect ID", "prospectId", "prospectID"):
+            if k in p and p.get(k) not in (None, ""):
                 return sanitize(p.get(k))
+
+        # Custom fields: irgendwas, das "prospect" enthält
+        for k, v in (p or {}).items():
+            if isinstance(k, str) and "prospect" in k.lower():
+                s = sanitize(v)
+                if s:
+                    return s
+
         return ""
 
-    def linkedin(p: dict) -> str:
-        for k in ("linkedin", "linkedin_url", "linkedin url"):
-            if k in p:
-                return sanitize(p.get(k))
-        return ""
-
-    def title(p: dict) -> str:
-        # häufig "title" oder custom field
-        return sanitize(p.get("title") or "")
-
-    def position(p: dict) -> str:
-        return sanitize(p.get("job_title") or p.get("position") or "")
-
-    rows = []
+    rows: List[dict] = []
     for p in selected:
-        first, last = split_first_last(p)
-        oid = org_id_from_person(p)
-        oname = org_name_from_lookup(p) or org_name_from_person(p)
+        # Namen
+        first = sanitize(p.get("first_name") or "")
+        last = sanitize(p.get("last_name") or "")
+        full = sanitize(p.get("name") or "")
+        if (not first) and (not last):
+            first, last = split_name(None, None, full)
 
         rows.append({
+            # Template/Export-Felder
             "Batch ID": sanitize(batch_id_label),
             "Channel": sanitize(DEFAULT_CHANNEL),
-            "Cold-Mailing Import": "",                 # falls du hier etwas setzen willst, hier rein
-            "Prospect ID": "",                         # falls du das aus custom fields hast, hier rein
-            "Organisation ID": sanitize(oid),
-            "Organisation Name": sanitize(oname),
+            "Cold-Mailing Import": sanitize(campaign),          # <- Kampagnenname
+            "Prospect ID": best_effort_prospect_id(p),          # <- aus Pipedrive
+
+            "Organisation ID": extract_org_id_from_person(p),
+            "Organisation Name": org_name_for_person(p),
+
             "Person ID": sanitize(p.get("id")),
-            "Person Vorname": sanitize(first),
-            "Person Nachname": sanitize(last),
-            "Person Titel": title(p),
-            "Person Geschlecht": gender_label(p),
-            "Person Position": position(p),
+            "Person Vorname": first,
+            "Person Nachname": last,
+            "Person Titel": sanitize(p.get("title") or ""),
+            "Person Geschlecht": sanitize(p.get("gender") or ""),
+            "Person Position": sanitize(p.get("job_title") or p.get("position") or ""),
             "Person E-Mail": primary_email(p),
-            "XING Profil": xing(p),
-            "LinkedIn URL": linkedin(p),
+            "XING Profil": sanitize(p.get("xing") or p.get("xing_url") or ""),
+            "LinkedIn URL": sanitize(p.get("linkedin") or p.get("linkedin_url") or ""),
         })
 
-    return pd.DataFrame(rows)
-
+    df_final = pd.DataFrame(rows)
+    return df_final
 
 
 # =============================================================================
@@ -1761,6 +1743,7 @@ async def _reconcile(prefix: str) -> None:
 
 import asyncio
 from typing import List, Optional
+
 async def run_nachfass_job(
     job_obj,
     job_id: str,
@@ -1769,13 +1752,13 @@ async def run_nachfass_job(
     nf_batch_ids: Optional[List[str]] = None,
 ):
     """
-    Orchestriert den Export-Job:
-    - IDs sammeln (Batch-IDs bevorzugt, Filter als Fallback)
-    - Personendetails laden
-    - Master bauen (nf_master_final schreiben)
-    - _reconcile("nf") -> nf_master_ready + nf_delete_log
-    - Excel aus nf_master_ready bauen
-    - Jobstatus sauber setzen
+    Nachfass-Job:
+      1) Personen-IDs sammeln (Batch bevorzugt)
+      2) Personendetails laden (mit Retry/2. Pass)
+      3) nf_master_final bauen
+      4) nf_master_final in DB speichern
+      5) _reconcile("nf") -> nf_master_ready + nf_delete_log
+      6) Excel aus nf_master_ready bauen + speichern
     """
     try:
         # ---------------------------------------------------------
@@ -1850,55 +1833,48 @@ async def run_nachfass_job(
             job_obj.percent = 100
             return
 
-        loaded_ids = {str(p.get("id")) for p in details if p.get("id") is not None}
-        missing_details = [pid for pid in person_ids if str(pid) not in loaded_ids]
-        print(
-            f"[NF] requested_ids={len(person_ids)} loaded_details={len(details)} "
-            f"missing_details={len(missing_details)}"
-        )
-
         # ---------------------------------------------------------
-        # C) Master bauen
+        # C) nf_master_final bauen
         # ---------------------------------------------------------
         job_obj.phase = "Baue Master (nf_master_final)"
         job_obj.percent = 70
 
-        master_df = await _build_nf_master_final(
+        master_final = await _build_nf_master_final(
             details,
             campaign=campaign,
             batch_id_label=",".join([str(x) for x in (nf_batch_ids or [])]) if nf_batch_ids else "",
             job_obj=job_obj,
         )
 
-        # nf_master_final schreiben
-        job_obj.phase = "Schreibe DB: nf_master_final"
+        # ---------------------------------------------------------
+        # D) nf_master_final speichern
+        # ---------------------------------------------------------
+        job_obj.phase = "Speichere Master (DB)"
         job_obj.percent = 78
-        await save_df_text(master_df, "nf_master_final")
+
+        await save_df_text(master_final, tables("nf")["final"])
 
         # ---------------------------------------------------------
-        # D) Abgleich -> nf_master_ready + nf_delete_log
+        # E) Abgleich -> nf_master_ready + nf_delete_log
         # ---------------------------------------------------------
         job_obj.phase = "Abgleich (nf -> ready/log)"
         job_obj.percent = 82
+
         await _reconcile("nf")
 
-        # ready laden (das ist dann die “finale Auswahl”)
-        job_obj.phase = "Lade DB: nf_master_ready"
-        job_obj.percent = 86
-        ready_df = await load_df_text("nf_master_ready")
-
         # ---------------------------------------------------------
-        # E) Excel schreiben (aus READY!)
+        # F) Excel aus nf_master_ready
         # ---------------------------------------------------------
-        job_obj.phase = "Baue Excel-Export"
+        job_obj.phase = "Erzeuge Excel"
         job_obj.percent = 90
 
-        export_df = build_nf_export(ready_df)
+        ready = await load_df_text(tables("nf")["ready"])
+        export_df = build_nf_export(ready)   # garantiert alle Spalten
 
         out_path = export_to_excel(export_df, prefix="nachfass_export", job_id=job_id)
-
         job_obj.path = out_path
         job_obj.filename_base = job_obj.filename_base or "Nachfass_Export"
+
         job_obj.error = None
         job_obj.phase = "Fertig"
         job_obj.percent = 100
