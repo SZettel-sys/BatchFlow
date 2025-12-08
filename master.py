@@ -57,6 +57,24 @@ PER_ORG_DEFAULT_LIMIT = int(os.getenv("PER_ORG_DEFAULT_LIMIT", "2"))
 MAX_ORG_NAMES = int(os.getenv("MAX_ORG_NAMES", "1000"))
 MAX_ORG_BUCKET = int(os.getenv("MAX_ORG_BUCKET", "200"))
 
+# --- Pipedrive Person Custom Field Keys (fix) ---
+PD_PERSON_FIELDS = {
+    "Batch ID": "5ac34dad3ea917fdef4087caebf77ba275f87eec",
+    "Prospect ID": "f9138f9040c44622808a4b8afda2b1b75ee5acd0",
+    "Person Geschlecht": "c4f5f434cdb0cfce3f6d62ec7291188fe968ac72",
+    "Person Titel": "0343bc43a91159aaf33a463ca603dc5662422ea5",
+    "Person Position": "4585e5de11068a3bccf02d8b93c126bcf5c257ff",
+    "XING Profil": "44ebb6feae2a670059bc5261001443a2878a2b43",
+    "LinkedIn URL": "25563b12f847a280346bba40deaf527af82038cc",
+    # Achtung: Büro-Email ist bei dir "email" (Standardfeld), kein custom key
+}
+
+# --- Organisation Custom Field Keys (fix) ---
+PD_ORG_FIELDS = {
+    "Organisationsart": "0ab03885d6792086a0bb007d6302d14b13b0c7d1",
+    "Organisation Vertriebsstop": "61d238b86784db69f7300fe8f12f54c601caeff8",
+}
+
 # -----------------------------------------------------------------------------
 # Cache-Strukturen
 # -----------------------------------------------------------------------------
@@ -191,7 +209,55 @@ async def _get_with_retries(client, url: str, sem: asyncio.Semaphore, label: str
             delay = min(delay * 2, max_delay)
 
     return None, last_err
-                                
+
+def _val(obj, key: str) -> str:
+    """
+    Robust: liest obj[key] und macht daraus einen String.
+    Pipedrive Custom Fields können str/int, dict, list sein.
+    """
+    if not obj or not key:
+        return ""
+
+    v = obj.get(key)
+
+    if v is None:
+        return ""
+
+    if isinstance(v, dict):
+        # häufig {"value": "..."} oder option dict
+        if "value" in v:
+            return sanitize(v.get("value"))
+        if "label" in v:
+            return sanitize(v.get("label"))
+        if "name" in v:
+            return sanitize(v.get("name"))
+        return sanitize(str(v))
+
+    if isinstance(v, list):
+        # multi-select o.Ä.
+        if not v:
+            return ""
+        first = v[0]
+        if isinstance(first, dict):
+            return sanitize(first.get("value") or first.get("label") or first.get("name") or str(first))
+        return sanitize(str(first))
+
+    return sanitize(v)
+
+def _primary_email(p: dict) -> str:
+    v = p.get("email")
+    # häufig: [{"label": "...", "value": "..."}]
+    if isinstance(v, list) and v:
+        e0 = v[0]
+        if isinstance(e0, dict):
+            return sanitize(e0.get("value") or e0.get("email") or "")
+        return sanitize(e0)
+    if isinstance(v, str):
+        return sanitize(v)
+    return ""
+
+
+
 import random
 import asyncio
 from typing import Optional, Tuple
@@ -1529,85 +1595,18 @@ async def _build_nf_master_final(
     batch_id: Optional[str] = None,
     job_obj=None,
 ) -> pd.DataFrame:
-    """
-    Baut den Nachfass-Master im Template-Format (NF_EXPORT_COLUMNS/TEMPLATE_COLUMNS).
-    - Cold-Mailing Import = Kampagnenname (campaign)
-    - Prospect ID kommt aus Pipedrive (Custom Field, per Hints "prospect")
-    - Org Name wird über Bulk-Org-Lookup ergänzt (best effort)
-    """
-
     if (not batch_id_label) and batch_id:
         batch_id_label = batch_id
 
-    # -----------------------------
-    # helpers (lokal, robust)
-    # -----------------------------
-    def _first_email(p: dict) -> str:
-        emails = p.get("email") or []
-        if isinstance(emails, list) and emails:
-            e0 = emails[0]
-            return sanitize(e0.get("value") if isinstance(e0, dict) else e0)
-        return ""
-
-    def _pick_custom_field_value(p: dict, hints_to_col: Dict[str, str], wanted_col: str) -> str:
-        """
-        Sucht in allen Feldern der Person nach einem Hint,
-        der auf wanted_col gemappt ist (z.B. "prospect" -> "Prospect ID").
-        """
-        for k, v in (p or {}).items():
-            # nur Custom-Fields typischerweise als "uuid-like keys" oder unbekannte keys,
-            # aber wir gehen pragmatisch über alle values
-            if k is None:
-                continue
-            key_l = str(k).lower()
-
-            # Hint match?
-            mapped = None
-            for hint, colname in hints_to_col.items():
-                if hint in key_l:
-                    mapped = colname
-                    break
-
-            if mapped != wanted_col:
-                continue
-
-            # Value extrahieren (dict/list/string)
-            if isinstance(v, dict):
-                return sanitize(v.get("value") or v.get("id") or v.get("name") or v.get("label"))
-            if isinstance(v, list):
-                return sanitize(v[0] if v else "")
-            return sanitize(v)
-
-        return ""
-
-    def _org_id_from_person(p: dict) -> str:
-        # robust: org_id kann dict oder int sein
-        org = p.get("org_id")
-        if isinstance(org, dict):
-            return sanitize(org.get("value") or org.get("id"))
-        return sanitize(org)
-
-    def _org_name_from_person_embedded(p: dict) -> str:
-        # manchmal ist name im dict enthalten
-        org = p.get("org_id")
-        if isinstance(org, dict):
-            return sanitize(org.get("name") or "")
-        return ""
-
-    # -----------------------------
-    # Org IDs sammeln
-    # -----------------------------
+    # Org IDs sammeln für Lookup (Name kommt aus Org-Tabelle)
     unique_org_ids: List[str] = []
     seen = set()
     for p in selected:
-        oid = _org_id_from_person(p)
+        oid = extract_org_id_from_person(p)
         if oid and oid not in seen:
             seen.add(oid)
             unique_org_ids.append(oid)
 
-    # -----------------------------
-    # Org Lookup (best effort)
-    # -----------------------------
     org_lookup: Dict[str, dict] = {}
     if unique_org_ids:
         try:
@@ -1619,70 +1618,57 @@ async def _build_nf_master_final(
             print(f"[NF][WARN] fetch_orgs_bulk failed: {type(e).__name__}: {e}")
             org_lookup = {}
 
-    def _org_name_from_lookup(p: dict) -> str:
-        oid = _org_id_from_person(p)
-        if not oid:
-            return ""
-        o = org_lookup.get(str(oid))
-        return sanitize((o or {}).get("name") or "")
+    def org_name(p: dict) -> str:
+        oid = extract_org_id_from_person(p)
+        if oid and oid in org_lookup:
+            return sanitize(org_lookup[oid].get("name") or "")
+        # fallback falls in person embedded
+        org = p.get("org_id")
+        if isinstance(org, dict):
+            return sanitize(org.get("name") or "")
+        return ""
 
-    # -----------------------------
-    # rows bauen (Template-Spalten!)
-    # -----------------------------
     rows: List[dict] = []
-
     for p in selected:
-        # Name splitten (Pipedrive liefert oft name + first_name/last_name)
-        first = sanitize(p.get("first_name") or "")
-        last = sanitize(p.get("last_name") or "")
-        full = sanitize(p.get("name") or "")
-        if not first and not last:
-            first, last = split_name(first or None, last or None, full or None)
-
-        org_id = _org_id_from_person(p)
-        org_name = _org_name_from_lookup(p) or _org_name_from_person_embedded(p)
-
-        prospect_id = _pick_custom_field_value(
-            p,
-            PERSON_FIELD_HINTS_TO_EXPORT,   # mapping hints -> zielspalte
-            "Prospect ID"
-        )
+        first, last = split_name(p.get("first_name"), p.get("last_name"), p.get("name"))
 
         row = {
-            "Batch ID": sanitize(batch_id_label),
+            "Batch ID": sanitize(batch_id_label) or _val(p, PD_PERSON_FIELDS["Batch ID"]),
             "Channel": sanitize(DEFAULT_CHANNEL),
-            "Cold-Mailing Import": sanitize(campaign),     # <- Kampagnenname
-            "Prospect ID": sanitize(prospect_id),          # <- aus Pipedrive
-            "Organisation ID": sanitize(org_id),
-            "Organisation Name": sanitize(org_name),
+
+            # Wunsch: campaign name in Cold-Mailing Import
+            "Cold-Mailing Import": sanitize(campaign),
+
+            # Prospect ID aus Custom Field Key
+            "Prospect ID": _val(p, PD_PERSON_FIELDS["Prospect ID"]),
+
+            "Organisation ID": extract_org_id_from_person(p),
+            "Organisation Name": org_name(p),
+
             "Person ID": sanitize(p.get("id")),
             "Person Vorname": sanitize(first),
             "Person Nachname": sanitize(last),
-            "Person Titel": sanitize(p.get("title") or ""),
-            "Person Geschlecht": sanitize(p.get("gender") or ""),
-            "Person Position": sanitize(p.get("job_title") or p.get("position") or ""),
-            "Person E-Mail": sanitize(_first_email(p)),
-            "XING Profil": sanitize(p.get("xing") or p.get("xing_url") or ""),
-            "LinkedIn URL": sanitize(p.get("linkedin") or p.get("linkedin_url") or ""),
+
+            # Custom fields über Keys
+            "Person Titel": _val(p, PD_PERSON_FIELDS["Person Titel"]),
+            "Person Geschlecht": _val(p, PD_PERSON_FIELDS["Person Geschlecht"]),
+            "Person Position": _val(p, PD_PERSON_FIELDS["Person Position"]),
+
+            # Standardfeld
+            "Person E-Mail": _primary_email(p),
+
+            # Custom fields über Keys
+            "XING Profil": _val(p, PD_PERSON_FIELDS["XING Profil"]),
+            "LinkedIn URL": _val(p, PD_PERSON_FIELDS["LinkedIn URL"]),
         }
 
         rows.append(row)
 
     df = pd.DataFrame(rows)
 
-    # -----------------------------
-    # Spalten sicher in korrekter Reihenfolge bereitstellen
-    # -----------------------------
-    # (damit Excel/DB nie "Spalten fehlen")
-    if "NF_EXPORT_COLUMNS" in globals():
-        df = build_nf_export(df)  # füllt fehlende Spalten mit ""
-    else:
-        # fallback: mindestens Template Columns
-        want = TEMPLATE_COLUMNS if "TEMPLATE_COLUMNS" in globals() else list(df.columns)
-        for c in want:
-            if c not in df.columns:
-                df[c] = ""
-        df = df[want]
+    # Spalten erzwingen (falls du build_nf_export hast)
+    if "build_nf_export" in globals():
+        df = build_nf_export(df)
 
     return df
 
