@@ -809,9 +809,16 @@ async def stream_person_ids_by_filter(
     filter_id: int,
     page_limit: int = PAGE_LIMIT,
     *,
-    max_pages: int = 5000,
-    max_total_time: float = 600.0,
+    max_pages: int = 2000,
+    max_total_time: float = 180.0,
 ) -> AsyncGenerator[List[str], None]:
+    """
+    Streamt Person-IDs eines Pipedrive-Filters seitenweise (v2).
+    Fix:
+      - nutzt PIPEDRIVE_API statt PD_BASE
+      - nutzt pd_get_with_retry + Auth (OAuth/api_token)
+      - Cursor-Schutz + Notbremsen
+    """
     client = http_client()
     cursor: Optional[str] = None
     seen_cursors: set[str] = set()
@@ -820,53 +827,64 @@ async def stream_person_ids_by_filter(
 
     while True:
         if (time.monotonic() - started) > max_total_time:
-            print(f"[stream_person_ids_by_filter] ABORT max_total_time={max_total_time}s filter={filter_id}")
+            print(f"[stream_person_ids_by_filter] ABORT: max_total_time={max_total_time}s filter={filter_id}")
             break
 
         page += 1
         if page > max_pages:
-            print(f"[stream_person_ids_by_filter] ABORT max_pages={max_pages} filter={filter_id}")
+            print(f"[stream_person_ids_by_filter] ABORT: max_pages={max_pages} filter={filter_id}")
             break
 
-        base = f"{PIPEDRIVE_API}/persons?filter_id={int(filter_id)}&limit={int(page_limit)}&sort_by=id&sort_direction=asc"
-        url = append_token(base)
+        base = f"{PIPEDRIVE_API}/persons?filter_id={int(filter_id)}&limit={int(page_limit)}"
         if cursor:
-            url += f"&cursor={cursor}"
+            base += f"&cursor={cursor}"
 
-        payload, status, err = await pd_get_json_with_retry(
+        # Auth zentral (OAuth oder api_token)
+        url = append_token(base) if not get_headers().get("Authorization") else base
+
+        r = await pd_get_with_retry(
             client,
             url,
-            get_headers(),
+            None,
             label=f"persons_filter[{filter_id}]",
-            retries=12,
-            base_delay=0.8,
-            max_total_time=180.0,
+            request_timeout=25.0,
+            max_total_time=120.0,
         )
 
-        if status != 200 or not payload:
-            print(f"[stream_person_ids_by_filter] WARN status={status} filter={filter_id} err={err}")
+        if r.status_code != 200:
+            print(f"[stream_person_ids_by_filter] HTTP {r.status_code} filter={filter_id}: {r.text[:300]}")
             break
 
+        payload = r.json() or {}
         data = payload.get("data") or []
         if not data:
+            print(f"[stream_person_ids_by_filter] DONE: no data filter={filter_id} page={page}")
             break
 
-        ids = [str(p.get("id")) for p in data if p.get("id") is not None]
+        ids: List[str] = []
+        for p in data:
+            pid = p.get("id")
+            if pid is not None:
+                ids.append(str(pid))
+
         if ids:
+            if page == 1 or page % 2 == 0:
+                elapsed = time.monotonic() - started
+                print(f"[stream_person_ids_by_filter] filter={filter_id} page={page} ids_in_page={len(ids)} cursor={cursor} elapsed={elapsed:.1f}s")
             yield ids
 
         additional = payload.get("additional_data") or {}
         next_cursor = additional.get("next_cursor") or (additional.get("pagination") or {}).get("next_cursor")
-
         if not next_cursor:
+            print(f"[stream_person_ids_by_filter] DONE: no next_cursor filter={filter_id} page={page}")
             break
+
         if next_cursor in seen_cursors:
-            print(f"[stream_person_ids_by_filter] ABORT cursor repeated filter={filter_id} cursor={next_cursor}")
+            print(f"[stream_person_ids_by_filter] ABORT: cursor repeated filter={filter_id} next_cursor={next_cursor}")
             break
 
         seen_cursors.add(next_cursor)
         cursor = next_cursor
-
 
 # =============================================================================
 # Organisationen – Bucketing + Kappung (Performanceoptimiert)
@@ -1090,6 +1108,59 @@ def sanitize(v: Any) -> str:
     if isinstance(v, list):
         return sanitize(v[0]) if v else ""
     return str(v)
+
+def _extract_custom_fields_blob(p: dict) -> dict:
+    """
+    V2/v1-mischform sicher:
+    - manchmal sind custom field keys direkt auf p (top-level)
+    - manchmal unter p["custom_fields"] (dict oder liste)
+    - manchmal liefert search-shape andere verschachtelungen
+    Ergebnis: dict(key -> value)
+    """
+    if not isinstance(p, dict):
+        return {}
+
+    blob: dict = {}
+
+    # 1) Falls "custom_fields" als dict
+    cf = p.get("custom_fields")
+    if isinstance(cf, dict):
+        blob.update(cf)
+
+    # 2) Falls "custom_fields" als Liste (seltene Shapes)
+    if isinstance(cf, list):
+        # try: [{key:..., value:...}] oder ähnliches
+        for it in cf:
+            if isinstance(it, dict):
+                k = it.get("key") or it.get("id")
+                if k:
+                    blob[str(k)] = it.get("value")
+
+    # 3) Zusätzlich: top-level keys, die wie field-keys aussehen
+    # (deine Keys sind lange Hex-Strings)
+    for k, v in p.items():
+        if isinstance(k, str) and len(k) >= 16 and all(ch in "0123456789abcdef" for ch in k.lower()):
+            blob.setdefault(k, v)
+
+    return blob
+
+
+def cf_value(p: dict, field_key: str) -> Any:
+    """
+    Liest einen Custom Field Value robust aus Person.
+    """
+    if not field_key:
+        return None
+    if not isinstance(p, dict):
+        return None
+
+    # erst direkt (falls top-level)
+    if field_key in p:
+        return p.get(field_key)
+
+    blob = _extract_custom_fields_blob(p)
+    return blob.get(field_key)
+
 
 async def get_next_activity_key() -> Optional[str]:
     """Ermittelt das Feld für 'Nächste Aktivität'."""
@@ -1595,18 +1666,43 @@ async def _build_nf_master_final(
     batch_id: Optional[str] = None,
     job_obj=None,
 ) -> pd.DataFrame:
+    """
+    Baut nf_master_final in der Struktur, die NF_EXPORT_COLUMNS erwartet.
+    - Prospect ID kommt aus Pipedrive Custom Field (field key)
+    - Cold-Mailing Import bekommt den Kampagnennamen
+    - Orga Name wird aus Orga Lookup geholt (bulk)
+    - Alle Spalten werden erzeugt (fehlende als "")
+    """
+
+    # ----------------------------
+    # Deine Field-Key Zuordnung
+    # ----------------------------
+    FIELD_BATCH_ID      = "5ac34dad3ea917fdef4087caebf77ba275f87eec"
+    FIELD_PROSPECT_ID   = "f9138f9040c44622808a4b8afda2b1b75ee5acd0"
+    FIELD_GENDER        = "c4f5f434cdb0cfce3f6d62ec7291188fe968ac72"
+    FIELD_TITLE         = "0343bc43a91159aaf33a463ca603dc5662422ea5"
+    FIELD_POSITION      = "4585e5de11068a3bccf02d8b93c126bcf5c257ff"
+    FIELD_XING          = "44ebb6feae2a670059bc5261001443a2878a2b43"
+    FIELD_LINKEDIN      = "25563b12f847a280346bba40deaf527af82038cc"
+
     if (not batch_id_label) and batch_id:
         batch_id_label = batch_id
 
-    # Org IDs sammeln für Lookup (Name kommt aus Org-Tabelle)
+    # ----------------------------
+    # Org IDs sammeln (robust)
+    # ----------------------------
     unique_org_ids: List[str] = []
-    seen = set()
+    seen: set[str] = set()
+
     for p in selected:
         oid = extract_org_id_from_person(p)
         if oid and oid not in seen:
             seen.add(oid)
             unique_org_ids.append(oid)
 
+    # ----------------------------
+    # Org Lookup (best effort)
+    # ----------------------------
     org_lookup: Dict[str, dict] = {}
     if unique_org_ids:
         try:
@@ -1618,59 +1714,96 @@ async def _build_nf_master_final(
             print(f"[NF][WARN] fetch_orgs_bulk failed: {type(e).__name__}: {e}")
             org_lookup = {}
 
-    def org_name(p: dict) -> str:
+    def org_name_for_person(p: dict) -> str:
         oid = extract_org_id_from_person(p)
-        if oid and oid in org_lookup:
-            return sanitize(org_lookup[oid].get("name") or "")
-        # fallback falls in person embedded
+        if not oid:
+            return ""
+        o = org_lookup.get(str(oid))
+        if isinstance(o, dict) and o.get("name"):
+            return sanitize(o.get("name"))
+        # fallback: manche shapes haben name im org_id dict
         org = p.get("org_id")
         if isinstance(org, dict):
             return sanitize(org.get("name") or "")
         return ""
 
+    def primary_email(p: dict) -> str:
+        # Standardfeld email (list of dicts)
+        emails = p.get("email") or []
+        if isinstance(emails, list) and emails:
+            e0 = emails[0]
+            return sanitize(e0.get("value") if isinstance(e0, dict) else e0)
+        # fallback: wenn email als string kommt
+        if isinstance(emails, str):
+            return sanitize(emails)
+        return ""
+
+    # ----------------------------
+    # Rows bauen
+    # ----------------------------
     rows: List[dict] = []
-    for p in selected:
-        first, last = split_name(p.get("first_name"), p.get("last_name"), p.get("name"))
+    total = len(selected)
 
-        row = {
-            "Batch ID": sanitize(batch_id_label) or _val(p, PD_PERSON_FIELDS["Batch ID"]),
-            "Channel": sanitize(DEFAULT_CHANNEL),
+    for idx, p in enumerate(selected, start=1):
+        if job_obj and (idx == 1 or idx % 50 == 0 or idx == total):
+            job_obj.phase = f"Baue Export ({idx}/{total})"
+            job_obj.percent = max(job_obj.percent, 70)
 
-            # Wunsch: campaign name in Cold-Mailing Import
+        person_id = sanitize(p.get("id"))
+        org_id = extract_org_id_from_person(p)
+        org_name = org_name_for_person(p)
+
+        first_name = sanitize(p.get("first_name"))
+        last_name = sanitize(p.get("last_name"))
+        if not first_name and not last_name:
+            # fallback: falls nur "name" existiert
+            fn, ln = split_name(None, None, sanitize(p.get("name")))
+            first_name, last_name = fn, ln
+
+        # Custom Fields über Keys
+        prospect_id = sanitize(cf_value(p, FIELD_PROSPECT_ID))
+        gender_raw  = sanitize(cf_value(p, FIELD_GENDER))
+        title_raw   = sanitize(cf_value(p, FIELD_TITLE))
+        pos_raw     = sanitize(cf_value(p, FIELD_POSITION))
+        xing_raw    = sanitize(cf_value(p, FIELD_XING))
+        li_raw      = sanitize(cf_value(p, FIELD_LINKEDIN))
+
+        # Gender ggf. mappen (wenn es ID ist)
+        gender = GENDER_OPTION_MAP.get(gender_raw, gender_raw)
+
+        # Batch ID pro Person: wenn im Datensatz vorhanden, sonst label
+        batch_from_person = sanitize(cf_value(p, FIELD_BATCH_ID))
+        batch_out = batch_from_person or sanitize(batch_id_label)
+
+        rows.append({
+            "Batch ID": batch_out,
+            "Channel": DEFAULT_CHANNEL,
+            # <- Cold-Mailing Import soll Kampagnenname sein (dein Wunsch)
             "Cold-Mailing Import": sanitize(campaign),
+            "Prospect ID": prospect_id,
 
-            # Prospect ID aus Custom Field Key
-            "Prospect ID": _val(p, PD_PERSON_FIELDS["Prospect ID"]),
+            "Organisation ID": sanitize(org_id),
+            "Organisation Name": sanitize(org_name),
 
-            "Organisation ID": extract_org_id_from_person(p),
-            "Organisation Name": org_name(p),
+            "Person ID": person_id,
+            "Person Vorname": first_name,
+            "Person Nachname": last_name,
+            "Person Titel": title_raw,
+            "Person Geschlecht": gender,
+            "Person Position": pos_raw,
+            "Person E-Mail": primary_email(p),
+            "XING Profil": xing_raw,
+            "LinkedIn URL": li_raw,
+        })
 
-            "Person ID": sanitize(p.get("id")),
-            "Person Vorname": sanitize(first),
-            "Person Nachname": sanitize(last),
+    df_final = pd.DataFrame(rows)
 
-            # Custom fields über Keys
-            "Person Titel": _val(p, PD_PERSON_FIELDS["Person Titel"]),
-            "Person Geschlecht": _val(p, PD_PERSON_FIELDS["Person Geschlecht"]),
-            "Person Position": _val(p, PD_PERSON_FIELDS["Person Position"]),
-
-            # Standardfeld
-            "Person E-Mail": _primary_email(p),
-
-            # Custom fields über Keys
-            "XING Profil": _val(p, PD_PERSON_FIELDS["XING Profil"]),
-            "LinkedIn URL": _val(p, PD_PERSON_FIELDS["LinkedIn URL"]),
-        }
-
-        rows.append(row)
-
-    df = pd.DataFrame(rows)
-
-    # Spalten erzwingen (falls du build_nf_export hast)
-    if "build_nf_export" in globals():
-        df = build_nf_export(df)
-
-    return df
+    # ----------------------------
+    # Exakt Spaltenreihenfolge erzwingen
+    # (und fehlende Spalten sicher anlegen)
+    # ----------------------------
+    df_final = build_nf_export(df_final)
+    return df_final
 
 
 # =============================================================================
@@ -1899,6 +2032,7 @@ async def run_nachfass_job(
 
         all_ids_set: set[str] = set()
 
+        # A1) Batch-IDs bevorzugt
         if nf_batch_ids:
             job_obj.phase = "Suche Personen (Batch IDs)"
             job_obj.percent = 12
@@ -1917,6 +2051,7 @@ async def run_nachfass_job(
 
             print(f"[NF] Personen aus Batch-IDs: {len(all_ids_set)} IDs")
 
+        # A2) Filter als Fallback
         if (not all_ids_set) and (filters is None or len(filters) == 0):
             filters = [FILTER_NACHFASS]
 
@@ -1977,12 +2112,13 @@ async def run_nachfass_job(
         )
 
         # ---------------------------------------------------------
-        # D) nf_master_final speichern
+        # D) nf_master_final in DB speichern
         # ---------------------------------------------------------
-        job_obj.phase = "Speichere Master (DB)"
+        job_obj.phase = "Speichere Master (DB: nf_master_final)"
         job_obj.percent = 78
 
-        await save_df_text(master_final, tables("nf")["final"])
+        t = tables("nf")
+        await save_df_text(master_final, t["final"])
 
         # ---------------------------------------------------------
         # E) Abgleich -> nf_master_ready + nf_delete_log
@@ -1998,13 +2134,16 @@ async def run_nachfass_job(
         job_obj.phase = "Erzeuge Excel"
         job_obj.percent = 90
 
-        ready = await load_df_text(tables("nf")["ready"])
-        export_df = build_nf_export(ready)   # garantiert alle Spalten
+        ready_df = await load_df_text(t["ready"])
+        export_df = build_nf_export(ready_df)  # garantiert alle Spalten
 
         out_path = export_to_excel(export_df, prefix="nachfass_export", job_id=job_id)
         job_obj.path = out_path
         job_obj.filename_base = job_obj.filename_base or "Nachfass_Export"
 
+        # ---------------------------------------------------------
+        # G) done
+        # ---------------------------------------------------------
         job_obj.error = None
         job_obj.phase = "Fertig"
         job_obj.percent = 100
@@ -2017,7 +2156,6 @@ async def run_nachfass_job(
         job_obj.percent = 100
         print(f"[NF][ERROR] Job failed: {job_obj.error}")
         return
-
 
 # =============================================================================
 # Excel-Export-Helfer – FINAL MODUL 3
