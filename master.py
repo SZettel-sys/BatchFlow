@@ -1298,12 +1298,11 @@ async def pd_get_json_with_retry(
 
 from typing import Dict, List, Optional, Tuple
 import asyncio
-
 async def fetch_person_details_many(
     person_ids: List[str],
     *,
     job_obj=None,
-    concurrency: int = 2,          # <= runter! (4/6 führt oft zu 429 Lotterie)
+    concurrency: int = 2,          # <= weniger parallel = weniger 429 = stabiler
     request_timeout: float = 25.0,
 ) -> Dict[str, dict]:
     if not person_ids:
@@ -1334,17 +1333,22 @@ async def fetch_person_details_many(
             r = await pd_get_with_retry(
                 client,
                 url,
-                None,  # Auth entscheidet pd_get_with_retry via pd_auth()
+                None,  # Auth macht pd_auth() intern (OAuth Header oder api_token)
                 label=f"person:{pid}",
                 request_timeout=request_timeout,
-                max_total_time=120.0
+                max_total_time=120.0,
+                retries=10,
             )
 
             if r.status_code == 200:
                 payload = r.json() or {}
                 data = payload.get("data")
-                if data:
+                if isinstance(data, dict) and data:
                     results[str(pid)] = data
+            else:
+                # sparsam loggen
+                if done < 5 or done % 100 == 0:
+                    print(f"[fetch_person_details_many] pid={pid} status={r.status_code} body={(r.text or '')[:160]}")
 
             done += 1
             if done % 10 == 0 or done == total:
@@ -1370,7 +1374,7 @@ async def fetch_person_details(person_ids: List[str], job_obj=None) -> List[dict
         job_obj.phase = f"Lade Personendetails (0/{len(person_ids)})"
         job_obj.percent = 25
 
-    # Pass 1 (konservativ)
+    # Pass 1
     lookup = await fetch_person_details_many(person_ids, job_obj=job_obj, concurrency=2)
 
     missing = [str(pid) for pid in person_ids if str(pid) not in lookup]
@@ -1390,7 +1394,7 @@ async def fetch_person_details(person_ids: List[str], job_obj=None) -> List[dict
         if missing2:
             print(f"[fetch_person_details] STILL missing examples: {missing2[:30]}")
 
-    # Ordered output
+    # ordered
     ordered: List[dict] = []
     for pid in person_ids:
         p = lookup.get(str(pid))
@@ -1398,7 +1402,6 @@ async def fetch_person_details(person_ids: List[str], job_obj=None) -> List[dict
             ordered.append(p)
 
     return ordered
-
 
 
 
@@ -1526,18 +1529,85 @@ async def _build_nf_master_final(
     batch_id: Optional[str] = None,
     job_obj=None,
 ) -> pd.DataFrame:
+    """
+    Baut den Nachfass-Master im Template-Format (NF_EXPORT_COLUMNS/TEMPLATE_COLUMNS).
+    - Cold-Mailing Import = Kampagnenname (campaign)
+    - Prospect ID kommt aus Pipedrive (Custom Field, per Hints "prospect")
+    - Org Name wird über Bulk-Org-Lookup ergänzt (best effort)
+    """
+
     if (not batch_id_label) and batch_id:
         batch_id_label = batch_id
 
-    # Org Lookup (best effort)
-    unique_org_ids = []
+    # -----------------------------
+    # helpers (lokal, robust)
+    # -----------------------------
+    def _first_email(p: dict) -> str:
+        emails = p.get("email") or []
+        if isinstance(emails, list) and emails:
+            e0 = emails[0]
+            return sanitize(e0.get("value") if isinstance(e0, dict) else e0)
+        return ""
+
+    def _pick_custom_field_value(p: dict, hints_to_col: Dict[str, str], wanted_col: str) -> str:
+        """
+        Sucht in allen Feldern der Person nach einem Hint,
+        der auf wanted_col gemappt ist (z.B. "prospect" -> "Prospect ID").
+        """
+        for k, v in (p or {}).items():
+            # nur Custom-Fields typischerweise als "uuid-like keys" oder unbekannte keys,
+            # aber wir gehen pragmatisch über alle values
+            if k is None:
+                continue
+            key_l = str(k).lower()
+
+            # Hint match?
+            mapped = None
+            for hint, colname in hints_to_col.items():
+                if hint in key_l:
+                    mapped = colname
+                    break
+
+            if mapped != wanted_col:
+                continue
+
+            # Value extrahieren (dict/list/string)
+            if isinstance(v, dict):
+                return sanitize(v.get("value") or v.get("id") or v.get("name") or v.get("label"))
+            if isinstance(v, list):
+                return sanitize(v[0] if v else "")
+            return sanitize(v)
+
+        return ""
+
+    def _org_id_from_person(p: dict) -> str:
+        # robust: org_id kann dict oder int sein
+        org = p.get("org_id")
+        if isinstance(org, dict):
+            return sanitize(org.get("value") or org.get("id"))
+        return sanitize(org)
+
+    def _org_name_from_person_embedded(p: dict) -> str:
+        # manchmal ist name im dict enthalten
+        org = p.get("org_id")
+        if isinstance(org, dict):
+            return sanitize(org.get("name") or "")
+        return ""
+
+    # -----------------------------
+    # Org IDs sammeln
+    # -----------------------------
+    unique_org_ids: List[str] = []
     seen = set()
     for p in selected:
-        oid = extract_org_id_from_person(p)
+        oid = _org_id_from_person(p)
         if oid and oid not in seen:
             seen.add(oid)
             unique_org_ids.append(oid)
 
+    # -----------------------------
+    # Org Lookup (best effort)
+    # -----------------------------
     org_lookup: Dict[str, dict] = {}
     if unique_org_ids:
         try:
@@ -1549,63 +1619,72 @@ async def _build_nf_master_final(
             print(f"[NF][WARN] fetch_orgs_bulk failed: {type(e).__name__}: {e}")
             org_lookup = {}
 
-    def org_name(p: dict) -> str:
-        oid = extract_org_id_from_person(p)
-        if oid and oid in org_lookup:
-            return sanitize(org_lookup[oid].get("name"))
-        org = p.get("org_id")
-        if isinstance(org, dict):
-            return sanitize(org.get("name"))
-        return ""
+    def _org_name_from_lookup(p: dict) -> str:
+        oid = _org_id_from_person(p)
+        if not oid:
+            return ""
+        o = org_lookup.get(str(oid))
+        return sanitize((o or {}).get("name") or "")
 
-    def primary_email(p: dict) -> str:
-        emails = p.get("email") or []
-        if isinstance(emails, list) and emails:
-            e0 = emails[0]
-            return sanitize(e0.get("value") if isinstance(e0, dict) else e0)
-        return ""
-
-    def best_effort_prospect_id(p: dict) -> str:
-        # 1) direkte keys
-        for k in ("prospect_id", "Prospect ID", "prospectId", "prospectID"):
-            if k in p and p.get(k) not in (None, ""):
-                return sanitize(p.get(k))
-        # 2) custom field keys enthalten oft "prospect"
-        for k, v in (p or {}).items():
-            if isinstance(k, str) and "prospect" in k.lower():
-                s = sanitize(v)
-                if s:
-                    return s
-        return ""
-
+    # -----------------------------
+    # rows bauen (Template-Spalten!)
+    # -----------------------------
     rows: List[dict] = []
+
     for p in selected:
-        first, last = split_name(p.get("first_name"), p.get("last_name"), p.get("name"))
-        rows.append({
+        # Name splitten (Pipedrive liefert oft name + first_name/last_name)
+        first = sanitize(p.get("first_name") or "")
+        last = sanitize(p.get("last_name") or "")
+        full = sanitize(p.get("name") or "")
+        if not first and not last:
+            first, last = split_name(first or None, last or None, full or None)
+
+        org_id = _org_id_from_person(p)
+        org_name = _org_name_from_lookup(p) or _org_name_from_person_embedded(p)
+
+        prospect_id = _pick_custom_field_value(
+            p,
+            PERSON_FIELD_HINTS_TO_EXPORT,   # mapping hints -> zielspalte
+            "Prospect ID"
+        )
+
+        row = {
             "Batch ID": sanitize(batch_id_label),
             "Channel": sanitize(DEFAULT_CHANNEL),
-
-            # ✅ so wie du willst
-            "Cold-Mailing Import": sanitize(campaign),
-
-            # ✅ aus Pipedrive Person
-            "Prospect ID": best_effort_prospect_id(p),
-
-            "Organisation ID": extract_org_id_from_person(p),
-            "Organisation Name": org_name(p),
-
+            "Cold-Mailing Import": sanitize(campaign),     # <- Kampagnenname
+            "Prospect ID": sanitize(prospect_id),          # <- aus Pipedrive
+            "Organisation ID": sanitize(org_id),
+            "Organisation Name": sanitize(org_name),
             "Person ID": sanitize(p.get("id")),
             "Person Vorname": sanitize(first),
             "Person Nachname": sanitize(last),
             "Person Titel": sanitize(p.get("title") or ""),
             "Person Geschlecht": sanitize(p.get("gender") or ""),
             "Person Position": sanitize(p.get("job_title") or p.get("position") or ""),
-            "Person E-Mail": primary_email(p),
+            "Person E-Mail": sanitize(_first_email(p)),
             "XING Profil": sanitize(p.get("xing") or p.get("xing_url") or ""),
             "LinkedIn URL": sanitize(p.get("linkedin") or p.get("linkedin_url") or ""),
-        })
+        }
 
-    return pd.DataFrame(rows)
+        rows.append(row)
+
+    df = pd.DataFrame(rows)
+
+    # -----------------------------
+    # Spalten sicher in korrekter Reihenfolge bereitstellen
+    # -----------------------------
+    # (damit Excel/DB nie "Spalten fehlen")
+    if "NF_EXPORT_COLUMNS" in globals():
+        df = build_nf_export(df)  # füllt fehlende Spalten mit ""
+    else:
+        # fallback: mindestens Template Columns
+        want = TEMPLATE_COLUMNS if "TEMPLATE_COLUMNS" in globals() else list(df.columns)
+        for c in want:
+            if c not in df.columns:
+                df[c] = ""
+        df = df[want]
+
+    return df
 
 
 # =============================================================================
