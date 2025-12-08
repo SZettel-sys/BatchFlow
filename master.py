@@ -263,7 +263,7 @@ import asyncio
 from typing import Optional, Tuple
 
 # Global: eine Bremse für alle Requests (Pipedrive mag keine parallelen Bursts)
-PD_SEM = asyncio.Semaphore(3)
+PD_SEM = asyncio.Semaphore(1)
 
 def _retry_after_seconds(resp) -> float:
     try:
@@ -1047,36 +1047,41 @@ async def fetch_person_details(person_ids: List[str], job_obj=None) -> List[dict
         job_obj.phase = f"Lade Personendetails (0/{len(person_ids)})"
         job_obj.percent = 25
 
-    # 1. Pass (parallel)
-    lookup = await fetch_person_details_many(person_ids, job_obj=job_obj, concurrency=4)
-
-    # Missing bestimmen
+    # Pass 1
+    lookup = await fetch_person_details_many(person_ids, job_obj=job_obj, concurrency=3, request_timeout=25.0)
     missing = [str(pid) for pid in person_ids if str(pid) not in lookup]
-    print(f"[fetch_person_details] Pass1: got={len(lookup)} missing={len(missing)}")
+    print(f"[fetch_person_details] pass1 got={len(lookup)} missing={len(missing)}")
 
-    # 2. Pass: missing nochmal langsamer/konservativer laden (reduziert Zufall durch 429)
+    # Pass 2
     if missing:
         if job_obj:
-            job_obj.phase = f"Nachladen fehlender Personendetails ({len(missing)})"
+            job_obj.phase = f"Nachladen fehlender Personendetails (pass2) ({len(missing)})"
             job_obj.percent = max(job_obj.percent, 66)
 
-        lookup2 = await fetch_person_details_many(missing, job_obj=job_obj, concurrency=2)
+        lookup2 = await fetch_person_details_many(missing, job_obj=job_obj, concurrency=2, request_timeout=30.0)
         lookup.update(lookup2)
+        missing = [str(pid) for pid in person_ids if str(pid) not in lookup]
+        print(f"[fetch_person_details] pass2 added={len(lookup2)} still_missing={len(missing)}")
+
+    # Pass 3 (ultra-konservativ)
+    if missing:
+        if job_obj:
+            job_obj.phase = f"Nachladen fehlender Personendetails (pass3, langsam) ({len(missing)})"
+            job_obj.percent = max(job_obj.percent, 72)
+
+        lookup3 = await fetch_person_details_many(missing, job_obj=job_obj, concurrency=1, request_timeout=35.0)
+        lookup.update(lookup3)
 
         missing2 = [str(pid) for pid in person_ids if str(pid) not in lookup]
-        print(f"[fetch_person_details] Pass2: added={len(lookup2)} still_missing={len(missing2)}")
-
-        # Optional: am Ende eine Liste loggen (nur Beispiele)
+        print(f"[fetch_person_details] pass3 added={len(lookup3)} still_missing={len(missing2)}")
         if missing2:
-            print(f"[fetch_person_details] STILL missing examples: {missing2[:20]}")
+            print(f"[fetch_person_details] STILL missing examples: {missing2[:30]}")
 
-    # Ordered output
     ordered: List[dict] = []
     for pid in person_ids:
         p = lookup.get(str(pid))
         if p:
             ordered.append(p)
-
     return ordered
 
 
@@ -1667,42 +1672,39 @@ async def _build_nf_master_final(
     job_obj=None,
 ) -> pd.DataFrame:
     """
-    Baut nf_master_final in der Struktur, die NF_EXPORT_COLUMNS erwartet.
-    - Prospect ID kommt aus Pipedrive Custom Field (field key)
-    - Cold-Mailing Import bekommt den Kampagnennamen
-    - Orga Name wird aus Orga Lookup geholt (bulk)
-    - Alle Spalten werden erzeugt (fehlende als "")
+    Baut nf_master_final.
+    Enthält:
+      - Exportspalten (NF_EXPORT_COLUMNS)
+      - zusätzlich interne Spalten für Regeln:
+          * Organisationsart
+          * Datum nächste Aktivität
     """
 
-    # ----------------------------
-    # Deine Field-Key Zuordnung
-    # ----------------------------
-    FIELD_BATCH_ID      = "5ac34dad3ea917fdef4087caebf77ba275f87eec"
-    FIELD_PROSPECT_ID   = "f9138f9040c44622808a4b8afda2b1b75ee5acd0"
-    FIELD_GENDER        = "c4f5f434cdb0cfce3f6d62ec7291188fe968ac72"
-    FIELD_TITLE         = "0343bc43a91159aaf33a463ca603dc5662422ea5"
-    FIELD_POSITION      = "4585e5de11068a3bccf02d8b93c126bcf5c257ff"
-    FIELD_XING          = "44ebb6feae2a670059bc5261001443a2878a2b43"
-    FIELD_LINKEDIN      = "25563b12f847a280346bba40deaf527af82038cc"
+    # Person custom field keys
+    FIELD_BATCH_ID      = PD_PERSON_FIELDS["Batch ID"]
+    FIELD_PROSPECT_ID   = PD_PERSON_FIELDS["Prospect ID"]
+    FIELD_GENDER        = PD_PERSON_FIELDS["Person Geschlecht"]
+    FIELD_TITLE         = PD_PERSON_FIELDS["Person Titel"]
+    FIELD_POSITION      = PD_PERSON_FIELDS["Person Position"]
+    FIELD_XING          = PD_PERSON_FIELDS["XING Profil"]
+    FIELD_LINKEDIN      = PD_PERSON_FIELDS["LinkedIn URL"]
+
+    # Org custom field keys
+    FIELD_ORG_ART       = PD_ORG_FIELDS["Organisationsart"]
 
     if (not batch_id_label) and batch_id:
         batch_id_label = batch_id
 
-    # ----------------------------
-    # Org IDs sammeln (robust)
-    # ----------------------------
+    # --- Org IDs sammeln
     unique_org_ids: List[str] = []
     seen: set[str] = set()
-
     for p in selected:
         oid = extract_org_id_from_person(p)
         if oid and oid not in seen:
             seen.add(oid)
             unique_org_ids.append(oid)
 
-    # ----------------------------
-    # Org Lookup (best effort)
-    # ----------------------------
+    # --- Orgs bulk laden
     org_lookup: Dict[str, dict] = {}
     if unique_org_ids:
         try:
@@ -1714,53 +1716,59 @@ async def _build_nf_master_final(
             print(f"[NF][WARN] fetch_orgs_bulk failed: {type(e).__name__}: {e}")
             org_lookup = {}
 
-    def org_name_for_person(p: dict) -> str:
+    def org_obj_for_person(p: dict) -> dict:
         oid = extract_org_id_from_person(p)
         if not oid:
-            return ""
+            return {}
         o = org_lookup.get(str(oid))
-        if isinstance(o, dict) and o.get("name"):
+        return o if isinstance(o, dict) else {}
+
+    def org_name_for_person(p: dict) -> str:
+        o = org_obj_for_person(p)
+        if o.get("name"):
             return sanitize(o.get("name"))
-        # fallback: manche shapes haben name im org_id dict
+
         org = p.get("org_id")
         if isinstance(org, dict):
             return sanitize(org.get("name") or "")
+
         return ""
 
+    def org_art_for_person(p: dict) -> str:
+        o = org_obj_for_person(p)
+        if not o:
+            return ""
+        return sanitize(o.get(FIELD_ORG_ART))
+
+    def next_activity_for_person(p: dict) -> str:
+        return sanitize(p.get("next_activity_date"))
+
     def primary_email(p: dict) -> str:
-        # Standardfeld email (list of dicts)
         emails = p.get("email") or []
         if isinstance(emails, list) and emails:
             e0 = emails[0]
             return sanitize(e0.get("value") if isinstance(e0, dict) else e0)
-        # fallback: wenn email als string kommt
         if isinstance(emails, str):
             return sanitize(emails)
         return ""
 
-    # ----------------------------
-    # Rows bauen
-    # ----------------------------
     rows: List[dict] = []
     total = len(selected)
 
     for idx, p in enumerate(selected, start=1):
         if job_obj and (idx == 1 or idx % 50 == 0 or idx == total):
-            job_obj.phase = f"Baue Export ({idx}/{total})"
+            job_obj.phase = f"Baue Master ({idx}/{total})"
             job_obj.percent = max(job_obj.percent, 70)
 
         person_id = sanitize(p.get("id"))
         org_id = extract_org_id_from_person(p)
-        org_name = org_name_for_person(p)
 
         first_name = sanitize(p.get("first_name"))
         last_name = sanitize(p.get("last_name"))
         if not first_name and not last_name:
-            # fallback: falls nur "name" existiert
             fn, ln = split_name(None, None, sanitize(p.get("name")))
             first_name, last_name = fn, ln
 
-        # Custom Fields über Keys
         prospect_id = sanitize(cf_value(p, FIELD_PROSPECT_ID))
         gender_raw  = sanitize(cf_value(p, FIELD_GENDER))
         title_raw   = sanitize(cf_value(p, FIELD_TITLE))
@@ -1768,23 +1776,19 @@ async def _build_nf_master_final(
         xing_raw    = sanitize(cf_value(p, FIELD_XING))
         li_raw      = sanitize(cf_value(p, FIELD_LINKEDIN))
 
-        # Gender ggf. mappen (wenn es ID ist)
         gender = GENDER_OPTION_MAP.get(gender_raw, gender_raw)
 
-        # Batch ID pro Person: wenn im Datensatz vorhanden, sonst label
         batch_from_person = sanitize(cf_value(p, FIELD_BATCH_ID))
         batch_out = batch_from_person or sanitize(batch_id_label)
 
         rows.append({
+            # Export-Spalten
             "Batch ID": batch_out,
             "Channel": DEFAULT_CHANNEL,
-            # <- Cold-Mailing Import soll Kampagnenname sein (dein Wunsch)
             "Cold-Mailing Import": sanitize(campaign),
             "Prospect ID": prospect_id,
-
             "Organisation ID": sanitize(org_id),
-            "Organisation Name": sanitize(org_name),
-
+            "Organisation Name": sanitize(org_name_for_person(p)),
             "Person ID": person_id,
             "Person Vorname": first_name,
             "Person Nachname": last_name,
@@ -1794,16 +1798,30 @@ async def _build_nf_master_final(
             "Person E-Mail": primary_email(p),
             "XING Profil": xing_raw,
             "LinkedIn URL": li_raw,
+
+            # Interne Spalten für Regeln/Log
+            "Organisationsart": org_art_for_person(p),
+            "Datum nächste Aktivität": next_activity_for_person(p),
         })
 
     df_final = pd.DataFrame(rows)
 
-    # ----------------------------
-    # Exakt Spaltenreihenfolge erzwingen
-    # (und fehlende Spalten sicher anlegen)
-    # ----------------------------
-    df_final = build_nf_export(df_final)
+    # ensure export columns exist in df_final
+    for c in NF_EXPORT_COLUMNS:
+        if c not in df_final.columns:
+            df_final[c] = ""
+
+    # ensure internal columns exist
+    for extra in ["Organisationsart", "Datum nächste Aktivität"]:
+        if extra not in df_final.columns:
+            df_final[extra] = ""
+
+    # finale Reihenfolge: Exportspalten zuerst, dann interne
+    ordered_cols = NF_EXPORT_COLUMNS + ["Organisationsart", "Datum nächste Aktivität"]
+    df_final = df_final.reindex(columns=ordered_cols, fill_value="")
+
     return df_final
+
 
 
 # =============================================================================
@@ -1825,81 +1843,110 @@ def fast_fuzzy(a: str, b: str) -> int:
 # =============================================================================
 async def _reconcile(prefix: str) -> None:
     """
-    Gemeinsamer Abgleich für Neukontakte / Nachfass:
-      - fuzzy Orga-Matching (≥95 % Ähnlichkeit) gegen Referenzfilter
-      - Entfernen von Personen, die bereits in bestimmten Filtern sind (1216/1708)
-      - Schreiben von <prefix>_master_ready und <prefix>_delete_log
-    Das Log-Schema ist so gebaut, dass sowohl /summary als auch /nachfass/excluded
-    keine KeyErrors mehr bekommen (id/name/org_name/extra etc. sind vorhanden).
+    Abgleich:
+      1) max 2 Kontakte pro Organisation
+      2) Organisationsart gesetzt -> löschen
+      3) Orga-Fuzzy >=95% gegen Filter 1245/851/1521 -> löschen
+      4) Person-ID bereits in Filtern 1216/1708 -> löschen
+      5) Datum nächste Aktivität: in Zukunft ODER innerhalb der letzten 3 Monate -> löschen
+
+    Schreibt:
+      - <prefix>_master_ready
+      - <prefix>_delete_log
+      - nf_excluded (Summary für Bulletpoints)
     """
     t = tables(prefix)
     df = await load_df_text(t["final"])
 
+    # erwartete Spalten im nf_master_final
+    col_pid = "Person ID"
+    col_orgid = "Organisation ID"
+    col_orgname = "Organisation Name"
+    col_orgtype = "Organisationsart"
+    col_next = "Datum nächste Aktivität"
+
     if df.empty:
         await save_df_text(pd.DataFrame(), t["ready"])
         await save_df_text(pd.DataFrame(), t["log"])
+        # Bulletpoints IMMER schreiben (auch 0)
+        await save_df_text(pd.DataFrame([
+            {"Grund": "Max 2 Kontakte pro Organisation", "Anzahl": 0},
+            {"Grund": "Datum nächste Aktivität steht an bzw. liegt in naher Vergangenheit", "Anzahl": 0},
+        ]), "nf_excluded")
         return
 
-    # Spalten im Master
-    col_pid = "Person ID"
-    col_orgname = "Organisation Name"
-    col_orgid = "Organisation ID"
-
-    delete_rows: List[dict] = []
-    drop_idx: List[int] = []
-
-    # -----------------------------------------------------------
-    # UNIVERSAL SANITIZER
-    # -----------------------------------------------------------
-    def sanitize_cell(v):
-        if v is None or (isinstance(v, float) and pd.isna(v)):
+    def flatten(v):
+        if v is None:
             return ""
-
-        if isinstance(v, str):
-            s = v.strip()
-            # JSON decode
-            if (s.startswith("[") and s.endswith("]")) or (
-                s.startswith("{") and s.endswith("}")
-            ):
-                try:
-                    parsed = json.loads(s)
-                    return sanitize_cell(parsed)
-                except Exception:
-                    return s
-            return s
-
-        if isinstance(v, dict):
-            return (
-                sanitize_cell(v.get("value"))
-                or sanitize_cell(v.get("label"))
-                or sanitize_cell(v.get("name"))
-                or sanitize_cell(v.get("id"))
-                or ""
-            )
-
+        if isinstance(v, float) and pd.isna(v):
+            return ""
         if isinstance(v, list):
-            return sanitize_cell(v[0]) if v else ""
+            return flatten(v[0] if v else "")
+        if isinstance(v, dict):
+            return flatten(v.get("value") or v.get("label") or v.get("name") or v.get("id") or "")
+        return str(v).strip()
 
-        return str(v)
+    # alles einmal säubern
+    df = df.replace({None: "", np.nan: ""}).copy()
+    for c in df.columns:
+        df[c] = df[c].map(flatten)
 
-    # -----------------------------------------------------------
-    # ALLE ORGANISATIONSNAMEN LADEN (mit CAPs)
-    # -----------------------------------------------------------
-    MAX_NAMES = 50000
-    MAX_BUCKET = 200
+    # Debug: sind Spalten überhaupt gefüllt?
+    if col_orgtype in df.columns:
+        filled_orgtype = int((df[col_orgtype].astype(str).str.strip() != "").sum())
+        print(f"[reconcile] Organisationsart gefüllt: {filled_orgtype}/{len(df)}")
+    else:
+        print(f"[reconcile][WARN] Spalte fehlt: {col_orgtype}")
 
-    buckets_all = await _fetch_org_names_for_filter_capped(
-        PAGE_LIMIT, MAX_NAMES, MAX_BUCKET
-    )
+    if col_next in df.columns:
+        filled_next = int((df[col_next].astype(str).str.strip() != "").sum())
+        print(f"[reconcile] Datum nächste Aktivität gefüllt: {filled_next}/{len(df)}")
+    else:
+        print(f"[reconcile][WARN] Spalte fehlt: {col_next}")
 
-    # -----------------------------------------------------------
-    # 1) FUZZY ORGANISATIONS-MATCHING
-    # -----------------------------------------------------------
+    delete_rows: list[dict] = []
+
+    def log_drop(row: pd.Series, reason: str, extra: str):
+        kontakt_id = flatten(row.get(col_pid))
+        name = (flatten(row.get("Person Vorname")) + " " + flatten(row.get("Person Nachname"))).strip()
+        org_id = flatten(row.get(col_orgid))
+        org_name = flatten(row.get(col_orgname))
+        delete_rows.append({
+            "reason": reason,
+            "Kontakt ID": kontakt_id,
+            "Name": name,
+            "Organisation ID": org_id,
+            "Organisationsname": org_name,
+            "Grund": extra,
+            "extra": extra,
+            "id": kontakt_id,
+            "name": name,
+            "org_name": org_name,
+        })
+
+    # (2) Organisationsart gesetzt -> raus
+    if col_orgtype in df.columns:
+        mask = df[col_orgtype].astype(str).str.strip() != ""
+        removed = df[mask]
+        for _, r in removed.iterrows():
+            log_drop(r, "org_type_present", "Organisationsart ist gesetzt")
+        df = df[~mask]
+
+    # (5) Datum nächste Aktivität -> raus
+    if col_next in df.columns:
+        mask = df[col_next].astype(str).map(lambda x: is_forbidden_activity_date(x if x else None))
+        removed = df[mask]
+        for _, r in removed.iterrows():
+            log_drop(r, "next_activity_blocked", f"Datum nächste Aktivität gesperrt: {flatten(r.get(col_next))}")
+        df = df[~mask]
+
+    # (3) FUZZY Orga >=95% -> raus
+    buckets_all = await _fetch_org_names_for_filter_capped(PAGE_LIMIT, MAX_ORG_NAMES, MAX_ORG_BUCKET)
+
+    drop_idx = []
     for idx, row in df.iterrows():
-        name_raw = row.get(col_orgname, "")
-        name_clean = sanitize_cell(name_raw)
+        name_clean = flatten(row.get(col_orgname))
         norm = normalize_name(name_clean)
-
         if not norm:
             continue
 
@@ -1917,91 +1964,61 @@ async def _reconcile(prefix: str) -> None:
             continue
 
         best_name, score, *_ = best
-        if score < 95:
-            continue
-
-        # Daten für Log
-        kontakt_id = sanitize_cell(row.get(col_pid))
-        full_name = sanitize_cell(
-            f"{row.get('Person Vorname', '')} {row.get('Person Nachname', '')}"
-        )
-        org_id_val = sanitize_cell(row.get(col_orgid))
-        org_name_val = name_clean
-        extra_text = f"Ähnlichkeit {score}% mit '{best_name}'"
-
-        delete_rows.append(
-            {
-                "reason": "org_match_95",
-                "Kontakt ID": kontakt_id,
-                "id": kontakt_id,
-                "Name": full_name,
-                "name": full_name,
-                "Organisation ID": org_id_val,
-                "Organisationsname": org_name_val,
-                "org_name": org_name_val,
-                "Grund": extra_text,
-                "extra": extra_text,
-            }
-        )
-
-        drop_idx.append(idx)
+        if score >= 95:
+            log_drop(row, "org_match_95", f"Orga ähnlich {score}% zu '{best_name}'")
+            drop_idx.append(idx)
 
     if drop_idx:
         df = df.drop(drop_idx)
 
-    # -----------------------------------------------------------
-    # 2) PERSONEN BEREITS KONTAKTIERT (Filter 1216/1708)
-    # -----------------------------------------------------------
+    # (4) Person-ID bereits in Filtern 1216/1708 -> raus
     suspect_ids: set[str] = set()
     for fid in (1216, 1708):
         async for ids in stream_person_ids_by_filter(fid):
-            suspect_ids.update(ids)
+            suspect_ids.update([str(x) for x in ids])
 
-    if col_pid not in df.columns:
-        # Wenn es keine Person-ID-Spalte gibt, können wir nichts filtern
-        ready_df = df
-    else:
+    if col_pid in df.columns and suspect_ids:
         mask = df[col_pid].astype(str).isin(suspect_ids)
         removed = df[mask]
-
         for _, r in removed.iterrows():
-            kontakt_id = sanitize_cell(r.get(col_pid))
-            full_name = sanitize_cell(
-                f"{r.get('Person Vorname', '')} {r.get('Person Nachname', '')}"
-            )
-            org_id_val = sanitize_cell(r.get(col_orgid))
-            org_name_val = sanitize_cell(r.get(col_orgname))
-            extra_text = "Bereits in Filter 1216/1708"
+            log_drop(r, "person_id_match", "Person bereits kontaktiert (Filter 1216/1708)")
+        df = df[~mask]
 
-            delete_rows.append(
-                {
-                    "reason": "person_id_match",
-                    "Kontakt ID": kontakt_id,
-                    "id": kontakt_id,
-                    "Name": full_name,
-                    "name": full_name,
-                    "Organisation ID": org_id_val,
-                    "Organisationsname": org_name_val,
-                    "org_name": org_name_val,
-                    "Grund": extra_text,
-                    "extra": extra_text,
-                }
-            )
+    # (1) Max 2 Kontakte pro Organisation -> raus
+    limit = int(PER_ORG_DEFAULT_LIMIT or 2)
+    if col_orgid in df.columns and col_pid in df.columns:
+        df = df.copy()
+        df["_orgid_sort"] = df[col_orgid].astype(str)
+        df["_pid_sort"] = pd.to_numeric(df[col_pid], errors="coerce").fillna(10**18).astype(np.int64)
+        df = df.sort_values(by=["_orgid_sort", "_pid_sort"], kind="mergesort")
 
-        ready_df = df[~mask]
+        over = df.groupby("_orgid_sort").cumcount() >= limit
+        removed = df[over]
+        for _, r in removed.iterrows():
+            log_drop(r, "per_org_limit", f"Max {limit} Kontakte pro Organisation")
+        df = df[~over].drop(columns=["_orgid_sort", "_pid_sort"], errors="ignore")
 
-    # -----------------------------------------------------------
-    # SPEICHERN
-    # -----------------------------------------------------------
-    if not ready_df.empty:
-        ready_df = ready_df.applymap(sanitize_cell)
-    if delete_rows:
-        log_df = pd.DataFrame(delete_rows).applymap(sanitize_cell)
-    else:
-        log_df = pd.DataFrame()
+    # READY + LOG speichern
+    ready_df = df.drop(columns=[c for c in ["_orgid_sort", "_pid_sort"] if c in df.columns], errors="ignore")
+    log_df = pd.DataFrame(delete_rows) if delete_rows else pd.DataFrame()
 
     await save_df_text(ready_df, t["ready"])
     await save_df_text(log_df, t["log"])
+
+    # SUMMARY IMMER schreiben (auch wenn log leer)
+    def cnt(reason: str) -> int:
+        if log_df.empty or "reason" not in log_df.columns:
+            return 0
+        return int((log_df["reason"] == reason).sum())
+
+    summary_rows = [
+        {"Grund": "Max 2 Kontakte pro Organisation", "Anzahl": cnt("per_org_limit")},
+        {"Grund": "Datum nächste Aktivität steht an bzw. liegt in naher Vergangenheit", "Anzahl": cnt("next_activity_blocked")},
+    ]
+    await save_df_text(pd.DataFrame(summary_rows), "nf_excluded")
+
+
+
 
 
 import asyncio
