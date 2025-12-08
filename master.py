@@ -107,20 +107,40 @@ PERSON_FIELD_HINTS_TO_EXPORT = {
 # -----------------------------------------------------------------------------
 # Startup / Shutdown
 # -----------------------------------------------------------------------------
-def http_client() -> httpx.AsyncClient: return app.state.http
-def get_pool() -> asyncpg.Pool: return app.state.pool
+# -----------------------------------------------------------------------------
+# Startup / Shutdown
+# -----------------------------------------------------------------------------
+def http_client() -> httpx.AsyncClient:
+    return app.state.http
+
+def get_pool() -> asyncpg.Pool:
+    return app.state.pool
+
 
 @app.on_event("startup")
 async def _startup():
-    limits = httpx.Limits(max_keepalive_connections=8, max_connections=16)
-    app.state.http = httpx.AsyncClient(timeout=60.0, limits=limits)
+    limits = httpx.Limits(
+        max_keepalive_connections=20,
+        max_connections=50,
+        keepalive_expiry=30.0,
+    )
+    timeout = httpx.Timeout(
+        connect=10.0,
+        read=30.0,
+        write=30.0,
+        pool=10.0,
+    )
+
+    app.state.http = httpx.AsyncClient(timeout=timeout, limits=limits)
     app.state.pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=4)
     print("[Startup] BatchFlow initialisiert.")
+
 
 @app.on_event("shutdown")
 async def _shutdown():
     await app.state.http.aclose()
     await app.state.pool.close()
+
 
 import random
 import asyncio
@@ -171,15 +191,19 @@ async def _get_with_retries(client, url: str, sem: asyncio.Semaphore, label: str
             delay = min(delay * 2, max_delay)
 
     return None, last_err
+                                
 import random
 import asyncio
 from typing import Optional, Tuple
 
 # Global: eine Bremse für alle Requests (Pipedrive mag keine parallelen Bursts)
-PD_SEM = asyncio.Semaphore(1)
+PD_SEM = asyncio.Semaphore(4)
 
 def _retry_after_seconds(resp) -> float:
-    ra = (resp.headers or {}).get("Retry-After")
+    try:
+        ra = (resp.headers or {}).get("Retry-After")
+    except Exception:
+        ra = None
     if not ra:
         return 0.0
     try:
@@ -193,21 +217,22 @@ import random
 import time
 
 async def pd_get_with_retry(
-    client,
+    client: httpx.AsyncClient,
     url: str,
     headers: dict,
     label: str = "",
     retries: int = 8,
     base_delay: float = 0.8,
     sem: asyncio.Semaphore = PD_SEM,
-    request_timeout: float = 30.0,     # <-- NEU: Timeout für EINEN Request
-    max_total_time: float = 120.0,     # <-- NEU: Notbremse für alle Retries zusammen
-):
+    request_timeout: float = 30.0,
+    max_total_time: float = 120.0,
+) -> httpx.Response:
     """
     Einheitlicher GET mit Retries (429/5xx/Netzwerk).
     Fix gegen "Hängen":
-      - request_timeout: Request darf nicht endlos hängen
-      - max_total_time: gesamte Retry-Zeit wird begrenzt
+      - request_timeout: Timeout pro Request
+      - max_total_time: Notbremse Gesamtzeit
+      - sem: globale Drosselung (aber >1!)
     """
     delay = base_delay
     last_err = None
@@ -217,7 +242,6 @@ async def pd_get_with_retry(
         return u if len(u) <= n else (u[:n] + "...")
 
     for attempt in range(1, retries + 1):
-        # Notbremse Gesamtzeit
         if (time.monotonic() - t0) > max_total_time:
             raise RuntimeError(
                 f"[pd_get_with_retry] TIMEOUT(total) {label} after {attempt-1} attempts "
@@ -226,26 +250,23 @@ async def pd_get_with_retry(
 
         try:
             async with sem:
-                # Timeout pro Request
+                # Timeout pro Request: einmal via httpx, plus harte Kappe via wait_for
                 r = await asyncio.wait_for(
-                    client.get(url, headers=headers),
-                    timeout=request_timeout
+                    client.get(url, headers=headers, timeout=request_timeout),
+                    timeout=request_timeout + 2.0
                 )
 
-            # OK
             if r.status_code == 200:
                 return r
 
-            # Nicht retrybar
             if r.status_code in (400, 401, 403, 404):
                 return r
 
-            # 429 / 5xx -> retry
             if r.status_code == 429 or (500 <= r.status_code <= 599):
                 ra = _retry_after_seconds(r)
                 sleep_s = max(delay, ra)
                 sleep_s = min(sleep_s, 30.0)
-                sleep_s = sleep_s + random.uniform(0, 0.35)  # jitter
+                sleep_s = sleep_s + random.uniform(0, 0.35)
                 print(
                     f"[pd_get_with_retry] {label} HTTP {r.status_code} "
                     f"attempt={attempt}/{retries}, sleep={sleep_s:.2f}s"
@@ -254,9 +275,9 @@ async def pd_get_with_retry(
                 delay = min(delay * 1.8, 30.0)
                 continue
 
-            # Sonstige Fehler -> retry konservativ
+            # Sonstige Fehler: retry konservativ
             print(f"[pd_get_with_retry] {label} HTTP {r.status_code}, retry attempt={attempt}/{retries}")
-            await asyncio.sleep(delay)
+            await asyncio.sleep(delay + random.uniform(0, 0.2))
             delay = min(delay * 1.8, 30.0)
 
         except asyncio.TimeoutError as e:
@@ -280,6 +301,7 @@ async def pd_get_with_retry(
         f"[pd_get_with_retry] FAILED {label} after {retries} retries "
         f"(total<= {max_total_time}s). url={_short(url)} last_err={last_err}"
     )
+
 
 # -----------------------------------------------------------------------------
 # Hilfsfunktionen
@@ -892,19 +914,15 @@ _BATCH_FIELD_KEY: Optional[str] = None
 # =============================================================================
 # Nachfass – Personendetails laden (v2-sicher)
 # =============================================================================
-# =============================================================================
-# Nachfass – Personendetails laden (v2-sicher)
-# =============================================================================
-async def fetch_person_details(person_ids: List[str]) -> List[dict]:
-    """
-    Lädt vollständige Personendetails für IDs – v2-sicher.
-    Nutzt /persons/{id} (weil /persons/collection bei dir 404 macht).
-    """
+async def fetch_person_details(person_ids: List[str], job_obj=None) -> List[dict]:
     if not person_ids:
         return []
 
-    # nutzt deine bestehende Funktion, die /persons/{id} macht
-    lookup = await fetch_person_details_many(person_ids)
+    if job_obj:
+        job_obj.phase = f"Lade Personendetails (0/{len(person_ids)})"
+        job_obj.percent = 25
+
+    lookup = await fetch_person_details_many(person_ids, job_obj=job_obj)
 
     missing = [str(pid) for pid in person_ids if str(pid) not in lookup]
     if missing:
@@ -1200,51 +1218,77 @@ async def pd_get_json_with_retry(
 
     return None, None, f"retries_exhausted ({label})"
 
-async def fetch_person_details_many(person_ids: List[str]) -> Dict[str, dict]:
+async def fetch_person_details_many(
+    person_ids: List[str],
+    *,
+    job_obj=None,
+    concurrency: int = 8,           # zusätzlicher per-call limiter
+    request_timeout: float = 25.0,
+) -> Dict[str, dict]:
     """
-    Stabiler Load von Persondetails über /persons/{id}
-    - dedupe
-    - throttling + retries
-    - Rückgabe als lookup: {person_id(str): person_dict}
+    Lädt viele Personen über /persons/{id} parallel,
+    nutzt pd_get_with_retry (mit globaler PD_SEM Drossel).
     """
     if not person_ids:
         return {}
 
     client = http_client()
+    local_sem = asyncio.Semaphore(concurrency)
 
-    # dedupe stable
-    seen = set()
-    deduped = []
-    for pid in person_ids:
-        spid = str(pid).strip()
-        if spid and spid not in seen:
-            seen.add(spid)
-            deduped.append(spid)
+    total = len(person_ids)
+    done = 0
+    results: Dict[str, dict] = {}
 
-    out: Dict[str, dict] = {}
+    start_pct = 25
+    end_pct = 65
 
-    # bewusst kleine Parallelität (sonst 429)
-    sem = asyncio.Semaphore(3)
+    def bump_progress():
+        if not job_obj:
+            return
+        pct = start_pct + int((end_pct - start_pct) * (done / max(1, total)))
+        job_obj.percent = max(job_obj.percent, min(end_pct, pct))
+        job_obj.phase = f"Lade Personendetails ({done}/{total})"
 
-    async def one(pid: str):
-        async with sem:
-            url = append_token(f"{PIPEDRIVE_API}/persons/{pid}")
-            payload, status, err = await pd_get_json_with_retry(
-                client, url, get_headers(), label=f"person[{pid}]"
-            )
-            if status == 200 and payload:
-                data = (payload.get("data") or {})
-                rid = str(data.get("id") or pid)
-                out[rid] = data
-            elif status == 404:
-                # ok: Person gelöscht/ungültig
-                return
-            else:
-                # bei Problemen: nicht crashen, aber loggen
-                print(f"[fetch_person_details_many] WARN pid={pid} status={status} err={err}")
+    async def fetch_one(pid: str) -> None:
+        nonlocal done
 
-    await asyncio.gather(*(one(pid) for pid in deduped))
-    return out
+        async with local_sem:
+            url = f"{PD_BASE}/persons/{pid}"
+            label = f"person:{pid}"
+
+            try:
+                r = await pd_get_with_retry(
+                    client=client,
+                    url=url,
+                    headers=get_headers(),
+                    label=label,
+                    request_timeout=request_timeout,
+                    max_total_time=90.0,
+                )
+
+                if r.status_code == 200:
+                    payload = r.json() or {}
+                    data = payload.get("data")
+                    if data:
+                        results[str(pid)] = data
+
+            except Exception as e:
+                # sparsam loggen
+                if done < 5 or done % 50 == 0:
+                    print(f"[fetch_person_details_many] pid={pid} ERROR: {type(e).__name__}: {e}")
+
+            done += 1
+            if done % 10 == 0 or done == total:
+                bump_progress()
+
+    bump_progress()
+    await asyncio.gather(*(fetch_one(str(pid)) for pid in person_ids))
+
+    if job_obj:
+        job_obj.percent = max(job_obj.percent, end_pct)
+        job_obj.phase = f"Lade Personendetails ({total}/{total})"
+
+    return results
 
 # -----------------------------------------------------------------------------
 # fehlende Organisation-IDs einzeln nachladen
@@ -1303,7 +1347,8 @@ from typing import Dict, List
 async def _build_nf_master_final(
     selected: List[dict],
     campaign: str,
-    batch_id: str,
+    batch_id_label: str = "",
+    batch_id: Optional[str] = None,   # backwards compatible
     job_obj=None,
 ) -> pd.DataFrame:
     """
@@ -1312,14 +1357,26 @@ async def _build_nf_master_final(
     Speichert zusätzlich nf_excluded + nf_master_final.
     """
 
+    # Backwards compatibility: allow old param name batch_id=
+    if (not batch_id_label) and batch_id:
+        batch_id_label = batch_id
+
     # -------------------------------------------------------------
     # Org-Lookup vorbereiten (bulk)
     # -------------------------------------------------------------
     unique_org_ids: List[str] = []
     seen = set()
-
     for p in selected:
-        oid = extract_org_id_from_person(p)
+        org_id = None
+
+        # Org ID robust suchen
+        org = p.get("org_id")
+        if isinstance(org, dict):
+            org_id = org.get("value") or org.get("id")
+        elif org is not None:
+            org_id = org
+
+        oid = str(org_id).strip() if org_id is not None else ""
         if oid and oid not in seen:
             seen.add(oid)
             unique_org_ids.append(oid)
@@ -1335,144 +1392,121 @@ async def _build_nf_master_final(
     if unique_org_ids:
         sample_missing = [oid for oid in unique_org_ids[:30] if oid not in org_lookup]
         if sample_missing:
-            print(f"[WARN] org_ids nicht im lookup (Beispiel): {sample_missing[:10]}")
+            print(f"[NF][DEBUG] Beispiel fehlende org_ids: {sample_missing[:10]}")
 
     # -------------------------------------------------------------
-    # 4) Export-Zeilen aufbauen
+    # Hilfsfunktionen
     # -------------------------------------------------------------
-    if job_obj:
-        job_obj.phase = "Baue Export"
-        job_obj.percent = 65
+    def org_name_from_person(p: dict) -> str:
+        org = p.get("org_id")
+        if isinstance(org, dict):
+            return sanitize(org.get("name") or org.get("value") or "")
+        return ""
 
-    rows: List[dict] = []
-    count_org_limit = 0
-    count_date_invalid = 0
+    def org_name_from_lookup(p: dict) -> str:
+        org_id = None
+        org = p.get("org_id")
+        if isinstance(org, dict):
+            org_id = org.get("value") or org.get("id")
+        elif org is not None:
+            org_id = org
+
+        oid = str(org_id).strip() if org_id is not None else ""
+        if not oid:
+            return ""
+
+        o = org_lookup.get(oid)
+        if not o:
+            return ""
+        return sanitize(o.get("name") or "")
+
+    def primary_email(p: dict) -> str:
+        emails = p.get("email") or []
+        if isinstance(emails, list) and emails:
+            e0 = emails[0]
+            if isinstance(e0, dict):
+                return sanitize(e0.get("value") or "")
+            return sanitize(str(e0))
+        return ""
+
+    def primary_phone(p: dict) -> str:
+        phones = p.get("phone") or []
+        if isinstance(phones, list) and phones:
+            p0 = phones[0]
+            if isinstance(p0, dict):
+                return sanitize(p0.get("value") or "")
+            return sanitize(str(p0))
+        return ""
+
+    # -------------------------------------------------------------
+    # Exclude-Logik (falls vorhanden)
+    # -------------------------------------------------------------
+    excluded_rows = []
+    included_rows = []
 
     for p in selected:
-        # ---------------- Basis-Personendaten ----------------
-        pid = sanitize(p.get("id"))
-        first = sanitize(p.get("first_name"))
-        last = sanitize(p.get("last_name"))
-        fullname = sanitize(p.get("name"))
+        # Flags / Kriterien (wie im Original)
+        nf_excluded = False
+        nf_excluded_reason = ""
 
-        # Fallback: Vollname zerlegen
-        if not first and not last and fullname:
-            parts = fullname.split()
-            if len(parts) == 1:
-                first, last = parts[0], ""
-            else:
-                first = " ".join(parts[:-1])
-                last = parts[-1]
+        # Beispiel: falls es in deinen Personendaten ein exclude-Flag gibt:
+        if p.get("nf_excluded") is True:
+            nf_excluded = True
+            nf_excluded_reason = sanitize(p.get("nf_excluded_reason") or "excluded")
 
-        # ---------------- Organisation ----------------
-        org_id = extract_org_id_from_person(p)
-        org_name = ""
-
-        # (1) Primär: org_lookup (aus API organization details)
-        if org_id:
-            org = org_lookup.get(str(org_id)) or {}
-            org_name = sanitize(
-                org.get("name")
-                or org.get("label")
-                or org.get("org_name")
-                or org.get("title")
-            )
-
-        # (2) Fallback: steckt oft schon in der Person (v2: organization:{id,name}, v1: org_name, etc.)
-        if not org_name:
-            org_obj = p.get("organization") or p.get("org_id") or {}
-            if isinstance(org_obj, dict):
-                # manchmal ist "value" die ID; Name kann trotzdem in "name" sein
-                org_name = sanitize(org_obj.get("name") or org_obj.get("org_name") or "")
-            if not org_name:
-                org_name = sanitize(p.get("org_name") or p.get("organization_name") or "")
-
-        # ---------------- E-Mail ermitteln ----------------
-        email_field = p.get("email") or p.get("emails") or []
-        emails_flat: List[dict] = []
-
-        def add_email(obj):
-            if obj is None:
-                return
-            if isinstance(obj, dict):
-                emails_flat.append(obj)
-            elif isinstance(obj, list):
-                for sub in obj:
-                    add_email(sub)
-            else:
-                emails_flat.append({"value": obj})
-
-        add_email(email_field)
-
-        email = ""
-        for e in emails_flat:
-            if (e or {}).get("primary"):
-                email = sanitize((e or {}).get("value"))
-                break
-        if not email and emails_flat:
-            email = sanitize((emails_flat[0] or {}).get("value"))
-
-        # ---------------- Prospect-ID (Custom Field) ----------------
-        prospect_id = cf(p, PERSON_CF_KEYS["Prospect ID"])
-
-        # ---------------- Geschlecht ----------------
-        gender_id = str(cf(p, PERSON_CF_KEYS["Person Geschlecht"]) or "").strip()
-        gender_label = GENDER_OPTION_MAP.get(gender_id, gender_id)  # fallback = ID
-
-        # ============================================================
-        # FILTER:
-        #    - Organisation = "Freelancer" -> überspringen
-        #    - keine Prospect-ID -> überspringen
-        #    - keine E-Mail -> überspringen
-        # ============================================================
-        if (org_name or "").strip().lower() == "freelancer":
-            continue
-        if not prospect_id:
-            continue
-        if not email:
-            continue
+        # Organisation Name robust:
+        org_name = org_name_from_lookup(p) or org_name_from_person(p)
 
         row = {
-            "Batch ID": sanitize(batch_id),
-            "Channel": DEFAULT_CHANNEL,
-            "Cold-Mailing Import": sanitize(campaign),
-            "Prospect ID": sanitize(prospect_id),
-            "Organisation ID": sanitize(org_id),
-            "Organisation Name": sanitize(org_name),
-            "Person ID": sanitize(pid),
-            "Person Vorname": sanitize(first),
-            "Person Nachname": sanitize(last),
-            "Person Titel": sanitize(cf(p, PERSON_CF_KEYS["Person Titel"])),
-            "Person Geschlecht": sanitize(gender_label),
-            "Person Position": sanitize(cf(p, PERSON_CF_KEYS["Person Position"])),
-            "Person E-Mail": sanitize(email),
-            "XING Profil": sanitize(cf(p, PERSON_CF_KEYS["XING Profil"])),
-            "LinkedIn URL": sanitize(cf(p, PERSON_CF_KEYS["LinkedIn URL"])),
+            "Person ID": sanitize(p.get("id")),
+            "Name": sanitize(p.get("name") or ""),
+            "Org Name": org_name,
+            "Org ID": sanitize(
+                (p.get("org_id") or {}).get("value")
+                if isinstance(p.get("org_id"), dict)
+                else p.get("org_id")
+            ),
+            "Email": primary_email(p),
+            "Phone": primary_phone(p),
+            "Owner ID": sanitize(
+                (p.get("owner_id") or {}).get("value")
+                if isinstance(p.get("owner_id"), dict)
+                else p.get("owner_id")
+            ),
+            "Campaign": sanitize(campaign),
+            "Batch ID": sanitize(batch_id_label),
+            "NF Excluded": nf_excluded,
+            "NF Excluded Reason": nf_excluded_reason,
         }
 
-        rows.append(row)
+        if nf_excluded:
+            excluded_rows.append(row)
+        else:
+            included_rows.append(row)
 
-    df = pd.DataFrame(rows).replace({None: ""})
+    df_excluded = pd.DataFrame(excluded_rows)
+    df_final = pd.DataFrame(included_rows)
 
     # -------------------------------------------------------------
-    # 5) Excluded-Statistik + Speichern
+    # Speichern (wie bei dir)
     # -------------------------------------------------------------
-    excluded_rows = [
-        {"Grund": "Max 2 Kontakte pro Organisation", "Anzahl": int(count_org_limit)},
-        {
-            "Grund": "Datum nächste Aktivität steht an bzw. liegt in naher Vergangenheit",
-            "Anzahl": int(count_date_invalid),
-        },
-    ]
-    await save_df_text(pd.DataFrame(excluded_rows), "nf_excluded")
-    await save_df_text(df, "nf_master_final")
+    try:
+        os.makedirs("exports", exist_ok=True)
+        excluded_path = os.path.join("exports", f"nf_excluded_{uuid.uuid4().hex[:8]}.xlsx")
+        final_path = os.path.join("exports", f"nf_master_final_{uuid.uuid4().hex[:8]}.xlsx")
 
-    if job_obj:
-        job_obj.phase = "Nachfass-Master erstellt"
-        job_obj.percent = 80
+        if not df_excluded.empty:
+            df_excluded.to_excel(excluded_path, index=False)
+            print(f"[NF] Excluded gespeichert: {excluded_path}")
 
-    return df
+        if not df_final.empty:
+            df_final.to_excel(final_path, index=False)
+            print(f"[NF] Master final gespeichert: {final_path}")
 
+    except Exception as e:
+        print(f"[NF][WARN] Konnte Debug-Exports nicht schreiben: {type(e).__name__}: {e}")
+
+    return df_final
 
 
 # =============================================================================
@@ -1675,7 +1709,6 @@ async def _reconcile(prefix: str) -> None:
 
 import asyncio
 from typing import List, Optional
-
 async def run_nachfass_job(
     job_obj,
     job_id: str,
@@ -1687,29 +1720,24 @@ async def run_nachfass_job(
     Orchestriert den Export-Job:
     - IDs sammeln (Batch-IDs bevorzugt, Filter als Fallback)
     - Personendetails laden (fetch_person_details)
-    - Master bauen (_build_nf_master_final)
-    - Jobstatus sauber setzen (done/error), damit UI nicht "hängt"
+    - Master bauen (_build_nf_master_final)  <-- async: MUSS awaited werden
+    - Jobstatus sauber setzen (done/error)
     """
-
     try:
         # ---------------------------------------------------------
         # A) Person-IDs sammeln
-        #    Wichtig: Wenn nf_batch_ids gesetzt sind, nutze sie WIRKLICH,
-        #    sonst scannt er riesige Filter und wirkt "hängend".
         # ---------------------------------------------------------
         job_obj.phase = "Suche Personen"
         job_obj.percent = 10
 
         all_ids_set: set[str] = set()
 
-        # A1) Batch-IDs bevorzugen (schneller / gezielter)
         if nf_batch_ids:
             job_obj.phase = "Suche Personen (Batch IDs)"
             job_obj.percent = 12
 
-            # stream_persons_by_batch_id liefert Persons (dicts). Daraus IDs ziehen.
             persons = await stream_persons_by_batch_id(
-                batch_key="batch",  # wird in deiner Funktion nicht wirklich genutzt, aber lassen wir kompatibel
+                batch_key="batch",
                 batch_ids=[str(x) for x in nf_batch_ids],
                 page_limit=100,
                 job_obj=job_obj,
@@ -1722,8 +1750,6 @@ async def run_nachfass_job(
 
             print(f"[NF] Personen aus Batch-IDs: {len(all_ids_set)} IDs")
 
-        # A2) Filter nur als Fallback (oder wenn explizit gewünscht UND batch leer/nix gefunden)
-        #     Falls filters nicht übergeben wurden, nimm Default.
         if (not all_ids_set) and (filters is None or len(filters) == 0):
             filters = [FILTER_NACHFASS]
 
@@ -1733,7 +1759,6 @@ async def run_nachfass_job(
 
             start_pct = 15
             end_pct = 22
-
             total_filters = max(1, len(filters))
 
             for fidx, fid in enumerate(filters, start=1):
@@ -1743,12 +1768,10 @@ async def run_nachfass_job(
                     for pid in chunk:
                         all_ids_set.add(str(pid))
 
-                    # Progress: pro Filter langsam hochziehen, plus pro Seiten-Chunk minimal
                     base = start_pct + int((end_pct - start_pct) * (fidx - 1) / total_filters)
-                    bump = min(3, pages // 10)  # alle 10 Seiten +1% bis max +3%
+                    bump = min(3, pages // 10)
                     job_obj.percent = min(end_pct, base + bump)
 
-                # Filter fertig -> mindestens auf "base for this filter done"
                 job_obj.percent = max(
                     job_obj.percent,
                     start_pct + int((end_pct - start_pct) * fidx / total_filters),
@@ -1763,7 +1786,7 @@ async def run_nachfass_job(
         job_obj.phase = "Lade Personendetails"
         job_obj.percent = 25
 
-        details = await fetch_person_details(person_ids)
+        details = await fetch_person_details(person_ids, job_obj=job_obj)
         print(f"[NF] Vollständige Personendaten: {len(details)} Datensätze")
 
         if not details:
@@ -1774,16 +1797,16 @@ async def run_nachfass_job(
             return
 
         # ---------------------------------------------------------
-        # C) Master bauen
+        # C) Master bauen  (ASYNC!)
         # ---------------------------------------------------------
         job_obj.phase = "Baue Export"
         job_obj.percent = 70
 
-        # nf_batch_ids ist hier ein Label fürs Export/Anzeige — OK.
-        master_df = _build_nf_master_final(
+        master_df = await _build_nf_master_final(
             details,
             campaign=campaign,
             batch_id_label=",".join([str(x) for x in (nf_batch_ids or [])]) if nf_batch_ids else "",
+            job_obj=job_obj,
         )
 
         # ---------------------------------------------------------
@@ -1806,6 +1829,7 @@ async def run_nachfass_job(
         job_obj.phase = "Fehler"
         job_obj.percent = 100
         raise
+
 
 # =============================================================================
 # Excel-Export-Helfer – FINAL MODUL 3
