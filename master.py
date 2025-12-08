@@ -1842,22 +1842,23 @@ async def run_nachfass_job(
         job_obj.percent = 90
 
         out_path = export_to_excel(master_df, prefix="nachfass_export", job_id=job_id)
-        
-        job_obj.result_path = out_path
+
+        job_obj.path = out_path
         job_obj.filename_base = job_obj.filename_base or "Nachfass_Export"
         
+        job_obj.error = None
         job_obj.phase = "Fertig"
         job_obj.percent = 100
         job_obj.done = True
-        job_obj.error = None
 
+      
     except Exception as e:
         job_obj.done = True
         job_obj.error = f"{type(e).__name__}: {e}"
         job_obj.phase = "Fehler"
         job_obj.percent = 100
         print(f"[NF][ERROR] Job failed: {job_obj.error}")
-        raise
+        return
 
 
 # =============================================================================
@@ -2457,9 +2458,7 @@ async function loadExcludedTable(){
 // Export Polling
 // ---------------------------------------------------------------------------
 async function poll(job_id){
-    let done = false;
-
-    while (!done){
+    while (true){
         await new Promise(r => setTimeout(r, 500));
 
         const res = await fetch('/nachfass/export_progress?job_id=' + job_id);
@@ -2474,25 +2473,25 @@ async function poll(job_id){
             return;
         }
 
-        done = !!s.done;
+        // ✅ Nur dann downloaden, wenn Datei wirklich da ist
+        if (s.download_ready){
+            showOverlay("Download startet …");
+            setProgress(100);
+
+            window.location.href = '/nachfass/export_download?job_id=' + job_id;
+
+            await loadExcludedTable();
+            hideOverlay();
+            return;
+        }
+
+        // done aber keine Datei => sauberer Fehler (sonst 404 "Keine Datei")
+        if (s.done && !s.has_file){
+            alert("Job ist beendet, aber keine Datei wurde erzeugt (job.path fehlt).");
+            hideOverlay();
+            return;
+        }
     }
-
-    // Defensive: final check
-    const res2 = await fetch('/nachfass/export_progress?job_id=' + job_id);
-    const s2 = await res2.json();
-    if (s2.error){
-        alert(s2.error);
-        hideOverlay();
-        return;
-    }
-
-    showOverlay("Download startet …");
-    setProgress(100);
-
-    window.location.href = '/nachfass/export_download?job_id=' + job_id;
-
-    await loadExcludedTable();
-    hideOverlay();
 }
 
 
