@@ -220,6 +220,7 @@ import time
 async def pd_get_with_retry(
     client: httpx.AsyncClient,
     url: str,
+    headers: Optional[dict] = None,   # <-- optional, damit alte Calls weiter gehen
     label: str = "",
     retries: int = 8,
     base_delay: float = 0.8,
@@ -227,6 +228,14 @@ async def pd_get_with_retry(
     request_timeout: float = 30.0,
     max_total_time: float = 120.0,
 ) -> httpx.Response:
+    """
+    Backward compatible:
+      - alt: pd_get_with_retry(client, url, headers, label="x")
+      - neu: pd_get_with_retry(client, url, label="x")  (headers None)
+    Auth-Handling:
+      - wenn headers mit Authorization übergeben -> nutze die (OAuth)
+      - sonst -> pd_auth(url) entscheidet (Bearer oder api_token)
+    """
     delay = base_delay
     last_err = None
     t0 = time.monotonic()
@@ -242,22 +251,26 @@ async def pd_get_with_retry(
             )
 
         try:
-            real_url, headers = pd_auth(url)
+            # 1) headers wurden explizit übergeben (alter Code) -> respektieren
+            if headers and headers.get("Authorization"):
+                real_url = url
+                real_headers = headers
+            else:
+                # 2) sonst zentral entscheiden (OAuth oder api_token)
+                real_url, real_headers = pd_auth(url)
 
             async with sem:
                 r = await asyncio.wait_for(
-                    client.get(real_url, headers=headers, timeout=request_timeout),
+                    client.get(real_url, headers=real_headers, timeout=request_timeout),
                     timeout=request_timeout + 2.0,
                 )
 
             if r.status_code == 200:
                 return r
 
-            # Nicht retrybar
             if r.status_code in (400, 401, 403, 404):
                 return r
 
-            # Retrybar
             if r.status_code == 429 or (500 <= r.status_code <= 599):
                 ra = _retry_after_seconds(r)
                 sleep_s = max(delay, ra)
@@ -271,7 +284,6 @@ async def pd_get_with_retry(
                 delay = min(delay * 1.8, 30.0)
                 continue
 
-            # Sonstige Fehler -> retry konservativ
             print(f"[pd_get_with_retry] {label} HTTP {r.status_code}, retry attempt={attempt}/{retries}")
             await asyncio.sleep(delay + random.uniform(0, 0.2))
             delay = min(delay * 1.8, 30.0)
@@ -1232,6 +1244,7 @@ async def pd_get_json_with_retry(
     return None, None, f"retries_exhausted ({label})"
 
 
+
 async def fetch_person_details_many(
     person_ids: List[str],
     *,
@@ -1264,13 +1277,13 @@ async def fetch_person_details_many(
 
         async with local_sem:
             url = f"{PIPEDRIVE_API}/persons/{pid}"
-            label = f"person:{pid}"
 
             try:
                 r = await pd_get_with_retry(
-                    client=client,
-                    url=url,
-                    label=label,
+                    client,
+                    url,
+                    None,                 # headers optional (alt kompatibel)
+                    label=f"person:{pid}",
                     request_timeout=request_timeout,
                     max_total_time=90.0,
                 )
@@ -1280,10 +1293,6 @@ async def fetch_person_details_many(
                     data = payload.get("data")
                     if data:
                         results[str(pid)] = data
-                else:
-                    # log nur sparsam
-                    if done < 5 or done % 50 == 0:
-                        print(f"[fetch_person_details_many] pid={pid} HTTP {r.status_code}")
 
             except Exception as e:
                 if done < 5 or done % 50 == 0:
@@ -1301,7 +1310,6 @@ async def fetch_person_details_many(
         job_obj.phase = f"Lade Personendetails ({total}/{total})"
 
     return results
-
 
 # -----------------------------------------------------------------------------
 # fehlende Organisation-IDs einzeln nachladen
