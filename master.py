@@ -1432,7 +1432,6 @@ async def fetch_org_details(org_ids: list[str]) -> dict[str, dict]:
 # -----------------------------------------------------------------------------
 import pandas as pd
 from typing import Dict, List
-
 async def _build_nf_master_final(
     selected: List[dict],
     campaign: str,
@@ -1443,7 +1442,7 @@ async def _build_nf_master_final(
     if (not batch_id_label) and batch_id:
         batch_id_label = batch_id
 
-    # --- Org IDs sammeln
+    # --- Org IDs sammeln (robust)
     unique_org_ids: List[str] = []
     seen = set()
     for p in selected:
@@ -1470,9 +1469,14 @@ async def _build_nf_master_final(
             org_lookup = await fetch_orgs_bulk(unique_org_ids, concurrency=2)
 
         except Exception as e:
-            # NICHT fatal
             print(f"[NF][WARN] fetch_orgs_bulk failed: {type(e).__name__}: {e}")
             org_lookup = {}
+
+    def org_id_from_person(p: dict) -> str:
+        org = p.get("org_id")
+        if isinstance(org, dict):
+            return sanitize(org.get("value") or org.get("id") or "")
+        return sanitize(org or "")
 
     def org_name_from_person(p: dict) -> str:
         org = p.get("org_id")
@@ -1481,14 +1485,7 @@ async def _build_nf_master_final(
         return ""
 
     def org_name_from_lookup(p: dict) -> str:
-        org_id = None
-        org = p.get("org_id")
-        if isinstance(org, dict):
-            org_id = org.get("value") or org.get("id")
-        elif org is not None:
-            org_id = org
-
-        oid = str(org_id).strip() if org_id is not None else ""
+        oid = org_id_from_person(p)
         if not oid:
             return ""
         o = org_lookup.get(oid)
@@ -1501,34 +1498,67 @@ async def _build_nf_master_final(
             return sanitize(e0.get("value") if isinstance(e0, dict) else str(e0))
         return ""
 
-    def primary_phone(p: dict) -> str:
-        phones = p.get("phone") or []
-        if isinstance(phones, list) and phones:
-            p0 = phones[0]
-            return sanitize(p0.get("value") if isinstance(p0, dict) else str(p0))
+    def split_first_last(p: dict) -> tuple[str, str]:
+        first = p.get("first_name")
+        last = p.get("last_name")
+        full = p.get("name")
+        return split_name(first, last, full)
+
+    def gender_label(p: dict) -> str:
+        # wenn du ein Feld hast, das direkt "gender" liefert:
+        v = p.get("gender")
+        if isinstance(v, dict):
+            v = v.get("value")
+        v = sanitize(v)
+        # falls numerisch (custom option id), mappe:
+        return GENDER_OPTION_MAP.get(v, v)
+
+    def xing(p: dict) -> str:
+        # v2: häufig custom field; hier best effort anhand vorhandener keys
+        for k in ("xing", "xing_url", "xing profil", "xing profile"):
+            if k in p:
+                return sanitize(p.get(k))
         return ""
+
+    def linkedin(p: dict) -> str:
+        for k in ("linkedin", "linkedin_url", "linkedin url"):
+            if k in p:
+                return sanitize(p.get(k))
+        return ""
+
+    def title(p: dict) -> str:
+        # häufig "title" oder custom field
+        return sanitize(p.get("title") or "")
+
+    def position(p: dict) -> str:
+        return sanitize(p.get("job_title") or p.get("position") or "")
 
     rows = []
     for p in selected:
-        org_name = org_name_from_lookup(p) or org_name_from_person(p)
+        first, last = split_first_last(p)
+        oid = org_id_from_person(p)
+        oname = org_name_from_lookup(p) or org_name_from_person(p)
 
         rows.append({
-            "Person ID": sanitize(p.get("id")),
-            "Name": sanitize(p.get("name") or ""),
-            "Organisation ID": sanitize(
-                (p.get("org_id") or {}).get("value")
-                if isinstance(p.get("org_id"), dict)
-                else p.get("org_id")
-            ),
-            "Organisationsname": org_name,
-            "Email": primary_email(p),
-            "Phone": primary_phone(p),
-            "Campaign": sanitize(campaign),
             "Batch ID": sanitize(batch_id_label),
+            "Channel": sanitize(DEFAULT_CHANNEL),
+            "Cold-Mailing Import": "",                 # falls du hier etwas setzen willst, hier rein
+            "Prospect ID": "",                         # falls du das aus custom fields hast, hier rein
+            "Organisation ID": sanitize(oid),
+            "Organisation Name": sanitize(oname),
+            "Person ID": sanitize(p.get("id")),
+            "Person Vorname": sanitize(first),
+            "Person Nachname": sanitize(last),
+            "Person Titel": title(p),
+            "Person Geschlecht": gender_label(p),
+            "Person Position": position(p),
+            "Person E-Mail": primary_email(p),
+            "XING Profil": xing(p),
+            "LinkedIn URL": linkedin(p),
         })
 
-    df_final = pd.DataFrame(rows)
-    return df_final
+    return pd.DataFrame(rows)
+
 
 
 # =============================================================================
@@ -1741,9 +1771,11 @@ async def run_nachfass_job(
     """
     Orchestriert den Export-Job:
     - IDs sammeln (Batch-IDs bevorzugt, Filter als Fallback)
-    - Personendetails laden (fetch_person_details)
-    - Master bauen (_build_nf_master_final)  <-- async: MUSS awaited werden
-    - Jobstatus sauber setzen (done/error)
+    - Personendetails laden
+    - Master bauen (nf_master_final schreiben)
+    - _reconcile("nf") -> nf_master_ready + nf_delete_log
+    - Excel aus nf_master_ready bauen
+    - Jobstatus sauber setzen
     """
     try:
         # ---------------------------------------------------------
@@ -1820,12 +1852,15 @@ async def run_nachfass_job(
 
         loaded_ids = {str(p.get("id")) for p in details if p.get("id") is not None}
         missing_details = [pid for pid in person_ids if str(pid) not in loaded_ids]
-        print(f"[NF] requested_ids={len(person_ids)} loaded_details={len(details)} missing_details={len(missing_details)}")
+        print(
+            f"[NF] requested_ids={len(person_ids)} loaded_details={len(details)} "
+            f"missing_details={len(missing_details)}"
+        )
 
         # ---------------------------------------------------------
-        # C) Master bauen  (ASYNC!)
+        # C) Master bauen
         # ---------------------------------------------------------
-        job_obj.phase = "Baue Export"
+        job_obj.phase = "Baue Master (nf_master_final)"
         job_obj.percent = 70
 
         master_df = await _build_nf_master_final(
@@ -1835,23 +1870,40 @@ async def run_nachfass_job(
             job_obj=job_obj,
         )
 
+        # nf_master_final schreiben
+        job_obj.phase = "Schreibe DB: nf_master_final"
+        job_obj.percent = 78
+        await save_df_text(master_df, "nf_master_final")
+
         # ---------------------------------------------------------
-        # D) Excel schreiben
+        # D) Abgleich -> nf_master_ready + nf_delete_log
         # ---------------------------------------------------------
-        job_obj.phase = "Schreibe Excel"
+        job_obj.phase = "Abgleich (nf -> ready/log)"
+        job_obj.percent = 82
+        await _reconcile("nf")
+
+        # ready laden (das ist dann die “finale Auswahl”)
+        job_obj.phase = "Lade DB: nf_master_ready"
+        job_obj.percent = 86
+        ready_df = await load_df_text("nf_master_ready")
+
+        # ---------------------------------------------------------
+        # E) Excel schreiben (aus READY!)
+        # ---------------------------------------------------------
+        job_obj.phase = "Baue Excel-Export"
         job_obj.percent = 90
 
-        out_path = export_to_excel(master_df, prefix="nachfass_export", job_id=job_id)
+        export_df = build_nf_export(ready_df)
+
+        out_path = export_to_excel(export_df, prefix="nachfass_export", job_id=job_id)
 
         job_obj.path = out_path
         job_obj.filename_base = job_obj.filename_base or "Nachfass_Export"
-        
         job_obj.error = None
         job_obj.phase = "Fertig"
         job_obj.percent = 100
         job_obj.done = True
 
-      
     except Exception as e:
         job_obj.done = True
         job_obj.error = f"{type(e).__name__}: {e}"
