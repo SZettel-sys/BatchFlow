@@ -663,8 +663,110 @@ def pd_auth(url: str) -> tuple[str, Dict[str, str]]:
     return append_token(url), {}
     
 # =============================================================================
-# GET Retry/Backoff
+# PERSONEN ÜBER FILTER LADEN
 # =============================================================================
+async def stream_persons_by_filter_and_batches(
+    filter_id: int,
+    batch_values: List[str],
+    batch_field_key: str,
+    page_limit: int = 200,
+    job_obj=None,
+) -> List[dict]:
+    """
+    Holt Persons über /persons/collection?filter_id=...
+    und filtert anschließend stabil auf Batch-ID Custom Field IN {batch_values}.
+    => Batch-ID bleibt variabel (1-2 Werte), ohne persons/search.
+    """
+    # normalize batch values (1-2 allowed, but we handle more)
+    want = []
+    seen_w: set[str] = set()
+    for b in (batch_values or []):
+        b = (b or "").strip()
+        if b and b not in seen_w:
+            seen_w.add(b)
+            want.append(b)
+
+    if not want:
+        return []
+
+    out: List[dict] = []
+    seen_pid: set[str] = set()
+
+    cursor: Optional[str] = None
+    start: Optional[int] = None
+    scanned = 0
+
+    while True:
+        base = f"{PIPEDRIVE_API}/persons/collection?filter_id={int(filter_id)}&limit={int(page_limit)}"
+        url = append_token(base)
+        if cursor:
+            url += f"&cursor={cursor}"
+        if start is not None:
+            url += f"&start={start}"
+
+        r = await pd_get_with_retry(
+            http_client(),
+            url,
+            get_headers(),
+            label=f"persons_collection filter={filter_id}",
+            retries=10,
+            request_timeout=30.0,
+            max_total_time=180.0,
+        )
+
+        if r.status_code != 200:
+            print(f"[WARN] persons/collection filter={filter_id} HTTP {r.status_code} {r.text[:200]}")
+            break
+
+        payload = r.json() or {}
+        data = payload.get("data") or []
+        if not data:
+            break
+
+        scanned += len(data)
+
+        for p in data:
+            if not isinstance(p, dict):
+                continue
+            pid = p.get("id")
+            if pid is None:
+                continue
+            pid = str(pid)
+
+            # Batch-ID Custom Field
+            v = sanitize(cf_value(p, batch_field_key)).strip()
+            if v not in want:
+                continue
+
+            if pid in seen_pid:
+                continue
+            seen_pid.add(pid)
+            out.append(p)
+
+        if job_obj:
+            job_obj.phase = f"Suche Personen (Filter {filter_id}, Batch {','.join(want)})"
+            # grob: 10..22%
+            job_obj.percent = min(22, max(job_obj.percent, 10 + int(12 * len(out) / max(1, len(out) + 50))))
+
+        ad = payload.get("additional_data") or {}
+
+        # cursor style
+        next_cursor = ad.get("next_cursor")
+        if next_cursor:
+            cursor = next_cursor
+            continue
+
+        # pagination style
+        pagination = ad.get("pagination") or {}
+        if pagination.get("more_items_in_collection") is True:
+            start = int(pagination.get("next_start") or (start or 0) + page_limit)
+            continue
+
+        break
+
+    print(f"[NF] persons/collection filter={filter_id} scanned={scanned}, matched={len(out)} (batch={want})")
+    return out
+
 
 
 # =============================================================================
@@ -2144,62 +2246,29 @@ async def run_nachfass_job(
     """
     try:
         # ---------------------------------------------------------
-        # A) Person-IDs sammeln
+        # A) Personen sammeln (Filter + Batch IDs aus UI)
         # ---------------------------------------------------------
         job_obj.phase = "Suche Personen"
         job_obj.percent = 10
+        
+        BASE_FILTER_ID = FILTER_NACHFASS              # z.B. 3024
+        FIELD_BATCH_ID = PD_PERSON_FIELDS["Batch ID"] # custom field key
+        
+        # UI: Batch IDs (1-2 Werte)
+        batch_values = [str(x).strip() for x in (nf_batch_ids or []) if str(x).strip()]
+        batch_values = batch_values[:2]
+        
+        persons = await stream_persons_by_filter_and_batches(
+            filter_id=BASE_FILTER_ID,
+            batch_values=batch_values,
+            batch_field_key=FIELD_BATCH_ID,
+            page_limit=200,
+            job_obj=job_obj,
+        )
+        
+        person_ids = [str(p.get("id")) for p in persons if p.get("id") is not None]
+        print(f"[NF] Personen aus Filter+Batch: {len(person_ids)} IDs")
 
-        all_ids_set: set[str] = set()
-
-        # A1) Batch-IDs bevorzugt
-        if nf_batch_ids:
-            job_obj.phase = "Suche Personen (Batch IDs)"
-            job_obj.percent = 12
-
-            persons = await stream_persons_by_batch_id(
-                batch_key="batch",
-                batch_ids=[str(x) for x in nf_batch_ids],
-                page_limit=100,
-                job_obj=job_obj,
-            )
-
-            for p in persons:
-                pid = p.get("id")
-                if pid is not None:
-                    all_ids_set.add(str(pid))
-
-            print(f"[NF] Personen aus Batch-IDs: {len(all_ids_set)} IDs")
-
-        # A2) Filter als Fallback
-        if (not all_ids_set) and (filters is None or len(filters) == 0):
-            filters = [FILTER_NACHFASS]
-
-        if (not all_ids_set) and filters:
-            job_obj.phase = "Suche Personen (Filter)"
-            job_obj.percent = 15
-
-            start_pct = 15
-            end_pct = 22
-            total_filters = max(1, len(filters))
-
-            for fidx, fid in enumerate(filters, start=1):
-                pages = 0
-                async for chunk in stream_person_ids_by_filter(int(fid), page_limit=PAGE_LIMIT):
-                    pages += 1
-                    for pid in chunk:
-                        all_ids_set.add(str(pid))
-
-                    base = start_pct + int((end_pct - start_pct) * (fidx - 1) / total_filters)
-                    bump = min(3, pages // 10)
-                    job_obj.percent = min(end_pct, base + bump)
-
-                job_obj.percent = max(
-                    job_obj.percent,
-                    start_pct + int((end_pct - start_pct) * fidx / total_filters),
-                )
-
-        person_ids = list(all_ids_set)
-        print(f"[NF] Personen aus Suche: {len(person_ids)} IDs")
 
         # ---------------------------------------------------------
         # B) Personendetails laden
