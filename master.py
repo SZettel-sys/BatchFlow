@@ -669,17 +669,29 @@ async def fetch_persons_by_filter_id_v2(
     filter_id: int,
     limit: int = 200,
     job_obj=None,
+    max_pages: int = 50,          # Notbremse
+    max_empty_growth: int = 3,    # Notbremse wenn keine neuen IDs mehr kommen
 ) -> List[dict]:
     """
     v2: Holt Persons über /persons?filter_id=...
-    WICHTIG: Bei dir ist 'start' NICHT erlaubt -> cursor-basiert.
+    Bei dir ist 'start' nicht erlaubt => cursor-basiert.
+    Notbremsen gegen Endlosschleifen (wiederholter cursor / keine neuen IDs / max_pages).
     """
     out: List[dict] = []
-    seen: set[str] = set()
+    seen_ids: set[str] = set()
+
     cursor: Optional[str] = None
-    scanned_pages = 0
+    seen_cursors: set[str] = set()
+
+    pages = 0
+    no_growth_streak = 0
 
     while True:
+        pages += 1
+        if pages > max_pages:
+            print(f"[WARN] fetch_persons_by_filter_id_v2 abort: max_pages={max_pages} reached")
+            break
+
         base = f"{PIPEDRIVE_API}/persons?filter_id={int(filter_id)}&limit={int(limit)}"
         url = append_token(base)
         if cursor:
@@ -689,7 +701,7 @@ async def fetch_persons_by_filter_id_v2(
             http_client(),
             url,
             get_headers(),
-            label=f"persons filter={filter_id} cursor={cursor or 'None'}",
+            label=f"persons filter={filter_id} page={pages} cursor={cursor or 'None'}",
             retries=10,
             request_timeout=30.0,
             max_total_time=180.0,
@@ -701,10 +713,8 @@ async def fetch_persons_by_filter_id_v2(
 
         payload = r.json() or {}
         data = payload.get("data") or []
-        scanned_pages += 1
 
-        if not data:
-            break
+        before = len(seen_ids)
 
         for p in data:
             if not isinstance(p, dict):
@@ -713,37 +723,51 @@ async def fetch_persons_by_filter_id_v2(
             if pid is None:
                 continue
             pid = str(pid)
-            if pid in seen:
+            if pid in seen_ids:
                 continue
-            seen.add(pid)
+            seen_ids.add(pid)
             out.append(p)
+
+        added = len(seen_ids) - before
+        print(f"[NF] filter={filter_id} page={pages} got={len(data)} added_ids={added} total={len(out)} cursor={str(cursor)[:16] if cursor else 'None'}")
+
+        if added == 0:
+            no_growth_streak += 1
+        else:
+            no_growth_streak = 0
 
         if job_obj:
             job_obj.phase = f"Suche Personen (Filter {filter_id})"
-            job_obj.percent = min(22, max(job_obj.percent, 12))
+            # 10..22%, grob nach pages / found
+            job_obj.percent = min(22, max(job_obj.percent, 12 + min(8, pages)))
+
+        # Wenn keine neuen IDs mehr kommen, brech ab (sonst Endlosschleife)
+        if no_growth_streak >= max_empty_growth:
+            print(f"[WARN] abort: no new IDs for {no_growth_streak} pages (possible cursor loop)")
+            break
 
         ad = payload.get("additional_data") or {}
-
-        # v2 cursor pagination
         next_cursor = ad.get("next_cursor")
-        if next_cursor:
-            cursor = next_cursor
-            continue
+        if not next_cursor:
+            pagination = ad.get("pagination") or {}
+            next_cursor = pagination.get("next_cursor")
 
-        # manchmal steckt es verschachtelt
-        pagination = ad.get("pagination") or {}
-        next_cursor2 = pagination.get("next_cursor")
-        if next_cursor2:
-            cursor = next_cursor2
-            continue
+        if not next_cursor:
+            # keine weitere Seite
+            break
 
-        # keine weitere Seite
-        break
+        next_cursor = str(next_cursor)
 
-    print(f"[NF] /persons?filter_id={filter_id}: pages={scanned_pages}, personen={len(out)}")
+        # Cursor wiederholt sich => Endlosschleife verhindern
+        if next_cursor in seen_cursors:
+            print(f"[WARN] abort: cursor repeated ({next_cursor[:16]}...)")
+            break
+
+        seen_cursors.add(next_cursor)
+        cursor = next_cursor
+
+    print(f"[NF] /persons?filter_id={filter_id}: pages={pages}, personen={len(out)}")
     return out
-
-
 
 def filter_persons_by_batch_values(persons: List[dict], batch_values: List[str], batch_field_key: str) -> List[dict]:
     want = {str(b).strip() for b in (batch_values or []) if str(b).strip()}
