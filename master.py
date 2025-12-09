@@ -948,6 +948,7 @@ def _pretty_reason(reason: str, extra: str = "") -> str:
 # =============================================================================
 from typing import List, Optional
 import asyncio
+
 async def stream_persons_by_batch_id(
     batch_key: str,
     batch_ids: List[str],
@@ -956,13 +957,14 @@ async def stream_persons_by_batch_id(
 ) -> List[dict]:
     """
     Holt Personen über /persons/search nach Batch-ID Term.
-    WICHTIG: Search-Items sind je nach API-Shape nicht immer "vollständige Personobjekte".
-    Diese Version extrahiert IDs robust und garantiert, dass jeder zurückgegebene Dict ein 'id' hat.
+    Gibt "rich" item-Dicts zurück (wie früher), garantiert aber 'id'.
+    Zusätzlich: debuggt 1 Sample pro Batch (keys + email), damit wir sehen,
+    ob persons/search email tatsächlich enthält.
     """
     results: List[dict] = []
     seen_ids: set[str] = set()
 
-    sem = asyncio.Semaphore(1)  # search ist 429-anfällig, 1 ist ok
+    sem = asyncio.Semaphore(1)  # search ist extrem 429-anfällig
 
     def _extract_id_from_search_item(it: dict) -> Optional[str]:
         """
@@ -972,12 +974,7 @@ async def stream_persons_by_batch_id(
         if not isinstance(it, dict):
             return None
 
-        # häufig: it = {"item": {...}}
         item = it.get("item") if isinstance(it.get("item"), dict) else it
-        
-        if total_items == 0 and cursor is None:  # nur beim allerersten Batch-Page
-            print("[DEBUG] persons/search item keys:", sorted(list(item.keys()))[:80])
-            print("[DEBUG] persons/search email raw:", item.get("email"))
 
         # direkte id
         if isinstance(item, dict) and item.get("id") is not None:
@@ -992,14 +989,14 @@ async def stream_persons_by_batch_id(
         if isinstance(item, dict) and item.get("person_id") is not None:
             return str(item["person_id"])
 
-        # fallback: gar nix
         return None
 
     async def fetch_one(bid: str):
         cursor: Optional[str] = None
         total_items = 0
         total_with_id = 0
-        local: List[dict] = []
+        added = 0
+        printed_sample = False
 
         while True:
             base_url = (
@@ -1014,7 +1011,7 @@ async def stream_persons_by_batch_id(
                 r = await pd_get_with_retry(
                     http_client(),
                     url,
-                    None,
+                    get_headers(),  # wichtig: nicht None
                     label=f"persons_search bid={bid}",
                     request_timeout=30.0,
                     max_total_time=180.0,
@@ -1031,9 +1028,11 @@ async def stream_persons_by_batch_id(
 
             total_items += len(raw_items)
 
-            # wir sammeln NICHT blind item dicts, sondern extrahieren ID robust
             for it in raw_items:
                 if not isinstance(it, dict):
+                    continue
+                item = it.get("item")
+                if not isinstance(item, dict):
                     continue
 
                 pid = _extract_id_from_search_item(it)
@@ -1041,30 +1040,41 @@ async def stream_persons_by_batch_id(
                     continue
 
                 total_with_id += 1
+
+                # Debug: genau 1 Beispiel pro Batch
+                if not printed_sample:
+                    printed_sample = True
+                    import json
+                    print("[DEBUG] persons/search keys:", sorted(list(item.keys()))[:80])
+                    print("[DEBUG] persons/search email raw:", item.get("email"))
+                    print(
+                        "[DEBUG] persons/search sample:",
+                        json.dumps(
+                            {k: item.get(k) for k in ["id", "name", "email", "org_id", "first_name", "last_name"]},
+                            ensure_ascii=False
+                        )[:800]
+                    )
+
                 if pid in seen_ids:
                     continue
                 seen_ids.add(pid)
 
-                # wir geben ein minimales dict zurück, das garantiert 'id' hat
-                # (Details kommen danach über fetch_person_details_many)
-                local.append({"id": pid})
+                # "rich" item behalten, aber id erzwingen
+                person_obj = dict(item)
+                person_obj["id"] = pid
+                results.append(person_obj)
+                added += 1
 
             cursor = (payload.get("additional_data") or {}).get("next_cursor")
             if not cursor:
                 break
 
-        if local:
-            print(f"[Batch {bid}] {total_items} Search-Items, {total_with_id} mit ID, {len(local)} neue IDs")
-            results.extend(local)
-        else:
-            print(f"[Batch {bid}] {total_items} Search-Items, {total_with_id} mit ID, 0 neue IDs")
-
-        print(f"[DEBUG] Batch {bid}: {len(local)} IDs geladen")
+        print(f"[Batch {bid}] {total_items} Search-Items, {total_with_id} mit ID, {added} neue Personen")
+        print(f"[DEBUG] Batch {bid}: {added} Personen geladen")
 
     await asyncio.gather(*(fetch_one(str(bid)) for bid in batch_ids))
-    print(f"[INFO] Alle Batch-IDs geladen: {len(results)} eindeutige Personen-IDs gesamt")
+    print(f"[INFO] Alle Batch-IDs geladen: {len(results)} eindeutige Personen gesamt")
     return results
-
 
 
 # =============================================================================
