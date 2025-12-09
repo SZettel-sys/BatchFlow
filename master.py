@@ -1387,47 +1387,32 @@ import asyncio
 
 async def stream_persons_by_batch_id(
     batch_key: str,
-    batch_ids: List[str],
-    page_limit: int = 100,
-    job_obj=None
-) -> List[dict]:
+    batch_ids: list[str],
+    page_limit: int = 100,   # persons/search: MUSS <= 100 sein
+    job_obj=None,
+) -> tuple[list[str], list[dict]]:
     """
-    Holt Personen über /persons/search (v2) und filtert EXAKT auf Batch-ID == bid.
-    Gibt eine Liste von (person-search-item)-dicts zurück (item aus search).
+    Sucht Personen über persons/search nach Batch-ID (Custom Field).
+    WICHTIG:
+      - persons/search limit <= 100
+      - liefert bei dir KEINE email -> nur IDs sammeln, Details später über /persons/{id}
+    Returns:
+      (unique_person_ids, raw_search_items_as_person_dicts)
     """
-    results: List[dict] = []
-    sem = asyncio.Semaphore(1)  # search ist 429-anfällig
 
-    # Custom field key für Batch-ID (z.B. "5ac34d...")
-    FIELD_BATCH_ID = PD_PERSON_FIELDS["Batch ID"]
+    page_limit = min(int(page_limit or 100), 100)
 
-    def _extract_batch_value(person_item: dict) -> str:
-        # persons/search liefert custom_fields als dict
-        cf = person_item.get("custom_fields") or {}
-        v = cf.get(FIELD_BATCH_ID)
-        if v is None:
-            return ""
-        if isinstance(v, dict):
-            # manchmal: {"value": "..."} o.ä.
-            return str(v.get("value") or v.get("name") or v.get("label") or "").strip()
-        if isinstance(v, list):
-            # falls multiselect -> wir nehmen join/erstes; hier: robust
-            if not v:
-                return ""
-            if isinstance(v[0], dict):
-                return str(v[0].get("value") or v[0].get("label") or v[0].get("name") or "").strip()
-            return str(v[0]).strip()
-        return str(v).strip()
+    sem = asyncio.Semaphore(1)  # search ist 429-anfällig -> 1 ist stabil
+    all_ids: set[str] = set()
+    all_person_objs: list[dict] = []
 
     async def fetch_one(bid: str):
-        cursor: Optional[str] = None
+        nonlocal all_ids, all_person_objs
 
-        total_search_items = 0
+        cursor: str | None = None
+        total_items = 0
         total_with_id = 0
-        total_batch_matches = 0
-
-        unique_ids: set[str] = set()
-        local: List[dict] = []
+        new_ids = 0
 
         while True:
             base_url = (
@@ -1458,7 +1443,7 @@ async def stream_persons_by_batch_id(
                 break
 
             # items -> item
-            page_persons: List[dict] = []
+            page_persons: list[dict] = []
             for it in raw_items:
                 if not isinstance(it, dict):
                     continue
@@ -1466,52 +1451,37 @@ async def stream_persons_by_batch_id(
                 if isinstance(item, dict):
                     page_persons.append(item)
 
-            if not page_persons:
-                break
+            total_items += len(raw_items)
+            all_person_objs.extend(page_persons)
 
-            total_search_items += len(page_persons)
-
-            # EXAKTES Batch-Matching
+            # IDs sammeln (dedupe)
             for p in page_persons:
                 pid = p.get("id")
                 if pid is None:
                     continue
                 total_with_id += 1
-
                 pid_s = str(pid)
-                batch_val = _extract_batch_value(p)
-
-                # exakt (case-insensitive ist optional; ich mach’s robust)
-                if batch_val and batch_val.strip().lower() == str(bid).strip().lower():
-                    if pid_s not in unique_ids:
-                        unique_ids.add(pid_s)
-                        local.append(p)
-                        total_batch_matches += 1
+                if pid_s not in all_ids:
+                    all_ids.add(pid_s)
+                    new_ids += 1
 
             cursor = (payload.get("additional_data") or {}).get("next_cursor")
             if not cursor:
                 break
 
-        if local:
-            print(f"[Batch {bid}] {total_search_items} Search-Items, {total_with_id} mit ID, {total_batch_matches} neue Personen")
-            results.extend(local)
-        else:
-            print(f"[Batch {bid}] 0 Batch-Matches (Search-Items={total_search_items})")
+        print(f"[Batch {bid}] {total_items} Search-Items, {total_with_id} mit ID, {new_ids} neue Personen")
 
-        print(f"[DEBUG] Batch {bid}: {len(local)} eindeutige Personen geladen")
+    # optional job progress
+    if job_obj:
+        job_obj.phase = "Suche Personen (Batch IDs)"
+        job_obj.percent = max(job_obj.percent, 12)
 
-    await asyncio.gather(*(fetch_one(str(bid)) for bid in batch_ids))
+    await asyncio.gather(*(fetch_one(str(b)) for b in batch_ids))
 
-    # dedupe über alle batch_ids (falls 2 IDs eingegeben)
-    dedup: Dict[str, dict] = {}
-    for p in results:
-        pid = p.get("id")
-        if pid is not None:
-            dedup[str(pid)] = p
+    unique_ids = sorted(all_ids)
+    print(f"[INFO] Alle Batch-IDs geladen: {len(unique_ids)} eindeutige Personen-IDs gesamt")
 
-    out = list(dedup.values())
-    print(f"[INFO] Alle Batch-IDs geladen: {len(out)} eindeutige Personen gesamt")
-    return out
+    return unique_ids, all_person_objs
 
 
 # =============================================================================
@@ -2062,41 +2032,34 @@ async def pd_get_json_with_retry(
 from typing import Dict, List, Optional, Tuple
 import asyncio
 async def fetch_person_details_many(
-    persons_from_search: List[dict],
-    job_obj=None,
+    person_ids: list[str],
+    *,
     concurrency: int = 2,
-) -> List[dict]:
+    job_obj=None,
+) -> list[dict]:
     """
-    Holt /persons/{id} für jede Person.
-    Gibt eine Liste von Detail-Objekten zurück.
-    Fallback: wenn Detail dauerhaft fehlschlägt, verwenden wir das Search-Objekt (damit nichts “verschwindet”).
+    Holt Personendetails via /persons/{id}.
+    Wichtig: Email kommt bei dir NICHT aus persons/search, sondern hier.
     """
-    sem = asyncio.Semaphore(max(1, int(concurrency)))
-    client = http_client()
 
-    # Map id -> search item (für fallback)
-    search_by_id: Dict[str, dict] = {}
-    for p in persons_from_search:
-        pid = p.get("id")
-        if pid is not None:
-            search_by_id[str(pid)] = p
+    ids = [str(x) for x in (person_ids or []) if str(x).strip()]
+    # dedupe, aber stabil
+    ids = sorted(set(ids), key=lambda x: int(x) if x.isdigit() else x)
 
-    ids = list(search_by_id.keys())
-    total = len(ids)
+    if not ids:
+        return []
 
-    results: Dict[str, dict] = {}
-    failed: List[str] = []
+    concurrency = max(1, int(concurrency or 2))
+    sem = asyncio.Semaphore(concurrency)
 
-    async def fetch_one(pid: str, idx: int):
-        if job_obj and (idx == 1 or idx % 25 == 0 or idx == total):
-            job_obj.phase = f"Lade Personendetails ({idx}/{total})"
-            # percent grob nach oben ziehen, ohne zu springen
-            job_obj.percent = max(job_obj.percent, min(69, 25 + int(45 * idx / max(1, total))))
+    details: dict[str, dict] = {}
+    failures: list[str] = []
 
+    async def fetch_one(pid: str):
         url = append_token(f"{PIPEDRIVE_API}/persons/{pid}")
         async with sem:
             r = await pd_get_with_retry(
-                client,
+                http_client(),
                 url,
                 None,
                 label=f"person:{pid}",
@@ -2105,42 +2068,40 @@ async def fetch_person_details_many(
             )
 
         if r.status_code != 200:
-            failed.append(pid)
-            # fallback
-            results[pid] = search_by_id.get(pid, {"id": pid})
+            failures.append(pid)
             return
 
         payload = r.json() or {}
         data = payload.get("data")
-        if isinstance(data, dict) and data:
-            results[pid] = data
+        if isinstance(data, dict) and data.get("id") is not None:
+            details[str(data["id"])] = data
         else:
-            # fallback, aber wir verlieren nicht komplett
-            failed.append(pid)
-            results[pid] = search_by_id.get(pid, {"id": pid})
+            failures.append(pid)
 
-    tasks = [fetch_one(pid, i + 1) for i, pid in enumerate(ids)]
-    await asyncio.gather(*tasks)
+    total = len(ids)
+    if job_obj:
+        job_obj.phase = f"Lade Personendetails (1/2) ({total})"
+        job_obj.percent = max(job_obj.percent, 25)
 
-    if failed:
-        print(f"[NF][WARN] Person-Details fehlgeschlagen für {len(failed)}/{total} (Fallback benutzt). Beispiele: {failed[:10]}")
+    await asyncio.gather(*(fetch_one(pid) for pid in ids))
 
-    # stabil sortiert zurück
-    out = [results[pid] for pid in ids if pid in results]
+    # 2. pass: fehlende IDs nochmal probieren (oft 429/temporär)
+    missing = [pid for pid in ids if pid not in details]
+    if missing:
+        if job_obj:
+            job_obj.phase = f"Lade Personendetails (2/2) (missing={len(missing)})"
+            job_obj.percent = max(job_obj.percent, 35)
 
-    # DEBUG: check email presence
-    # (E-Mail ist im Detail typischerweise `email: [{value:..}]` oder `email: []`)
-    email_count = 0
-    for d in out:
-        em = d.get("email")
-        if isinstance(em, list) and em:
-            email_count += 1
-        elif isinstance(em, str) and em.strip():
-            email_count += 1
-    print(f"[NF] Details geladen: {len(out)} | mit Email: {email_count}")
+        failures = []
+        await asyncio.gather(*(fetch_one(pid) for pid in missing))
 
+    out = list(details.values())
+    print(f"[NF] Vollständige Personendaten: {len(out)} Datensätze (missing: {total - len(out)})")
+
+    # optional: Debug, warum E-Mail leer wirkt
+    # (In Pipedrive kann email auch [] sein, oder nur primary_email gesetzt)
     return out
-   
+
 
 from typing import List
 
@@ -2709,63 +2670,68 @@ async def run_nachfass_job(
     job_obj,
     job_id: str,
     campaign: str,
-    filters: Optional[List[int]] = None,
-    nf_batch_ids: Optional[List[str]] = None,
-    export_batch_id: Optional[str] = None,   # UI "Export-Batch-ID" (z.B. B000)
+    filters: list[int] | None = None,         # bleibt drin, wird aber ignoriert wenn Batch da ist
+    nf_batch_ids: list[str] | None = None,
 ):
     """
-    Nachfass-Job (robust & reproduzierbar):
-      1) Personen finden:
-         - bevorzugt: Filter 3024 "Nachfass" + Batch-ID(s) seitenweise scannen (NICHT alles ziehen)
-         - fallback: persons/search nach Batch-ID(s)
-         - fallback2: stream_person_ids_by_filter (wenn keine Batch IDs)
-      2) Personendetails laden (/persons/{id}) mit Retry + 2. Pass
+    Nachfass-Job (Batch-only, stabil):
+      1) IDs nur aus Batch
+      2) Personendetails via /persons/{id}
       3) nf_master_final bauen
       4) nf_master_final in DB speichern
-      5) _reconcile("nf") -> nf_master_ready + nf_delete_log + nf_excluded
+      5) _reconcile("nf") -> nf_master_ready + nf_delete_log (+ nf_excluded)
       6) Excel aus nf_master_ready bauen + speichern
     """
     try:
         # ---------------------------------------------------------
-        # A) Personen über Batch-ID (nur user-input) sammeln
+        # A) IDs sammeln (Batch-only)
         # ---------------------------------------------------------
-        job_obj.phase = "Suche Personen (Batch IDs)"
-        job_obj.percent = 12
-        
+        job_obj.phase = "Suche Personen (Batch)"
+        job_obj.percent = 10
+
         if not nf_batch_ids:
             job_obj.done = True
             job_obj.error = "Keine Batch-ID angegeben."
-            job_obj.phase = "Fehler"
+            job_obj.phase = "Fertig (leer)"
             job_obj.percent = 100
             return
-        
-        persons_search = await stream_persons_by_batch_id(
+
+        batch_ids = [str(x).strip() for x in nf_batch_ids if str(x).strip()]
+        if not batch_ids:
+            job_obj.done = True
+            job_obj.error = "Batch-ID ist leer."
+            job_obj.phase = "Fertig (leer)"
+            job_obj.percent = 100
+            return
+
+        person_ids, _search_objs = await stream_persons_by_batch_id(
             batch_key="batch",
-            batch_ids=[str(x).strip() for x in nf_batch_ids if str(x).strip()],
-            page_limit=200,
+            batch_ids=batch_ids,
+            page_limit=100,     # <=100 wichtig
             job_obj=job_obj,
         )
-        
-        if not persons_search:
+
+        if not person_ids:
             job_obj.done = True
             job_obj.error = "Keine Personen zur Batch-ID gefunden."
             job_obj.phase = "Fertig (leer)"
             job_obj.percent = 100
             return
-        
-        # Unique IDs
-        person_ids = sorted({str(p.get("id")) for p in persons_search if p.get("id") is not None})
+
         print(f"[NF] Personen aus Batch-Search: {len(person_ids)} IDs")
-        
+
         # ---------------------------------------------------------
-        # B) Personendetails laden (mit Fallback, damit nichts verloren geht)
+        # B) Personendetails laden
         # ---------------------------------------------------------
         job_obj.phase = "Lade Personendetails"
         job_obj.percent = 25
-        
-        details = await fetch_person_details_many(persons_search, job_obj=job_obj, concurrency=2)
-        print(f"[NF] Personendetails result: {len(details)} Datensätze")
-        
+
+        details = await fetch_person_details_many(
+            person_ids,
+            concurrency=2,
+            job_obj=job_obj,
+        )
+
         if not details:
             job_obj.done = True
             job_obj.error = "Keine Personendetails gefunden."
@@ -2773,25 +2739,17 @@ async def run_nachfass_job(
             job_obj.percent = 100
             return
 
-        
         # ---------------------------------------------------------
         # C) nf_master_final bauen
         # ---------------------------------------------------------
         job_obj.phase = "Baue Master (nf_master_final)"
         job_obj.percent = 70
 
-        # Batch-Label fürs Export:
-        # - export_batch_id ist das UI-Feld "Export-Batch-ID" (z.B. B000)
-        # - nf_batch_ids ist die Such-Batch (z.B. B443)
-        batch_id_label = (export_batch_id or "").strip()
-        if not batch_id_label:
-            batch_id_label = ",".join(batch_ids_clean) if batch_ids_clean else ""
-
         master_final = await _build_nf_master_final(
             details,
             campaign=campaign,
-            batch_id_label=batch_id_label,
-            batch_id=(batch_ids_clean[0] if batch_ids_clean else None),
+            batch_id_label=",".join(batch_ids),
+            batch_id=None,
             job_obj=job_obj,
         )
 
@@ -2804,18 +2762,8 @@ async def run_nachfass_job(
         t = tables("nf")
         await save_df_text(master_final, t["final"])
 
-        # optional: failed-details loggen (damit du “Verluste” siehst)
-        # (nur wenn du eine Tabelle dafür hast/ willst – sonst entfernen)
-        try:
-            if failed:
-                await save_df_text(pd.DataFrame(failed), "nf_failed_details")
-            else:
-                await save_df_text(pd.DataFrame(), "nf_failed_details")
-        except Exception as _:
-            pass
-
         # ---------------------------------------------------------
-        # E) Abgleich -> nf_master_ready + nf_delete_log + nf_excluded
+        # E) Abgleich -> nf_master_ready + nf_delete_log (+ nf_excluded)
         # ---------------------------------------------------------
         job_obj.phase = "Abgleich (nf -> ready/log)"
         job_obj.percent = 82
@@ -2828,8 +2776,8 @@ async def run_nachfass_job(
         job_obj.phase = "Erzeuge Excel"
         job_obj.percent = 90
 
-        ready_df = await load_df_text(t["ready"])
-        export_df = build_nf_export(ready_df)  # garantiert Exportspalten
+        ready = await load_df_text(t["ready"])
+        export_df = build_nf_export(ready)
 
         out_path = export_to_excel(export_df, prefix="nachfass_export", job_id=job_id)
         job_obj.path = out_path
