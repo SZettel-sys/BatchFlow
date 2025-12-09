@@ -1388,7 +1388,7 @@ import asyncio
 async def stream_persons_by_batch_id(
     batch_key: str,
     batch_ids: List[str],
-    page_limit: int = 200,
+    page_limit: int = 100,
     job_obj=None
 ) -> List[dict]:
     """
