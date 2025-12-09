@@ -665,6 +665,87 @@ def pd_auth(url: str) -> tuple[str, Dict[str, str]]:
 # =============================================================================
 # PERSONEN ÜBER FILTER LADEN
 # =============================================================================
+
+async def fetch_persons_by_filter_id_v2(
+    filter_id: int,
+    limit: int = 200,
+    job_obj=None,
+) -> List[dict]:
+    """
+    Robust: versucht v2 persons Liste mit filter_id über /persons?filter_id=...
+    (weil /persons/collection bei dir 404 ist).
+    Paginiert über start/next_start.
+    """
+    out: List[dict] = []
+    start = 0
+
+    while True:
+        base = f"{PIPEDRIVE_API}/persons?filter_id={int(filter_id)}&limit={int(limit)}&start={int(start)}"
+        url = append_token(base)
+
+        r = await pd_get_with_retry(
+            http_client(),
+            url,
+            get_headers(),
+            label=f"persons filter={filter_id} start={start}",
+            retries=10,
+            request_timeout=30.0,
+            max_total_time=180.0,
+        )
+
+        if r.status_code != 200:
+            print(f"[WARN] /persons?filter_id={filter_id} HTTP {r.status_code} {r.text[:200]}")
+            break
+
+        payload = r.json() or {}
+        data = payload.get("data") or []
+        if not data:
+            break
+
+        out.extend([p for p in data if isinstance(p, dict)])
+
+        ad = payload.get("additional_data") or {}
+        pag = ad.get("pagination") or {}
+        if pag.get("more_items_in_collection") is True:
+            start = int(pag.get("next_start") or (start + limit))
+            if job_obj:
+                job_obj.phase = f"Suche Personen (Filter {filter_id})"
+                job_obj.percent = min(22, max(job_obj.percent, 10))
+            continue
+
+        break
+
+    print(f"[NF] /persons?filter_id={filter_id}: {len(out)} Personen")
+    return out
+
+
+def filter_persons_by_batch_values(persons: List[dict], batch_values: List[str], batch_field_key: str) -> List[dict]:
+    want = {str(b).strip() for b in (batch_values or []) if str(b).strip()}
+    if not want:
+        return []
+
+    out = []
+    seen = set()
+    for p in persons:
+        if not isinstance(p, dict):
+            continue
+        pid = p.get("id")
+        if pid is None:
+            continue
+        pid = str(pid)
+
+        v = sanitize(cf_value(p, batch_field_key)).strip()
+        if v not in want:
+            continue
+
+        if pid in seen:
+            continue
+        seen.add(pid)
+        out.append(p)
+
+    return out
+
+
 async def stream_persons_by_filter_and_batches(
     filter_id: int,
     batch_values: List[str],
@@ -2251,20 +2332,21 @@ async def run_nachfass_job(
         job_obj.phase = "Suche Personen"
         job_obj.percent = 10
         
-        BASE_FILTER_ID = FILTER_NACHFASS              # z.B. 3024
-        FIELD_BATCH_ID = PD_PERSON_FIELDS["Batch ID"] # custom field key
+        BASE_FILTER_ID = FILTER_NACHFASS               # 3024
+        FIELD_BATCH_ID = PD_PERSON_FIELDS["Batch ID"]
         
-        # UI: Batch IDs (1-2 Werte)
         batch_values = [str(x).strip() for x in (nf_batch_ids or []) if str(x).strip()]
         batch_values = batch_values[:2]
         
-        persons = await stream_persons_by_filter_and_batches(
+        # 1) Alle Personen aus dem Filter (wie Screenshot-Logik)
+        persons_all = await fetch_persons_by_filter_id_v2(
             filter_id=BASE_FILTER_ID,
-            batch_values=batch_values,
-            batch_field_key=FIELD_BATCH_ID,
-            page_limit=200,
+            limit=200,
             job_obj=job_obj,
         )
+        
+        # 2) Batch-ID(s) clientseitig exakt matchen
+        persons = filter_persons_by_batch_values(persons_all, batch_values, FIELD_BATCH_ID)
         
         person_ids = [str(p.get("id")) for p in persons if p.get("id") is not None]
         print(f"[NF] Personen aus Filter+Batch: {len(person_ids)} IDs")
