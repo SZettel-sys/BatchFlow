@@ -1679,70 +1679,76 @@ async def pd_get_json_with_retry(
 
 from typing import Dict, List, Optional, Tuple
 import asyncio
+    
 async def fetch_person_details_many(
     person_ids: List[str],
-    *,
+    concurrency: int = 1,
     job_obj=None,
-    concurrency: int = 2,          # <= weniger parallel = weniger 429 = stabiler
-    request_timeout: float = 25.0,
+    retries: int = 10,
+    request_timeout: float = 30.0,
+    max_total_time: float = 180.0,
 ) -> Dict[str, dict]:
-    if not person_ids:
+    """
+    Lädt Personendetails über /persons/{id} (v2-sicher) und gibt ein dict {id: person_dict} zurück.
+    Robust gegen 429: concurrency niedrig, Retry-Wrapper pd_get_with_retry.
+    Gibt für fehlgeschlagene IDs einfach keinen Eintrag zurück (der Caller kann fallbacken).
+    """
+    ids = [str(x).strip() for x in (person_ids or []) if str(x).strip()]
+    # stable dedupe
+    ids = list(dict.fromkeys(ids))
+    if not ids:
         return {}
 
-    client = http_client()
-    local_sem = asyncio.Semaphore(concurrency)
+    sem = asyncio.Semaphore(max(1, int(concurrency)))
+    out: Dict[str, dict] = {}
 
-    results: Dict[str, dict] = {}
-    total = len(person_ids)
-    done = 0
-
-    start_pct = 25
-    end_pct = 65
-
-    def bump_progress():
-        if not job_obj:
-            return
-        pct = start_pct + int((end_pct - start_pct) * (done / max(1, total)))
-        job_obj.percent = max(job_obj.percent, min(end_pct, pct))
-        job_obj.phase = f"Lade Personendetails ({done}/{total})"
-
-    async def fetch_one(pid: str) -> None:
-        nonlocal done
-        async with local_sem:
-            url = f"{PIPEDRIVE_API}/persons/{pid}"
-
+    async def fetch_one(pid: str):
+        url = append_token(f"{PIPEDRIVE_API}/persons/{pid}")
+        async with sem:
             r = await pd_get_with_retry(
-                client,
+                http_client(),
                 url,
-                None,  # Auth macht pd_auth() intern (OAuth Header oder api_token)
+                get_headers(),
                 label=f"person:{pid}",
+                retries=retries,
                 request_timeout=request_timeout,
-                max_total_time=120.0,
-                retries=10,
+                max_total_time=max_total_time,
             )
 
-            if r.status_code == 200:
-                payload = r.json() or {}
-                data = payload.get("data")
-                if isinstance(data, dict) and data:
-                    results[str(pid)] = data
-            else:
-                # sparsam loggen
-                if done < 5 or done % 100 == 0:
-                    print(f"[fetch_person_details_many] pid={pid} status={r.status_code} body={(r.text or '')[:160]}")
+        if r.status_code != 200:
+            # 404 etc. -> skip
+            print(f"[WARN] /persons/{pid} HTTP {r.status_code} {r.text[:120]}")
+            return
 
-            done += 1
-            if done % 10 == 0 or done == total:
-                bump_progress()
+        payload = r.json() or {}
+        data = payload.get("data")
+        if isinstance(data, dict):
+            # id sicher setzen
+            if data.get("id") is None:
+                data["id"] = pid
+            out[str(data["id"])] = data
+        else:
+            print(f"[WARN] /persons/{pid} data not dict")
 
-    bump_progress()
-    await asyncio.gather(*(fetch_one(str(pid)) for pid in person_ids))
-
+    total = len(ids)
     if job_obj:
-        job_obj.percent = max(job_obj.percent, end_pct)
-        job_obj.phase = f"Lade Personendetails ({total}/{total})"
+        job_obj.phase = f"Lade Personendetails ({total})"
+        job_obj.percent = max(job_obj.percent, 25)
 
-    return results
+    # sequenziell in batches, damit Render nicht explodiert + progress
+    for i in range(0, total, 25):
+        chunk = ids[i:i+25]
+        await asyncio.gather(*(fetch_one(pid) for pid in chunk))
+
+        if job_obj:
+            done = min(total, i + len(chunk))
+            pct = 25 + int(35 * done / max(1, total))  # 25..60%
+            job_obj.phase = f"Lade Personendetails ({done}/{total})"
+            job_obj.percent = max(job_obj.percent, pct)
+
+    print(f"[fetch_person_details_many] loaded={len(out)}/{len(ids)}")
+    return out
+
 
 
 from typing import List
@@ -2352,21 +2358,41 @@ async def run_nachfass_job(
         print(f"[NF] Personen aus Filter+Batch: {len(person_ids)} IDs")
 
 
+      
         # ---------------------------------------------------------
-        # B) Personendetails laden
+        # B) Personendetails laden (Upgrade, kein Muss)
         # ---------------------------------------------------------
         job_obj.phase = "Lade Personendetails"
         job_obj.percent = 25
-
-        details = await fetch_person_details(person_ids, job_obj=job_obj)
-        print(f"[NF] Vollständige Personendaten: {len(details)} Datensätze")
-
+        
+        print(f"[NF][DEBUG] person_ids count = {len(person_ids)} sample={person_ids[:5]}")
+        
+        details_lookup = await fetch_person_details_many(
+            person_ids,
+            concurrency=1,
+            job_obj=job_obj,
+        )
+        
+        # Merge: Basis = persons (aus Filter/Search), Details ergänzen
+        details: List[dict] = []
+        for p in (persons or []):
+            pid = str(p.get("id")) if p.get("id") is not None else ""
+            merged = dict(p)
+            d = details_lookup.get(pid)
+            if isinstance(d, dict):
+                merged.update(d)
+            details.append(merged)
+        
+        print(f"[NF] Merge persons+details: {len(details)} Datensätze (details found: {len(details_lookup)})")
+        
+        # NICHT mehr abbrechen, solange wir wenigstens persons haben:
         if not details:
             job_obj.done = True
-            job_obj.error = "Keine Personendetails gefunden."
+            job_obj.error = "Keine Personen gefunden."
             job_obj.phase = "Fertig (leer)"
             job_obj.percent = 100
             return
+
 
         # ---------------------------------------------------------
         # C) nf_master_final bauen
