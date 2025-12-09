@@ -1389,25 +1389,16 @@ async def stream_persons_by_batch_id(
     batch_key: str,
     batch_ids: List[str],
     page_limit: int = 100,
-    job_obj=None,
+    job_obj=None
 ) -> List[dict]:
-    """
-    Sucht Personen über /persons/search?term=<batch> ...
-    Liefert die "item"-Objekte aus search (oft unvollständig, aber ID ist wichtig).
-    """
-    results: List[dict] = []
-    seen_ids: set[str] = set()
 
-    # Search ist 429-anfällig -> lieber seriell
+    results: Dict[str, dict] = {}      # <-- statt List[str]: Dict für stabile De-Dupe
     sem = asyncio.Semaphore(1)
 
     async def fetch_one(bid: str):
-        nonlocal results, seen_ids
-
-        cursor: Optional[str] = None
-        total_items = 0
-        total_with_id = 0
-        added_new = 0
+        cursor = None
+        total_raw = 0
+        total_unique = 0
 
         while True:
             base_url = (
@@ -1422,7 +1413,7 @@ async def stream_persons_by_batch_id(
                 r = await pd_get_with_retry(
                     http_client(),
                     url,
-                    get_headers(),
+                    None,
                     label=f"persons_search bid={bid}",
                     request_timeout=30.0,
                     max_total_time=180.0,
@@ -1434,12 +1425,12 @@ async def stream_persons_by_batch_id(
 
             payload = r.json() or {}
             raw_items = (payload.get("data") or {}).get("items") or []
+
             if not raw_items:
                 break
 
-            total_items += len(raw_items)
+            total_raw += len(raw_items)
 
-            persons: List[dict] = []
             for it in raw_items:
                 if not isinstance(it, dict):
                     continue
@@ -1451,29 +1442,24 @@ async def stream_persons_by_batch_id(
                 if pid is None:
                     continue
 
-                total_with_id += 1
                 pid = str(pid)
 
-                # Keine Duplikate adden
-                if pid in seen_ids:
-                    continue
-                seen_ids.add(pid)
-
-                persons.append(item)
-                added_new += 1
-
-            results.extend(persons)
+                # <-- WICHTIG: echte De-Dupe mit Dict
+                if pid not in results:
+                    results[pid] = item
+                    total_unique += 1
 
             cursor = (payload.get("additional_data") or {}).get("next_cursor")
             if not cursor:
                 break
 
-        print(f"[Batch {bid}] {total_items} Search-Items, {total_with_id} mit ID, {added_new} neue Personen")
-        print(f"[DEBUG] Batch {bid}: {added_new} Personen geladen")
+        print(f"[Batch {bid}] {total_raw} Search-Items, "
+              f"{total_unique} neue eindeutige Personen")
 
-    await asyncio.gather(*(fetch_one(str(b).strip()) for b in (batch_ids or []) if str(b).strip()))
+    await asyncio.gather(*(fetch_one(str(bid)) for bid in batch_ids))
+
     print(f"[INFO] Alle Batch-IDs geladen: {len(results)} eindeutige Personen gesamt")
-    return results
+    return list(results.values())
 
 
 
