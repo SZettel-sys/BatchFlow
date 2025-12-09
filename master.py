@@ -1240,87 +1240,40 @@ async def stream_organizations_by_filter(
 from typing import AsyncGenerator, List, Optional, Set
 import asyncio
 import time
-
-async def stream_person_ids_by_filter(
-    filter_id: int,
-    page_limit: int = PAGE_LIMIT,
-    *,
-    max_pages: int = 2000,
-    max_total_time: float = 180.0,
-) -> AsyncGenerator[List[str], None]:
-    """
-    Streamt Person-IDs eines Pipedrive-Filters seitenweise (v2).
-    Fix:
-      - nutzt PIPEDRIVE_API statt PD_BASE
-      - nutzt pd_get_with_retry + Auth (OAuth/api_token)
-      - Cursor-Schutz + Notbremsen
-    """
-    client = http_client()
-    cursor: Optional[str] = None
-    seen_cursors: set[str] = set()
+async def stream_person_ids_by_filter(filter_id: int, limit: int = 100, job_obj=None):
+    limit = min(int(limit), 100)
+    cursor = None
     page = 0
-    started = time.monotonic()
+    total = 0
 
     while True:
-        if (time.monotonic() - started) > max_total_time:
-            print(f"[stream_person_ids_by_filter] ABORT: max_total_time={max_total_time}s filter={filter_id}")
-            break
-
         page += 1
-        if page > max_pages:
-            print(f"[stream_person_ids_by_filter] ABORT: max_pages={max_pages} filter={filter_id}")
-            break
-
-        base = f"{PIPEDRIVE_API}/persons?filter_id={int(filter_id)}&limit={int(page_limit)}"
+        base = f"{PIPEDRIVE_API}/persons?filter_id={int(filter_id)}&limit={limit}"
+        url = append_token(base)
         if cursor:
-            base += f"&cursor={cursor}"
+            url += f"&cursor={cursor}"
 
-        # Auth zentral (OAuth oder api_token)
-        url = append_token(base) if not get_headers().get("Authorization") else base
-
-        r = await pd_get_with_retry(
-            client,
-            url,
-            None,
-            label=f"persons_filter[{filter_id}]",
-            request_timeout=25.0,
-            max_total_time=120.0,
-        )
-
+        r = await pd_get_with_retry(http_client(), url, None, label=f"persons filter={filter_id}")
         if r.status_code != 200:
-            print(f"[stream_person_ids_by_filter] HTTP {r.status_code} filter={filter_id}: {r.text[:300]}")
+            print(f"[WARN] /persons?filter_id={filter_id} HTTP {r.status_code}: {r.text[:200]}")
             break
 
         payload = r.json() or {}
         data = payload.get("data") or []
         if not data:
-            print(f"[stream_person_ids_by_filter] DONE: no data filter={filter_id} page={page}")
             break
 
-        ids: List[str] = []
-        for p in data:
-            pid = p.get("id")
-            if pid is not None:
-                ids.append(str(pid))
+        ids = [str(p.get("id")) for p in data if isinstance(p, dict) and p.get("id") is not None]
+        total += len(ids)
 
-        if ids:
-            if page == 1 or page % 2 == 0:
-                elapsed = time.monotonic() - started
-                print(f"[stream_person_ids_by_filter] filter={filter_id} page={page} ids_in_page={len(ids)} cursor={cursor} elapsed={elapsed:.1f}s")
-            yield ids
+        if job_obj and page % 5 == 0:
+            job_obj.phase = f"Suche Personen (Filter {filter_id}) – {total}"
+        yield ids
 
-        additional = payload.get("additional_data") or {}
-        next_cursor = additional.get("next_cursor") or (additional.get("pagination") or {}).get("next_cursor")
-        if not next_cursor:
-            print(f"[stream_person_ids_by_filter] DONE: no next_cursor filter={filter_id} page={page}")
+        cursor = (payload.get("additional_data") or {}).get("next_cursor")
+        if not cursor:
             break
 
-        if next_cursor in seen_cursors:
-            print(f"[stream_person_ids_by_filter] ABORT: cursor repeated filter={filter_id} next_cursor={next_cursor}")
-            break
-
-        seen_cursors.add(next_cursor)
-        cursor = next_cursor
 
 # =============================================================================
 # Organisationen – Bucketing + Kappung (Performanceoptimiert)
