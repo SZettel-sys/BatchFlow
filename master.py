@@ -974,6 +974,10 @@ async def stream_persons_by_batch_id(
 
         # häufig: it = {"item": {...}}
         item = it.get("item") if isinstance(it.get("item"), dict) else it
+        
+        if total_items == 0 and cursor is None:  # nur beim allerersten Batch-Page
+            print("[DEBUG] persons/search item keys:", sorted(list(item.keys()))[:80])
+            print("[DEBUG] persons/search email raw:", item.get("email"))
 
         # direkte id
         if isinstance(item, dict) and item.get("id") is not None:
