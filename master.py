@@ -665,29 +665,31 @@ def pd_auth(url: str) -> tuple[str, Dict[str, str]]:
 # =============================================================================
 # PERSONEN ÜBER FILTER LADEN
 # =============================================================================
-
 async def fetch_persons_by_filter_id_v2(
     filter_id: int,
     limit: int = 200,
     job_obj=None,
 ) -> List[dict]:
     """
-    Robust: versucht v2 persons Liste mit filter_id über /persons?filter_id=...
-    (weil /persons/collection bei dir 404 ist).
-    Paginiert über start/next_start.
+    v2: Holt Persons über /persons?filter_id=...
+    WICHTIG: Bei dir ist 'start' NICHT erlaubt -> cursor-basiert.
     """
     out: List[dict] = []
-    start = 0
+    seen: set[str] = set()
+    cursor: Optional[str] = None
+    scanned_pages = 0
 
     while True:
-        base = f"{PIPEDRIVE_API}/persons?filter_id={int(filter_id)}&limit={int(limit)}&start={int(start)}"
+        base = f"{PIPEDRIVE_API}/persons?filter_id={int(filter_id)}&limit={int(limit)}"
         url = append_token(base)
+        if cursor:
+            url += f"&cursor={cursor}"
 
         r = await pd_get_with_retry(
             http_client(),
             url,
             get_headers(),
-            label=f"persons filter={filter_id} start={start}",
+            label=f"persons filter={filter_id} cursor={cursor or 'None'}",
             retries=10,
             request_timeout=30.0,
             max_total_time=180.0,
@@ -699,24 +701,48 @@ async def fetch_persons_by_filter_id_v2(
 
         payload = r.json() or {}
         data = payload.get("data") or []
+        scanned_pages += 1
+
         if not data:
             break
 
-        out.extend([p for p in data if isinstance(p, dict)])
+        for p in data:
+            if not isinstance(p, dict):
+                continue
+            pid = p.get("id")
+            if pid is None:
+                continue
+            pid = str(pid)
+            if pid in seen:
+                continue
+            seen.add(pid)
+            out.append(p)
+
+        if job_obj:
+            job_obj.phase = f"Suche Personen (Filter {filter_id})"
+            job_obj.percent = min(22, max(job_obj.percent, 12))
 
         ad = payload.get("additional_data") or {}
-        pag = ad.get("pagination") or {}
-        if pag.get("more_items_in_collection") is True:
-            start = int(pag.get("next_start") or (start + limit))
-            if job_obj:
-                job_obj.phase = f"Suche Personen (Filter {filter_id})"
-                job_obj.percent = min(22, max(job_obj.percent, 10))
+
+        # v2 cursor pagination
+        next_cursor = ad.get("next_cursor")
+        if next_cursor:
+            cursor = next_cursor
             continue
 
+        # manchmal steckt es verschachtelt
+        pagination = ad.get("pagination") or {}
+        next_cursor2 = pagination.get("next_cursor")
+        if next_cursor2:
+            cursor = next_cursor2
+            continue
+
+        # keine weitere Seite
         break
 
-    print(f"[NF] /persons?filter_id={filter_id}: {len(out)} Personen")
+    print(f"[NF] /persons?filter_id={filter_id}: pages={scanned_pages}, personen={len(out)}")
     return out
+
 
 
 def filter_persons_by_batch_values(persons: List[dict], batch_values: List[str], batch_field_key: str) -> List[dict]:
