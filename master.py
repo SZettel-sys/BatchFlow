@@ -669,13 +669,13 @@ async def fetch_persons_by_filter_id_v2(
     filter_id: int,
     limit: int = 200,
     job_obj=None,
-    max_pages: int = 50,          # Notbremse
-    max_empty_growth: int = 3,    # Notbremse wenn keine neuen IDs mehr kommen
+    max_pages: int = 80,
+    max_empty_growth: int = 2,
 ) -> List[dict]:
     """
     v2: Holt Persons über /persons?filter_id=...
-    Bei dir ist 'start' nicht erlaubt => cursor-basiert.
-    Notbremsen gegen Endlosschleifen (wiederholter cursor / keine neuen IDs / max_pages).
+    Bei dir ist 'start' NICHT erlaubt -> cursor-basiert.
+    Enthält Notbremsen gegen Cursor-Loops.
     """
     out: List[dict] = []
     seen_ids: set[str] = set()
@@ -701,7 +701,7 @@ async def fetch_persons_by_filter_id_v2(
             http_client(),
             url,
             get_headers(),
-            label=f"persons filter={filter_id} page={pages} cursor={cursor or 'None'}",
+            label=f"persons filter={filter_id} page={pages}",
             retries=10,
             request_timeout=30.0,
             max_total_time=180.0,
@@ -729,7 +729,12 @@ async def fetch_persons_by_filter_id_v2(
             out.append(p)
 
         added = len(seen_ids) - before
-        print(f"[NF] filter={filter_id} page={pages} got={len(data)} added_ids={added} total={len(out)} cursor={str(cursor)[:16] if cursor else 'None'}")
+
+        # DEBUG (zeigt dir exakt, was passiert)
+        print(
+            f"[NF] filter={filter_id} page={pages} got={len(data)} "
+            f"added_ids={added} total={len(out)} cursor={(cursor[:16] + '...') if cursor else 'None'}"
+        )
 
         if added == 0:
             no_growth_streak += 1
@@ -738,12 +743,11 @@ async def fetch_persons_by_filter_id_v2(
 
         if job_obj:
             job_obj.phase = f"Suche Personen (Filter {filter_id})"
-            # 10..22%, grob nach pages / found
-            job_obj.percent = min(22, max(job_obj.percent, 12 + min(8, pages)))
+            job_obj.percent = min(22, max(job_obj.percent, 12 + min(10, pages)))
 
-        # Wenn keine neuen IDs mehr kommen, brech ab (sonst Endlosschleife)
+        # Notbremse: keine neuen IDs mehr -> stop
         if no_growth_streak >= max_empty_growth:
-            print(f"[WARN] abort: no new IDs for {no_growth_streak} pages (possible cursor loop)")
+            print(f"[WARN] abort: no new IDs for {no_growth_streak} pages (possible loop)")
             break
 
         ad = payload.get("additional_data") or {}
@@ -758,7 +762,124 @@ async def fetch_persons_by_filter_id_v2(
 
         next_cursor = str(next_cursor)
 
-        # Cursor wiederholt sich => Endlosschleife verhindern
+        # (WICHTIG) Cursor-Loop-Abbruch: cursor bleibt gleich -> stop
+        if cursor and next_cursor == cursor:
+            print(f"[WARN] abort: next_cursor == cursor (no progress) cursor={cursor[:16]}...")
+            break
+
+        # Wiederholte Cursor -> stop
+        if next_cursor in seen_cursors:
+            print(f"[WARN] abort: cursor repeated ({next_cursor[:16]}...)")
+            break
+
+        seen_cursors.add(next_cursor)
+        cursor = next_cursor
+
+    print(f"[NF] /persons?filter_id={filter_id}: pages={pages}, personen={len(out)}")
+    return out
+async def fetch_persons_by_filter_id_v2(
+    filter_id: int,
+    limit: int = 200,
+    job_obj=None,
+    max_pages: int = 80,
+    max_empty_growth: int = 2,
+) -> List[dict]:
+    """
+    v2: Holt Persons über /persons?filter_id=...
+    Bei dir ist 'start' NICHT erlaubt -> cursor-basiert.
+    Enthält Notbremsen gegen Cursor-Loops.
+    """
+    out: List[dict] = []
+    seen_ids: set[str] = set()
+
+    cursor: Optional[str] = None
+    seen_cursors: set[str] = set()
+
+    pages = 0
+    no_growth_streak = 0
+
+    while True:
+        pages += 1
+        if pages > max_pages:
+            print(f"[WARN] fetch_persons_by_filter_id_v2 abort: max_pages={max_pages} reached")
+            break
+
+        base = f"{PIPEDRIVE_API}/persons?filter_id={int(filter_id)}&limit={int(limit)}"
+        url = append_token(base)
+        if cursor:
+            url += f"&cursor={cursor}"
+
+        r = await pd_get_with_retry(
+            http_client(),
+            url,
+            get_headers(),
+            label=f"persons filter={filter_id} page={pages}",
+            retries=10,
+            request_timeout=30.0,
+            max_total_time=180.0,
+        )
+
+        if r.status_code != 200:
+            print(f"[WARN] /persons?filter_id={filter_id} HTTP {r.status_code} {r.text[:200]}")
+            break
+
+        payload = r.json() or {}
+        data = payload.get("data") or []
+
+        before = len(seen_ids)
+
+        for p in data:
+            if not isinstance(p, dict):
+                continue
+            pid = p.get("id")
+            if pid is None:
+                continue
+            pid = str(pid)
+            if pid in seen_ids:
+                continue
+            seen_ids.add(pid)
+            out.append(p)
+
+        added = len(seen_ids) - before
+
+        # DEBUG (zeigt dir exakt, was passiert)
+        print(
+            f"[NF] filter={filter_id} page={pages} got={len(data)} "
+            f"added_ids={added} total={len(out)} cursor={(cursor[:16] + '...') if cursor else 'None'}"
+        )
+
+        if added == 0:
+            no_growth_streak += 1
+        else:
+            no_growth_streak = 0
+
+        if job_obj:
+            job_obj.phase = f"Suche Personen (Filter {filter_id})"
+            job_obj.percent = min(22, max(job_obj.percent, 12 + min(10, pages)))
+
+        # Notbremse: keine neuen IDs mehr -> stop
+        if no_growth_streak >= max_empty_growth:
+            print(f"[WARN] abort: no new IDs for {no_growth_streak} pages (possible loop)")
+            break
+
+        ad = payload.get("additional_data") or {}
+        next_cursor = ad.get("next_cursor")
+        if not next_cursor:
+            pagination = ad.get("pagination") or {}
+            next_cursor = pagination.get("next_cursor")
+
+        if not next_cursor:
+            # keine weitere Seite
+            break
+
+        next_cursor = str(next_cursor)
+
+        # (WICHTIG) Cursor-Loop-Abbruch: cursor bleibt gleich -> stop
+        if cursor and next_cursor == cursor:
+            print(f"[WARN] abort: next_cursor == cursor (no progress) cursor={cursor[:16]}...")
+            break
+
+        # Wiederholte Cursor -> stop
         if next_cursor in seen_cursors:
             print(f"[WARN] abort: cursor repeated ({next_cursor[:16]}...)")
             break
@@ -769,29 +890,94 @@ async def fetch_persons_by_filter_id_v2(
     print(f"[NF] /persons?filter_id={filter_id}: pages={pages}, personen={len(out)}")
     return out
 
-def filter_persons_by_batch_values(persons: List[dict], batch_values: List[str], batch_field_key: str) -> List[dict]:
-    want = {str(b).strip() for b in (batch_values or []) if str(b).strip()}
-    if not want:
+def get_person_custom_field(p: dict, field_key: str) -> str:
+    """
+    Pipedrive liefert Custom Fields je nach Endpoint unterschiedlich:
+    - manchmal in p["custom_fields"]
+    - manchmal direkt als p[field_key]
+    - manchmal als dict/list
+
+    Rückgabe: immer ein sauberer string (kann leer sein).
+    """
+    if not isinstance(p, dict):
+        return ""
+
+    # 1) Versuch über deine vorhandene cf_value(...)
+    try:
+        v = cf_value(p, field_key)
+        s = sanitize(v).strip()
+        if s:
+            return s
+    except Exception:
+        pass
+
+    # 2) Fallback: direkt im root (häufig bei /persons)
+    try:
+        v2 = p.get(field_key)
+        return sanitize(v2).strip()
+    except Exception:
+        return ""
+
+def filter_persons_by_batch_values(
+    persons: List[dict],
+    batch_values: List[str],
+    batch_field_key: str,
+    debug: bool = True,
+) -> List[dict]:
+    """
+    Filtert Personenliste auf exakt passende Batch-ID(s).
+    Robust: liest Batch-Wert über get_person_custom_field().
+    Enthält Debug, damit du siehst, warum ggf. 0 matchen.
+    """
+    want = [str(b).strip() for b in (batch_values or []) if str(b).strip()]
+    want = want[:2]
+    want_set = set(want)
+
+    if not want_set:
         return []
 
-    out = []
-    seen = set()
-    for p in persons:
+    out: List[dict] = []
+    seen: set[str] = set()
+
+    # Debug stats
+    with_batch = 0
+    sample_values: Dict[str, int] = {}
+
+    for p in persons or []:
         if not isinstance(p, dict):
             continue
+
         pid = p.get("id")
         if pid is None:
             continue
         pid = str(pid)
 
-        v = sanitize(cf_value(p, batch_field_key)).strip()
-        if v not in want:
+        v = get_person_custom_field(p, batch_field_key)
+
+        if v:
+            with_batch += 1
+            sample_values[v] = sample_values.get(v, 0) + 1
+
+        if v not in want_set:
             continue
 
         if pid in seen:
             continue
         seen.add(pid)
         out.append(p)
+
+    if debug:
+        top = sorted(sample_values.items(), key=lambda x: x[1], reverse=True)[:10]
+        print(
+            f"[NF][BatchFilter] want={want} total_in={len(persons or [])} "
+            f"with_batch_value={with_batch} matched={len(out)}"
+        )
+        print(f"[NF][BatchFilter] top_batch_values={top}")
+
+        # optional: wenn 0 gematched, zeig beispiel keys
+        if len(out) == 0 and persons:
+            ks = list((persons[0] or {}).keys())
+            print(f"[NF][BatchFilter] sample keys[0]={ks[:40]}")
 
     return out
 
