@@ -1799,15 +1799,61 @@ async def _build_nf_master_final(
     def next_activity_for_person(p: dict) -> str:
         return sanitize(p.get("next_activity_date"))
 
+    
     def primary_email(p: dict) -> str:
-        emails = p.get("email") or []
+        """
+        Pipedrive v2 persons/search liefert oft:
+          - primary_email: "a@b.de"
+          - emails: [{"value": "...", "primary": true}, ...] ODER ["a@b.de", ...]
+        Und /persons/{id} liefert teils wieder "email".
+        """
+        if not isinstance(p, dict):
+            return ""
+    
+        # 1) primary_email (v2 search)
+        pe = p.get("primary_email")
+        if isinstance(pe, str) and pe.strip():
+            return sanitize(pe)
+    
+        # 2) emails (v2 search)
+        emails = p.get("emails")
         if isinstance(emails, list) and emails:
-            e0 = emails[0]
-            return sanitize(e0.get("value") if isinstance(e0, dict) else e0)
-        if isinstance(emails, str):
-            return sanitize(emails)
+            # primary zuerst
+            prim = None
+            for e in emails:
+                if isinstance(e, dict) and e.get("primary") is True:
+                    prim = e
+                    break
+            e0 = prim or emails[0]
+            if isinstance(e0, dict):
+                return sanitize(e0.get("value") or e0.get("email") or "")
+            if isinstance(e0, str):
+                return sanitize(e0)
+        if isinstance(emails, dict):
+            return sanitize(emails.get("value") or emails.get("email") or "")
+    
+        # 3) email (kommt oft aus /persons/{id})
+        email = p.get("email")
+        if isinstance(email, list) and email:
+            prim = None
+            for e in email:
+                if isinstance(e, dict) and e.get("primary") is True:
+                    prim = e
+                    break
+            e0 = prim or email[0]
+            if isinstance(e0, dict):
+                return sanitize(e0.get("value") or e0.get("email") or "")
+            if isinstance(e0, str):
+                return sanitize(e0)
+        if isinstance(email, dict):
+            return sanitize(email.get("value") or email.get("email") or "")
+        if isinstance(email, str) and email.strip():
+            return sanitize(email)
+    
         return ""
 
+
+    
     rows: List[dict] = []
     total = len(selected)
 
