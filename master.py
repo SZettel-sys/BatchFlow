@@ -16,9 +16,9 @@ fuzz.default_processor = lambda s: s  # kein Vor-Preprocessing
 
 # ------------------------------------------------------------------------------
 # 
-# -----------------------------------------------------------------------------# 
+# -----------------------------------------------------------------------------
 # PIPEDRIVE API - V2 
-# -----------------------------------------------------------------------------# 
+# ----------------------------------------------------------------------------- 
 # 
 # -----------------------------------------------------------------------------
 # -----------------------------------------------------------------------------
@@ -33,9 +33,11 @@ if os.path.isdir("static"):
 async def healthz():
     """Einfacher Healthcheck für Render: immer 200."""
     return {"status": "ok"}
+    
 # -----------------------------------------------------------------------------
 # Umgebungsvariablen & Konstanten setzen
 # -----------------------------------------------------------------------------
+
 PD_API_TOKEN = os.getenv("PD_API_TOKEN", "")
 PIPEDRIVE_API = "https://api.pipedrive.com/api/v2"
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -58,14 +60,14 @@ MAX_ORG_BUCKET = int(os.getenv("MAX_ORG_BUCKET", "200"))
 
 # --- Pipedrive Person Custom Field Keys (fix) ---
 PD_PERSON_FIELDS = {
-    "Batch ID": "7b5bda2891fd1ce14c53488304afc9b4c639fb4a",
+    "Batch ID": "7b5bda2891fd1ce14c53488304afc9b4c639fb4a", 
     "Prospect ID": "f9138f9040c44622808a4b8afda2b1b75ee5acd0",
     "Person Geschlecht": "c4f5f434cdb0cfce3f6d62ec7291188fe968ac72",
     "Person Titel": "0343bc43a91159aaf33a463ca603dc5662422ea5",
     "Person Position": "4585e5de11068a3bccf02d8b93c126bcf5c257ff",
     "XING Profil": "44ebb6feae2a670059bc5261001443a2878a2b43",
     "LinkedIn URL": "25563b12f847a280346bba40deaf527af82038cc",
-    # Achtung: Büro-Email ist bei dir "email" (Standardfeld), kein custom key
+   
 }
 
 # --- Organisation Custom Field Keys (fix) ---
@@ -121,9 +123,7 @@ PERSON_FIELD_HINTS_TO_EXPORT = {
     "office email": "Person E-Mail",
 }
 
-# -----------------------------------------------------------------------------
-# Startup / Shutdown
-# -----------------------------------------------------------------------------
+
 # -----------------------------------------------------------------------------
 # Startup / Shutdown
 # -----------------------------------------------------------------------------
@@ -158,6 +158,9 @@ async def _shutdown():
     await app.state.http.aclose()
     await app.state.pool.close()
 
+# ------------------------------------------------------------------------------
+# REQUEST SAUBER HALTEN --> FEHLER 425 VERMEIDEN
+# -----------------------------------------------------------------------------
 
 import random
 import asyncio
@@ -209,6 +212,9 @@ async def _get_with_retries(client, url: str, sem: asyncio.Semaphore, label: str
 
     return None, last_err
 
+# ------------------------------------------------------------------------------
+# LISTEN, ARRAYS, DICS SAUBER FÜR API V2 GLÄTTEN
+# -----------------------------------------------------------------------------
 def _val(obj, key: str) -> str:
     """
     Robust: liest obj[key] und macht daraus einen String.
@@ -243,6 +249,9 @@ def _val(obj, key: str) -> str:
 
     return sanitize(v)
 
+# ------------------------------------------------------------------------------
+# E-MAIL SAUBER LADEN
+# ------------------------------------------------------------------------------
 def _primary_email(p: dict) -> str:
     v = p.get("email")
     # häufig: [{"label": "...", "value": "..."}]
@@ -255,13 +264,15 @@ def _primary_email(p: dict) -> str:
         return sanitize(v)
     return ""
 
-
+# ------------------------------------------------------------------------------
+# PAUSEN FÜR REQUEST EINBAUEN - API ENTLASTUNG
+# ------------------------------------------------------------------------------
 
 import random
 import asyncio
 from typing import Optional, Tuple
 
-# Global: eine Bremse für alle Requests (Pipedrive mag keine parallelen Bursts)
+
 PD_SEM = asyncio.Semaphore(1)
 
 def _retry_after_seconds(resp) -> float:
@@ -296,7 +307,7 @@ async def pd_get_with_retry(
     """
     Backward compatible:
       - alt: pd_get_with_retry(client, url, headers, label="x")
-      - neu: pd_get_with_retry(client, url, label="x")
+      - neu: (client, url, label="x")
 
     Wichtig: label ist KEYWORD-ONLY (wegen '*'), damit "multiple values for label" nicht mehr passieren kann.
     """
@@ -310,7 +321,7 @@ async def pd_get_with_retry(
     for attempt in range(1, retries + 1):
         if (time.monotonic() - t0) > max_total_time:
             raise RuntimeError(
-                f"[pd_get_with_retry] TIMEOUT(total) {label} after {attempt-1} attempts "
+                f"[] TIMEOUT(total) {label} after {attempt-1} attempts "
                 f"({max_total_time}s). url={_short(url)} last_err={last_err}"
             )
 
@@ -337,14 +348,14 @@ async def pd_get_with_retry(
                 ra = _retry_after_seconds(r)
                 sleep_s = min(max(delay, ra) + random.uniform(0, 0.35), 30.0)
                 print(
-                    f"[pd_get_with_retry] {label} HTTP {r.status_code} "
+                    f"[] {label} HTTP {r.status_code} "
                     f"attempt={attempt}/{retries}, sleep={sleep_s:.2f}s"
                 )
                 await asyncio.sleep(sleep_s)
                 delay = min(delay * 1.8, 30.0)
                 continue
 
-            print(f"[pd_get_with_retry] {label} HTTP {r.status_code}, retry attempt={attempt}/{retries}")
+            print(f"[] {label} HTTP {r.status_code}, retry attempt={attempt}/{retries}")
             await asyncio.sleep(delay + random.uniform(0, 0.2))
             delay = min(delay * 1.8, 30.0)
 
@@ -352,7 +363,7 @@ async def pd_get_with_retry(
             last_err = e
             sleep_s = delay + random.uniform(0, 0.35)
             print(
-                f"[pd_get_with_retry] {label} REQ_TIMEOUT {request_timeout}s, "
+                f"[] {label} REQ_TIMEOUT {request_timeout}s, "
                 f"retry attempt={attempt}/{retries}, sleep={sleep_s:.2f}s"
             )
             await asyncio.sleep(sleep_s)
@@ -361,12 +372,12 @@ async def pd_get_with_retry(
         except Exception as e:
             last_err = e
             sleep_s = delay + random.uniform(0, 0.35)
-            print(f"[pd_get_with_retry] {label} EXC {e}, retry attempt={attempt}/{retries}, sleep={sleep_s:.2f}s")
+            print(f"[] {label} EXC {e}, retry attempt={attempt}/{retries}, sleep={sleep_s:.2f}s")
             await asyncio.sleep(sleep_s)
             delay = min(delay * 1.8, 30.0)
 
     raise RuntimeError(
-        f"[pd_get_with_retry] FAILED {label} after {retries} retries "
+        f"[] FAILED {label} after {retries} retries "
         f"(total<= {max_total_time}s). url={_short(url)} last_err={last_err}"
     )
 
@@ -714,7 +725,7 @@ async def fetch_persons_by_filter_id_v2(
         if cursor:
             url += f"&cursor={cursor}"
 
-        r = await pd_get_with_retry(
+        r = await (
             http_client(),
             url,
             get_headers(),
@@ -1022,7 +1033,68 @@ async def stream_organizations_by_filter(
         if not cursor:
             break
 
+# =============================================================================
+# STREAM FILTER
+# =============================================================================
+import urllib.parse
+from typing import AsyncGenerator, List, Optional
 
+async def stream_person_ids_by_filter_cursor(
+    filter_id: int,
+    page_limit: int = 200,
+) -> AsyncGenerator[List[str], None]:
+    """
+    Streamt Personen-IDs eines Pipedrive-Filters seitenweise (API v2, cursor-basiert).
+    Endpoint: GET /persons?filter_id=...&limit=...&cursor=...
+
+    Yields: Liste von Person-IDs (strings) pro Seite.
+    """
+    client = http_client()
+    cursor: Optional[str] = None
+
+    while True:
+        base = f"{PIPEDRIVE_API}/persons?filter_id={int(filter_id)}&limit={int(page_limit)}"
+        url = append_token(base)
+        if cursor:
+            url += f"&cursor={urllib.parse.quote(str(cursor))}"
+
+        payload, status, err = await pd_get_json_with_retry(
+            client,
+            url,
+            get_headers(),
+            label=f"persons_filter[{filter_id}]",
+            retries=10,
+            base_delay=0.8,
+            request_timeout=30.0,
+            max_total_time=180.0,
+        )
+
+        if status != 200 or not payload:
+            print(f"[stream_person_ids_by_filter_cursor] WARN status={status} filter={filter_id} err={err}")
+            break
+
+        data = payload.get("data") or []
+        if not data:
+            break
+
+        ids: List[str] = []
+        for p in data:
+            if isinstance(p, dict) and p.get("id") is not None:
+                ids.append(str(p["id"]))
+
+        if ids:
+            yield ids
+
+        additional = payload.get("additional_data") or {}
+        next_cursor = additional.get("next_cursor")
+        if not next_cursor:
+            pagination = additional.get("pagination") or {}
+            next_cursor = pagination.get("next_cursor")
+
+        if not next_cursor:
+            break
+
+        cursor = str(next_cursor)
 
     
 from typing import AsyncGenerator, List, Optional, Set, Dict
@@ -1532,10 +1604,9 @@ async def fetch_person_details_many(
 
     return cleaned
 
-
-import asyncio
 import urllib.parse
 from typing import Optional, List, Dict, Any
+import asyncio
 
 async def stream_person_items_by_batch_id_v2(
     batch_id: str,
@@ -1546,14 +1617,18 @@ async def stream_person_items_by_batch_id_v2(
     Holt Personen-Search-Items über API v2:
       GET /persons/search?term=<batch_id>&fields=custom_fields&limit<=100&cursor=...
 
-    Rückgabe: Liste der "item"-Dicts (aus data.items[].item)
+    Rückgabe: Liste der Person-Objekte (item) aus data.items[].item
+    WICHTIG: Wir verlassen uns NICHT darauf, dass custom_fields im item enthalten sind.
+             Für Batch-only reicht: term=batch_id + IDs sammeln.
     """
     batch_id = (batch_id or "").strip()
     if not batch_id:
         return []
 
     limit = min(int(page_limit or 100), 100)
-    sem = asyncio.Semaphore(1)  # persons/search ist sehr 429-anfällig
+
+    # persons/search ist 429-anfällig → konservativ
+    sem = asyncio.Semaphore(1)
 
     cursor: Optional[str] = None
     page = 0
@@ -1605,21 +1680,27 @@ async def stream_person_items_by_batch_id_v2(
             item = it.get("item")
             if not isinstance(item, dict):
                 continue
+
             pid = item.get("id")
             if pid is None:
                 continue
+
             got_ids += 1
             spid = str(pid)
+
             if spid in seen_ids:
                 continue
+
             seen_ids.add(spid)
             results.append(item)
             new_ids += 1
 
-        cursor = (payload.get("additional_data") or {}).get("next_cursor")
+        additional = payload.get("additional_data") or {}
+        cursor = additional.get("next_cursor")
+
         print(
-            f"[Batch {batch_id}] page={page} "
-            f"items={got_items}, with_id={got_ids}, new={new_ids}, total_unique={len(results)} cursor={'yes' if cursor else 'no'}"
+            f"[Batch {batch_id}] page={page} items={got_items}, with_id={got_ids}, "
+            f"new={new_ids}, total_unique={len(results)} cursor={'yes' if cursor else 'no'}"
         )
 
         if not cursor:
@@ -2141,10 +2222,11 @@ async def _reconcile(prefix: str) -> None:
         df = df.drop(drop_idx)
 
     # (4) Person-ID bereits in Filtern 1216/1708 -> raus
+  
     suspect_ids: set[str] = set()
     for fid in (1216, 1708):
-        async for ids in stream_person_ids_by_filter(fid):
-            suspect_ids.update([str(x) for x in ids])
+        async for ids in stream_person_ids_by_filter_cursor(fid, page_limit=PAGE_LIMIT):
+            suspect_ids.update(map(str, ids))
 
     if col_pid in df.columns and suspect_ids:
         mask = df[col_pid].astype(str).isin(suspect_ids)
@@ -2186,21 +2268,24 @@ async def _reconcile(prefix: str) -> None:
     ]
     await save_df_text(pd.DataFrame(summary_rows), "nf_excluded")
 
-
+# =============================================================================
+# NACHFASS - LOGIK
+# =============================================================================
 from typing import Optional, List, Set
+import math
 
 async def run_nachfass_job(
     job_obj,
     job_id: str,
     campaign: str,
-    filters: Optional[List[int]] = None,          # wird hier NICHT genutzt (Batch-only)
+    filters: Optional[List[int]] = None,          # hier weiterhin ungenutzt (Batch-only)
     nf_batch_ids: Optional[List[str]] = None,
 ):
     """
-    Nachfass-Job (Batch-only, schnell):
+    Nachfass-Job (Batch-only):
       1) Personen via persons/search anhand Batch-ID(s) holen (nur Kandidaten)
-      2) Vorfilter VOR Detail-Calls: Batch exakt + E-Mail nicht leer
-      3) Personendetails nur für gefilterte IDs laden
+      2) Vorfilter: NUR dedupe (keine E-Mail-Prüfung, kein cf_value Batch-Match)
+      3) Personendetails für IDs laden
       4) nf_master_final bauen
       5) nf_master_final speichern
       6) _reconcile("nf") -> ready + delete_log + excluded summary
@@ -2211,7 +2296,7 @@ async def run_nachfass_job(
         # A) Batch IDs aus UI
         # ------------------------------
         user_batches = [str(b).strip() for b in (nf_batch_ids or []) if str(b).strip()]
-        user_batches = [b for b in user_batches if b]  # clean
+        user_batches = [b for b in user_batches if b]
         if not user_batches:
             job_obj.done = True
             job_obj.error = "Keine Batch-ID angegeben."
@@ -2221,7 +2306,6 @@ async def run_nachfass_job(
 
         # max 2 (wie UI)
         user_batches = user_batches[:2]
-        user_batches_set = set(user_batches)
 
         job_obj.phase = "Suche Personen (Batch IDs)"
         job_obj.percent = 10
@@ -2230,7 +2314,9 @@ async def run_nachfass_job(
         # B) Kandidaten per Batch Search holen (items)
         # ------------------------------
         all_items: List[dict] = []
-        for b in user_batches:
+        for i, b in enumerate(user_batches, start=1):
+            job_obj.phase = f"Suche Personen (Batch {b})"
+            job_obj.percent = min(20, 10 + int((i - 1) * 5))
             items = await stream_person_items_by_batch_id_v2(b, page_limit=100, job_obj=job_obj)
             all_items.extend(items)
 
@@ -2242,30 +2328,10 @@ async def run_nachfass_job(
             return
 
         # ------------------------------
-        # C) Vorfilter VOR Detailcalls
-        #     - Batch ID exakt
-        #     - Email nicht leer
+        # C) Vorfilter: NUR dedupe + IDs sammeln
         # ------------------------------
-        job_obj.phase = "Vorfilter (Batch + E-Mail)"
-        job_obj.percent = 18
-
-        FIELD_BATCH_ID = PD_PERSON_FIELDS["Batch ID"]
-
-        def has_email_from_search_item(p: dict) -> bool:
-            if not isinstance(p, dict):
-                return False
-            if (p.get("primary_email") or "").strip():
-                return True
-            emails = p.get("emails") or p.get("email")
-            if isinstance(emails, list) and emails:
-                e0 = emails[0]
-                if isinstance(e0, dict):
-                    return bool((e0.get("value") or e0.get("email") or "").strip())
-                if isinstance(e0, str):
-                    return bool(e0.strip())
-            if isinstance(emails, str):
-                return bool(emails.strip())
-            return False
+        job_obj.phase = "Vorfilter (Deduplicate)"
+        job_obj.percent = 22
 
         ids_keep: List[str] = []
         seen: Set[str] = set()
@@ -2280,38 +2346,29 @@ async def run_nachfass_job(
             if spid in seen:
                 continue
             seen.add(spid)
-
-            # Batch exakt matchen (Custom Field)
-            bval = str(cf_value(p, FIELD_BATCH_ID) or "").strip()
-            if bval not in user_batches_set:
-                continue
-
-            # Email muss vorhanden sein
-            if not has_email_from_search_item(p):
-                continue
-
             ids_keep.append(spid)
 
-        print(f"[NF] Batch candidates: {len(all_items)} items, nach Vorfilter: {len(ids_keep)} IDs")
+        print(f"[NF] Batch candidates: {len(all_items)} items, nach Dedupe: {len(ids_keep)} IDs")
 
         if not ids_keep:
             job_obj.done = True
-            job_obj.error = "Keine Personen nach Vorfilter (Batch + E-Mail) übrig."
+            job_obj.error = "Keine Personen nach Dedupe übrig."
             job_obj.phase = "Fertig (leer)"
             job_obj.percent = 100
             return
 
         # ------------------------------
-        # D) Details nur für ids_keep laden
+        # D) Details für ids_keep laden
         # ------------------------------
         job_obj.phase = "Lade Personendetails"
-        job_obj.percent = 25
+        job_obj.percent = 30
 
         details_all = await fetch_person_details_many(ids_keep, job_obj=job_obj, concurrency=2)
 
-        # Fehlerobjekte rausfiltern (aber NICHT still droppen ohne Info)
+        # Fehlerobjekte rausfiltern (aber zählen/loggen)
         details = [p for p in details_all if isinstance(p, dict) and p.get("id") is not None and not p.get("_error")]
-        print(f"[NF] Vollständige Personendaten: {len(details)} Datensätze (errors: {len(details_all)-len(details)})")
+        err_count = len(details_all) - len(details)
+        print(f"[NF] Vollständige Personendaten: {len(details)} Datensätze (errors: {err_count})")
 
         if not details:
             job_obj.done = True
@@ -2361,6 +2418,8 @@ async def run_nachfass_job(
 
         out_path = export_to_excel(export_df, prefix="nachfass_export", job_id=job_id)
         job_obj.path = out_path
+
+        # falls du filename_base setzen willst:
         job_obj.filename_base = job_obj.filename_base or "Nachfass_Export"
 
         job_obj.error = None
@@ -2375,7 +2434,6 @@ async def run_nachfass_job(
         job_obj.percent = 100
         print(f"[NF][ERROR] Job failed: {job_obj.error}")
         return
-
 
 # =============================================================================
 # Excel-Export-Helfer – FINAL MODUL 3
