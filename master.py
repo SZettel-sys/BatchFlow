@@ -809,6 +809,54 @@ async def fetch_persons_by_filter_id_v2(
     return out
 
 
+from typing import List, Optional, Set
+
+async def fetch_person_ids_for_batch_from_filter_v2(
+    filter_id: int,
+    batch_ids: List[str],
+    *,
+    page_limit: int = 200,
+    max_pages: int = 200,
+) -> List[str]:
+    """
+    Lädt ALLE Personen aus einem Pipedrive-Filter (v2 /persons?filter_id=...)
+    und gibt NUR die Person-IDs zurück, deren Custom Field "Batch ID" exakt
+    in batch_ids liegt.
+    """
+    want: Set[str] = {str(b).strip() for b in (batch_ids or []) if str(b).strip()}
+    if not want:
+        return []
+
+    FIELD_BATCH_ID = PD_PERSON_FIELDS["Batch ID"]
+
+    persons = await fetch_persons_by_filter_id_v2(
+        filter_id=int(filter_id),
+        limit=int(page_limit),
+        max_pages=int(max_pages),
+        job_obj=None,
+    )
+
+    ids: List[str] = []
+    seen: Set[str] = set()
+
+    for p in persons:
+        if not isinstance(p, dict):
+            continue
+        pid = p.get("id")
+        if pid is None:
+            continue
+        spid = str(pid)
+        if spid in seen:
+            continue
+
+        bval = str(cf_value(p, FIELD_BATCH_ID) or "").strip()
+        if bval in want:
+            seen.add(spid)
+            ids.append(spid)
+
+    return ids
+
+
 def get_person_custom_field(p: dict, field_key: str) -> str:
     """
     Pipedrive liefert Custom Fields je nach Endpoint unterschiedlich:
@@ -2316,19 +2364,29 @@ async def run_nachfass_job(
         # ------------------------------
         # B) Kandidaten per Batch Search holen (items)
         # ------------------------------
-        all_items: List[dict] = []
-        for i, b in enumerate(user_batches, start=1):
-            job_obj.phase = f"Suche Personen (Batch {b})"
-            job_obj.percent = min(20, 10 + int((i - 1) * 5))
-            items = await stream_person_items_by_batch_id_v2(b, page_limit=100, job_obj=job_obj)
-            all_items.extend(items)
-
-        if not all_items:
+        job_obj.phase = "Suche Personen (Batch-ID über Filter)"
+        job_obj.percent = 10
+        
+        # nimm den ersten Filter (default ist bei dir [FILTER_NACHFASS])
+        source_filter_id = int((filters or [FILTER_NACHFASS])[0])
+        
+        ids_keep = await fetch_person_ids_for_batch_from_filter_v2(
+            filter_id=source_filter_id,
+            batch_ids=user_batches,
+            page_limit=200,
+            max_pages=200,
+        )
+        
+        print(f"[NF] Batch-exakt aus Filter {source_filter_id}: {len(ids_keep)} IDs")
+        
+        if not ids_keep:
             job_obj.done = True
             job_obj.error = "Keine Personen zur Batch-ID gefunden."
             job_obj.phase = "Fertig (leer)"
             job_obj.percent = 100
             return
+
+    
 
         # ------------------------------
         # C) Vorfilter: NUR dedupe + IDs sammeln
