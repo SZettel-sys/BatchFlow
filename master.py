@@ -693,6 +693,8 @@ def pd_auth(url: str) -> tuple[str, Dict[str, str]]:
 # PERSONEN ÜBER FILTER LADEN
 # =============================================================================
 
+from typing import Optional, List
+
 async def fetch_persons_by_filter_id_v2(
     filter_id: int,
     limit: int = 200,
@@ -702,8 +704,8 @@ async def fetch_persons_by_filter_id_v2(
 ) -> List[dict]:
     """
     v2: Holt Persons über /persons?filter_id=...
-    Bei dir ist 'start' NICHT erlaubt -> cursor-basiert.
-    Enthält Notbremsen gegen Cursor-Loops.
+    Cursor-basiert (kein start).
+    Enthält Notbremsen gegen Cursor-Loops / keine neuen IDs.
     """
     out: List[dict] = []
     seen_ids: set[str] = set()
@@ -725,10 +727,11 @@ async def fetch_persons_by_filter_id_v2(
         if cursor:
             url += f"&cursor={cursor}"
 
-        r = await (
+        # ✅ FIX: richtiger Call (statt 'await ( ... )' )
+        r = await pd_get_with_retry(
             http_client(),
             url,
-            get_headers(),
+            None,
             label=f"persons filter={filter_id} page={pages}",
             retries=10,
             request_timeout=30.0,
@@ -750,30 +753,31 @@ async def fetch_persons_by_filter_id_v2(
             pid = p.get("id")
             if pid is None:
                 continue
-            pid = str(pid)
-            if pid in seen_ids:
+            spid = str(pid)
+            if spid in seen_ids:
                 continue
-            seen_ids.add(pid)
+            seen_ids.add(spid)
             out.append(p)
 
         added = len(seen_ids) - before
 
-        # DEBUG (zeigt dir exakt, was passiert)
+        # DEBUG
         print(
-            f"[NF] filter={filter_id} page={pages} got={len(data)} "
-            f"added_ids={added} total={len(out)} cursor={(cursor[:16] + '...') if cursor else 'None'}"
+            f"[persons/filter] filter={filter_id} page={pages} got={len(data)} "
+            f"added_ids={added} total={len(out)} cursor={'yes' if cursor else 'no'}"
         )
+
+        # Fortschritt (optional)
+        if job_obj:
+            job_obj.phase = f"Suche Personen (Filter {filter_id})"
+            job_obj.percent = min(22, max(int(getattr(job_obj, "percent", 0) or 0), 12 + min(10, pages)))
 
         if added == 0:
             no_growth_streak += 1
         else:
             no_growth_streak = 0
 
-        if job_obj:
-            job_obj.phase = f"Suche Personen (Filter {filter_id})"
-            job_obj.percent = min(22, max(job_obj.percent, 12 + min(10, pages)))
-
-        # Notbremse: keine neuen IDs mehr -> stop
+        # Notbremse: keine neuen IDs mehr
         if no_growth_streak >= max_empty_growth:
             print(f"[WARN] abort: no new IDs for {no_growth_streak} pages (possible loop)")
             break
@@ -785,17 +789,15 @@ async def fetch_persons_by_filter_id_v2(
             next_cursor = pagination.get("next_cursor")
 
         if not next_cursor:
-            # keine weitere Seite
             break
 
         next_cursor = str(next_cursor)
 
-        # (WICHTIG) Cursor-Loop-Abbruch: cursor bleibt gleich -> stop
+        # Cursor-Loop-Abbruch
         if cursor and next_cursor == cursor:
             print(f"[WARN] abort: next_cursor == cursor (no progress) cursor={cursor[:16]}...")
             break
 
-        # Wiederholte Cursor -> stop
         if next_cursor in seen_cursors:
             print(f"[WARN] abort: cursor repeated ({next_cursor[:16]}...)")
             break
@@ -803,8 +805,9 @@ async def fetch_persons_by_filter_id_v2(
         seen_cursors.add(next_cursor)
         cursor = next_cursor
 
-    print(f"[NF] /persons?filter_id={filter_id}: pages={pages}, personen={len(out)}")
+    print(f"[persons/filter] /persons?filter_id={filter_id}: pages={pages}, personen={len(out)}")
     return out
+
 
 def get_person_custom_field(p: dict, field_key: str) -> str:
     """
