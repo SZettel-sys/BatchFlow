@@ -1,4 +1,3 @@
-
 import logging
 
 
@@ -682,118 +681,7 @@ def pd_auth(url: str) -> tuple[str, Dict[str, str]]:
 # =============================================================================
 # PERSONEN ÜBER FILTER LADEN
 # =============================================================================
-async def fetch_persons_by_filter_id_v2(
-    filter_id: int,
-    limit: int = 200,
-    job_obj=None,
-    max_pages: int = 80,
-    max_empty_growth: int = 2,
-) -> List[dict]:
-    """
-    v2: Holt Persons über /persons?filter_id=...
-    Bei dir ist 'start' NICHT erlaubt -> cursor-basiert.
-    Enthält Notbremsen gegen Cursor-Loops.
-    """
-    out: List[dict] = []
-    seen_ids: set[str] = set()
 
-    cursor: Optional[str] = None
-    seen_cursors: set[str] = set()
-
-    pages = 0
-    no_growth_streak = 0
-
-    while True:
-        pages += 1
-        if pages > max_pages:
-            print(f"[WARN] fetch_persons_by_filter_id_v2 abort: max_pages={max_pages} reached")
-            break
-
-        base = f"{PIPEDRIVE_API}/persons?filter_id={int(filter_id)}&limit={int(limit)}"
-        url = append_token(base)
-        if cursor:
-            url += f"&cursor={cursor}"
-
-        r = await pd_get_with_retry(
-            http_client(),
-            url,
-            get_headers(),
-            label=f"persons filter={filter_id} page={pages}",
-            retries=10,
-            request_timeout=30.0,
-            max_total_time=180.0,
-        )
-
-        if r.status_code != 200:
-            print(f"[WARN] /persons?filter_id={filter_id} HTTP {r.status_code} {r.text[:200]}")
-            break
-
-        payload = r.json() or {}
-        data = payload.get("data") or []
-
-        before = len(seen_ids)
-
-        for p in data:
-            if not isinstance(p, dict):
-                continue
-            pid = p.get("id")
-            if pid is None:
-                continue
-            pid = str(pid)
-            if pid in seen_ids:
-                continue
-            seen_ids.add(pid)
-            out.append(p)
-
-        added = len(seen_ids) - before
-
-        # DEBUG (zeigt dir exakt, was passiert)
-        print(
-            f"[NF] filter={filter_id} page={pages} got={len(data)} "
-            f"added_ids={added} total={len(out)} cursor={(cursor[:16] + '...') if cursor else 'None'}"
-        )
-
-        if added == 0:
-            no_growth_streak += 1
-        else:
-            no_growth_streak = 0
-
-        if job_obj:
-            job_obj.phase = f"Suche Personen (Filter {filter_id})"
-            job_obj.percent = min(22, max(job_obj.percent, 12 + min(10, pages)))
-
-        # Notbremse: keine neuen IDs mehr -> stop
-        if no_growth_streak >= max_empty_growth:
-            print(f"[WARN] abort: no new IDs for {no_growth_streak} pages (possible loop)")
-            break
-
-        ad = payload.get("additional_data") or {}
-        next_cursor = ad.get("next_cursor")
-        if not next_cursor:
-            pagination = ad.get("pagination") or {}
-            next_cursor = pagination.get("next_cursor")
-
-        if not next_cursor:
-            # keine weitere Seite
-            break
-
-        next_cursor = str(next_cursor)
-
-        # (WICHTIG) Cursor-Loop-Abbruch: cursor bleibt gleich -> stop
-        if cursor and next_cursor == cursor:
-            print(f"[WARN] abort: next_cursor == cursor (no progress) cursor={cursor[:16]}...")
-            break
-
-        # Wiederholte Cursor -> stop
-        if next_cursor in seen_cursors:
-            print(f"[WARN] abort: cursor repeated ({next_cursor[:16]}...)")
-            break
-
-        seen_cursors.add(next_cursor)
-        cursor = next_cursor
-
-    print(f"[NF] /persons?filter_id={filter_id}: pages={pages}, personen={len(out)}")
-    return out
 async def fetch_persons_by_filter_id_v2(
     filter_id: int,
     limit: int = 200,
@@ -1134,114 +1022,11 @@ async def stream_organizations_by_filter(
         if not cursor:
             break
 
+
+
+    
 from typing import AsyncGenerator, List, Optional, Set, Dict
 import asyncio
-
-async def stream_person_ids_by_filter_cursor(
-    filter_id: int,
-    page_limit: int = 100,
-    job_obj=None,
-    batch_ids: Optional[List[str]] = None,
-    batch_field_key: Optional[str] = None,
-    stop_after_no_matches_pages: int = 3,   # stoppt früh, wenn Filter eigentlich nur Batch liefern sollte
-) -> AsyncGenerator[List[str], None]:
-    """
-    Streamt Person-IDs aus Pipedrive API v2: GET /persons?filter_id=...&limit=...&cursor=...
-
-    Wenn batch_ids + batch_field_key gesetzt:
-      - prüft pro Person die Batch-ID in custom_fields
-      - yieldet nur passende IDs
-      - stoppt optional nach N Seiten ohne Treffer (für Performance)
-    """
-    assert page_limit <= 100, "Pipedrive v2: limit muss <= 100 sein"
-
-    wanted_batches: Set[str] = set([str(b).strip() for b in (batch_ids or []) if str(b).strip()])
-    require_batch = bool(wanted_batches)
-
-    cursor: Optional[str] = None
-    page = 0
-    no_match_pages = 0
-
-    while True:
-        page += 1
-
-        base_url = f"{PIPEDRIVE_API}/persons?filter_id={int(filter_id)}&limit={int(page_limit)}"
-        url = append_token(base_url)
-        if cursor:
-            url += f"&cursor={cursor}"
-
-        r = await pd_get_with_retry(
-            http_client(),
-            url,
-            None,
-            label=f"persons_filter filter={filter_id} page={page}",
-            request_timeout=30.0,
-            max_total_time=180.0,
-        )
-
-        if r.status_code != 200:
-            print(f"[WARN] /persons?filter_id={filter_id} HTTP {r.status_code} {r.text[:200]}")
-            break
-
-        payload = r.json() or {}
-        items = payload.get("data") or []
-        if not items:
-            break
-
-        # Fortschritt grob
-        if job_obj and (page == 1 or page % 5 == 0):
-            job_obj.phase = f"Suche Personen (Filter {filter_id})"
-            job_obj.percent = min(24, 10 + page)  # nur kosmetisch
-
-        out: List[str] = []
-        matched_this_page = 0
-
-        for p in items:
-            if not isinstance(p, dict):
-                continue
-            pid = p.get("id")
-            if pid is None:
-                continue
-
-            if require_batch:
-                # Batch steht i.d.R. in custom_fields oder direkt unter dem field_key
-                # je nach Pipedrive-Shape -> wir prüfen robust:
-                batch_val = ""
-                if batch_field_key:
-                    # 1) manche payloads haben custom_fields dict
-                    cf = p.get("custom_fields")
-                    if isinstance(cf, dict) and batch_field_key in cf:
-                        batch_val = str(cf.get(batch_field_key) or "").strip()
-                    else:
-                        # 2) oder field_key direkt im object
-                        batch_val = str(p.get(batch_field_key) or "").strip()
-
-                if batch_val in wanted_batches:
-                    out.append(str(pid))
-                    matched_this_page += 1
-            else:
-                out.append(str(pid))
-
-        if require_batch:
-            if matched_this_page == 0:
-                no_match_pages += 1
-            else:
-                no_match_pages = 0
-
-            if stop_after_no_matches_pages and no_match_pages >= stop_after_no_matches_pages:
-                print(f"[NF] stop: keine Batch-Matches in {no_match_pages} Seiten (Filter {filter_id})")
-                break
-
-        if out:
-            yield out
-
-        # cursor handling
-        ad = payload.get("additional_data") or {}
-        cursor = ad.get("next_cursor")
-        if not cursor:
-            break
-
-
 
 
 # =============================================================================
@@ -1314,133 +1099,6 @@ _BATCH_FIELD_KEY: Optional[str] = None
 # -----------------------------------------------------------------------------
 # PIPEDRIVE HILFSFUNKTIONEN
 # -----------------------------------------------------------------------------
-async def fetch_persons_for_filter_and_batches(
-    filter_id: int,
-    batch_values: List[str],
-    batch_field_key: str,
-    limit: int = 200,
-    job_obj=None,
-    max_pages: int = 200,
-    stop_after_pages_no_new_match: int = 3,
-) -> List[dict]:
-    """
-    Scannt /persons?filter_id=... seitenweise,
-    filtert IN DER SCHLEIFE auf Batch-ID(s) und bricht ab,
-    wenn über N Seiten keine neuen Matches mehr gefunden werden.
-
-    Dadurch ziehst du NICHT die ganzen 7000+ Personen aus Filter 3024,
-    sondern nur die, die zur Batch-ID gehören.
-    """
-    want = [str(b).strip() for b in (batch_values or []) if str(b).strip()]
-    want_set = set(want)
-    if not want_set:
-        return []
-
-    out: List[dict] = []
-    out_ids: set[str] = set()
-
-    cursor: Optional[str] = None
-    seen_cursors: set[str] = set()
-
-    pages = 0
-    no_new_match_pages = 0
-
-    while True:
-        pages += 1
-        if pages > max_pages:
-            print(f"[WARN] abort: max_pages={max_pages} reached (filter={filter_id})")
-            break
-
-        base = f"{PIPEDRIVE_API}/persons?filter_id={int(filter_id)}&limit={int(limit)}"
-        url = append_token(base)
-        if cursor:
-            url += f"&cursor={cursor}"
-
-        r = await pd_get_with_retry(
-            http_client(),
-            url,
-            get_headers(),
-            label=f"persons filter={filter_id} page={pages}",
-            retries=10,
-            request_timeout=30.0,
-            max_total_time=180.0,
-        )
-
-        if r.status_code != 200:
-            print(f"[WARN] /persons?filter_id={filter_id} HTTP {r.status_code} {r.text[:200]}")
-            break
-
-        payload = r.json() or {}
-        data = payload.get("data") or []
-        if not isinstance(data, list):
-            data = []
-
-        before = len(out_ids)
-
-        for p in data:
-            if not isinstance(p, dict):
-                continue
-            pid = p.get("id")
-            if pid is None:
-                continue
-            pid = str(pid)
-
-            batch_val = get_person_custom_field(p, batch_field_key)
-            if batch_val not in want_set:
-                continue
-
-            if pid in out_ids:
-                continue
-
-            out_ids.add(pid)
-            out.append(p)
-
-        added_matches = len(out_ids) - before
-
-        print(
-            f"[NF] filter={filter_id} page={pages} got={len(data)} "
-            f"added_batch_matches={added_matches} total_batch_matches={len(out)} cursor={(cursor[:16]+'...') if cursor else None}"
-        )
-
-        if job_obj:
-            job_obj.phase = f"Suche Personen (Filter {filter_id})"
-            # grobe Progress-Anzeige, damit UI nicht “steht”
-            job_obj.percent = min(22, max(job_obj.percent, 12 + min(10, pages // 2)))
-
-        if added_matches == 0:
-            no_new_match_pages += 1
-        else:
-            no_new_match_pages = 0
-
-        if no_new_match_pages >= stop_after_pages_no_new_match:
-            print(f"[NF] stop: no new batch matches for {no_new_match_pages} pages")
-            break
-
-        ad = payload.get("additional_data") or {}
-        next_cursor = ad.get("next_cursor")
-        if not next_cursor:
-            pagination = ad.get("pagination") or {}
-            next_cursor = pagination.get("next_cursor")
-
-        if not next_cursor:
-            break
-
-        next_cursor = str(next_cursor)
-
-        if cursor and next_cursor == cursor:
-            print("[WARN] abort: next_cursor == cursor (no progress)")
-            break
-
-        if next_cursor in seen_cursors:
-            print(f"[WARN] abort: cursor repeated ({next_cursor[:16]}...)")
-            break
-
-        seen_cursors.add(next_cursor)
-        cursor = next_cursor
-
-    print(f"[NF] filter={filter_id}: batch_matches={len(out)}")
-    return out
-
 
 # =============================================================================
 # Nachfass – Personendetails laden (v2-sicher)
@@ -1808,25 +1466,25 @@ from typing import List, Dict, Any, Optional
 import asyncio
 
 async def fetch_person_details_many(
-    person_ids: List[str],
+    person_ids: list[str],
     job_obj=None,
     concurrency: int = 2,
-) -> List[Dict[str, Any]]:
+) -> list[dict]:
     """
-    Lädt Personendetails über API v2: GET /persons/{id}
-    Gibt für jede ID ein dict zurück (bei Fehlern mit _error).
+    Lädt Personendetails via /persons/{id} (API v2).
+    Gibt für jede ID EIN dict zurück.
+    Bei Fehler: {"id": <id>, "_error": "..."} (wird nicht still gedroppt)
     """
-    ids = [str(x).strip() for x in person_ids if str(x).strip()]
+    ids = [str(x).strip() for x in (person_ids or []) if str(x).strip()]
     total = len(ids)
     if total == 0:
         return []
 
     sem = asyncio.Semaphore(max(1, int(concurrency)))
-    out: List[Dict[str, Any]] = []
-    out_lock = asyncio.Lock()
+    out: list[dict] = [None] * total  # preserve order
 
-    async def fetch_one(pid: str):
-        url = append_token(f"{PIPEDRIVE_API}/persons/{pid}")
+    async def fetch_one(i: int, pid: str):
+        url = append_token(f"{PIPEDRIVE_API}/persons/{urllib.parse.quote(pid)}")
         async with sem:
             r = await pd_get_with_retry(
                 http_client(),
@@ -1834,31 +1492,141 @@ async def fetch_person_details_many(
                 None,
                 label=f"person:{pid}",
                 request_timeout=30.0,
+                max_total_time=240.0,
+            )
+        if r.status_code != 200:
+            out[i] = {"id": pid, "_error": f"HTTP {r.status_code}: {r.text[:200]}"}
+            return
+
+        payload = r.json() or {}
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            out[i] = {"id": pid, "_error": "No data in response"}
+            return
+
+        out[i] = data
+
+    # progress helper
+    done_counter = 0
+    done_lock = asyncio.Lock()
+
+    async def wrapped(i: int, pid: str):
+        nonlocal done_counter
+        await fetch_one(i, pid)
+        async with done_lock:
+            done_counter += 1
+            if job_obj and (done_counter == 1 or done_counter % 50 == 0 or done_counter == total):
+                job_obj.phase = f"Lade Personendetails ({done_counter}/{total})"
+                job_obj.percent = max(int(job_obj.percent), 25)
+
+    await asyncio.gather(*(wrapped(i, pid) for i, pid in enumerate(ids)))
+
+    # None sollte nicht passieren, aber just in case:
+    cleaned: list[dict] = []
+    for i, pid in enumerate(ids):
+        item = out[i]
+        if item is None:
+            cleaned.append({"id": pid, "_error": "Unknown error (None result)"})
+        else:
+            cleaned.append(item)
+
+    return cleaned
+
+
+import asyncio
+import urllib.parse
+from typing import Optional, List, Dict, Any
+
+async def stream_person_items_by_batch_id_v2(
+    batch_id: str,
+    page_limit: int = 100,   # search limit must be <= 100
+    job_obj=None,
+) -> List[dict]:
+    """
+    Holt Personen-Search-Items über API v2:
+      GET /persons/search?term=<batch_id>&fields=custom_fields&limit<=100&cursor=...
+
+    Rückgabe: Liste der "item"-Dicts (aus data.items[].item)
+    """
+    batch_id = (batch_id or "").strip()
+    if not batch_id:
+        return []
+
+    limit = min(int(page_limit or 100), 100)
+    sem = asyncio.Semaphore(1)  # persons/search ist sehr 429-anfällig
+
+    cursor: Optional[str] = None
+    page = 0
+
+    results: List[dict] = []
+    seen_ids: set[str] = set()
+
+    while True:
+        page += 1
+
+        base_url = (
+            f"{PIPEDRIVE_API}/persons/search?"
+            f"term={urllib.parse.quote(batch_id)}&fields=custom_fields&limit={limit}"
+        )
+        url = append_token(base_url)
+        if cursor:
+            url += f"&cursor={urllib.parse.quote(cursor)}"
+
+        if job_obj and page % 2 == 1:
+            job_obj.phase = f"Suche Personen (Batch {batch_id})"
+            job_obj.percent = max(int(getattr(job_obj, "percent", 0) or 0), 12)
+
+        async with sem:
+            r = await pd_get_with_retry(
+                http_client(),
+                url,
+                None,
+                label=f"persons_search batch={batch_id} page={page}",
+                request_timeout=30.0,
                 max_total_time=180.0,
             )
 
         if r.status_code != 200:
-            item = {"id": pid, "_error": f"HTTP {r.status_code}: {r.text[:200]}"}
-        else:
-            payload = r.json() or {}
-            data = payload.get("data")
-            if isinstance(data, dict):
-                item = data
-            else:
-                item = {"id": pid, "_error": "no data in response"}
+            print(f"[WARN] Batch {batch_id} Fehler: HTTP {r.status_code} {r.text[:200]}")
+            break
 
-        async with out_lock:
-            out.append(item)
-            if job_obj:
-                # nur UI-Kosmetik
-                done = len(out)
-                if done == 1 or done % 50 == 0 or done == total:
-                    job_obj.phase = f"Lade Personendetails ({done}/{total})"
-                    job_obj.percent = max(int(job_obj.percent), 25)
+        payload = r.json() or {}
+        raw_items = (payload.get("data") or {}).get("items") or []
+        if not raw_items:
+            break
 
-    await asyncio.gather(*(fetch_one(pid) for pid in ids))
-    return out
+        got_items = len(raw_items)
+        got_ids = 0
+        new_ids = 0
 
+        for it in raw_items:
+            if not isinstance(it, dict):
+                continue
+            item = it.get("item")
+            if not isinstance(item, dict):
+                continue
+            pid = item.get("id")
+            if pid is None:
+                continue
+            got_ids += 1
+            spid = str(pid)
+            if spid in seen_ids:
+                continue
+            seen_ids.add(spid)
+            results.append(item)
+            new_ids += 1
+
+        cursor = (payload.get("additional_data") or {}).get("next_cursor")
+        print(
+            f"[Batch {batch_id}] page={page} "
+            f"items={got_items}, with_id={got_ids}, new={new_ids}, total_unique={len(results)} cursor={'yes' if cursor else 'no'}"
+        )
+
+        if not cursor:
+            break
+
+    print(f"[INFO] Batch {batch_id}: {len(results)} eindeutige Personen (aus search) gesamt")
+    return results
 
 
 from typing import List
@@ -2425,24 +2193,25 @@ async def run_nachfass_job(
     job_obj,
     job_id: str,
     campaign: str,
-    filters: Optional[List[int]] = None,
+    filters: Optional[List[int]] = None,          # wird hier NICHT genutzt (Batch-only)
     nf_batch_ids: Optional[List[str]] = None,
 ):
     """
-    Nachfass-Job (korrekt & schnell):
-      1) IDs via Filter 3024 streamen, aber INLINE auf User-Batch filtern
-      2) NUR für diese IDs Details laden
-      3) nf_master_final bauen
-      4) in DB speichern
-      5) _reconcile("nf") -> ready/log + nf_excluded
-      6) Excel aus ready
+    Nachfass-Job (Batch-only, schnell):
+      1) Personen via persons/search anhand Batch-ID(s) holen (nur Kandidaten)
+      2) Vorfilter VOR Detail-Calls: Batch exakt + E-Mail nicht leer
+      3) Personendetails nur für gefilterte IDs laden
+      4) nf_master_final bauen
+      5) nf_master_final speichern
+      6) _reconcile("nf") -> ready + delete_log + excluded summary
+      7) Excel aus ready
     """
     try:
-        # ---- Filter: immer 3024 (wenn nicht explizit gesetzt)
-        if not filters:
-            filters = [3024]
-
+        # ------------------------------
+        # A) Batch IDs aus UI
+        # ------------------------------
         user_batches = [str(b).strip() for b in (nf_batch_ids or []) if str(b).strip()]
+        user_batches = [b for b in user_batches if b]  # clean
         if not user_batches:
             job_obj.done = True
             job_obj.error = "Keine Batch-ID angegeben."
@@ -2450,42 +2219,99 @@ async def run_nachfass_job(
             job_obj.percent = 100
             return
 
-        # Batch field key (custom field key)
-        FIELD_BATCH_ID = PD_PERSON_FIELDS["Batch ID"]
+        # max 2 (wie UI)
+        user_batches = user_batches[:2]
+        user_batches_set = set(user_batches)
 
-        job_obj.phase = "Suche Personen (Filter + Batch)"
+        job_obj.phase = "Suche Personen (Batch IDs)"
         job_obj.percent = 10
 
-        ids: Set[str] = set()
+        # ------------------------------
+        # B) Kandidaten per Batch Search holen (items)
+        # ------------------------------
+        all_items: List[dict] = []
+        for b in user_batches:
+            items = await stream_person_items_by_batch_id_v2(b, page_limit=100, job_obj=job_obj)
+            all_items.extend(items)
 
-        # ---- IDs streamen (nur passende Batch)
-        for fid in filters:
-            async for chunk in stream_person_ids_by_filter_cursor(
-                int(fid),
-                page_limit=100,
-                job_obj=job_obj,
-                batch_ids=user_batches,
-                batch_field_key=FIELD_BATCH_ID,
-                stop_after_no_matches_pages=3,  # huge speedup wenn Filter groß ist
-            ):
-                ids.update(chunk)
-
-        person_ids = sorted(ids)
-        print(f"[NF] Personen aus Filter {filters} mit Batch {user_batches}: {len(person_ids)} IDs")
-
-        if not person_ids:
+        if not all_items:
             job_obj.done = True
             job_obj.error = "Keine Personen zur Batch-ID gefunden."
             job_obj.phase = "Fertig (leer)"
             job_obj.percent = 100
             return
 
-        # ---- Details nur für diese IDs
+        # ------------------------------
+        # C) Vorfilter VOR Detailcalls
+        #     - Batch ID exakt
+        #     - Email nicht leer
+        # ------------------------------
+        job_obj.phase = "Vorfilter (Batch + E-Mail)"
+        job_obj.percent = 18
+
+        FIELD_BATCH_ID = PD_PERSON_FIELDS["Batch ID"]
+
+        def has_email_from_search_item(p: dict) -> bool:
+            if not isinstance(p, dict):
+                return False
+            if (p.get("primary_email") or "").strip():
+                return True
+            emails = p.get("emails") or p.get("email")
+            if isinstance(emails, list) and emails:
+                e0 = emails[0]
+                if isinstance(e0, dict):
+                    return bool((e0.get("value") or e0.get("email") or "").strip())
+                if isinstance(e0, str):
+                    return bool(e0.strip())
+            if isinstance(emails, str):
+                return bool(emails.strip())
+            return False
+
+        ids_keep: List[str] = []
+        seen: Set[str] = set()
+
+        for p in all_items:
+            if not isinstance(p, dict):
+                continue
+            pid = p.get("id")
+            if pid is None:
+                continue
+            spid = str(pid)
+            if spid in seen:
+                continue
+            seen.add(spid)
+
+            # Batch exakt matchen (Custom Field)
+            bval = str(cf_value(p, FIELD_BATCH_ID) or "").strip()
+            if bval not in user_batches_set:
+                continue
+
+            # Email muss vorhanden sein
+            if not has_email_from_search_item(p):
+                continue
+
+            ids_keep.append(spid)
+
+        print(f"[NF] Batch candidates: {len(all_items)} items, nach Vorfilter: {len(ids_keep)} IDs")
+
+        if not ids_keep:
+            job_obj.done = True
+            job_obj.error = "Keine Personen nach Vorfilter (Batch + E-Mail) übrig."
+            job_obj.phase = "Fertig (leer)"
+            job_obj.percent = 100
+            return
+
+        # ------------------------------
+        # D) Details nur für ids_keep laden
+        # ------------------------------
         job_obj.phase = "Lade Personendetails"
         job_obj.percent = 25
 
-        details_all = await fetch_person_details_many(person_ids, job_obj=job_obj, concurrency=2)
+        details_all = await fetch_person_details_many(ids_keep, job_obj=job_obj, concurrency=2)
+
+        # Fehlerobjekte rausfiltern (aber NICHT still droppen ohne Info)
         details = [p for p in details_all if isinstance(p, dict) and p.get("id") is not None and not p.get("_error")]
+        print(f"[NF] Vollständige Personendaten: {len(details)} Datensätze (errors: {len(details_all)-len(details)})")
 
         if not details:
             job_obj.done = True
@@ -2494,7 +2320,9 @@ async def run_nachfass_job(
             job_obj.percent = 100
             return
 
-        # ---- Master bauen
+        # ------------------------------
+        # E) nf_master_final bauen
+        # ------------------------------
         job_obj.phase = "Baue Master (nf_master_final)"
         job_obj.percent = 70
 
@@ -2505,20 +2333,29 @@ async def run_nachfass_job(
             job_obj=job_obj,
         )
 
-        # ---- speichern
+        # ------------------------------
+        # F) Master final speichern
+        # ------------------------------
         job_obj.phase = "Speichere Master (DB)"
         job_obj.percent = 78
+
         t = tables("nf")
         await save_df_text(master_final, t["final"])
 
-        # ---- reconcile
+        # ------------------------------
+        # G) Abgleich
+        # ------------------------------
         job_obj.phase = "Abgleich (nf -> ready/log)"
         job_obj.percent = 82
+
         await _reconcile("nf")
 
-        # ---- Excel
+        # ------------------------------
+        # H) Excel aus ready
+        # ------------------------------
         job_obj.phase = "Erzeuge Excel"
         job_obj.percent = 90
+
         ready_df = await load_df_text(t["ready"])
         export_df = build_nf_export(ready_df)
 
