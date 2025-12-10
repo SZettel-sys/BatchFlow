@@ -1655,6 +1655,56 @@ async def fetch_person_details_many(
 
     return cleaned
 
+from typing import List, Set, Dict
+
+async def person_ids_in_filter_v2(filter_id: int, limit: int = 200, max_pages: int = 200) -> List[str]:
+    """Holt nur Person-IDs aus /persons?filter_id=... (ohne Custom Fields zu erwarten)."""
+    persons = await fetch_persons_by_filter_id_v2(filter_id=filter_id, limit=limit, max_pages=max_pages)
+    ids: List[str] = []
+    seen: Set[str] = set()
+    for p in persons:
+        if not isinstance(p, dict):
+            continue
+        pid = p.get("id")
+        if pid is None:
+            continue
+        spid = str(pid)
+        if spid in seen:
+            continue
+        seen.add(spid)
+        ids.append(spid)
+    return ids
+
+
+async def filter_person_ids_by_batch_via_details(
+    person_ids: List[str],
+    batch_ids: List[str],
+    *,
+    concurrency: int = 2,
+) -> List[str]:
+    """
+    Prüft Batch-ID exakt über /persons/{id} (da sind Custom Fields zuverlässig).
+    Gibt nur IDs zurück, deren FIELD_BATCH_ID in batch_ids liegt.
+    """
+    want: Set[str] = {str(b).strip() for b in (batch_ids or []) if str(b).strip()}
+    if not want or not person_ids:
+        return []
+
+    FIELD_BATCH_ID = PD_PERSON_FIELDS["Batch ID"]
+
+    # Details laden (nutzt deine bestehende Funktion, die bereits retry/limits hat)
+    details_all = await fetch_person_details_many(person_ids, concurrency=concurrency)
+
+    out: List[str] = []
+    for p in details_all:
+        if not isinstance(p, dict) or p.get("_error") or p.get("id") is None:
+            continue
+        bval = str(cf_value(p, FIELD_BATCH_ID) or "").strip()
+        if bval in want:
+            out.append(str(p["id"]))
+    return out
+
+
 import urllib.parse
 from typing import Optional, List, Dict, Any
 import asyncio
@@ -2323,24 +2373,29 @@ async def _reconcile(prefix: str) -> None:
 # NACHFASS - LOGIK
 # =============================================================================
 from typing import Optional, List, Set
-import math
 
 async def run_nachfass_job(
     job_obj,
     job_id: str,
     campaign: str,
-    filters: Optional[List[int]] = None,          # hier weiterhin ungenutzt (Batch-only)
+    filters: Optional[List[int]] = None,
     nf_batch_ids: Optional[List[str]] = None,
 ):
     """
-    Nachfass-Job (Batch-only):
-      1) Personen via persons/search anhand Batch-ID(s) holen (nur Kandidaten)
-      2) Vorfilter: NUR dedupe (keine E-Mail-Prüfung, kein cf_value Batch-Match)
-      3) Personendetails für IDs laden
-      4) nf_master_final bauen
-      5) nf_master_final speichern
-      6) _reconcile("nf") -> ready + delete_log + excluded summary
-      7) Excel aus ready
+    Nachfass-Job (Batch-only, robust):
+      - Quelle: Personen-IDs aus einem Pipedrive-Filter (z.B. FILTER_NACHFASS=3024)
+      - Batch-ID-Exaktmatch wird über /persons/{id} geprüft (Custom Fields dort zuverlässig)
+      - Danach wird (wie bisher) der Master gebaut, gespeichert, _reconcile("nf") aufgerufen und Excel erzeugt.
+
+    WICHTIG:
+      - Setzt voraus, dass diese Hilfsfunktionen im Skript existieren:
+          person_ids_in_filter_v2(...)
+          filter_person_ids_by_batch_via_details(...)
+          fetch_person_details_many(...)
+          _build_nf_master_final(...)
+          save_df_text(...), load_df_text(...), tables(...)
+          _reconcile(...)
+          build_nf_export(...), export_to_excel(...)
     """
     try:
         # ------------------------------
@@ -2358,27 +2413,44 @@ async def run_nachfass_job(
         # max 2 (wie UI)
         user_batches = user_batches[:2]
 
-        job_obj.phase = "Suche Personen (Batch IDs)"
-        job_obj.percent = 10
+        # Filterquelle (Default: FILTER_NACHFASS)
+        source_filter_id = int((filters or [FILTER_NACHFASS])[0])
 
         # ------------------------------
-        # B) Kandidaten per Batch Search holen (items)
+        # B) IDs aus Filter holen (schnell, ohne Custom Fields zu erwarten)
         # ------------------------------
         job_obj.phase = "Suche Personen (Batch-ID über Filter)"
         job_obj.percent = 10
-        
-        # nimm den ersten Filter (default ist bei dir [FILTER_NACHFASS])
-        source_filter_id = int((filters or [FILTER_NACHFASS])[0])
-        
-        ids_keep = await fetch_person_ids_for_batch_from_filter_v2(
+
+        all_filter_ids = await person_ids_in_filter_v2(
             filter_id=source_filter_id,
-            batch_ids=user_batches,
-            page_limit=200,
+            limit=200,
             max_pages=200,
         )
-        
-        print(f"[NF] Batch-exakt aus Filter {source_filter_id}: {len(ids_keep)} IDs")
-        
+
+        print(f"[NF] Filter {source_filter_id}: {len(all_filter_ids)} IDs gesamt")
+
+        if not all_filter_ids:
+            job_obj.done = True
+            job_obj.error = "Filter enthält keine Personen."
+            job_obj.phase = "Fertig (leer)"
+            job_obj.percent = 100
+            return
+
+        # ------------------------------
+        # C) Batch-Exaktmatch via Details-Check (Custom Field sicher)
+        # ------------------------------
+        job_obj.phase = "Prüfe Batch-ID (Details-Check)"
+        job_obj.percent = 18
+
+        ids_keep = await filter_person_ids_by_batch_via_details(
+            person_ids=all_filter_ids,
+            batch_ids=user_batches,
+            concurrency=2,
+        )
+
+        print(f"[NF] Batch-exakt: {len(ids_keep)} IDs")
+
         if not ids_keep:
             job_obj.done = True
             job_obj.error = "Keine Personen zur Batch-ID gefunden."
@@ -2386,50 +2458,20 @@ async def run_nachfass_job(
             job_obj.percent = 100
             return
 
-    
-
         # ------------------------------
-        # C) Vorfilter: NUR dedupe + IDs sammeln
-        # ------------------------------
-        job_obj.phase = "Vorfilter (Deduplicate)"
-        job_obj.percent = 22
-
-        ids_keep: List[str] = []
-        seen: Set[str] = set()
-
-        for p in all_items:
-            if not isinstance(p, dict):
-                continue
-            pid = p.get("id")
-            if pid is None:
-                continue
-            spid = str(pid)
-            if spid in seen:
-                continue
-            seen.add(spid)
-            ids_keep.append(spid)
-
-        print(f"[NF] Batch candidates: {len(all_items)} items, nach Dedupe: {len(ids_keep)} IDs")
-
-        if not ids_keep:
-            job_obj.done = True
-            job_obj.error = "Keine Personen nach Dedupe übrig."
-            job_obj.phase = "Fertig (leer)"
-            job_obj.percent = 100
-            return
-
-        # ------------------------------
-        # D) Details für ids_keep laden
+        # D) Details für ids_keep laden (wie bisher)
         # ------------------------------
         job_obj.phase = "Lade Personendetails"
-        job_obj.percent = 30
+        job_obj.percent = 25
 
         details_all = await fetch_person_details_many(ids_keep, job_obj=job_obj, concurrency=2)
 
-        # Fehlerobjekte rausfiltern (aber zählen/loggen)
-        details = [p for p in details_all if isinstance(p, dict) and p.get("id") is not None and not p.get("_error")]
-        err_count = len(details_all) - len(details)
-        print(f"[NF] Vollständige Personendaten: {len(details)} Datensätze (errors: {err_count})")
+        # Fehlerobjekte rausfiltern (aber NICHT still droppen ohne Info)
+        details = [
+            p for p in details_all
+            if isinstance(p, dict) and p.get("id") is not None and not p.get("_error")
+        ]
+        print(f"[NF] Vollständige Personendaten: {len(details)} Datensätze (errors: {len(details_all)-len(details)})")
 
         if not details:
             job_obj.done = True
@@ -2466,7 +2508,7 @@ async def run_nachfass_job(
         job_obj.phase = "Abgleich (nf -> ready/log)"
         job_obj.percent = 82
 
-        await _reconcile("nf")
+        await _reconcile("nf")  # ✅ genau diese Funktion ruft _reconcile auf
 
         # ------------------------------
         # H) Excel aus ready
@@ -2479,8 +2521,6 @@ async def run_nachfass_job(
 
         out_path = export_to_excel(export_df, prefix="nachfass_export", job_id=job_id)
         job_obj.path = out_path
-
-        # falls du filename_base setzen willst:
         job_obj.filename_base = job_obj.filename_base or "Nachfass_Export"
 
         job_obj.error = None
