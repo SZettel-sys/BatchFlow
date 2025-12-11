@@ -47,6 +47,7 @@ if not DATABASE_URL:
 SCHEMA = os.getenv("PGSCHEMA", "public")
 FILTER_NEUKONTAKTE = int(os.getenv("FILTER_NEUKONTAKTE", "2998"))
 FILTER_NACHFASS   = int(os.getenv("FILTER_NACHFASS", "3024"))
+FILTER_REFRESH = int(os.getenv("FILTER_REFRESH", "4444"))
 FIELD_FACHBEREICH_HINT = os.getenv("FIELD_FACHBEREICH_HINT", "fachbereich")
 
 DEFAULT_CHANNEL = "Cold E-Mail"
@@ -67,6 +68,7 @@ PD_PERSON_FIELDS = {
     "Person Position": "4585e5de11068a3bccf02d8b93c126bcf5c257ff",
     "XING Profil": "44ebb6feae2a670059bc5261001443a2878a2b43",
     "LinkedIn URL": "25563b12f847a280346bba40deaf527af82038cc",
+    "Fachbereich - Kampagne": "f000c9eee4bfa74714a30972383d74dd965d34bf"
    
 }
 
@@ -1044,6 +1046,46 @@ async def get_person_field_by_hint(label_hint: str) -> Optional[dict]:
         if hint in nm:
             return f
     return None
+    
+# =============================================================================
+# Fachbereich - Kampagne
+# =============================================================================
+from typing import Dict  # falls oben schon importiert, diesen Import ignorieren
+
+async def get_fachbereich_label_map() -> Dict[str, str]:
+    """
+    Liefert ein Mapping ID -> Label für das Personenfeld
+    'Fachbereich - Kampagne'.
+    Ergebnis wird in _OPTIONS_CACHE gecacht.
+    """
+    field_key = PD_PERSON_FIELDS.get("Fachbereich - Kampagne")
+    if not field_key:
+        return {}
+
+    cached = _OPTIONS_CACHE.get(field_key)  # Cache nach Field-Key
+    if isinstance(cached, dict) and cached:
+        return cached  # type: ignore[return-value]
+
+    client = http_client()
+    url = append_token(f"{PIPEDRIVE_API}/personFields/{field_key}")
+    payload, status, err = await pd_get_json_with_retry(
+        client,
+        url,
+        get_headers(),
+        label="personField Fachbereich - Kampagne",
+        retries=8,
+        base_delay=0.8,
+    )
+
+    mapping: Dict[str, str] = {}
+    if status == 200 and isinstance(payload, dict):
+        data = payload.get("data") or {}
+        if isinstance(data, dict):
+            mapping = field_options_id_to_label_map(data)
+
+    _OPTIONS_CACHE[field_key] = mapping
+    return mapping
+
 
 # =============================================================================
 # org_BULK
@@ -2459,6 +2501,52 @@ async def _build_nf_master_final(
     return df_final
 
 
+# =============================================================================
+# REFRESH - MASTER
+# =============================================================================
+async def _build_refresh_master_final(
+    selected: List[dict],
+    campaign: str,
+    batch_id: str,
+    job_obj=None,
+) -> pd.DataFrame:
+    """
+    Baut rf_master_final für Refresh.
+
+    Intern wird _build_nf_master_final genutzt, aber vorhandene Batch-ID-Werte
+    an der Person werden ignoriert, so dass für den Export immer die vom Nutzer
+    übergebene Batch-ID verwendet wird.
+    """
+    batch_id = sanitize(batch_id) or ""
+    field_batch = PD_PERSON_FIELDS.get("Batch ID")
+
+    # Kopie der Personen ohne vorhandene Batch-ID
+    cleaned: List[dict] = []
+    for p in selected:
+        if not isinstance(p, dict):
+            continue
+        q = dict(p)
+        if field_batch:
+            # Top-Level-Field entfernen
+            q.pop(field_batch, None)
+
+            # custom_fields bereinigen
+            cf = q.get("custom_fields")
+            if isinstance(cf, dict):
+                cf = dict(cf)
+                cf.pop(field_batch, None)
+                q["custom_fields"] = cf
+        cleaned.append(q)
+
+    df = await _build_nf_master_final(
+        cleaned,
+        campaign=campaign,
+        batch_id_label=batch_id,
+        batch_id=batch_id,
+        job_obj=job_obj,
+    )
+    return df
+
 
 # =============================================================================
 # BASIS-ABGLEICH (Organisationen & IDs) – MODUL 4 FINAL
@@ -2967,6 +3055,74 @@ async def reconcile_with_progress(job: "Job", prefix: str):
         job.phase = "Fehler"; job.percent = 100
         job.done = True
 
+
+# =============================================================================
+# ANZAHL pro Fachbereich: 2 pro ORG und Aktivitäsdatum – REFRESH
+# =============================================================================    
+@app.get("/refresh/options")
+async def refresh_options():
+    """
+    Liefert eine Liste der verfügbaren Fachbereiche inkl. Anzahl der Kontakte,
+    nach einfacher Bereinigung:
+      - max. PER_ORG_DEFAULT_LIMIT Kontakte pro Organisation
+      - Datum 'nächste Aktivität' darf NICHT in Zukunft oder in den letzten
+        3 Monaten liegen (wie im Abgleich).
+    """
+    field_key = PD_PERSON_FIELDS.get("Fachbereich - Kampagne")
+    if not field_key:
+        return JSONResponse({"options": []})
+
+    persons = await fetch_persons_by_filter_id_v2(
+        filter_id=FILTER_REFRESH,
+        limit=PAGE_LIMIT,
+        job_obj=None,
+        max_pages=120,
+        max_empty_growth=2,
+    )
+
+    label_map = await get_fachbereich_label_map()
+
+    per_fach_counts: Dict[str, int] = {}
+    per_fach_org_counts: Dict[str, Dict[str, int]] = {}
+
+    for p in persons:
+        if not isinstance(p, dict):
+            continue
+
+        fach_val = sanitize(cf_value(p, field_key))
+        if not fach_val:
+            continue
+
+        org_id = extract_org_id_from_person(p)
+        if not org_id:
+            continue
+
+        # Datum "nächste Aktivität" – gleiche Logik wie im Abgleich
+        next_date = sanitize(p.get("next_activity_date"))
+        if next_date and is_forbidden_activity_date(next_date):
+            continue
+
+        org_counts = per_fach_org_counts.setdefault(fach_val, {})
+        if org_counts.get(org_id, 0) >= PER_ORG_DEFAULT_LIMIT:
+            continue
+        org_counts[org_id] = org_counts.get(org_id, 0) + 1
+
+        per_fach_counts[fach_val] = per_fach_counts.get(fach_val, 0) + 1
+
+    options = []
+    for value, count in per_fach_counts.items():
+        label = label_map.get(value) or value
+        options.append({
+            "value": value,
+            "label": label,
+            "count": count,   # in Klammern anzuzeigen
+        })
+
+    options.sort(key=lambda o: o["label"].lower())
+    return JSONResponse({"options": options})
+
+
+
 # =============================================================================
 # EXPORT-START – NEUKONTAKTE
 # =============================================================================
@@ -3024,10 +3180,146 @@ async def export_start_nk(
     asyncio.create_task(_run())
     return JSONResponse({"job_id": job_id})
 
+# =============================================================================
+# EXPORT-FORTSCHRITT & DOWNLOAD-ENDPUNKTE REFRESH
+# =============================================================================
+@app.post("/refresh/export_start")
+async def refresh_export_start(
+    fachbereich: str = Body(...),
+    take_count: Optional[int] = Body(None),
+    batch_id: Optional[str] = Body(None),
+    campaign: Optional[str] = Body(None),
+    per_org_limit: int = Body(PER_ORG_DEFAULT_LIMIT),
+):
+    """
+    Startet den Refresh-Export:
+      - liest Personen aus FILTER_REFRESH
+      - filtert nach Fachbereich
+      - begrenzt pro Organisation und optional auf eine Gesamtanzahl
+      - schreibt rf_master_final → rf_master_ready / rf_delete_log
+      - erzeugt eine Excel-Datei in der üblichen NF-Exportstruktur.
+    """
+    job_id = str(uuid.uuid4())
+    job = Job()
+    JOBS[job_id] = job
+    job.phase = "Initialisiere Refresh …"
+    job.percent = 1
+    job.filename_base = slugify_filename(campaign or "Refresh_Export")
+
+    async def _run():
+        try:
+            # 1️⃣ Personen aus Filter laden
+            job.phase = f"Lade Refresh-Kandidaten (Filter {FILTER_REFRESH})"
+            job.percent = 5
+
+            persons_all = await fetch_persons_by_filter_id_v2(
+                filter_id=FILTER_REFRESH,
+                limit=PAGE_LIMIT,
+                job_obj=job,
+                max_pages=120,
+                max_empty_growth=2,
+            )
+
+            field_key = PD_PERSON_FIELDS.get("Fachbereich - Kampagne")
+            target_fach = sanitize(fachbereich)
+
+            selected: List[dict] = []
+            org_counts: Dict[str, int] = {}
+            note_date_invalid = 0  # optional, falls du später im UI Zahlen anzeigen willst
+
+            job.phase = "Filtere nach Fachbereich / Regeln …"
+            job.percent = 30
+
+            total = len(persons_all) or 1
+            for idx, p in enumerate(persons_all, start=1):
+                # kleiner Fortschrittsbalken während des Filterns
+                if idx == 1 or idx % 200 == 0 or idx == total:
+                    job.percent = max(job.percent, min(60, 30 + int(idx / total * 20)))
+
+                if not isinstance(p, dict) or not field_key:
+                    continue
+
+                fach_val = sanitize(cf_value(p, field_key))
+                if not fach_val or fach_val != target_fach:
+                    continue
+
+                org_id = extract_org_id_from_person(p)
+                if not org_id:
+                    continue
+
+                # Datum "nächste Aktivität" wie beim Nachfass
+                next_date = sanitize(p.get("next_activity_date"))
+                if next_date and is_forbidden_activity_date(next_date):
+                    note_date_invalid += 1
+                    continue
+
+                cur = org_counts.get(org_id, 0)
+                if cur >= int(per_org_limit or PER_ORG_DEFAULT_LIMIT or 2):
+                    continue
+                org_counts[org_id] = cur + 1
+
+                selected.append(p)
+
+                # optional: globale Begrenzung
+                if take_count is not None and take_count > 0 and len(selected) >= take_count:
+                    break
+
+            # 2️⃣ Master-Tabelle bauen
+            job.phase = f"Baue Master (Auswahl={len(selected)})"
+            job.percent = 60
+
+            batch = sanitize(batch_id or "")
+            camp = sanitize(campaign or "")
+
+            master_final = await _build_refresh_master_final(
+                selected,
+                campaign=camp,
+                batch_id=batch,
+                job_obj=job,
+            )
+
+            # 3️⃣ Master in DB speichern
+            job.phase = "Speichere Master (DB)"
+            job.percent = 70
+            t = tables("rf")
+            await save_df_text(master_final, t["final"])
+
+            # 4️⃣ Abgleich durchführen (identisch zur Nachfass-Logik)
+            job.phase = "Abgleich (rf -> ready/log)"
+            job.percent = 80
+            await _reconcile("rf")
+
+            # 5️⃣ Excel-Datei erzeugen
+            job.phase = "Erzeuge Excel-Datei …"
+            job.percent = 90
+
+            ready_df = await load_df_text(t["ready"])
+            export_df = build_nf_export(ready_df)
+            data = _df_to_excel_bytes(export_df)
+
+            path = f"/tmp/{job.filename_base}.xlsx"
+            with open(path, "wb") as f:
+                f.write(data)
+
+            job.path = path
+            job.total_rows = len(export_df)
+            job.phase = f"Fertig – {job.total_rows} Zeilen"
+            job.percent = 100
+            job.done = True
+
+        except Exception as e:
+            job.error = f"Fehler: {e}"
+            job.phase = "Fehler"
+            job.percent = 100
+            job.done = True
+
+    asyncio.create_task(_run())
+    return JSONResponse({"job_id": job_id})
+
 
 
 # =============================================================================
-# EXPORT-FORTSCHRITT & DOWNLOAD-ENDPUNKTE
+# EXPORT-FORTSCHRITT & DOWNLOAD-ENDPUNKTE NEUKONTAKTE
 # =============================================================================
 @app.get("/neukontakte/export_progress")
 async def neukontakte_export_progress(job_id: str = Query(...)):
@@ -3512,7 +3804,297 @@ el('btnExportNf').onclick = startExport;
     )
 
 
+# =============================================================================
+# Frontend – Refresh (analog zu Nachfass)
+# =============================================================================
+@app.get("/refresh", response_class=HTMLResponse)
+async def refresh_page(request: Request):
+    authed = bool(user_tokens.get("default") or PD_API_TOKEN)
+    auth_info = "<span class='muted'>angemeldet</span>" if authed else "<a href='/login'>Anmelden</a>"
 
+    return HTMLResponse(
+        r"""<!doctype html><html lang="de">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Refresh – BatchFlow</title>
+
+<style>
+  body{margin:0;background:#f6f8fb;color:#0f172a;font:16px/1.6 Inter,sans-serif}
+  header{background:#fff;border-bottom:1px solid #e2e8f0}
+  .hwrap{max-width:1120px;margin:0 auto;padding:14px 20px;display:flex;
+         align-items:center;justify-content:space-between}
+  main{max-width:1120px;margin:28px auto;padding:0 20px}
+  .card{background:#fff;border:1px solid #e2e8f0;border-radius:14px;padding:20px;
+         box-shadow:0 2px 8px rgba(2,8,23,.04)}
+  label{display:block;font-weight:600;margin:8px 0 6px}
+  select,input{width:100%;padding:10px;border:1px solid #cbd5e1;border-radius:10px}
+  .btn{background:#0ea5e9;border:none;color:#fff;border-radius:10px;
+       padding:12px 16px;cursor:pointer;font-weight:600}
+  .btn:hover{background:#0284c7}
+  #overlay{display:none;position:fixed;inset:0;background:rgba(255,255,255,.75);
+           backdrop-filter:blur(2px);z-index:9999;align-items:center;
+           justify-content:center;flex-direction:column;gap:12px;}
+  .barwrap{width:min(520px,90vw);height:10px;border-radius:999px;
+           background:#e2e8f0;overflow:hidden}
+  .bar{height:100%;width:0%;background:#0ea5e9;transition:width .2s linear}
+  table{width:100%;border-collapse:collapse;margin-top:20px;border:1px solid #e2e8f0;
+        border-radius:10px;background:#fff;box-shadow:0 2px 8px rgba(2,8,23,.04)}
+  th,td{padding:8px 10px;border-bottom:1px solid #e2e8f0;text-align:left}
+  th{background:#f8fafc;font-weight:600}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="hwrap">
+    <div><a href="/campaign" style="color:#0a66c2;text-decoration:none">← Kampagne wählen</a></div>
+    <div><b>Refresh</b></div>
+    <div>""" + auth_info + r"""</div>
+  </div>
+</header>
+
+<main>
+
+  <section class="card">
+    <label>Fachbereich – Kampagne</label>
+    <select id="fachbereich">
+      <option value="">Bitte auswählen …</option>
+    </select>
+
+    <label style="margin-top:12px">Batch ID</label>
+    <input id="batch_id" placeholder="RF-2025-01"/>
+
+    <label style="margin-top:12px">Kampagnenname</label>
+    <input id="campaign" placeholder="z. B. Refresh Q1 / IT"/>
+
+    <label style="margin-top:12px">Anzahl Kontakte (optional)</label>
+    <input id="take_count" type="number" min="1" step="1" placeholder="leer = alle"/>
+
+    <div style="margin-top:20px;text-align:right">
+      <button class="btn" id="btnExportRf">Export starten</button>
+    </div>
+  </section>
+
+  <section style="margin-top:30px;">
+    <h3>Entfernte Datensätze</h3>
+    <div id="excluded-summary-box"></div>
+
+    <table>
+      <thead><tr>
+        <th>Kontakt ID</th><th>Name</th><th>Organisation ID</th>
+        <th>Organisationsname</th><th>Grund</th>
+      </tr></thead>
+      <tbody id="excluded-table-body">
+        <tr><td colspan="5" style="text-align:center;color:#999">Noch keine Daten geladen</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+</main>
+
+<div id="overlay">
+  <div id="overlay-phase" style="font-weight:600"></div>
+  <div class="barwrap"><div class="bar" id="overlay-bar"></div></div>
+</div>
+
+<script>
+const el = id => document.getElementById(id);
+function showOverlay(msg){ el('overlay-phase').textContent = msg; el('overlay').style.display='flex'; }
+function hideOverlay(){ el('overlay').style.display='none'; }
+function setProgress(p){ el('overlay-bar').style.width = p + '%'; }
+
+async function loadFachbereiche(){
+  const r = await fetch('/refresh/options');
+  const data = await r.json();
+  const sel = el('fachbereich');
+  sel.innerHTML = '<option value="">Bitte auswählen …</option>';
+  (data.options||[]).forEach(o=>{
+    const opt=document.createElement('option');
+    opt.value=o.value; opt.textContent=`${o.label} (${o.count})`;
+    sel.appendChild(opt);
+  });
+}
+
+async function loadExcluded(){
+  const r=await fetch('/refresh/excluded/json');
+  const data=await r.json();
+  const body=el('excluded-table-body'); body.innerHTML='';
+  const summaryBox=el('excluded-summary-box'); summaryBox.innerHTML='';
+  if(data.summary&&data.summary.length){
+    summaryBox.innerHTML='<ul>'+data.summary.map(s=>`<li>${s.Grund}: <b>${s.Anzahl}</b></li>`).join('')+'</ul>';
+  }
+  if(!data.rows||!data.rows.length){
+    body.innerHTML='<tr><td colspan=5 style="text-align:center;color:#999">Keine Treffer</td></tr>'; return;
+  }
+  data.rows.forEach(rw=>{
+    const tr=document.createElement('tr');
+    tr.innerHTML=`<td>${rw["Kontakt ID"]||""}</td><td>${rw["Name"]||""}</td>
+      <td>${rw["Organisation ID"]||""}</td><td>${rw["Organisationsname"]||""}</td>
+      <td>${rw["Grund"]||""}</td>`;
+    body.appendChild(tr);
+  });
+}
+
+async function poll(job_id){
+  while(true){
+    await new Promise(r=>setTimeout(r,500));
+    const res=await fetch('/refresh/export_progress?job_id='+job_id);
+    const s=await res.json();
+    el('overlay-phase').textContent=`${s.phase} (${s.percent}%)`;
+    setProgress(s.percent);
+    if(s.error){ alert(s.error); hideOverlay(); return; }
+    if(s.download_ready){
+      showOverlay("Download startet …");
+      setProgress(100);
+      window.location.href='/refresh/export_download?job_id='+job_id;
+      await loadExcluded();
+      hideOverlay(); return;
+    }
+  }
+}
+
+async function startExport(){
+  const fach=el('fachbereich').value;
+  if(!fach){alert("Bitte Fachbereich auswählen");return;}
+  showOverlay("Starte Export …"); setProgress(10);
+  const r=await fetch('/refresh/export_start',{
+    method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({
+      fachbereich:fach,
+      batch_id:el('batch_id').value,
+      campaign:el('campaign').value,
+      take_count:parseInt(el('take_count').value)||null
+    })
+  });
+  const {job_id}=await r.json(); await poll(job_id);
+}
+el('btnExportRf').onclick=startExport;
+loadFachbereiche();
+</script>
+</body></html>"""
+    )
+
+# =============================================================================
+# Refresh – Summary-Seite
+# =============================================================================
+@app.get("/refresh/summary", response_class=HTMLResponse)
+async def refresh_summary(job_id: str = Query(...)):
+    ready = await load_df_text("rf_master_ready")
+    log   = await load_df_text("rf_delete_log")
+
+    def count(df: pd.DataFrame, reason_keys: list) -> int:
+        if df.empty or "reason" not in df.columns:
+            return 0
+        keys = [k.lower() for k in reason_keys]
+        return int(df["reason"].astype(str).str.lower().isin(keys).sum())
+
+    total   = len(ready)
+    cnt_org = count(log, ["org_match_95"])
+    cnt_pid = count(log, ["person_id_match"])
+    removed = cnt_org + cnt_pid
+
+    if not log.empty:
+        view = log.tail(50).copy()
+        view["Grund"] = view.apply(lambda r: f"{r['reason']} – {r['extra']}", axis=1)
+        table_html = view[["id","name","org_name","Grund"]].to_html(index=False, border=0)
+    else:
+        table_html = "<i>Keine entfernt</i>"
+
+    html = f"""
+    <!doctype html><html lang="de"><head><meta charset="utf-8"/><title>Refresh – Ergebnis</title></head>
+    <body style="font-family:Inter,sans-serif;max-width:1100px;margin:30px auto;padding:0 20px">
+      <h2>Refresh – Ergebnis</h2>
+      <ul>
+        <li>Gesamt exportierte Zeilen: <b>{total}</b></li>
+        <li>Organisationen ≥95 % Ähnlichkeit entfernt: <b>{cnt_org}</b></li>
+        <li>Bereits kontaktierte Personen entfernt: <b>{cnt_pid}</b></li>
+        <li><b>Gesamt entfernt: {removed}</b></li>
+      </ul>
+      <h3>Letzte Ausschlüsse</h3>
+      {table_html}
+      <p><a href="/campaign">Zur Übersicht</a></p>
+    </body></html>"""
+    return HTMLResponse(html)
+
+
+# =============================================================================
+# Refresh – Excluded JSON / HTML
+# =============================================================================
+@app.get("/refresh/excluded/json")
+async def refresh_excluded_json():
+    def flatten(v):
+        if v is None or (isinstance(v,float) and pd.isna(v)): return ""
+        if isinstance(v,list): return flatten(v[0] if v else "")
+        if isinstance(v,dict):
+            return flatten(v.get("value") or v.get("label") or v.get("name") or v.get("id") or "")
+        return str(v)
+
+    excluded_df = await load_df_text("rf_excluded")
+    deleted_df  = await load_df_text("rf_delete_log")
+
+    excluded_summary=[]
+    if not excluded_df.empty:
+        for _,r in excluded_df.iterrows():
+            excluded_summary.append({"Grund":flatten(r.get("Grund")),"Anzahl":int(r.get("Anzahl") or 0)})
+
+    rows=[]
+    if not deleted_df.empty:
+        deleted_df=deleted_df.replace({None:"",np.nan:""})
+        for _,r in deleted_df.iterrows():
+            rows.append({
+                "Kontakt ID": flatten(r.get("Kontakt ID") or r.get("id")),
+                "Name": flatten(r.get("Name") or r.get("name")),
+                "Organisation ID": flatten(r.get("Organisation ID")),
+                "Organisationsname": flatten(r.get("Organisationsname") or r.get("org_name")),
+                "Grund": flatten(r.get("Grund") or r.get("reason") or r.get("extra")),
+            })
+
+    return JSONResponse({"summary":excluded_summary,"total":len(rows),"rows":rows})
+
+
+@app.get("/refresh/excluded", response_class=HTMLResponse)
+async def refresh_excluded():
+    html = r"""
+    <!DOCTYPE html><html lang="de"><head><meta charset="UTF-8">
+    <title>Refresh – Nicht berücksichtigte Datensätze</title>
+    <style>
+      body{font-family:Inter,sans-serif;margin:30px auto;max-width:1100px;
+           padding:0 20px;background:#f6f8fb;}
+      table{width:100%;border-collapse:collapse}
+      th,td{border-bottom:1px solid #e5e7eb;padding:8px 10px;text-align:left}
+      th{background:#f1f5f9;font-weight:600}
+      tr:hover td{background:#f9fafb}
+      .center{text-align:center;color:#6b7280}
+    </style></head><body>
+    <h2>Refresh – Nicht berücksichtigte Datensätze</h2>
+    <table><thead><tr>
+      <th>Kontakt ID</th><th>Name</th><th>Organisation ID</th>
+      <th>Organisationsname</th><th>Grund</th>
+    </tr></thead><tbody id="excluded-table-body">
+      <tr><td colspan="5" class="center">Lade Daten…</td></tr>
+    </tbody></table>
+    <script>
+      async function loadExcluded(){
+        const r=await fetch('/refresh/excluded/json');
+        const data=await r.json();
+        const body=document.getElementById('excluded-table-body'); body.innerHTML='';
+        if(!data.rows||!data.rows.length){
+          body.innerHTML='<tr><td colspan="5" class="center">Keine Datensätze ausgeschlossen</td></tr>'; return;
+        }
+        for(const row of data.rows){
+          const tr=document.createElement('tr');
+          tr.innerHTML=`<td>${row["Kontakt ID"]||""}</td>
+                        <td>${row["Name"]||""}</td>
+                        <td>${row["Organisation ID"]||""}</td>
+                        <td>${row["Organisationsname"]||""}</td>
+                        <td>${row["Grund"]||""}</td>`;
+          body.appendChild(tr);
+        }
+      }
+      loadExcluded();
+    </script></body></html>"""
+    return HTMLResponse(html)
 
 # =============================================================================
 # Summary-Seiten
@@ -3806,6 +4388,217 @@ async def nachfass_summary(job_id: str = Query(...)):
     return HTMLResponse(html)
 
 # =============================================================================
+# REFRESH – SUMMARY-SEITE (analog Nachfass)
+# =============================================================================
+@app.get("/refresh/summary", response_class=HTMLResponse)
+async def refresh_summary(job_id: str = Query(...)):
+    """
+    Übersicht nach Refresh-Export:
+    - Gesamtzeilen
+    - Orga ≥95% entfernt
+    - Person-ID-Dubletten entfernt
+    - letzte 50 geloggte Ausschlüsse
+    """
+    ready = await load_df_text("rf_master_ready")
+    log   = await load_df_text("rf_delete_log")
+
+    def count(df: pd.DataFrame, reason_keys: list) -> int:
+        if df.empty:
+            return 0
+        if "reason" not in df.columns:
+            return 0
+        keys = [k.lower() for k in reason_keys]
+        return int(df["reason"].astype(str).str.lower().isin(keys).sum())
+
+    total    = len(ready)
+    cnt_org  = count(log, ["org_match_95"])
+    cnt_pid  = count(log, ["person_id_match"])
+    removed  = cnt_org + cnt_pid
+
+    # Tabelle mit letzten 50 Ausschlüssen
+    if not log.empty:
+        view = log.tail(50).copy()
+        view["Grund"] = view.apply(lambda r: f"{r['reason']} – {r['extra']}", axis=1)
+        table_html = view[["id", "name", "org_name", "Grund"]].to_html(index=False, border=0)
+    else:
+        table_html = "<i>Keine entfernt</i>"
+
+    html = f"""
+    <!doctype html>
+    <html lang="de">
+    <head><meta charset="utf-8"/>
+    <title>Refresh – Ergebnis</title>
+    </head>
+    <body style='font-family:Inter,sans-serif;max-width:1100px;margin:30px auto;padding:0 20px'>
+
+      <h2>Refresh – Ergebnis</h2>
+
+      <ul>
+        <li>Gesamt exportierte Zeilen: <b>{total}</b></li>
+        <li>Organisationen ≥95% Ähnlichkeit entfernt: <b>{cnt_org}</b></li>
+        <li>Bereits kontaktierte Personen entfernt: <b>{cnt_pid}</b></li>
+        <li><b>Gesamt entfernt: {removed}</b></li>
+      </ul>
+
+      <h3>Letzte Ausschlüsse</h3>
+      {table_html}
+
+      <p><a href="/campaign">Zur Übersicht</a></p>
+
+    </body>
+    </html>
+    """
+
+    return HTMLResponse(html)
+
+# =============================================================================
+# REFRESH – Excluded JSON
+# =============================================================================
+@app.get("/refresh/excluded/json")
+async def refresh_excluded_json():
+
+    def flatten(v):
+        if v is None or (isinstance(v, float) and pd.isna(v)): 
+            return ""
+        if isinstance(v, list):
+            return flatten(v[0] if v else "")
+        if isinstance(v, dict):
+            return flatten(
+                v.get("value") or v.get("label") or v.get("name") or v.get("id") or ""
+            )
+        return str(v)
+
+    excluded_df = await load_df_text("rf_excluded")
+    deleted_df  = await load_df_text("rf_delete_log")
+
+    # ---------------------------
+    # 1) Summary aus rf_excluded
+    # ---------------------------
+    excluded_summary = []
+    if not excluded_df.empty:
+        for _, r in excluded_df.iterrows():
+            excluded_summary.append({
+                "Grund": flatten(r.get("Grund")),
+                "Anzahl": int(r.get("Anzahl") or 0)
+            })
+
+    # ---------------------------
+    # 2) Abgleich-Ausschlüsse
+    # ---------------------------
+    rows = []
+    if not deleted_df.empty:
+        deleted_df = deleted_df.replace({None:"", np.nan:""})
+        for _, r in deleted_df.iterrows():
+            rows.append({
+                "Kontakt ID":       flatten(r.get("Kontakt ID") or r.get("id")),
+                "Name":             flatten(r.get("Name") or r.get("name")),
+                "Organisation ID":  flatten(r.get("Organisation ID")),
+                "Organisationsname":flatten(r.get("Organisationsname") or r.get("org_name")),
+                "Grund":            flatten(r.get("Grund") or r.get("reason") or r.get("extra")),
+            })
+
+    return JSONResponse({
+        "summary": excluded_summary,
+        "total": len(rows),
+        "rows": rows
+    })
+
+# =============================================================================
+# REFRESH – Excluded HTML
+# =============================================================================
+@app.get("/refresh/excluded", response_class=HTMLResponse)
+async def refresh_excluded():
+
+    html = r"""
+    <!DOCTYPE html>
+    <html lang="de">
+    <head>
+      <meta charset="UTF-8">
+      <title>Refresh – Nicht berücksichtigte Datensätze</title>
+      <style>
+        body {
+          font-family: Inter, sans-serif;
+          margin: 30px auto;
+          max-width: 1100px;
+          padding: 0 20px;
+          background: #f6f8fb;
+        }
+        table { width: 100%; border-collapse: collapse; }
+        th, td {
+          border-bottom: 1px solid #e5e7eb;
+          padding: 8px 10px;
+          text-align: left;
+        }
+        th {
+          background: #f1f5f9;
+          font-weight: 600;
+        }
+        tr:hover td {
+          background: #f9fafb;
+        }
+        .center { text-align: center; color: #6b7280; }
+      </style>
+    </head>
+    <body>
+
+      <h2>Refresh – Nicht berücksichtigte Datensätze</h2>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Kontakt ID</th>
+            <th>Name</th>
+            <th>Organisation ID</th>
+            <th>Organisationsname</th>
+            <th>Grund</th>
+          </tr>
+        </thead>
+        <tbody id="excluded-table-body">
+          <tr><td colspan="5" class="center">Lade Daten…</td></tr>
+        </tbody>
+      </table>
+
+      <script>
+        async function loadExcludedTable() {
+          try {
+            const r = await fetch('/refresh/excluded/json');
+            const data = await r.json();
+            const body = document.getElementById('excluded-table-body');
+            body.innerHTML = '';
+
+            if (!data.rows || !data.rows.length) {
+              body.innerHTML = '<tr><td colspan="5" class="center">Keine Datensätze ausgeschlossen</td></tr>';
+              return;
+            }
+
+            for (const row of data.rows) {
+              const tr = document.createElement('tr');
+              tr.innerHTML = `
+                <td>${row["Kontakt ID"] || ""}</td>
+                <td>${row["Name"] || ""}</td>
+                <td>${row["Organisation ID"] || ""}</td>
+                <td>${row["Organisationsname"] || ""}</td>
+                <td>${row["Grund"] || ""}</td>
+              `;
+              body.appendChild(tr);
+            }
+          } catch (err) {
+            console.error("Fehler bei excluded:", err);
+            document.getElementById('excluded-table-body').innerHTML =
+              '<tr><td colspan="5" class="center" style="color:red">Fehler beim Laden</td></tr>';
+          }
+        }
+
+        loadExcludedTable();
+      </script>
+
+    </body>
+    </html>
+    """
+    return HTMLResponse(html)
+
+
+# =============================================================================
 # MODUL 6 – FINALER JOB-/WORKFLOW FÜR NACHFASS (EXPORT/PROGRESS/DOWNLOAD)
 # =============================================================================
 from uuid import uuid4
@@ -3896,6 +4689,44 @@ async def debug_pd_person(pid: int):
         }
     )
 
+# =============================================================================
+# PROGRESS UND DOWNLOAD REFRESH
+# =============================================================================
+
+@app.get("/refresh/export_progress")
+async def refresh_export_progress(job_id: str = Query(...)):
+    job = JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job nicht gefunden")
+
+    return JSONResponse(
+        {
+            "phase": job.phase,
+            "percent": job.percent,
+            "done": job.done,
+            "error": job.error,
+            "total_rows": getattr(job, "total_rows", 0),
+        }
+    )
+
+
+@app.get("/refresh/export_download")
+async def refresh_export_download(job_id: str = Query(...)):
+    job = JOBS.get(job_id)
+    if not job:
+        return JSONResponse({"error": "Job nicht gefunden"}, status_code=404)
+
+    if job.error:
+        return JSONResponse({"error": job.error}, status_code=400)
+
+    if not getattr(job, "path", None):
+        return JSONResponse({"error": "Keine Datei gefunden"}, status_code=404)
+
+    return FileResponse(
+        job.path,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename=f"{slugify_filename(job.filename_base or 'Refresh_Export')}.xlsx",
+    )
 
 
 # =============================================================================
@@ -3917,6 +4748,28 @@ async def nachfass_export_download(job_id: str):
         job.path,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         filename=f"{slugify_filename(job.filename_base or 'Nachfass_Export')}.xlsx"
+    )
+
+
+# =============================================================================
+# Download – Refresh (analog zu Nachfass)
+# =============================================================================
+@app.get("/refresh/export_download")
+async def refresh_export_download(job_id: str):
+    job = JOBS.get(job_id)
+    if not job:
+        return JSONResponse({"error": "Job nicht gefunden"}, status_code=404)
+
+    if job.error:
+        return JSONResponse({"error": job.error}, status_code=400)
+
+    if not getattr(job, "path", None):
+        return JSONResponse({"error": "Keine Datei gefunden"}, status_code=404)
+
+    return FileResponse(
+        job.path,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename=f"{slugify_filename(job.filename_base or 'Refresh_Export')}.xlsx"
     )
 
 # =============================================================================
