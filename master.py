@@ -808,6 +808,73 @@ async def fetch_persons_by_filter_id_v2(
     print(f"[persons/filter] /persons?filter_id={filter_id}: pages={pages}, personen={len(out)}")
     return out
 
+from typing import List, Optional, Set
+
+async def collect_person_ids_by_filter_fast(
+    filter_id: int,
+    *,
+    limit: int = 500,          # höheres Limit für weniger Seiten
+    job_obj=None,
+) -> List[str]:
+    """
+    Holt NUR die Personen-IDs für einen Pipedrive-Filter (API v2).
+    - nutzt /persons?filter_id=...
+    - cursor-basiert (kein start)
+    - deutlich leichter als fetch_persons_by_filter_id_v2 (keine kompletten Datensätze)
+    """
+    client = http_client()
+    cursor: Optional[str] = None
+    pages = 0
+    ids: List[str] = []
+
+    while True:
+        pages += 1
+        base = f"{PIPEDRIVE_API}/persons?filter_id={int(filter_id)}&limit={int(limit)}"
+        url = append_token(base)
+        if cursor:
+            url += f"&cursor={cursor}"
+
+        r = await pd_get_with_retry(
+            client,
+            url,
+            None,
+            label=f"persons/filter_id={filter_id} page={pages}",
+            retries=8,
+            request_timeout=30.0,
+            max_total_time=180.0,
+        )
+
+        if r.status_code != 200:
+            print(f"[WARN] collect_person_ids_by_filter_fast /persons?filter_id={filter_id} HTTP {r.status_code} {r.text[:200]}")
+            break
+
+        payload = r.json() or {}
+        data = payload.get("data") or []
+        if not data:
+            break
+
+        for p in data:
+            if not isinstance(p, dict):
+                continue
+            pid = p.get("id")
+            if pid is None:
+                continue
+            ids.append(str(pid))
+
+        if job_obj:
+            job_obj.phase = f"Suche Personen (Filter {filter_id})"
+            # grobe Fortschritts-Schätzung
+            job_obj.percent = max(int(getattr(job_obj, "percent", 0) or 0), 10)
+
+        ad = payload.get("additional_data") or {}
+        cursor = ad.get("next_cursor") or (ad.get("pagination") or {}).get("next_cursor")
+
+        if not cursor:
+            break
+
+    print(f"[INFO] collect_person_ids_by_filter_fast filter={filter_id}: pages={pages}, ids={len(ids)}")
+    return ids
+
 
 from typing import List, Optional, Set
 
@@ -2574,31 +2641,51 @@ async def _reconcile(prefix: str) -> None:
 # =============================================================================
 # NACHFASS - LOGIK
 # =============================================================================
-from typing import Optional, List, Set, Dict
+from typing import Optional, List, Set
+import re
 
 async def run_nachfass_job(
     job_obj,
     job_id: str,
     campaign: str,
-    filters: Optional[List[int]] = None,
+    filters: Optional[List[int]] = None,          # Nachfass-Filter, default 3024
     nf_batch_ids: Optional[List[str]] = None,
 ):
     """
-    Nachfass-Job (Filter-scope + exaktes Batch-Custom-Field):
-      1) IDs aus FILTER_NACHFASS (3024) streamen
-      2) Details chunked laden
-      3) exakt auf Custom Field "Batch-ID neu" (PD_PERSON_FIELDS["Batch ID"]) matchen
-      4) nf_master_final bauen
-      5) speichern
-      6) _reconcile("nf")
-      7) Excel aus ready
+    Nachfass-Job (Batch + Filter 3024):
+
+      1) Personen via /persons/search anhand Batch-ID neu holen (nur Kandidaten)
+      2) IDs aus Nachfass-Filter 3024 holen
+      3) Schnittmenge bilden (nur Personen mit gewünschter Batch-ID im Filter)
+      4) Personendetails nur für diese IDs laden
+      5) nf_master_final bauen & speichern
+      6) _reconcile("nf") -> ready + delete_log + excluded summary
+      7) Excel aus ready erzeugen
     """
+
+    # kleine Hilfsfunktion: Batch-ID immer als saubere Zahl behandeln
+    def _norm_batch(x) -> Optional[str]:
+        try:
+            return str(int(str(x).strip()))
+        except Exception:
+            return None
+
     try:
-        # ------------------------------
-        # A) Batch IDs aus UI
-        # ------------------------------
-        user_batches = [str(b).strip() for b in (nf_batch_ids or []) if str(b).strip()]
+        # ------------------------------------------------
+        # 1) Batch-IDs aus UI
+        # ------------------------------------------------
+        raw_batches = nf_batch_ids or []
+        user_batches: List[str] = []
+
+        for b in raw_batches:
+            nb = _norm_batch(b)
+            if nb:
+                user_batches.append(nb)
+
+        # wie im UI: max. 2 IDs
         user_batches = user_batches[:2]
+        user_batch_set: Set[str] = set(user_batches)
+
         if not user_batches:
             job_obj.done = True
             job_obj.error = "Keine Batch-ID angegeben."
@@ -2606,152 +2693,144 @@ async def run_nachfass_job(
             job_obj.percent = 100
             return
 
-        # Batch IDs so matchen, wie sie im Custom Field stehen (NUMMER)
-        # -> wenn UI "B443" erlaubt, aber Feld ist Nummer: auf Ziffern reduzieren
-        # Wenn bei euch tatsächlich im Feld "443" steht, passt das.
-        def normalize_batch_number(s: str) -> str:
-            s = (s or "").strip()
-            if not s:
-                return ""
-            m = re.search(r"\d+", s)
-            return m.group(0) if m else s
+        batch_label = ", ".join(user_batches)
+        print(f"[NF] run_nachfass_job: Batch-IDs (normalisiert) = {user_batches}")
 
-        user_batches = [normalize_batch_number(x) for x in user_batches if normalize_batch_number(x)]
-        user_batches = user_batches[:2]
-        user_batches_set: Set[str] = set(user_batches)
+        # ------------------------------------------------
+        # 2) Kandidaten via persons/search (Batch-Feld)
+        # ------------------------------------------------
+        job_obj.phase = "Suche Personen (Batch-ID via Search)"
+        job_obj.percent = 8
 
-        if not user_batches_set:
-            job_obj.done = True
-            job_obj.error = "Batch-ID ist leer/ungültig."
-            job_obj.phase = "Fertig (leer)"
-            job_obj.percent = 100
-            return
+        # wichtig: hier dein neues Feld verwenden!
+        BATCH_FIELD_KEY = PD_PERSON_FIELDS["Batch ID neu"]
 
-        # Filter-Scope (default: 3024)
-        filter_id = int((filters or [FILTER_NACHFASS])[0])
+        candidate_ids_search: Set[str] = set()
 
-        job_obj.phase = "Suche Personen (Batch-ID über Filter)"
-        job_obj.percent = 10
+        # aktuell nur die erste Batch-ID für das Search-Term verwenden,
+        # aber beim Prüfen alle erlaubten Batch-Werte berücksichtigen
+        search_term = user_batches[0]
 
-        # ------------------------------
-        # B) IDs aus Filter streamen
-        # ------------------------------
-        # (benötigt: stream_person_ids_by_filter im Skript!)
-        all_ids: List[str] = []
-        seen_ids: Set[str] = set()
-
-        async for chunk_ids in stream_person_ids_by_filter(filter_id, page_limit=200, job_obj=job_obj):
-            for pid in chunk_ids:
-                if pid not in seen_ids:
-                    seen_ids.add(pid)
-                    all_ids.append(pid)
-
-            # leichte Progress-Anhebung
-            if job_obj:
-                job_obj.phase = f"Suche Personen (Filter {filter_id})"
-                job_obj.percent = max(int(getattr(job_obj, "percent", 0) or 0), 12)
-
-            # optional: harte Bremse, falls Filter riesig ist
-            if len(all_ids) >= NF_MAX_ROWS:
-                print(f"[NF][WARN] reached NF_MAX_ROWS={NF_MAX_ROWS}, stop collecting further ids")
-                break
-
-        if not all_ids:
-            job_obj.done = True
-            job_obj.error = "Keine Personen im Nachfass-Filter gefunden."
-            job_obj.phase = "Fertig (leer)"
-            job_obj.percent = 100
-            return
-
-        # ------------------------------
-        # C) Details chunked laden & Batch exakt matchen
-        # ------------------------------
-        job_obj.phase = "Prüfe Batch-ID (Details-Check)"
-        job_obj.percent = 18
-
-        FIELD_BATCH = PD_PERSON_FIELDS["Batch ID"]  # muss Key von "Batch-ID neu" sein!
-
-        # Chunk-Parameter (gegen 429)
-        chunk_size = 120
-        detail_concurrency = 3
-
-        matched_details: List[dict] = []
-        matched_seen: Set[str] = set()
-
-        total = len(all_ids)
-        processed = 0
-
-        async def process_chunk(ids_chunk: List[str]):
-            nonlocal processed, matched_details, matched_seen
-       
-            details = await fetch_person_details_many_fast(ids_chunk, job_obj=job_obj, concurrency=8, rate_limit_per_sec=6.0)
-
-            for p in details:
-                if not isinstance(p, dict) or p.get("_error") or p.get("id") is None:
+        async for items in stream_person_items_by_batch_id_v2(
+            search_term,
+            page_limit=100,
+            job_obj=job_obj,
+        ):
+            for item in items:
+                if not isinstance(item, dict):
                     continue
-                pid = str(p.get("id"))
-                bval = str(cf_value(p, FIELD_BATCH) or "").strip()
+                pid = item.get("id")
+                if pid is None:
+                    continue
+                spid = str(pid)
 
-                # Nummernfeld => robust auf Ziffern normalisieren
-                bval_norm = normalize_batch_number(bval)
-                if bval_norm in user_batches_set:
-                    if pid not in matched_seen:
-                        matched_seen.add(pid)
-                        matched_details.append(p)
+                # exakten Batch-Wert aus dem Custom Field lesen
+                bval_raw = cf_value(item, BATCH_FIELD_KEY)
+                nb = _norm_batch(bval_raw)
 
-            processed += len(ids_chunk)
-            if job_obj:
-                job_obj.phase = f"Prüfe Batch-ID (Details-Check) ({processed}/{total})"
-                # 18% .. 40%
-                job_obj.percent = max(int(getattr(job_obj, "percent", 0) or 0), min(40, 18 + int(22 * processed / max(1, total))))
+                if nb in user_batch_set:
+                    candidate_ids_search.add(spid)
 
-        for i in range(0, len(all_ids), chunk_size):
-            chunk = all_ids[i:i + chunk_size]
-            await process_chunk(chunk)
-            await asyncio.sleep(0.3)  # Burst glätten (429)
+        print(f"[NF] Search-Kandidaten (Batch-ID neu): {len(candidate_ids_search)} IDs")
 
-        print(f"[NF] filter={filter_id} total_ids={len(all_ids)} matched={len(matched_details)} batches={sorted(user_batches_set)}")
-
-        if not matched_details:
+        if not candidate_ids_search:
             job_obj.done = True
             job_obj.error = "Keine Personen zur Batch-ID gefunden."
             job_obj.phase = "Fertig (leer)"
             job_obj.percent = 100
             return
 
-        # ------------------------------
-        # D) nf_master_final bauen
-        # ------------------------------
+        # ------------------------------------------------
+        # 3) IDs aus Nachfass-Filter (3024) holen
+        # ------------------------------------------------
+        filter_id = filters[0] if (filters and len(filters) > 0) else FILTER_NACHFASS
+
+        job_obj.phase = "Suche Personen (Filter 3024)"
+        job_obj.percent = 12
+
+        ids_in_filter = await collect_person_ids_by_filter_fast(
+            filter_id,
+            limit=NF_PAGE_LIMIT,
+            job_obj=job_obj,
+        )
+        ids_in_filter_set: Set[str] = set(ids_in_filter)
+
+        print(f"[NF] IDs im Nachfass-Filter {filter_id}: {len(ids_in_filter_set)}")
+
+        # Schnittmenge: nur Personen mit gewünschter Batch-ID UND im Filter 3024
+        ids_keep: List[str] = [
+            pid for pid in candidate_ids_search
+            if pid in ids_in_filter_set
+        ]
+
+        print(f"[NF] Schnittmenge (Batch-ID ∩ Filter {filter_id}): {len(ids_keep)} IDs")
+
+        if not ids_keep:
+            job_obj.done = True
+            job_obj.error = "Keine Personen zur Batch-ID im Nachfass-Filter."
+            job_obj.phase = "Fertig (leer)"
+            job_obj.percent = 100
+            return
+
+        # ------------------------------------------------
+        # 4) Personendetails nur für ids_keep laden
+        # ------------------------------------------------
+        job_obj.phase = f"Lade Personendetails (0/{len(ids_keep)})"
+        job_obj.percent = 18
+
+        # etwas höheres concurrency, aber pd_get_with_retry fängt 429 ab
+        details_all = await fetch_person_details_many(
+            ids_keep,
+            job_obj=job_obj,
+            concurrency=6,  # 4–8 ist meist ok, je nach Rate Limit
+        )
+
+        # Fehlerobjekte rausfiltern
+        details: List[dict] = [
+            p for p in details_all
+            if isinstance(p, dict) and p.get("id") is not None and not p.get("_error")
+        ]
+
+        print(f"[NF] Vollständige Personendaten: {len(details)} Datensätze "
+              f"(errors: {len(details_all) - len(details)})")
+
+        if not details:
+            job_obj.done = True
+            job_obj.error = "Keine Personendetails gefunden."
+            job_obj.phase = "Fertig (leer)"
+            job_obj.percent = 100
+            return
+
+        # ------------------------------------------------
+        # 5) nf_master_final bauen
+        # ------------------------------------------------
         job_obj.phase = "Baue Master (nf_master_final)"
         job_obj.percent = 70
 
         master_final = await _build_nf_master_final(
-            matched_details,
+            details,
             campaign=campaign,
-            batch_id_label=",".join(sorted(user_batches_set)),
+            batch_id_label=batch_label,
             job_obj=job_obj,
         )
 
-        # ------------------------------
-        # E) Speichern
-        # ------------------------------
+        # ------------------------------------------------
+        # 6) Master final speichern & Abgleich
+        # ------------------------------------------------
         job_obj.phase = "Speichere Master (DB)"
         job_obj.percent = 78
 
         t = tables("nf")
         await save_df_text(master_final, t["final"])
 
-        # ------------------------------
-        # F) Abgleich
-        # ------------------------------
         job_obj.phase = "Abgleich (nf -> ready/log)"
         job_obj.percent = 82
 
         await _reconcile("nf")
 
-        # ------------------------------
-        # G) Excel aus ready
-        # ------------------------------
+        # ------------------------------------------------
+        # 7) Excel aus ready erzeugen
+        # ------------------------------------------------
         job_obj.phase = "Erzeuge Excel"
         job_obj.percent = 90
 
