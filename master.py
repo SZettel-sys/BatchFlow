@@ -3370,7 +3370,7 @@ async def campaign_home():
       <a class="btn" href="/nachfass">Öffnen</a></div>
     <div class="card"><div class="title">Refresh</div>
       <div class="desc">Kontaktdaten aktualisieren / ergänzen.</div>
-      <a class="btn" href="/neukontakte?mode=refresh">Öffnen</a></div>
+      <a class="btn" href="/refresh">Öffnen</a></div>
   </div>
 </main></body></html>""")
 
@@ -4707,25 +4707,6 @@ async def refresh_export_progress(job_id: str = Query(...)):
             "error": job.error,
             "total_rows": getattr(job, "total_rows", 0),
         }
-    )
-
-
-@app.get("/refresh/export_download")
-async def refresh_export_download(job_id: str = Query(...)):
-    job = JOBS.get(job_id)
-    if not job:
-        return JSONResponse({"error": "Job nicht gefunden"}, status_code=404)
-
-    if job.error:
-        return JSONResponse({"error": job.error}, status_code=400)
-
-    if not getattr(job, "path", None):
-        return JSONResponse({"error": "Keine Datei gefunden"}, status_code=404)
-
-    return FileResponse(
-        job.path,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        filename=f"{slugify_filename(job.filename_base or 'Refresh_Export')}.xlsx",
     )
 
 
