@@ -575,14 +575,14 @@ async def save_df_text(df: pd.DataFrame, table: str):
 # =============================================================================
 # Organisation Cache (beschleunigt Refresh massiv)
 # =============================================================================
-
 ORG_CACHE = {}
 
-async def fetch_org_cached(org_id: int):
+async def fetch_org_cached(org_id):
     """
-    Holt eine Organisation – verwendet Cache, um 1000+ API Requests zu vermeiden.
+    Holt Organisationen crash-sicher, liefert IMMER ein dict zurück.
     """
-    if not org_id:
+    # ungültige org_id → nie Fehler werfen
+    if not org_id or str(org_id).lower() in ("none", "null", "0"):
         return {}
 
     if org_id in ORG_CACHE:
@@ -591,10 +591,23 @@ async def fetch_org_cached(org_id: int):
     client = http_client()
     url = append_token(f"{PIPEDRIVE_API}/organizations/{org_id}")
     r = await client.get(url, headers=get_headers())
-    data = r.json().get("data") or {}
+
+    # API-Fehler → nicht crashen, sondern leeres Dict zurückgeben
+    if r.status_code != 200:
+        print("FETCH ORG ERROR:", r.status_code, "ORG_ID:", org_id, "BODY:", r.text[:200])
+        ORG_CACHE[org_id] = {}
+        return {}
+
+    # JSON-Fehler (HTML / leer) → vermeiden
+    try:
+        data = r.json().get("data") or {}
+    except Exception as e:
+        print("JSON ERROR in fetch_org_cached:", org_id, "BODY:", r.text[:200])
+        data = {}
 
     ORG_CACHE[org_id] = data
     return data
+
 
 # =============================================================================
 # Tabellen-Namenszuordnung (einheitlich für Nachfass / Neukontakte)
