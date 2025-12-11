@@ -1871,6 +1871,7 @@ async def pd_global_rate(limit_per_sec: float = 6.0):
             await asyncio.sleep(wait)
         _PD_NEXT_TS = time.monotonic() + min_interval
 
+
 import asyncio
 import urllib.parse
 from typing import List, Dict, Any
@@ -1878,17 +1879,17 @@ from typing import List, Dict, Any
 async def fetch_person_details_many(
     person_ids: List[str],
     job_obj=None,
-    concurrency: int = 4,
+    concurrency: int = 2,          # bewusst niedrig wegen 429
     request_timeout: float = 30.0,
 ) -> List[dict]:
     """
     Lädt Personendetails via /persons/{id} (API v2) für eine Liste von IDs.
 
-    Rückgabe: Liste von Dicts (eine pro Person). Bei Fehlern werden
-    Dummy-Einträge mit "_error" zurückgegeben, damit nichts "still" verloren geht.
+    - Nutzt globale Drosselung (pd_throttle), um 429 zu vermeiden.
+    - concurrency klein halten (1–2), damit Pipedrive nicht überfahren wird.
+    - Bei Fehlern werden Dummy-Dicts mit "_error" zurückgegeben.
     """
 
-    # IDs säubern
     ids = [str(x).strip() for x in (person_ids or []) if str(x).strip()]
     total = len(ids)
     if total == 0:
@@ -1899,7 +1900,11 @@ async def fetch_person_details_many(
 
     async def fetch_one(idx: int, pid: str):
         url = append_token(f"{PIPEDRIVE_API}/persons/{urllib.parse.quote(pid)}")
+
         async with sem:
+            # 🔹 globale Drosselung: max ~3–4 Requests/Sek
+            await pd_throttle(0.3)
+
             try:
                 r = await pd_get_with_retry(
                     http_client(),
@@ -1925,7 +1930,7 @@ async def fetch_person_details_many(
 
         out[idx] = data
 
-    # Progress-Tracking
+    # Fortschritt für UI
     done_counter = 0
     lock = asyncio.Lock()
 
