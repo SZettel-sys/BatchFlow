@@ -572,6 +572,29 @@ async def save_df_text(df: pd.DataFrame, table: str):
             if batch:
                 await conn.executemany(sql, batch)
 
+# =============================================================================
+# Organisation Cache (beschleunigt Refresh massiv)
+# =============================================================================
+
+ORG_CACHE = {}
+
+async def fetch_org_cached(org_id: int):
+    """
+    Holt eine Organisation – verwendet Cache, um 1000+ API Requests zu vermeiden.
+    """
+    if not org_id:
+        return {}
+
+    if org_id in ORG_CACHE:
+        return ORG_CACHE[org_id]
+
+    client = http_client()
+    url = append_token(f"{PIPEDRIVE_API}/organizations/{org_id}")
+    r = await client.get(url, headers=get_headers())
+    data = r.json().get("data") or {}
+
+    ORG_CACHE[org_id] = data
+    return data
 
 # =============================================================================
 # Tabellen-Namenszuordnung (einheitlich für Nachfass / Neukontakte)
@@ -1595,23 +1618,26 @@ def cf_value(p: dict, field_key: str) -> Any:
     blob = _extract_custom_fields_blob(p)
     return blob.get(field_key)
 
+# =============================================================================
+# Custom Field Reader for API v2 (nur Refresh)
+# =============================================================================
 def cf_value_v2(item: dict, field_key: str):
     """
-    Liest benutzerdefinierte Felder gemäß API v2 (Top-Level Felder).
-    Fällt auf API v1 Struktur zurück, falls notwendig.
-    Wird ausschließlich für REFRESH benutzt.
+    Holt den Wert eines benutzerdefinierten Feldes.
+    API v2: Feld liegt top-level.
+    API v1 fallback: custom_fields dict.
     """
     if not item or not isinstance(item, dict):
         return None
 
-    # API v2: Custom Fields liegen direkt auf der Person
+    # API v2: Feld am Objekt
     if field_key in item:
         return item.get(field_key)
 
-    # API v1 fallback (ältere Struktur)
-    custom = item.get("custom_fields") or item.get("custom_fields_data")
-    if isinstance(custom, dict):
-        return custom.get(field_key)
+    # API v1
+    cf = item.get("custom_fields") or item.get("custom_fields_data")
+    if isinstance(cf, dict):
+        return cf.get(field_key)
 
     return None
 
@@ -3075,19 +3101,22 @@ async def reconcile_with_progress(job: "Job", prefix: str):
         job.done = True
 
 
+
 # =============================================================================
-# /refresh/options – Variante B (zeigt auch Fachbereiche mit count = 0)
+# /refresh/options  –  liefert Dropdown inkl. 0-Werte und korrekter Bereinigung
 # =============================================================================
 @app.get("/refresh/options")
 async def refresh_options():
 
     field_key = PD_PERSON_FIELDS.get("Fachbereich - Kampagne")
+    org_type_key = PD_ORG_FIELDS.get("Organisationsart")
+
     if not field_key:
         return JSONResponse({"options": []})
 
-    # -------------------------------------------------------------------------
-    # 1) Personen laden (Turbo: große Pages + fewer max_pages)
-    # -------------------------------------------------------------------------
+    # ------------------------------ #
+    # Personen laden (Turbo-Optimiert)
+    # ------------------------------ #
     persons = await fetch_persons_by_filter_id_v2(
         filter_id=FILTER_REFRESH,
         limit=500,
@@ -3096,43 +3125,43 @@ async def refresh_options():
         max_empty_growth=2,
     )
 
-    # -------------------------------------------------------------------------
-    # 2) Alle möglichen Fachbereichs-Labels laden
-    # -------------------------------------------------------------------------
+    # Alle Dropdown-Werte holen
     label_map = await get_fachbereich_label_map()
+    fach_values = list(label_map.keys())
 
-    # Liste aller verfügbaren Dropdown-Werte (z. B. "marketing", "crm", ...)
-    all_possible_values = list(label_map.keys())
+    # Initialisierung
+    per_fach_counts = {k: 0 for k in fach_values}
+    fach_org_counts = {k: {} for k in fach_values}
 
-    # Ergebnisse
-    per_fach_counts: Dict[str, int] = {k: 0 for k in all_possible_values}
-    fach_org_counts: Dict[str, Dict[str, int]] = {k: {} for k in all_possible_values}
-
-    # -------------------------------------------------------------------------
-    # 3) Personen bereinigen wie im Export:
-    #    - Fachbereich muss gesetzt sein
-    #    - Next activity darf nicht blockiert sein
-    #    - Max 2 Kontakte pro Organisation
-    # -------------------------------------------------------------------------
+    # ------------------------------ #
+    # Bereinigung der Personen
+    # ------------------------------ #
     for p in persons:
         if not isinstance(p, dict):
             continue
 
+        # 1) Fachbereich
         fach_val = sanitize(cf_value_v2(p, field_key))
-        if not fach_val:
-            continue
-        if fach_val not in all_possible_values:
+        if not fach_val or fach_val not in fach_values:
             continue
 
+        # 2) Organisation
         org_id = extract_org_id_from_person(p)
         if not org_id:
             continue
 
+        # 3) Organisationsart = Ausschluss
+        org = await fetch_org_cached(org_id)
+        org_type = sanitize(cf_value_v2(org, org_type_key))
+        if org_type:
+            continue
+
+        # 4) next_activity_date
         next_date = sanitize(p.get("next_activity_date"))
         if next_date and is_forbidden_activity_date(next_date):
             continue
 
-        # Organisationslimit: max 2 Kontakte
+        # 5) max. 2 Kontakte pro Organisation
         orgs = fach_org_counts[fach_val]
         if orgs.get(org_id, 0) >= PER_ORG_DEFAULT_LIMIT:
             continue
@@ -3140,23 +3169,19 @@ async def refresh_options():
         orgs[org_id] = orgs.get(org_id, 0) + 1
         per_fach_counts[fach_val] += 1
 
-    # -------------------------------------------------------------------------
-    # 4) Ausgabe sortieren + auch 0-Werte anzeigen
-    # -------------------------------------------------------------------------
+    # ------------------------------ #
+    # Ergebnis vorbereiten
+    # ------------------------------ #
     options = []
-    for fach_val in all_possible_values:
-        label = label_map.get(fach_val) or fach_val
-        count = per_fach_counts.get(fach_val, 0)
+    for val in fach_values:
         options.append({
-            "value": fach_val,
-            "label": label,
-            "count": count,
+            "value": val,
+            "label": label_map.get(val) or val,
+            "count": per_fach_counts.get(val, 0)
         })
 
     options.sort(key=lambda o: o["label"].lower())
     return JSONResponse({"options": options})
-
-
 
 
 # =============================================================================
@@ -3282,6 +3307,57 @@ async def refresh_export_start(
                 org_id = extract_org_id_from_person(p)
                 if not org_id:
                     continue
+                # --------------------------
+                # Ausschluss: Organisationsart gefüllt
+                # --------------------------
+                org = await fetch_org_cached(org_id)
+                org_type_key = PD_ORG_FIELDS.get("Organisationsart")
+                org_type = sanitize(cf_value_v2(org, org_type_key))
+                
+                if org_type:
+                    delete_log.append({
+                        "Kontakt ID": p.get("id"),
+                        "Name": p.get("name"),
+                        "Organisation ID": org_id,
+                        "Organisationsname": org.get("name"),
+                        "Grund": "org_type_filled",
+                        "Extra": org_type,
+                        "Quelle": "refresh"
+                    })
+                    continue
+                
+                # --------------------------
+                # Ausschluss: Datum nächste Aktivität
+                # --------------------------
+                next_date = sanitize(p.get("next_activity_date"))
+                if next_date and is_forbidden_activity_date(next_date):
+                    delete_log.append({
+                        "Kontakt ID": p.get("id"),
+                        "Name": p.get("name"),
+                        "Organisation ID": org_id,
+                        "Organisationsname": org.get("name"),
+                        "Grund": "next_activity_blocked",
+                        "Extra": next_date,
+                        "Quelle": "refresh"
+                    })
+                    continue
+                
+                # --------------------------
+                # Ausschluss: max 2 Kontakte pro Organisation
+                # --------------------------
+                cur = org_counts.get(org_id, 0)
+                if cur >= int(per_org_limit or PER_ORG_DEFAULT_LIMIT):
+                    delete_log.append({
+                        "Kontakt ID": p.get("id"),
+                        "Name": p.get("name"),
+                        "Organisation ID": org_id,
+                        "Organisationsname": org.get("name"),
+                        "Grund": "per_org_limit",
+                        "Extra": org_id,
+                        "Quelle": "refresh"
+                    })
+                    continue
+
 
                 # Datum "nächste Aktivität" wie beim Nachfass
                 next_date = sanitize(p.get("next_activity_date"))
@@ -3324,6 +3400,22 @@ async def refresh_export_start(
             job.phase = "Abgleich (rf -> ready/log)"
             job.percent = 80
             await _reconcile("rf")
+
+            # --------------------------
+            # Summary in rf_excluded speichern
+            # --------------------------
+            def cnt(reason):
+                return sum(1 for r in delete_log if r["Grund"] == reason)
+            
+            summary_rows = [
+                {"Grund": "Max 2 Kontakte pro Organisation", "Anzahl": cnt("per_org_limit")},
+                {"Grund": "Datum nächste Aktivität blockiert", "Anzahl": cnt("next_activity_blocked")},
+                {"Grund": "Organisationsart gefüllt", "Anzahl": cnt("org_type_filled")},
+            ]
+            
+            await save_df_text(pd.DataFrame(summary_rows), "rf_excluded")
+            await save_df_text(pd.DataFrame(delete_log), "rf_delete_log")
+
 
             # 5️⃣ Excel-Datei erzeugen
             job.phase = "Erzeuge Excel-Datei …"
@@ -4047,13 +4139,21 @@ async function poll(job_id){
     el('overlay-phase').textContent=`${s.phase} (${s.percent}%)`;
     setProgress(s.percent);
     if(s.error){ alert(s.error); hideOverlay(); return; }
-    if(s.download_ready){
-      showOverlay("Download startet …");
-      setProgress(100);
-      window.location.href='/refresh/export_download?job_id='+job_id;
-      await loadExcluded();
-      hideOverlay(); return;
+    if (s.download_ready) {
+        showOverlay("Download startet …");
+        setProgress(100);
+    
+        // Datei herunterladen
+        window.location.href = '/refresh/export_download?job_id=' + job_id;
+    
+        // Excluded-Tabelle neu laden
+        await loadExcluded();
+    
+        // etwas warten, dann Overlay schließen
+        setTimeout(() => hideOverlay(), 300);
+        return;
     }
+
   }
 }
 
@@ -4122,38 +4222,43 @@ async def refresh_summary(job_id: str = Query(...)):
 
 
 # =============================================================================
-# Refresh – Excluded JSON / HTML
+# /refresh/excluded/json – analog nachfass, aber rf_ Tabellen
 # =============================================================================
 @app.get("/refresh/excluded/json")
 async def refresh_excluded_json():
-    def flatten(v):
-        if v is None or (isinstance(v,float) and pd.isna(v)): return ""
-        if isinstance(v,list): return flatten(v[0] if v else "")
-        if isinstance(v,dict):
-            return flatten(v.get("value") or v.get("label") or v.get("name") or v.get("id") or "")
+
+    def flat(v):
+        if v is None: return ""
+        if isinstance(v, float) and pd.isna(v): return ""
         return str(v)
 
-    excluded_df = await load_df_text("rf_excluded")
-    deleted_df  = await load_df_text("rf_delete_log")
+    excluded_df = await load_df_text("rf_excluded") or pd.DataFrame()
+    deleted_df  = await load_df_text("rf_delete_log") or pd.DataFrame()
 
-    excluded_summary=[]
-    if not excluded_df.empty:
-        for _,r in excluded_df.iterrows():
-            excluded_summary.append({"Grund":flatten(r.get("Grund")),"Anzahl":int(r.get("Anzahl") or 0)})
+    summary = []
+    for _, r in excluded_df.iterrows():
+        summary.append({
+            "Grund": flat(r.get("Grund")),
+            "Anzahl": int(r.get("Anzahl") or 0)
+        })
 
-    rows=[]
-    if not deleted_df.empty:
-        deleted_df=deleted_df.replace({None:"",np.nan:""})
-        for _,r in deleted_df.iterrows():
-            rows.append({
-                "Kontakt ID": flatten(r.get("Kontakt ID") or r.get("id")),
-                "Name": flatten(r.get("Name") or r.get("name")),
-                "Organisation ID": flatten(r.get("Organisation ID")),
-                "Organisationsname": flatten(r.get("Organisationsname") or r.get("org_name")),
-                "Grund": flatten(r.get("Grund") or r.get("reason") or r.get("extra")),
-            })
+    rows = []
+    for _, r in deleted_df.iterrows():
+        rows.append({
+            "Kontakt ID": flat(r.get("Kontakt ID")),
+            "Name": flat(r.get("Name")),
+            "Organisation ID": flat(r.get("Organisation ID")),
+            "Organisationsname": flat(r.get("Organisationsname")),
+            "Grund": flat(r.get("Grund")),
+            "Extra": flat(r.get("Extra")),
+            "Quelle": "refresh"
+        })
 
-    return JSONResponse({"summary":excluded_summary,"total":len(rows),"rows":rows})
+    return JSONResponse({
+        "summary": summary,
+        "total": len(rows),
+        "rows": rows
+    })
 
 
 @app.get("/refresh/excluded", response_class=HTMLResponse)
@@ -4179,22 +4284,44 @@ async def refresh_excluded():
     </tbody></table>
     <script>
       async function loadExcluded(){
-        const r=await fetch('/refresh/excluded/json');
-        const data=await r.json();
-        const body=document.getElementById('excluded-table-body'); body.innerHTML='';
-        if(!data.rows||!data.rows.length){
-          body.innerHTML='<tr><td colspan="5" class="center">Keine Datensätze ausgeschlossen</td></tr>'; return;
+        const r = await fetch('/refresh/excluded/json');
+        const data = await r.json();
+    
+        const body = el('excluded-table-body');
+        const summaryBox = el('excluded-summary-box');
+    
+        body.innerHTML = '';
+        summaryBox.innerHTML = '';
+    
+        // Summary
+        if (data.summary && data.summary.length){
+            let html = "<ul>";
+            data.summary.forEach(s => {
+                html += `<li>${s.Grund}: <b>${s.Anzahl}</b></li>`;
+            });
+            html += "</ul>";
+            summaryBox.innerHTML = html;
         }
-        for(const row of data.rows){
-          const tr=document.createElement('tr');
-          tr.innerHTML=`<td>${row["Kontakt ID"]||""}</td>
-                        <td>${row["Name"]||""}</td>
-                        <td>${row["Organisation ID"]||""}</td>
-                        <td>${row["Organisationsname"]||""}</td>
-                        <td>${row["Grund"]||""}</td>`;
-          body.appendChild(tr);
+    
+        // Rows
+        if (!data.rows || !data.rows.length){
+            body.innerHTML = '<tr><td colspan="5" style="text-align:center;color:#999">Keine Datensätze</td></tr>';
+            return;
         }
-      }
+    
+        data.rows.forEach(rw => {
+            const tr = document.createElement('tr');
+            tr.innerHTML = `
+                <td>${rw["Kontakt ID"]||""}</td>
+                <td>${rw["Name"]||""}</td>
+                <td>${rw["Organisation ID"]||""}</td>
+                <td>${rw["Organisationsname"]||""}</td>
+                <td>${rw["Grund"]||""}</td>
+            `;
+            body.appendChild(tr);
+        });
+    }
+
       loadExcluded();
     </script></body></html>"""
     return HTMLResponse(html)
