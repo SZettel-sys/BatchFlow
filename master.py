@@ -4795,22 +4795,23 @@ async def debug_pd_person(pid: int):
 # =============================================================================
 # PROGRESS UND DOWNLOAD REFRESH
 # =============================================================================
-
 @app.get("/refresh/export_progress")
 async def refresh_export_progress(job_id: str = Query(...)):
     job = JOBS.get(job_id)
     if not job:
-        raise HTTPException(status_code=404, detail="Job nicht gefunden")
+        return JSONResponse({"error": "Job nicht gefunden"}, status_code=404)
 
-    return JSONResponse(
-        {
-            "phase": job.phase,
-            "percent": job.percent,
-            "done": job.done,
-            "error": job.error,
-            "total_rows": getattr(job, "total_rows", 0),
-        }
-    )
+    has_file = bool(getattr(job, "path", None))
+
+    return JSONResponse({
+        "phase": str(job.phase),
+        "percent": int(job.percent),
+        "done": bool(job.done),
+        "error": str(job.error) if job.error else None,
+        "has_file": has_file,
+        "download_ready": bool(job.done) and (job.error is None) and has_file
+    })
+
 
 
 # =============================================================================
@@ -4855,6 +4856,7 @@ async def refresh_export_download(job_id: str):
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         filename=f"{slugify_filename(job.filename_base or 'Refresh_Export')}.xlsx"
     )
+
 
 # =============================================================================
 # Redirects & Fallbacks (fix für /overview & ungültige Pfade)
