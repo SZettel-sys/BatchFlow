@@ -3076,34 +3076,44 @@ async def reconcile_with_progress(job: "Job", prefix: str):
 
 
 # =============================================================================
-# ANZAHL pro Fachbereich: 2 pro ORG und Aktivitäsdatum – REFRESH
-# =============================================================================    
+# /refresh/options – Variante B (zeigt auch Fachbereiche mit count = 0)
+# =============================================================================
 @app.get("/refresh/options")
 async def refresh_options():
-    """
-    Liefert eine Liste der verfügbaren Fachbereiche inkl. Anzahl der Kontakte,
-    nach einfacher Bereinigung:
-      - max. PER_ORG_DEFAULT_LIMIT Kontakte pro Organisation
-      - Datum 'nächste Aktivität' darf NICHT in Zukunft oder in den letzten
-        3 Monaten liegen (wie im Abgleich).
-    """
+
     field_key = PD_PERSON_FIELDS.get("Fachbereich - Kampagne")
     if not field_key:
         return JSONResponse({"options": []})
 
+    # -------------------------------------------------------------------------
+    # 1) Personen laden (Turbo: große Pages + fewer max_pages)
+    # -------------------------------------------------------------------------
     persons = await fetch_persons_by_filter_id_v2(
         filter_id=FILTER_REFRESH,
-        limit=PAGE_LIMIT,
+        limit=500,
         job_obj=None,
-        max_pages=120,
+        max_pages=60,
         max_empty_growth=2,
     )
 
+    # -------------------------------------------------------------------------
+    # 2) Alle möglichen Fachbereichs-Labels laden
+    # -------------------------------------------------------------------------
     label_map = await get_fachbereich_label_map()
 
-    per_fach_counts: Dict[str, int] = {}
-    per_fach_org_counts: Dict[str, Dict[str, int]] = {}
+    # Liste aller verfügbaren Dropdown-Werte (z. B. "marketing", "crm", ...)
+    all_possible_values = list(label_map.keys())
 
+    # Ergebnisse
+    per_fach_counts: Dict[str, int] = {k: 0 for k in all_possible_values}
+    fach_org_counts: Dict[str, Dict[str, int]] = {k: {} for k in all_possible_values}
+
+    # -------------------------------------------------------------------------
+    # 3) Personen bereinigen wie im Export:
+    #    - Fachbereich muss gesetzt sein
+    #    - Next activity darf nicht blockiert sein
+    #    - Max 2 Kontakte pro Organisation
+    # -------------------------------------------------------------------------
     for p in persons:
         if not isinstance(p, dict):
             continue
@@ -3111,34 +3121,41 @@ async def refresh_options():
         fach_val = sanitize(cf_value_v2(p, field_key))
         if not fach_val:
             continue
+        if fach_val not in all_possible_values:
+            continue
 
         org_id = extract_org_id_from_person(p)
         if not org_id:
             continue
 
-        # Datum "nächste Aktivität" – gleiche Logik wie im Abgleich
         next_date = sanitize(p.get("next_activity_date"))
         if next_date and is_forbidden_activity_date(next_date):
             continue
 
-        org_counts = per_fach_org_counts.setdefault(fach_val, {})
-        if org_counts.get(org_id, 0) >= PER_ORG_DEFAULT_LIMIT:
+        # Organisationslimit: max 2 Kontakte
+        orgs = fach_org_counts[fach_val]
+        if orgs.get(org_id, 0) >= PER_ORG_DEFAULT_LIMIT:
             continue
-        org_counts[org_id] = org_counts.get(org_id, 0) + 1
 
-        per_fach_counts[fach_val] = per_fach_counts.get(fach_val, 0) + 1
+        orgs[org_id] = orgs.get(org_id, 0) + 1
+        per_fach_counts[fach_val] += 1
 
+    # -------------------------------------------------------------------------
+    # 4) Ausgabe sortieren + auch 0-Werte anzeigen
+    # -------------------------------------------------------------------------
     options = []
-    for value, count in per_fach_counts.items():
-        label = label_map.get(value) or value
+    for fach_val in all_possible_values:
+        label = label_map.get(fach_val) or fach_val
+        count = per_fach_counts.get(fach_val, 0)
         options.append({
-            "value": value,
+            "value": fach_val,
             "label": label,
-            "count": count,   # in Klammern anzuzeigen
+            "count": count,
         })
 
     options.sort(key=lambda o: o["label"].lower())
     return JSONResponse({"options": options})
+
 
 
 
@@ -3876,8 +3893,22 @@ async def refresh_page(request: Request):
 <main>
 
   <section class="card">
+  
     <label>Fachbereich – Kampagne</label>
+
+    <div id="fb-loading-box" style="display:none; margin-bottom:6px;">
+      <div style="font-size:14px; color:#0a66c2; margin-bottom:4px;">
+        Fachbereiche werden geladen … bitte warten.
+      </div>
+    
+      <div style="width:100%; max-width:400px; height:8px; background:#e2e8f0; border-radius:4px; overflow:hidden;">
+        <div id="fb-loading-bar"
+             style="width:0%; height:8px; background:#0ea5e9; transition:width 0.3s;"></div>
+      </div>
+    </div>
+    
     <select id="fachbereich">
+
       <option value="">Bitte auswählen …</option>
     </select>
 
@@ -3923,17 +3954,70 @@ function showOverlay(msg){ el('overlay-phase').textContent = msg; el('overlay').
 function hideOverlay(){ el('overlay').style.display='none'; }
 function setProgress(p){ el('overlay-bar').style.width = p + '%'; }
 
-async function loadFachbereiche(){
-  const r = await fetch('/refresh/options');
-  const data = await r.json();
-  const sel = el('fachbereich');
-  sel.innerHTML = '<option value="">Bitte auswählen …</option>';
-  (data.options||[]).forEach(o=>{
-    const opt=document.createElement('option');
-    opt.value=o.value; opt.textContent=`${o.label} (${o.count})`;
-    sel.appendChild(opt);
+async function loadFachbereiche() {
+
+  // -------------------------------------------------------------
+  // 1) Ladeanzeige aktivieren
+  // -------------------------------------------------------------
+  const box = el('fb-loading-box');
+  const bar = el('fb-loading-bar');
+
+  box.style.display = 'block';
+  bar.style.width = '0%';
+
+  // Animierter Fortschritt (Pseudo-Progress)
+  let progress = 0;
+  const interval = setInterval(() => {
+    progress = Math.min(progress + 5, 90);   // Max bis 90% (Rest nach Backend)
+    bar.style.width = progress + '%';
+  }, 250);
+
+
+  // -------------------------------------------------------------
+  // 2) Daten laden
+  // -------------------------------------------------------------
+  let data = null;
+  try {
+    const resp = await fetch('/refresh/options');
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    data = await resp.json();
+
+  } catch (e) {
+    console.error(e);
+    clearInterval(interval);
+    bar.style.width = '100%';
+    setTimeout(() => { box.style.display = 'none'; }, 400);
+    setStatus("Fehler beim Laden der Fachbereiche.");
+    return;
+  }
+
+
+  // -------------------------------------------------------------
+  // 3) Dropdown füllen
+  // -------------------------------------------------------------
+  const select = el('fachbereich');
+  select.innerHTML = '<option value="">Bitte auswählen …</option>';
+
+  (data.options || []).forEach(o => {
+    const opt = document.createElement('option');
+    opt.value = o.value;
+    opt.textContent = `${o.label} (${o.count})`;
+    select.appendChild(opt);
   });
+
+
+  // -------------------------------------------------------------
+  // 4) Ladeanzeige beenden
+  // -------------------------------------------------------------
+  clearInterval(interval);
+
+  // kurz noch smooth animieren
+  bar.style.width = '100%';
+  setTimeout(() => { box.style.display = 'none'; }, 400);
+
+  setStatus('Fachbereiche geladen.');
 }
+
 
 async function loadExcluded(){
   const r=await fetch('/refresh/excluded/json');
