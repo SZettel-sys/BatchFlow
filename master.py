@@ -2703,7 +2703,7 @@ async def run_nachfass_job(
         job_obj.percent = 8
 
         # wichtig: hier dein neues Feld verwenden!
-        BATCH_FIELD_KEY = PD_PERSON_FIELDS["Batch ID neu"]
+        BATCH_FIELD_KEY = PD_PERSON_FIELDS["Batch ID"]
 
         candidate_ids_search: Set[str] = set()
 
