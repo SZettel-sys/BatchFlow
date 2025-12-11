@@ -1871,74 +1871,85 @@ async def pd_global_rate(limit_per_sec: float = 6.0):
             await asyncio.sleep(wait)
         _PD_NEXT_TS = time.monotonic() + min_interval
 
-async def fetch_person_details_many_fast(
+import asyncio
+import urllib.parse
+from typing import List, Dict, Any
+
+async def fetch_person_details_many(
     person_ids: List[str],
     job_obj=None,
-    concurrency: int = 8,          # <<< deutlich höher
-    rate_limit_per_sec: float = 6.0, # <<< gesamt-limit
+    concurrency: int = 4,
+    request_timeout: float = 30.0,
 ) -> List[dict]:
+    """
+    Lädt Personendetails via /persons/{id} (API v2) für eine Liste von IDs.
+
+    Rückgabe: Liste von Dicts (eine pro Person). Bei Fehlern werden
+    Dummy-Einträge mit "_error" zurückgegeben, damit nichts "still" verloren geht.
+    """
+
+    # IDs säubern
     ids = [str(x).strip() for x in (person_ids or []) if str(x).strip()]
     total = len(ids)
     if total == 0:
         return []
 
     sem = asyncio.Semaphore(max(1, int(concurrency)))
-    out: List[Optional[dict]] = [None] * total
+    out: List[dict] = [None] * total  # Reihenfolge beibehalten
 
-    async def fetch_one(i: int, pid: str):
+    async def fetch_one(idx: int, pid: str):
         url = append_token(f"{PIPEDRIVE_API}/persons/{urllib.parse.quote(pid)}")
-
-        # wenige Retries, strikt nach Retry-After
-        attempts = 0
-        delay = 0.6
-        while attempts < 4:
-            attempts += 1
-            await pd_global_rate(rate_limit_per_sec)
-
-            async with sem:
-                r = await http_client().get(url, headers=get_headers(), timeout=30.0)
-
-            if r.status_code == 200:
-                data = (r.json() or {}).get("data")
-                out[i] = data if isinstance(data, dict) else {"id": pid, "_error": "No data"}
+        async with sem:
+            try:
+                r = await pd_get_with_retry(
+                    http_client(),
+                    url,
+                    None,
+                    label=f"person:{pid}",
+                    request_timeout=request_timeout,
+                    max_total_time=240.0,
+                )
+            except Exception as e:
+                out[idx] = {"id": pid, "_error": f"EXC: {e}"}
                 return
 
-            if r.status_code in (400, 401, 403, 404):
-                out[i] = {"id": pid, "_error": f"HTTP {r.status_code}"}
-                return
+        if r.status_code != 200:
+            out[idx] = {"id": pid, "_error": f"HTTP {r.status_code}: {r.text[:200]}"}
+            return
 
-            if r.status_code == 429:
-                ra = (r.headers or {}).get("Retry-After")
-                try:
-                    sleep_s = float(ra) if ra else delay
-                except:
-                    sleep_s = delay
-                await asyncio.sleep(min(30.0, sleep_s + random.uniform(0, 0.2)))
-                delay = min(30.0, delay * 1.6)
-                continue
+        payload = r.json() or {}
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            out[idx] = {"id": pid, "_error": "No data in response"}
+            return
 
-            # 5xx o.ä.
-            await asyncio.sleep(delay + random.uniform(0, 0.2))
-            delay = min(30.0, delay * 1.6)
+        out[idx] = data
 
-        out[i] = {"id": pid, "_error": f"FAILED after retries"}
+    # Progress-Tracking
+    done_counter = 0
+    lock = asyncio.Lock()
 
-    done = 0
-    done_lock = asyncio.Lock()
-
-    async def wrapped(i: int, pid: str):
-        nonlocal done
-        await fetch_one(i, pid)
-        async with done_lock:
-            done += 1
-            if job_obj and (done == 1 or done % 50 == 0 or done == total):
-                job_obj.phase = f"Lade Personendetails ({done}/{total})"
-                # 18..65 (nur Beispiel)
-                job_obj.percent = max(int(getattr(job_obj, "percent", 0) or 0), 18 + int(47 * done / max(1, total)))
+    async def wrapped(idx: int, pid: str):
+        nonlocal done_counter
+        await fetch_one(idx, pid)
+        async with lock:
+            done_counter += 1
+            if job_obj and (done_counter == 1 or done_counter % 50 == 0 or done_counter == total):
+                job_obj.phase = f"Lade Personendetails ({done_counter}/{total})"
+                job_obj.percent = max(int(getattr(job_obj, "percent", 0) or 0), 20)
 
     await asyncio.gather(*(wrapped(i, pid) for i, pid in enumerate(ids)))
 
-    return [x if x is not None else {"id": ids[i], "_error": "None"} for i, x in enumerate(out)]
+    # None-Einträge absichern
+    cleaned: List[dict] = []
+    for i, pid in enumerate(ids):
+        item = out[i]
+        if item is None:
+            cleaned.append({"id": pid, "_error": "Unknown error (None result)"})
+        else:
+            cleaned.append(item)
+
+    return cleaned
 
 
 from typing import List, Dict, Any, Optional
