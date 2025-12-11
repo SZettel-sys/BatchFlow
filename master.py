@@ -2642,7 +2642,6 @@ async def _reconcile(prefix: str) -> None:
 # NACHFASS - LOGIK
 # =============================================================================
 from typing import Optional, List, Set
-import re
 
 async def run_nachfass_job(
     job_obj,
@@ -2652,19 +2651,21 @@ async def run_nachfass_job(
     nf_batch_ids: Optional[List[str]] = None,
 ):
     """
-    Nachfass-Job (Batch + Filter 3024):
+    Nachfass-Job:
 
-      1) Personen via /persons/search anhand Batch-ID neu holen (nur Kandidaten)
-      2) IDs aus Nachfass-Filter 3024 holen
-      3) Schnittmenge bilden (nur Personen mit gewünschter Batch-ID im Filter)
+      1) Personen via /persons/search anhand Batch-ID (Custom Field) holen
+      2) Personen aus Nachfass-Filter 3024 holen
+      3) Schnittmenge bilden (nur Personen mit gewünschter Batch-ID UND im Filter)
       4) Personendetails nur für diese IDs laden
       5) nf_master_final bauen & speichern
       6) _reconcile("nf") -> ready + delete_log + excluded summary
       7) Excel aus ready erzeugen
     """
 
-    # kleine Hilfsfunktion: Batch-ID immer als saubere Zahl behandeln
     def _norm_batch(x) -> Optional[str]:
+        """Batch-ID immer als Zahl (String) normalisieren."""
+        if x is None:
+            return None
         try:
             return str(int(str(x).strip()))
         except Exception:
@@ -2672,7 +2673,7 @@ async def run_nachfass_job(
 
     try:
         # ------------------------------------------------
-        # 1) Batch-IDs aus UI
+        # 1) Batch-IDs aus UI normalisieren
         # ------------------------------------------------
         raw_batches = nf_batch_ids or []
         user_batches: List[str] = []
@@ -2682,7 +2683,7 @@ async def run_nachfass_job(
             if nb:
                 user_batches.append(nb)
 
-        # wie im UI: max. 2 IDs
+        # max 2 wie im UI
         user_batches = user_batches[:2]
         user_batch_set: Set[str] = set(user_batches)
 
@@ -2702,20 +2703,20 @@ async def run_nachfass_job(
         job_obj.phase = "Suche Personen (Batch-ID via Search)"
         job_obj.percent = 8
 
-        # wichtig: hier dein neues Feld verwenden!
+        # WICHTIG: der Dict-Key bleibt "Batch ID", nur die Field-ID ist neu
         BATCH_FIELD_KEY = PD_PERSON_FIELDS["Batch ID"]
 
         candidate_ids_search: Set[str] = set()
 
-        # aktuell nur die erste Batch-ID für das Search-Term verwenden,
-        # aber beim Prüfen alle erlaubten Batch-Werte berücksichtigen
-        search_term = user_batches[0]
+        # für jede angegebene Batch-ID separat suchen
+        for batch_term in user_batches:
+            # ❗ Korrekt: einfache await-Aufruf, KEIN async for
+            items = await stream_person_items_by_batch_id_v2(
+                batch_term,
+                page_limit=100,
+                job_obj=job_obj,
+            )
 
-        async for items in stream_person_items_by_batch_id_v2(
-            search_term,
-            page_limit=100,
-            job_obj=job_obj,
-        ):
             for item in items:
                 if not isinstance(item, dict):
                     continue
@@ -2741,26 +2742,33 @@ async def run_nachfass_job(
             return
 
         # ------------------------------------------------
-        # 3) IDs aus Nachfass-Filter (3024) holen
+        # 3) Personen aus Nachfass-Filter holen (3024)
         # ------------------------------------------------
         filter_id = filters[0] if (filters and len(filters) > 0) else FILTER_NACHFASS
 
         job_obj.phase = "Suche Personen (Filter 3024)"
         job_obj.percent = 12
 
-        ids_in_filter = await collect_person_ids_by_filter_fast(
-            filter_id,
-            limit=NF_PAGE_LIMIT,
+        persons_in_filter = await fetch_persons_by_filter_id_v2(
+            filter_id=filter_id,
+            limit=PAGE_LIMIT,
             job_obj=job_obj,
+            max_pages=200,          # bei ~20.000 Personen ok
+            max_empty_growth=2,
         )
-        ids_in_filter_set: Set[str] = set(ids_in_filter)
 
-        print(f"[NF] IDs im Nachfass-Filter {filter_id}: {len(ids_in_filter_set)}")
+        ids_in_filter: Set[str] = set()
+        for p in persons_in_filter:
+            pid = p.get("id")
+            if pid is not None:
+                ids_in_filter.add(str(pid))
 
-        # Schnittmenge: nur Personen mit gewünschter Batch-ID UND im Filter 3024
+        print(f"[NF] IDs im Nachfass-Filter {filter_id}: {len(ids_in_filter)}")
+
+        # Schnittmenge: nur Personen mit gewünschter Batch-ID UND im Filter
         ids_keep: List[str] = [
             pid for pid in candidate_ids_search
-            if pid in ids_in_filter_set
+            if pid in ids_in_filter
         ]
 
         print(f"[NF] Schnittmenge (Batch-ID ∩ Filter {filter_id}): {len(ids_keep)} IDs")
@@ -2778,21 +2786,21 @@ async def run_nachfass_job(
         job_obj.phase = f"Lade Personendetails (0/{len(ids_keep)})"
         job_obj.percent = 18
 
-        # etwas höheres concurrency, aber pd_get_with_retry fängt 429 ab
         details_all = await fetch_person_details_many(
             ids_keep,
             job_obj=job_obj,
-            concurrency=6,  # 4–8 ist meist ok, je nach Rate Limit
+            concurrency=6,   # etwas höher, aber noch 429-freundlich
         )
 
-        # Fehlerobjekte rausfiltern
         details: List[dict] = [
             p for p in details_all
             if isinstance(p, dict) and p.get("id") is not None and not p.get("_error")
         ]
 
-        print(f"[NF] Vollständige Personendaten: {len(details)} Datensätze "
-              f"(errors: {len(details_all) - len(details)})")
+        print(
+            f"[NF] Vollständige Personendaten: {len(details)} Datensätze "
+            f"(errors: {len(details_all) - len(details)})"
+        )
 
         if not details:
             job_obj.done = True
