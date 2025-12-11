@@ -2657,161 +2657,166 @@ async def _reconcile(prefix: str) -> None:
 # =============================================================================
 # NACHFASS - LOGIK
 # =============================================================================
-from typing import List, Set, Optional
-import re
+from typing import Optional, List, Set
+from collections import Counter
 
 async def run_nachfass_job(
     job_obj,
     job_id: str,
     campaign: str,
-    filters: Optional[List[int]] = None,
+    filters: Optional[List[int]] = None,   # enthält normalerweise [FILTER_NACHFASS]
     nf_batch_ids: Optional[List[str]] = None,
 ):
     """
-    Neue stabile Version:
-      - KEIN persons/search mehr (liefert Batch-Feld nicht!)
-      - Nur Filter 3024 IDs holen
-      - Details in Chunks laden
-      - Exakt auf Batch-ID neu matchen
+    Nachfass-Job (schnell):
+      1) Personen über Filter 3024 laden (/persons?filter_id=...)
+      2) lokal auf Batch-ID-Field filtern (kein /persons/{id} mehr!)
+      3) nf_master_final bauen
+      4) _reconcile("nf") ausführen
+      5) Excel aus nf_master_ready erzeugen
     """
 
-    def _norm_batch(x):
-        try:
-            return str(int(str(x).strip()))
-        except:
-            return None
-
     try:
-        # ------------------------------------------------
-        # Batch-ID(s)
-        # ------------------------------------------------
-        raw_batches = nf_batch_ids or []
-        user_batches = []
-
-        for b in raw_batches:
-            nb = _norm_batch(b)
-            if nb:
-                user_batches.append(nb)
-
-        user_batches = user_batches[:2]
-        if not user_batches:
+        # ------------------------------
+        # A) Batch IDs aus UI normalisieren
+        # ------------------------------
+        user_batches_raw = [str(b).strip() for b in (nf_batch_ids or []) if str(b).strip()]
+        if not user_batches_raw:
             job_obj.done = True
             job_obj.error = "Keine Batch-ID angegeben."
             job_obj.phase = "Fertig (leer)"
             job_obj.percent = 100
             return
 
-        user_batch_set = set(user_batches)
-        batch_label = ", ".join(user_batches)
+        user_batches_raw = user_batches_raw[:2]
 
-        print(f"[NF] Batch-IDs (normalisiert) = {user_batches}")
+        user_batch_set: Set[str] = set()
+        for b in user_batches_raw:
+            b = b.strip()
+            if not b:
+                continue
+            # nur Ziffern nehmen, falls jemand "B443" eingibt
+            digits = "".join(ch for ch in b if ch.isdigit())
+            if digits:
+                user_batch_set.add(digits)
+            else:
+                user_batch_set.add(b)
 
-        # ------------------------------------------------
-        # Filter-ID
-        # ------------------------------------------------
-        filter_id = filters[0] if (filters and len(filters) > 0) else FILTER_NACHFASS
+        print("[NF] run_nachfass_job: Batch-IDs (normalisiert) =", sorted(user_batch_set))
 
-        job_obj.phase = f"Suche Personen (Filter {filter_id})"
-        job_obj.percent = 10
-
-        # ------------------------------------------------
-        # 1) IDs aus Filter holen (IDs only)
-        # ------------------------------------------------
-        ids_in_filter = await collect_person_ids_by_filter_fast(
-            filter_id,
-            limit=NF_PAGE_LIMIT,
-            job_obj=job_obj
-        )
-
-        print(f"[NF] IDs im Nachfass-Filter {filter_id}: {len(ids_in_filter)}")
-
-        if not ids_in_filter:
+        if not user_batch_set:
             job_obj.done = True
-            job_obj.error = "Filter enthält keine Personen."
+            job_obj.error = "Keine gültige Batch-ID angegeben."
             job_obj.phase = "Fertig (leer)"
             job_obj.percent = 100
             return
 
-        ids_in_filter_set = set(ids_in_filter)
+        # ------------------------------
+        # B) Personen über Filter laden
+        # ------------------------------
+        filter_id = int((filters or [FILTER_NACHFASS])[0])
 
-        # ------------------------------------------------
-        # 2) Details für IDs in Chunks laden + Batch-ID neu prüfen
-        # ------------------------------------------------
-        BATCH_FIELD_KEY = PD_PERSON_FIELDS["Batch ID"]
+        job_obj.phase = f"Suche Personen (Filter {filter_id})"
+        job_obj.percent = 8
 
-        matched_ids: List[str] = []
-        details_final: List[dict] = []
+        persons_all = await fetch_persons_by_filter_id_v2(
+            filter_id=filter_id,
+            limit=PAGE_LIMIT,
+            job_obj=job_obj,
+            max_pages=120,
+            max_empty_growth=2,
+        )
 
-        chunk_size = 200
-        detail_concurrency = 6
+        total_filter = len(persons_all)
+        print(f"[NF] Personen im Nachfass-Filter {filter_id}: {total_filter}")
 
-        total = len(ids_in_filter)
-        processed = 0
+        if total_filter == 0:
+            job_obj.done = True
+            job_obj.error = "Keine Personen im Nachfass-Filter gefunden."
+            job_obj.phase = "Fertig (leer)"
+            job_obj.percent = 100
+            return
 
-        for i in range(0, total, chunk_size):
-            chunk = ids_in_filter[i:i+chunk_size]
+        # ------------------------------
+        # C) Lokal nach Batch-ID-Feld filtern + LOGGING
+        # ------------------------------
+        job_obj.phase = "Prüfe Batch-ID (Details-Check)"
+        job_obj.percent = 18
 
-            job_obj.phase = f"Prüfe Batch-ID (Details-Check) ({processed}/{total})"
-            job_obj.percent = max(job_obj.percent, 15)
+        FIELD_BATCH_ID = PD_PERSON_FIELDS["Batch ID"]   # zeigt auf dein neues Integer-Feld
 
-            details = await fetch_person_details_many(
-                chunk,
-                job_obj=job_obj,
-                concurrency=detail_concurrency
-            )
+        def get_batch_value(p: dict) -> str:
+            v = cf_value(p, FIELD_BATCH_ID)
+            if v is None:
+                return ""
+            s = str(v).strip()
+            digits = "".join(ch for ch in s if ch.isdigit())
+            return digits or s
 
-            for p in details:
-                if not isinstance(p, dict) or p.get("_error"):
-                    continue
-                pid = str(p.get("id"))
-                bval = cf_value(p, BATCH_FIELD_KEY)
+        selected: List[dict] = []
+        has_batch_count = 0
+        batch_counter: Counter[str] = Counter()
 
-                nb = _norm_batch(bval)
-                if nb in user_batch_set:
-                    matched_ids.append(pid)
-                    details_final.append(p)
+        for p in persons_all:
+            bval = get_batch_value(p)
+            if bval:
+                has_batch_count += 1
+                batch_counter[bval] += 1
 
-            processed += len(chunk)
+                if bval in user_batch_set:
+                    selected.append(p)
 
-        print(f"[NF] Gefundene Batch-Matches: {len(details_final)}")
+        print(f"[NF] Personen mit irgendeiner Batch-ID im Filter {filter_id}: {has_batch_count}")
+        print(f"[NF] Treffer nach Batch-ID-Filter ({sorted(user_batch_set)}): {len(selected)}")
 
-        if not details_final:
+        # Top 10 Batch-Werte im Filter für Debug
+        if batch_counter:
+            top10 = batch_counter.most_common(10)
+            print("[NF] Häufigste Batch-ID-Werte im Filter (Top 10):", top10)
+
+        if not selected:
             job_obj.done = True
             job_obj.error = "Keine Personen zur Batch-ID gefunden."
             job_obj.phase = "Fertig (leer)"
             job_obj.percent = 100
             return
 
-        # ------------------------------------------------
-        # 3) Master bauen
-        # ------------------------------------------------
+        # ------------------------------
+        # D) Master bauen (ohne zusätzliche Detail-Calls)
+        # ------------------------------
         job_obj.phase = "Baue Master (nf_master_final)"
-        job_obj.percent = 70
+        job_obj.percent = 55
+
+        batch_label_for_export = ",".join(sorted(user_batch_set))
 
         master_final = await _build_nf_master_final(
-            details_final,
+            selected,
             campaign=campaign,
-            batch_id_label=batch_label,
+            batch_id_label=batch_label_for_export,
+            batch_id=None,
             job_obj=job_obj,
         )
 
-        # ------------------------------------------------
-        # 4) Speichern + Abgleich
-        # ------------------------------------------------
+        # ------------------------------
+        # E) Master in DB speichern
+        # ------------------------------
         job_obj.phase = "Speichere Master (DB)"
-        job_obj.percent = 78
+        job_obj.percent = 70
 
         t = tables("nf")
         await save_df_text(master_final, t["final"])
 
+        # ------------------------------
+        # F) Abgleich (Orga, Dubletten, etc.)
+        # ------------------------------
         job_obj.phase = "Abgleich (nf -> ready/log)"
-        job_obj.percent = 82
+        job_obj.percent = 80
 
         await _reconcile("nf")
 
-        # ------------------------------------------------
-        # 5) Excel erzeugen
-        # ------------------------------------------------
+        # ------------------------------
+        # G) Excel aus Ready-Tabelle
+        # ------------------------------
         job_obj.phase = "Erzeuge Excel"
         job_obj.percent = 90
 
@@ -2820,7 +2825,7 @@ async def run_nachfass_job(
 
         out_path = export_to_excel(export_df, prefix="nachfass_export", job_id=job_id)
         job_obj.path = out_path
-        job_obj.filename_base = "Nachfass_Export"
+        job_obj.filename_base = job_obj.filename_base or "Nachfass_Export"
 
         job_obj.error = None
         job_obj.phase = "Fertig"
@@ -2834,7 +2839,6 @@ async def run_nachfass_job(
         job_obj.percent = 100
         print(f"[NF][ERROR] Job failed: {job_obj.error}")
         return
-
 
 # =============================================================================
 # Excel-Export-Helfer – FINAL MODUL 3
