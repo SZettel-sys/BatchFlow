@@ -1595,6 +1595,25 @@ def cf_value(p: dict, field_key: str) -> Any:
     blob = _extract_custom_fields_blob(p)
     return blob.get(field_key)
 
+def cf_value_v2(item: dict, field_key: str):
+    """
+    Liest benutzerdefinierte Felder gemäß API v2 (Top-Level Felder).
+    Fällt auf API v1 Struktur zurück, falls notwendig.
+    Wird ausschließlich für REFRESH benutzt.
+    """
+    if not item or not isinstance(item, dict):
+        return None
+
+    # API v2: Custom Fields liegen direkt auf der Person
+    if field_key in item:
+        return item.get(field_key)
+
+    # API v1 fallback (ältere Struktur)
+    custom = item.get("custom_fields") or item.get("custom_fields_data")
+    if isinstance(custom, dict):
+        return custom.get(field_key)
+
+    return None
 
 async def get_next_activity_key() -> Optional[str]:
     """Ermittelt das Feld für 'Nächste Aktivität'."""
@@ -3089,7 +3108,7 @@ async def refresh_options():
         if not isinstance(p, dict):
             continue
 
-        fach_val = sanitize(cf_value(p, field_key))
+        fach_val = sanitize(cf_value_v2(p, field_key))
         if not fach_val:
             continue
 
@@ -3239,7 +3258,7 @@ async def refresh_export_start(
                 if not isinstance(p, dict) or not field_key:
                     continue
 
-                fach_val = sanitize(cf_value(p, field_key))
+                fach_val = sanitize(cf_value_v2(p, field_key))
                 if not fach_val or fach_val != target_fach:
                     continue
 
