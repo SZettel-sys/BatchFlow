@@ -635,9 +635,10 @@ def tables(prefix: str) -> dict:
     """
     prefix = prefix.lower().strip()
     return {
-        "final": f"{prefix}_master_final",
-        "ready": f"{prefix}_master_ready",
-        "log":   f"{prefix}_delete_log",
+        "final":     f"{prefix}_master_final",
+        "ready":     f"{prefix}_master_ready",
+        "log":       f"{prefix}_delete_log",
+        "excluded":  f"{prefix}_excluded",
     }
 
 
@@ -3860,13 +3861,30 @@ async function poll(job_id){
         if (s.download_ready){
             showOverlay("Download startet …");
             setProgress(100);
-
-            window.location.href = '/nachfass/export_download?job_id=' + job_id;
-
-            await loadExcludedTable();
+        
+            // Download auslösen
+            const url = '/refresh/export_download?job_id=' + job_id;
+            const a = document.createElement("a");
+            a.href = url;
+            a.download = "";
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+        
+            // kleine Verzögerung, damit der Download „wirklich“ startet
+            await new Promise(r => setTimeout(r, 1200));
+        
+            // Excluded-Daten nachladen
+            try {
+                await loadRefreshExcluded();
+            } catch(e){
+                console.error("Fehler loadRefreshExcluded:", e);
+            }
+        
             hideOverlay();
             return;
         }
+
 
         // done aber keine Datei => sauberer Fehler (sonst 404 "Keine Datei")
         if (s.done && !s.has_file){
@@ -4099,43 +4117,106 @@ async function loadFachbereiche() {
 }
 
 
-async function loadExcluded(){
-  const r=await fetch('/refresh/excluded/json');
-  const data=await r.json();
-  const body=el('excluded-table-body'); body.innerHTML='';
-  const summaryBox=el('excluded-summary-box'); summaryBox.innerHTML='';
-  if(data.summary&&data.summary.length){
-    summaryBox.innerHTML='<ul>'+data.summary.map(s=>`<li>${s.Grund}: <b>${s.Anzahl}</b></li>`).join('')+'</ul>';
-  }
-  if(!data.rows||!data.rows.length){
-    body.innerHTML='<tr><td colspan=5 style="text-align:center;color:#999">Keine Treffer</td></tr>'; return;
-  }
-  data.rows.forEach(rw=>{
-    const tr=document.createElement('tr');
-    tr.innerHTML=`<td>${rw["Kontakt ID"]||""}</td><td>${rw["Name"]||""}</td>
-      <td>${rw["Organisation ID"]||""}</td><td>${rw["Organisationsname"]||""}</td>
-      <td>${rw["Grund"]||""}</td>`;
-    body.appendChild(tr);
-  });
+async function loadExcluded() {
+    const body = el("excluded-table-body");
+    const summary = el("excluded-summary-box");
+
+    body.innerHTML = "";
+    summary.innerHTML = "";
+
+    let res;
+    try {
+        res = await fetch("/refresh/excluded/json");
+    } catch (err) {
+        console.error("Fehler beim Laden:", err);
+        body.innerHTML = `<tr><td colspan="5" style="text-align:center;color:#999">
+            Fehler beim Laden der Daten
+        </td></tr>`;
+        return;
+    }
+
+    // Backend liefert 500 → Tabelle existiert nicht
+    if (res.status === 500) {
+        body.innerHTML = `<tr><td colspan="5" style="text-align:center;color:#999">
+            (Noch) keine entfernten Datensätze — Tabelle nicht vorhanden
+        </td></tr>`;
+        return;
+    }
+
+    const data = await res.json();
+
+    if (!data.rows || data.rows.length === 0) {
+        body.innerHTML = `<tr><td colspan="5" style="text-align:center;color:#999">
+            Keine entfernten Datensätze
+        </td></tr>`;
+        return;
+    }
+
+    if (data.summary && data.summary.length > 0) {
+        summary.innerHTML = "<ul>" +
+            data.summary.map(s => `<li>${s.Grund}: <b>${s.Anzahl}</b></li>`).join("") +
+            "</ul>";
+    }
+
+    for (const rw of data.rows) {
+        const tr = document.createElement("tr");
+        tr.innerHTML = `
+            <td>${rw["Kontakt ID"] || ""}</td>
+            <td>${rw["Name"] || ""}</td>
+            <td>${rw["Organisation ID"] || ""}</td>
+            <td>${rw["Organisationsname"] || ""}</td>
+            <td>${rw["Grund"] || ""}</td>`;
+        body.appendChild(tr);
+    }
 }
 
+
+
 async function poll(job_id){
-  while(true){
-    await new Promise(r=>setTimeout(r,500));
-    const res=await fetch('/refresh/export_progress?job_id='+job_id);
-    const s=await res.json();
-    el('overlay-phase').textContent=`${s.phase} (${s.percent}%)`;
-    setProgress(s.percent);
-    if(s.error){ alert(s.error); hideOverlay(); return; }
-    if(s.download_ready){
-      showOverlay("Download startet …");
-      setProgress(100);
-      window.location.href='/refresh/export_download?job_id='+job_id;
-      await loadExcluded();
-      hideOverlay(); return;
+    while (true) {
+        const res = await fetch(`/refresh/export_progress?job_id=${job_id}`);
+        const s = await res.json();
+
+        if (s.error) {
+            alert(s.error);
+            hideOverlay();
+            return;
+        }
+
+        if (s.percent !== undefined)
+            setProgress(s.percent);
+
+        el("overlay-phase").textContent = s.phase || "";
+
+        // ---------------------------------------------------------
+        // Download ist fertig
+        // ---------------------------------------------------------
+        if (s.download_ready) {
+
+            showOverlay("Download startet …");
+            setProgress(100);
+
+            // Download auslösen OHNE redirect
+            const url = `/refresh/export_download?job_id=${job_id}`;
+            const a = document.createElement("a");
+            a.href = url;
+            a.download = "";
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+
+            // Browser Zeit geben
+            await new Promise(r => setTimeout(r, 1000));
+
+            await loadExcluded();  // entfernte Datensätze laden
+            hideOverlay();
+            return;
+        }
+
+        await new Promise(r => setTimeout(r, 600));
     }
-  }
 }
+
 
 async function startExport(){
   const fach=el('fachbereich').value;
