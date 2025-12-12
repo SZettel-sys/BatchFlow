@@ -443,12 +443,37 @@ def parse_pd_date(d: Optional[str]) -> Optional[datetime]:
     try: return datetime.strptime(d, "%Y-%m-%d").replace(tzinfo=timezone.utc)
     except Exception: return None
 
-def is_forbidden_activity_date(val: Optional[str]) -> bool:
-    dt = parse_pd_date(val)
-    if not dt: return False
-    today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-    three_months = today - timedelta(days=90)
-    return dt > today or (three_months <= dt <= today)
+def is_forbidden_activity_date(dt):
+    """
+    Gibt True zurück, wenn das Datum eine zukünftige Aktivität darstellt.
+    Verarbeitet alle fehlerhaften Pipedrive-Werte sicher.
+    """
+
+    # Kein Datum → kein Ausschluss
+    if not dt:
+        return False
+
+    # Sonderfall aus älteren Pipedrive-Systemen
+    if dt in ("0000-00-00", "0000-00-00 00:00:00"):
+        return False
+
+    # In echtes datetime wandeln
+    try:
+        if isinstance(dt, str):
+            # ISO-Formate reparieren
+            cleaned = dt.replace("Z", "").replace("+00:00", "")
+            dt = datetime.fromisoformat(cleaned)
+    except:
+        # Unbekanntes Format → nicht blockieren
+        return False
+
+    now = datetime.utcnow()
+
+    # Vergleich immer try/except schützen
+    try:
+        return dt > now
+    except Exception:
+        return False
 
 def _as_list_email(value) -> List[str]:
     if not value: return []
