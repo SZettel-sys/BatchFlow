@@ -4446,63 +4446,67 @@ async def nachfass_summary(job_id: str = Query(...)):
 @app.get("/nachfass/excluded/json")
 async def nachfass_excluded_json():
 
-    # Universeller Sanitizer – macht JEDE Struktur zu einem sauberen String
-    def flatten(v):
-        if v is None:
-            return ""
-        if isinstance(v, float) and pd.isna(v):
-            return ""
-        if isinstance(v, list):
-            return flatten(v[0] if v else "")
-        if isinstance(v, dict):
-            return flatten(
-                v.get("value")
-                or v.get("label")
-                or v.get("name")
-                or v.get("id")
-                or ""
-            )
+    # Hilfsfunktion für Strings
+    def flat(v):
+        if v is None: return ""
+        if isinstance(v, float) and pd.isna(v): return ""
         return str(v)
 
-    excluded_df = await load_df_text("nf_excluded")
-    deleted_df  = await load_df_text("nf_delete_log")
+    # Tabellen laden
+    excluded_df = await load_df_text("nf_excluded")      # 2-Kontakte-Regel
+    delete_df   = await load_df_text("nf_delete_log")    # Fuzzy + ID + Activity
 
-    # ---------------------------
-    # 1) Summary (Batch-/Filter-Ausschlüsse)
-    # ---------------------------
-    excluded_summary = []
+    summary = []
+
+    # -----------------------------------------------------
+    # 1) 2-Kontakte-Regel
+    # -----------------------------------------------------
     if not excluded_df.empty:
         for _, r in excluded_df.iterrows():
-            excluded_summary.append({
-                "Grund": flatten(r.get("Grund")),
+            summary.append({
+                "Grund": flat(r.get("Grund")),
                 "Anzahl": int(r.get("Anzahl") or 0)
             })
 
-    # ---------------------------
-    # 2) Abgleich-Ausschlüsse (Fuzzy / ID-Dubletten)
-    # ---------------------------
+    # -----------------------------------------------------
+    # 2) Abgleich-Ausschlüsse aus nf_delete_log
+    # -----------------------------------------------------
     rows = []
-    if not deleted_df.empty:
-        deleted_df = deleted_df.replace({None: "", np.nan: ""})
 
-        for _, r in deleted_df.iterrows():
+    if not delete_df.empty:
+        for _, r in delete_df.iterrows():
+
             rows.append({
-                "Kontakt ID":     flatten(r.get("Kontakt ID") or r.get("id")),
-                "Name":           flatten(r.get("Name") or r.get("name")),
-                "Organisation ID": flatten(r.get("Organisation ID")),
-                "Organisationsname": flatten(
-                    r.get("Organisationsname")
-                    or r.get("org_name")
-                ),
-                "Grund": flatten(r.get("Grund") or r.get("reason") or r.get("extra")),
+                "Kontakt ID":       flat(r.get("id") or r.get("Kontakt ID")),
+                "Name":             flat(r.get("name") or r.get("Name")),
+                "Organisation ID":  flat(r.get("org_id") or r.get("Organisation ID")),
+                "Organisationsname":flat(r.get("org_name") or r.get("Organisationsname")),
+                "Grund":            flat(r.get("reason")),
             })
 
+        # COUNTER pro reason
+        reason_counts = delete_df["reason"].fillna("").str.lower().value_counts()
+
+        def add_reason(label, keys):
+            count = int(sum(reason_counts.get(k.lower(), 0) for k in keys))
+            if count > 0:
+                summary.append({ "Grund": label, "Anzahl": count })
+
+        add_reason("Fuzzy Orga ≥95%", ["org_match_95"])
+        add_reason("Personen-ID Dublette", ["person_id_match"])
+        add_reason("Nächste Aktivität blockiert", ["forbidden_activity_date"])
+
+    # -----------------------------------------------------
+    # Falls nichts ausgeschlossen wurde
+    # -----------------------------------------------------
+    if not summary:
+        summary.append({"Grund": "Keine Datensätze ausgeschlossen", "Anzahl": 0})
+
     return JSONResponse({
-        "summary": excluded_summary,
+        "summary": summary,
         "total": len(rows),
         "rows": rows
     })
-
 
 
 # =============================================================================
@@ -4728,48 +4732,81 @@ async def refresh_summary(job_id: str = Query(...)):
 @app.get("/refresh/excluded/json")
 async def refresh_excluded_json():
 
-    def flatten(v):
-        if v is None or (isinstance(v, float) and pd.isna(v)): 
-            return ""
-        if isinstance(v, list):
-            return flatten(v[0] if v else "")
-        if isinstance(v, dict):
-            return flatten(
-                v.get("value") or v.get("label") or v.get("name") or v.get("id") or ""
-            )
+    # -----------------------------------------------------
+    # Hilfsfunktionen
+    # -----------------------------------------------------
+    def flat(v):
+        if v is None: return ""
+        if isinstance(v, float) and pd.isna(v): return ""
         return str(v)
 
-    excluded_df = await load_df_text("rf_excluded")
-    deleted_df  = await load_df_text("rf_delete_log")
+    # -----------------------------------------------------
+    # Tabellen laden
+    # -----------------------------------------------------
+    excluded_df = await load_df_text("rf_excluded")     # 2-Kontakte-Regel
+    delete_df   = await load_df_text("rf_delete_log")   # Fuzzy / ID / Activity / OrgaArt
 
-    # ---------------------------
-    # 1) Summary aus rf_excluded
-    # ---------------------------
-    excluded_summary = []
+    summary = []
+    rows = []
+
+    # -----------------------------------------------------
+    # 1) 2-Kontakte-Regel (rf_excluded)
+    # -----------------------------------------------------
     if not excluded_df.empty:
         for _, r in excluded_df.iterrows():
-            excluded_summary.append({
-                "Grund": flatten(r.get("Grund")),
+            summary.append({
+                "Grund": flat(r.get("Grund")),
                 "Anzahl": int(r.get("Anzahl") or 0)
             })
 
-    # ---------------------------
-    # 2) Abgleich-Ausschlüsse
-    # ---------------------------
-    rows = []
-    if not deleted_df.empty:
-        deleted_df = deleted_df.replace({None:"", np.nan:""})
-        for _, r in deleted_df.iterrows():
+    # -----------------------------------------------------
+    # 2) Abgleich-Ausschlüsse (rf_delete_log)
+    #    Gründe enthalten u.a.:
+    #    - org_match_95
+    #    - person_id_match
+    #    - forbidden_activity_date
+    #    - org_art_not_empty
+    # -----------------------------------------------------
+    if not delete_df.empty:
+
+        # Tabellenzeilen für UI
+        for _, r in delete_df.iterrows():
             rows.append({
-                "Kontakt ID":       flatten(r.get("Kontakt ID") or r.get("id")),
-                "Name":             flatten(r.get("Name") or r.get("name")),
-                "Organisation ID":  flatten(r.get("Organisation ID")),
-                "Organisationsname":flatten(r.get("Organisationsname") or r.get("org_name")),
-                "Grund":            flatten(r.get("Grund") or r.get("reason") or r.get("extra")),
+                "Kontakt ID":        flat(r.get("id") or r.get("Kontakt ID")),
+                "Name":              flat(r.get("name") or r.get("Name")),
+                "Organisation ID":   flat(r.get("org_id") or r.get("Organisation ID")),
+                "Organisationsname": flat(r.get("org_name") or r.get("Organisationsname")),
+                "Grund":             flat(r.get("reason")),
             })
 
+        # Gruppierung nach Gründen
+        reason_counts = (
+            delete_df["reason"]
+            .fillna("")
+            .astype(str)
+            .str.lower()
+            .value_counts()
+        )
+
+        # Hilfsfunktion für Summen
+        def add_reason(label, keys):
+            count = int(sum(reason_counts.get(k.lower(), 0) for k in keys))
+            if count > 0:
+                summary.append({"Grund": label, "Anzahl": count})
+
+        add_reason("Fuzzy Orga ≥95%", ["org_match_95"])
+        add_reason("Personen-ID Dublette", ["person_id_match"])
+        add_reason("Nächste Aktivität blockiert", ["forbidden_activity_date"])
+        add_reason("Organisationsart gefüllt", ["org_art_not_empty"])
+
+    # -----------------------------------------------------
+    # Falls GAR nichts ausgeschlossen wurde → Hinweis
+    # -----------------------------------------------------
+    if not summary:
+        summary.append({"Grund": "Keine Datensätze ausgeschlossen", "Anzahl": 0})
+
     return JSONResponse({
-        "summary": excluded_summary,
+        "summary": summary,
         "total": len(rows),
         "rows": rows
     })
