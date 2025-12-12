@@ -728,7 +728,7 @@ async def fetch_persons_by_filter_id_v2(
     filter_id: int,
     limit: int = 200,
     job_obj=None,
-    max_pages: int = 80,
+    max_pages: int =None,
     max_empty_growth: int = 2,
 ) -> List[dict]:
     """
@@ -2857,7 +2857,7 @@ async def run_nachfass_job(
             filter_id=filter_id,
             limit=PAGE_LIMIT,
             job_obj=job_obj,
-            max_pages=120,
+            max_pages=None,
             max_empty_growth=2,
         )
 
@@ -2957,9 +2957,16 @@ async def run_nachfass_job(
         ready_df = await load_df_text(t["ready"])
         export_df = build_nf_export(ready_df)
 
-        out_path = export_to_excel(export_df, prefix="nachfass_export", job_id=job_id)
+        safe_campaign = slugify_filename(campaign or "Nachfass")
+
+        out_path = export_to_excel(
+            export_df,
+            prefix=safe_campaign,       # <-- Kampagnenname als Dateiname
+            job_id=job_id
+        )
+        
         job_obj.path = out_path
-        job_obj.filename_base = job_obj.filename_base or "Nachfass_Export"
+        job_obj.filename_base = safe_campaign
 
         job_obj.error = None
         job_obj.phase = "Fertig"
@@ -3289,7 +3296,7 @@ async def refresh_export_start(
                 filter_id=FILTER_REFRESH,
                 limit=PAGE_LIMIT,
                 job_obj=job,
-                max_pages=120,
+                max_pages=None,
                 max_empty_growth=2,
             )
 
