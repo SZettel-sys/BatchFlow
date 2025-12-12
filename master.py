@@ -4393,30 +4393,53 @@ async def neukontakte_summary(job_id: str = Query(...)):
 @app.get("/nachfass/summary", response_class=HTMLResponse)
 async def nachfass_summary(job_id: str = Query(...)):
     ready = await load_df_text("nf_master_ready")
-    # → sauber machen ALLER Felder in ALLEN Zellen:
+    log   = await load_df_text("nf_delete_log")
+
+    # Sicherheits-Normalisierung
     for col in ready.columns:
-        ready[col] = ready[col].apply(normalize_cell)
-    print("DEBUG READY TYPES:\n", ready.applymap(type).head(20))
-    log = await load_df_text("nf_delete_log")
-    print("DEBUG LOG TYPES:\n", log.applymap(type).head(20))
+        ready[col] = ready[col].astype(str)
+
     total = len(ready)
-    cnt_org = _count_reason(log, ["org_match_95"])
-    cnt_pid = _count_reason(log, ["person_id_match"])
-    removed = cnt_org + cnt_pid
-    table_html = "<i>Keine entfernt</i>"
+
+    def count_reason(df, keys):
+        if df.empty: return 0
+        return df["reason"].astype(str).str.lower().isin([k.lower() for k in keys]).sum()
+
+    cnt_org95 = count_reason(log, ["org_match_95"])
+    cnt_pid   = count_reason(log, ["person_id_match"])
+    cnt_orgart = count_reason(log, ["org_art_not_empty"])
+    cnt_nextact = count_reason(log, ["forbidden_activity_date"])
+
+    removed = cnt_org95 + cnt_pid + cnt_orgart + cnt_nextact
+
+    # Letzte 50 Details
     if not log.empty:
         view = log.tail(50).copy()
-        view["Grund"] = view.apply(lambda r: f"{r['reason']} – {r['extra']}", axis=1)
+        view["Grund"] = view["reason"].astype(str) + " – " + view["extra"].astype(str)
         table_html = view[["id","name","org_name","Grund"]].to_html(index=False, border=0)
-    html = f"""<!doctype html><html lang="de"><head><meta charset="utf-8"/>
-    <meta name="viewport" content="width=device-width,initial-scale=1"/><title>Nachfass – Ergebnis</title></head>
-    <body><main style='max-width:1100px;margin:30px auto;padding:0 20px;font-family:Inter,sans-serif'>
-    <h2>Ergebnis: {total} Zeilen</h2>
-    <ul><li>Orga ≥95% entfernt: {cnt_org}</li><li>Person-ID Dubletten: {cnt_pid}</li><li><b>Gesamt entfernt: {removed}</b></li></ul>
-    <section>{table_html}</section>
-    <a href='/campaign'>Zur Übersicht</a></main></body></html>"""
+    else:
+        table_html = "<i>Keine entfernt</i>"
+
+    html = f"""
+    <!doctype html><html><body style='font-family:Inter;max-width:900px;margin:40px auto'>
+    <h2>Nachfass – Ergebnis</h2>
+    <ul>
+      <li>Exportierte Zeilen: <b>{total}</b></li>
+      <li>Orga ≥95% Ähnlichkeit: <b>{cnt_org95}</b></li>
+      <li>Person-ID Dubletten: <b>{cnt_pid}</b></li>
+      <li>Organisationsart gefüllt: <b>{cnt_orgart}</b></li>
+      <li>Nächste Aktivität blockiert: <b>{cnt_nextact}</b></li>
+      <li><b>Gesamt entfernt: {removed}</b></li>
+    </ul>
+
+    <h3>Letzte 50 entfernte Datensätze</h3>
+    {table_html}
+
+    <p><a href='/campaign'>Zur Übersicht</a></p>
+    </body></html>
+    """
     return HTMLResponse(html)
-    
+
 # =============================================================================
 # EXCLUDED + SUMMARY + DEBUG (FINAL & KOMPATIBEL)
 # =============================================================================
@@ -4656,63 +4679,47 @@ async def nachfass_summary(job_id: str = Query(...)):
 # =============================================================================
 @app.get("/refresh/summary", response_class=HTMLResponse)
 async def refresh_summary(job_id: str = Query(...)):
-    """
-    Übersicht nach Refresh-Export:
-    - Gesamtzeilen
-    - Orga ≥95% entfernt
-    - Person-ID-Dubletten entfernt
-    - letzte 50 geloggte Ausschlüsse
-    """
     ready = await load_df_text("rf_master_ready")
     log   = await load_df_text("rf_delete_log")
 
-    def count(df: pd.DataFrame, reason_keys: list) -> int:
-        if df.empty:
-            return 0
-        if "reason" not in df.columns:
-            return 0
-        keys = [k.lower() for k in reason_keys]
-        return int(df["reason"].astype(str).str.lower().isin(keys).sum())
+    total = len(ready)
 
-    total    = len(ready)
-    cnt_org  = count(log, ["org_match_95"])
-    cnt_pid  = count(log, ["person_id_match"])
-    removed  = cnt_org + cnt_pid
+    def count_reason(df, keys):
+        if df.empty: return 0
+        return df["reason"].astype(str).str.lower().isin([k.lower() for k in keys]).sum()
 
-    # Tabelle mit letzten 50 Ausschlüssen
+    cnt_org95 = count_reason(log, ["org_match_95"])
+    cnt_pid   = count_reason(log, ["person_id_match"])
+    cnt_orgart = count_reason(log, ["org_art_not_empty"])
+    cnt_nextact = count_reason(log, ["forbidden_activity_date"])
+
+    removed = cnt_org95 + cnt_pid + cnt_orgart + cnt_nextact
+
     if not log.empty:
         view = log.tail(50).copy()
-        view["Grund"] = view.apply(lambda r: f"{r['reason']} – {r['extra']}", axis=1)
-        table_html = view[["id", "name", "org_name", "Grund"]].to_html(index=False, border=0)
+        view["Grund"] = view["reason"].astype(str) + " – " + view["extra"].astype(str)
+        table_html = view[["id","name","org_name","Grund"]].to_html(index=False, border=0)
     else:
         table_html = "<i>Keine entfernt</i>"
 
     html = f"""
-    <!doctype html>
-    <html lang="de">
-    <head><meta charset="utf-8"/>
-    <title>Refresh – Ergebnis</title>
-    </head>
-    <body style='font-family:Inter,sans-serif;max-width:1100px;margin:30px auto;padding:0 20px'>
+    <!doctype html><html><body style='font-family:Inter;max-width:900px;margin:40px auto'>
+    <h2>Refresh – Ergebnis</h2>
+    <ul>
+      <li>Exportierte Zeilen: <b>{total}</b></li>
+      <li>Orga ≥95% Ähnlichkeit: <b>{cnt_org95}</b></li>
+      <li>Person-ID Dubletten: <b>{cnt_pid}</b></li>
+      <li>Organisationsart gefüllt: <b>{cnt_orgart}</b></li>
+      <li>Nächste Aktivität blockiert: <b>{cnt_nextact}</b></li>
+      <li><b>Gesamt entfernt: {removed}</b></li>
+    </ul>
 
-      <h2>Refresh – Ergebnis</h2>
+    <h3>Letzte 50 entfernte Datensätze</h3>
+    {table_html}
 
-      <ul>
-        <li>Gesamt exportierte Zeilen: <b>{total}</b></li>
-        <li>Organisationen ≥95% Ähnlichkeit entfernt: <b>{cnt_org}</b></li>
-        <li>Bereits kontaktierte Personen entfernt: <b>{cnt_pid}</b></li>
-        <li><b>Gesamt entfernt: {removed}</b></li>
-      </ul>
-
-      <h3>Letzte Ausschlüsse</h3>
-      {table_html}
-
-      <p><a href="/campaign">Zur Übersicht</a></p>
-
-    </body>
-    </html>
+    <p><a href='/campaign'>Zur Übersicht</a></p>
+    </body></html>
     """
-
     return HTMLResponse(html)
 
 # =============================================================================
