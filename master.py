@@ -125,6 +125,20 @@ PERSON_FIELD_HINTS_TO_EXPORT = {
     "office email": "Person E-Mail",
 }
 
+# =============================================================================
+# API REQUEST COUNTER
+# =============================================================================
+REQUEST_COUNTER = {
+    "total": 0,
+    "persons": 0,
+    "organizations": 0,
+    "search": 0,
+    "generic": 0
+}
+
+def inc(kind):
+    REQUEST_COUNTER["total"] += 1
+    REQUEST_COUNTER[kind] = REQUEST_COUNTER.get(kind, 0) + 1
 
 # -----------------------------------------------------------------------------
 # Startup / Shutdown
@@ -326,6 +340,19 @@ async def pd_get_with_retry(
                 f"[] TIMEOUT(total) {label} after {attempt-1} attempts "
                 f"({max_total_time}s). url={_short(url)} last_err={last_err}"
             )
+
+        # --- API REQUEST COUNTING ---
+        try:
+            if "/persons/" in real_url:
+                inc("persons")
+            elif "/organizations/" in real_url:
+                inc("organizations")
+            elif "/search" in real_url:
+                inc("search")
+            else:
+                inc("generic")
+        except:
+            inc("generic")
 
         try:
             if headers and headers.get("Authorization"):
@@ -2937,7 +2964,17 @@ async def run_nachfass_job(
         job_obj.error = None
         job_obj.phase = "Fertig"
         job_obj.percent = 100
+        # --- API COUNTERS sichern ---
+        try:
+            job_obj.api_calls = dict(REQUEST_COUNTER)
+        except:
+            job_obj.api_calls = {}
+    
+        # Counter zurücksetzen für den nächsten Job
+        for k in REQUEST_COUNTER:
+            REQUEST_COUNTER[k] = 0
         job_obj.done = True
+        
 
     except Exception as e:
         job_obj.done = True
@@ -3341,6 +3378,17 @@ async def refresh_export_start(
             job.total_rows = len(export_df)
             job.phase = f"Fertig – {job.total_rows} Zeilen"
             job.percent = 100
+            # ----------------------------------------------------
+            # API-Request-Counter sichern & zurücksetzen (BLOCK 3)
+            # ----------------------------------------------------
+            try:
+                job.api_calls = dict(REQUEST_COUNTER)   # Werte kopieren
+            except:
+                job.api_calls = {}
+            
+            # Counter für nächsten Job zurücksetzen
+            for k in REQUEST_COUNTER:
+                REQUEST_COUNTER[k] = 0
             job.done = True
 
         except Exception as e:
