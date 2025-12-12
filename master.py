@@ -2810,7 +2810,10 @@ async def _reconcile(prefix: str) -> None:
 
     summary_rows = [
         {"Grund": "Max 2 Kontakte pro Organisation", "Anzahl": cnt("per_org_limit")},
+        {"Grund": "Organisationsart ist gesetzt", "Anzahl": cnt("org_type_present")},
         {"Grund": "Datum nächste Aktivität steht an bzw. liegt in naher Vergangenheit", "Anzahl": cnt("next_activity_blocked")},
+        {"Grund": "Organisation ähnlich ≥95%", "Anzahl": cnt("org_match_95")},
+        {"Grund": "Person bereits kontaktiert (Filter 1216/1708)", "Anzahl": cnt("person_id_match")},
     ]
     await save_df_text(pd.DataFrame(summary_rows), "nf_excluded")
 
@@ -4446,20 +4449,20 @@ async def nachfass_summary(job_id: str = Query(...)):
 @app.get("/nachfass/excluded/json")
 async def nachfass_excluded_json():
 
-    # Hilfsfunktion für Strings
     def flat(v):
         if v is None: return ""
         if isinstance(v, float) and pd.isna(v): return ""
         return str(v)
 
     # Tabellen laden
-    excluded_df = await load_df_text("nf_excluded")      # 2-Kontakte-Regel
-    delete_df   = await load_df_text("nf_delete_log")    # Fuzzy + ID + Activity
+    excluded_df = await load_df_text("nf_excluded")     # 2-Kontakte-Regel (Nachfass jetzt aktiviert)
+    delete_df   = await load_df_text("nf_delete_log")   # Fuzzy / ID / Activity / OrgaArt
 
     summary = []
+    rows = []
 
     # -----------------------------------------------------
-    # 1) 2-Kontakte-Regel
+    # 1) Ausschlüsse wegen "nur 2 Kontakte pro Organisation"
     # -----------------------------------------------------
     if not excluded_df.empty:
         for _, r in excluded_df.iterrows():
@@ -4469,35 +4472,40 @@ async def nachfass_excluded_json():
             })
 
     # -----------------------------------------------------
-    # 2) Abgleich-Ausschlüsse aus nf_delete_log
+    # 2) Ausschlüsse aus Abgleich (delete_log)
     # -----------------------------------------------------
-    rows = []
-
     if not delete_df.empty:
-        for _, r in delete_df.iterrows():
 
+        for _, r in delete_df.iterrows():
             rows.append({
-                "Kontakt ID":       flat(r.get("id") or r.get("Kontakt ID")),
-                "Name":             flat(r.get("name") or r.get("Name")),
-                "Organisation ID":  flat(r.get("org_id") or r.get("Organisation ID")),
-                "Organisationsname":flat(r.get("org_name") or r.get("Organisationsname")),
-                "Grund":            flat(r.get("reason")),
+                "Kontakt ID":        flat(r.get("id") or r.get("Kontakt ID")),
+                "Name":              flat(r.get("name") or r.get("Name")),
+                "Organisation ID":   flat(r.get("org_id") or r.get("Organisation ID")),
+                "Organisationsname": flat(r.get("org_name") or r.get("Organisationsname")),
+                "Grund":             flat(r.get("reason")),
             })
 
-        # COUNTER pro reason
-        reason_counts = delete_df["reason"].fillna("").str.lower().value_counts()
+        # Gründe zählen
+        reason_counts = (
+            delete_df["reason"]
+            .fillna("")
+            .astype(str)
+            .str.lower()
+            .value_counts()
+        )
 
         def add_reason(label, keys):
             count = int(sum(reason_counts.get(k.lower(), 0) for k in keys))
             if count > 0:
-                summary.append({ "Grund": label, "Anzahl": count })
+                summary.append({"Grund": label, "Anzahl": count})
 
         add_reason("Fuzzy Orga ≥95%", ["org_match_95"])
         add_reason("Personen-ID Dublette", ["person_id_match"])
         add_reason("Nächste Aktivität blockiert", ["forbidden_activity_date"])
+        add_reason("Organisationsart gefüllt", ["org_art_not_empty"])
 
     # -----------------------------------------------------
-    # Falls nichts ausgeschlossen wurde
+    # Nichts ausgeschlossen?
     # -----------------------------------------------------
     if not summary:
         summary.append({"Grund": "Keine Datensätze ausgeschlossen", "Anzahl": 0})
@@ -4507,7 +4515,6 @@ async def nachfass_excluded_json():
         "total": len(rows),
         "rows": rows
     })
-
 
 # =============================================================================
 # HTML-Seite (Excluded Viewer)
