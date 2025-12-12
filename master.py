@@ -772,7 +772,7 @@ async def fetch_persons_by_filter_id_v2(
 
     while True:
         pages += 1
-        if pages > max_pages:
+        if max_pages is not None and pages > max_pages:
             print(f"[WARN] fetch_persons_by_filter_id_v2 abort: max_pages={max_pages} reached")
             break
 
