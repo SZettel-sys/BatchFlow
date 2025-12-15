@@ -3690,32 +3690,107 @@ async def nachfass_page(request: Request):
 <title>Nachfass – BatchFlow</title>
 
 <style>
-  body{margin:0;background:#f6f8fb;color:#0f172a;font:16px/1.6 Inter,sans-serif}
-  header{background:#fff;border-bottom:1px solid #e2e8f0}
-  .hwrap{max-width:1120px;margin:0 auto;padding:14px 20px;display:flex;
-         align-items:center;justify-content:space-between}
-  main{max-width:1120px;margin:28px auto;padding:0 20px}
-  .card{background:#fff;border:1px solid #e2e8f0;border-radius:14px;padding:20px;
-         box-shadow:0 2px 8px rgba(2,8,23,.04)}
-  label{display:block;font-weight:600;margin:8px 0 6px}
-  textarea,input{width:100%;padding:10px;border:1px solid #cbd5e1;border-radius:10px}
-  .btn{background:#0ea5e9;border:none;color:#fff;border-radius:10px;
-       padding:12px 16px;cursor:pointer;font-weight:600}
-  .btn:hover{background:#0284c7}
+  /* --- GLOBAL LAYOUT MODERN --- */
 
-  #overlay{
-    display:none;position:fixed;inset:0;background:rgba(255,255,255,.75);
-    backdrop-filter:blur(2px);z-index:9999;align-items:center;
-    justify-content:center;flex-direction:column;gap:12px;
-  }
+    body {
+        margin: 0;
+        background: #f7f9fc;
+        color: #0f172a;
+        font: 16px/1.6 "Inter", sans-serif;
+    }
+    
+    main {
+        max-width: 720px;
+        margin: 32px auto;
+        padding: 0 20px;
+    }
+    
+    .card {
+        background: #ffffff;
+        border: 1px solid #e2e8f0;
+        border-radius: 14px;
+        padding: 24px;
+        margin-bottom: 28px;
+        box-shadow: 0 3px 12px rgba(0,0,0,0.04);
+    }
+    
+    .form-row {
+        margin-bottom: 18px;
+    }
+    
+    label {
+        font-weight: 600;
+        display: block;
+        margin-bottom: 6px;
+    }
+    
+    input, select, textarea {
+        width: 100%;
+        padding: 12px 14px;
+        border: 1px solid #cbd5e1;
+        border-radius: 10px;
+        background: #fff;
+        font-size: 15px;
+    }
+    
+    input:focus, select:focus, textarea:focus {
+        outline: none;
+        border-color: #0ea5e9;
+        box-shadow: 0 0 0 3px rgba(14,165,233,0.2);
+    }
+    
+    .btn-primary {
+        background: #0ea5e9;
+        border: none;
+        color: #fff;
+        padding: 12px 18px;
+        font-size: 15px;
+        border-radius: 10px;
+        cursor: pointer;
+        font-weight: 600;
+    }
+    
+    .btn-primary:hover {
+        background: #0284c7;
+    }
+    
+    .section-title {
+        font-size: 20px;
+        font-weight: 700;
+        margin-bottom: 16px;
+    }
+    
+    .table-box {
+        margin-top: 24px;
+    }
+    
+    table {
+        width: 100%;
+        border-collapse: collapse;
+        background: #fff;
+        border-radius: 12px;
+        overflow: hidden;
+        box-shadow: 0 2px 6px rgba(0,0,0,0.05);
+    }
+    
+    th {
+        background: #f1f5f9;
+        padding: 10px;
+        text-align: left;
+        font-weight: 600;
+    }
+    
+    td {
+        padding: 10px;
+        border-top: 1px solid #e2e8f0;
+    }
+    
+    .text-muted {
+        color: #94a3b8;
+        text-align: center;
+        padding: 14px 0;
+    }
 
-  .barwrap{width:min(520px,90vw);height:10px;border-radius:999px;background:#e2e8f0;overflow:hidden}
-  .bar{height:100%;width:0%;background:#0ea5e9;transition:width .2s linear}
-
-  table{width:100%;border-collapse:collapse;margin-top:20px;border:1px solid #e2e8f0;
-        border-radius:10px;background:#fff;box-shadow:0 2px 8px rgba(2,8,23,.04)}
-  th,td{padding:8px 10px;border-bottom:1px solid #e2e8f0;text-align:left}
-  th{background:#f8fafc;font-weight:600}
 </style>
 
 </head>
@@ -3728,46 +3803,55 @@ async def nachfass_page(request: Request):
     <div>""" + auth_info + r"""</div>
   </div>
 </header>
-
 <main>
 
-  <section class="card">
-    <label>Batch IDs (1–2 Werte)</label>
-    <textarea id="nf_batch_ids" rows="3" placeholder="B111, B222"></textarea>
-    <small style="color:#64748b">Komma oder Zeilenumbruch. Max. 2 IDs.</small>
+    <section class="card">
+        <div class="section-title">Nachfass – Einstellungen</div>
 
-    <label style="margin-top:12px">Export-Batch-ID</label>
-    <input id="batch_id" placeholder="B999"/>
+        <div class="form-row">
+            <label>Batch ID</label>
+            <textarea id="batch_ids" placeholder="000" rows="2"></textarea>
+        </div>
 
-    <label style="margin-top:12px">Kampagnenname</label>
-    <input id="campaign" placeholder="z. B. Nachfass KW45"/>
+        <div class="form-row">
+            <label>Export-Batch-ID</label>
+            <input id="export_batch" placeholder="001">
+        </div>
 
-    <div style="margin-top:20px;text-align:right">
-      <button class="btn" id="btnExportNf">Abgleich & Download</button>
-    </div>
-  </section>
+        <div class="form-row">
+            <label>Kampagnenname</label>
+            <input id="campaign" placeholder="z. B. Nachfass KW45">
+        </div>
 
-  <section style="margin-top:30px;">
-    <h3>Entfernte Datensätze</h3>
-    <div id="excluded-summary-box"></div>
+        <div style="text-align:right;margin-top:22px;">
+            <button class="btn-primary" id="btnNachfassStart">Abgleich & Download</button>
+        </div>
+    </section>
 
-    <table>
-      <thead>
-        <tr>
-          <th>Kontakt ID</th>
-          <th>Name</th>
-          <th>Organisation ID</th>
-          <th>Organisationsname</th>
-          <th>Grund</th>
-        </tr>
-      </thead>
-      <tbody id="excluded-table-body">
-        <tr><td colspan="5" style="text-align:center;color:#999">Noch keine Daten geladen</td></tr>
-      </tbody>
-    </table>
-  </section>
+    <section class="card">
+        <div class="section-title">Entfernte Datensätze</div>
+        <div id="excluded-summary-box"></div>
+
+        <div class="table-box">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Kontakt ID</th>
+                        <th>Name</th>
+                        <th>Organisation ID</th>
+                        <th>Organisationsname</th>
+                        <th>Grund</th>
+                    </tr>
+                </thead>
+                <tbody id="excluded-table-body">
+                    <tr><td colspan="5" class="text-muted">Noch keine Daten geladen</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </section>
 
 </main>
+
 
 <div id="overlay">
   <div id="overlay-phase" style="font-weight:600"></div>
@@ -3957,28 +4041,107 @@ async def refresh_page(request: Request):
 <title>Refresh – BatchFlow</title>
 
 <style>
-  body{margin:0;background:#f6f8fb;color:#0f172a;font:16px/1.6 Inter,sans-serif}
-  header{background:#fff;border-bottom:1px solid #e2e8f0}
-  .hwrap{max-width:1120px;margin:0 auto;padding:14px 20px;display:flex;
-         align-items:center;justify-content:space-between}
-  main{max-width:1120px;margin:28px auto;padding:0 20px}
-  .card{background:#fff;border:1px solid #e2e8f0;border-radius:14px;padding:20px;
-         box-shadow:0 2px 8px rgba(2,8,23,.04)}
-  label{display:block;font-weight:600;margin:8px 0 6px}
-  select,input{width:100%;padding:10px;border:1px solid #cbd5e1;border-radius:10px}
-  .btn{background:#0ea5e9;border:none;color:#fff;border-radius:10px;
-       padding:12px 16px;cursor:pointer;font-weight:600}
-  .btn:hover{background:#0284c7}
-  #overlay{display:none;position:fixed;inset:0;background:rgba(255,255,255,.75);
-           backdrop-filter:blur(2px);z-index:9999;align-items:center;
-           justify-content:center;flex-direction:column;gap:12px;}
-  .barwrap{width:min(520px,90vw);height:10px;border-radius:999px;
-           background:#e2e8f0;overflow:hidden}
-  .bar{height:100%;width:0%;background:#0ea5e9;transition:width .2s linear}
-  table{width:100%;border-collapse:collapse;margin-top:20px;border:1px solid #e2e8f0;
-        border-radius:10px;background:#fff;box-shadow:0 2px 8px rgba(2,8,23,.04)}
-  th,td{padding:8px 10px;border-bottom:1px solid #e2e8f0;text-align:left}
-  th{background:#f8fafc;font-weight:600}
+ /* --- GLOBAL LAYOUT MODERN --- */
+
+    body {
+        margin: 0;
+        background: #f7f9fc;
+        color: #0f172a;
+        font: 16px/1.6 "Inter", sans-serif;
+    }
+    
+    main {
+        max-width: 720px;
+        margin: 32px auto;
+        padding: 0 20px;
+    }
+    
+    .card {
+        background: #ffffff;
+        border: 1px solid #e2e8f0;
+        border-radius: 14px;
+        padding: 24px;
+        margin-bottom: 28px;
+        box-shadow: 0 3px 12px rgba(0,0,0,0.04);
+    }
+    
+    .form-row {
+        margin-bottom: 18px;
+    }
+    
+    label {
+        font-weight: 600;
+        display: block;
+        margin-bottom: 6px;
+    }
+    
+    input, select, textarea {
+        width: 100%;
+        padding: 12px 14px;
+        border: 1px solid #cbd5e1;
+        border-radius: 10px;
+        background: #fff;
+        font-size: 15px;
+    }
+    
+    input:focus, select:focus, textarea:focus {
+        outline: none;
+        border-color: #0ea5e9;
+        box-shadow: 0 0 0 3px rgba(14,165,233,0.2);
+    }
+    
+    .btn-primary {
+        background: #0ea5e9;
+        border: none;
+        color: #fff;
+        padding: 12px 18px;
+        font-size: 15px;
+        border-radius: 10px;
+        cursor: pointer;
+        font-weight: 600;
+    }
+    
+    .btn-primary:hover {
+        background: #0284c7;
+    }
+    
+    .section-title {
+        font-size: 20px;
+        font-weight: 700;
+        margin-bottom: 16px;
+    }
+    
+    .table-box {
+        margin-top: 24px;
+    }
+    
+    table {
+        width: 100%;
+        border-collapse: collapse;
+        background: #fff;
+        border-radius: 12px;
+        overflow: hidden;
+        box-shadow: 0 2px 6px rgba(0,0,0,0.05);
+    }
+    
+    th {
+        background: #f1f5f9;
+        padding: 10px;
+        text-align: left;
+        font-weight: 600;
+    }
+    
+    td {
+        padding: 10px;
+        border-top: 1px solid #e2e8f0;
+    }
+    
+    .text-muted {
+        color: #94a3b8;
+        text-align: center;
+        padding: 14px 0;
+    }
+
 </style>
 </head>
 <body>
@@ -3990,59 +4153,63 @@ async def refresh_page(request: Request):
     <div>""" + auth_info + r"""</div>
   </div>
 </header>
-
 <main>
 
-  <section class="card">
-  
-    <label>Fachbereich – Kampagne</label>
+    <section class="card">
+        <div class="section-title">Refresh – Kampagnen Einstellungen</div>
 
-    <div id="fb-loading-box" style="display:none; margin-bottom:6px;">
-      <div style="font-size:14px; color:#0a66c2; margin-bottom:4px;">
-        Fachbereiche werden geladen … bitte warten.
-      </div>
-    
-      <div style="width:100%; max-width:400px; height:8px; background:#e2e8f0; border-radius:4px; overflow:hidden;">
-        <div id="fb-loading-bar"
-             style="width:0%; height:8px; background:#0ea5e9; transition:width 0.3s;"></div>
-      </div>
-    </div>
-    
-    <select id="fachbereich">
+        <div class="form-row">
+            <label>Fachbereich – Kampagne</label>
+            <select id="fachbereich">
+                <option value="">Bitte auswählen …</option>
+            </select>
+        </div>
 
-      <option value="">Bitte auswählen …</option>
-    </select>
+        <div class="form-row">
+            <label>Batch ID</label>
+            <input id="batch_id" placeholder="000">
+        </div>
 
-    <label style="margin-top:12px">Batch ID</label>
-    <input id="batch_id" placeholder="RF-2025-01"/>
+        <div class="form-row">
+            <label>Kampagnenname</label>
+            <input id="campaign" placeholder="z. B. Refresh Q1 / IT">
+        </div>
 
-    <label style="margin-top:12px">Kampagnenname</label>
-    <input id="campaign" placeholder="z. B. Refresh Q1 / IT"/>
+        <div class="form-row">
+            <label>Anzahl Kontakte (optional)</label>
+            <input id="take_count" type="number" min="1" step="1" placeholder="leer = alle">
+        </div>
 
-    <label style="margin-top:12px">Anzahl Kontakte (optional)</label>
-    <input id="take_count" type="number" min="1" step="1" placeholder="leer = alle"/>
+        <div style="text-align:right;margin-top:22px;">
+            <button class="btn-primary" id="btnExportRf">Export starten</button>
+        </div>
+    </section>
 
-    <div style="margin-top:20px;text-align:right">
-      <button class="btn" id="btnExportRf">Export starten</button>
-    </div>
-  </section>
+    <section class="card">
+        <div class="section-title">Entfernte Datensätze</div>
+        <div id="excluded-summary-box"></div>
 
-  <section style="margin-top:30px;">
-    <h3>Entfernte Datensätze</h3>
-    <div id="excluded-summary-box"></div>
-
-    <table>
-      <thead><tr>
-        <th>Kontakt ID</th><th>Name</th><th>Organisation ID</th>
-        <th>Organisationsname</th><th>Grund</th>
-      </tr></thead>
-      <tbody id="excluded-table-body">
-        <tr><td colspan="5" style="text-align:center;color:#999">Noch keine Daten geladen</td></tr>
-      </tbody>
-    </table>
-  </section>
+        <div class="table-box">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Kontakt ID</th>
+                        <th>Name</th>
+                        <th>Organisation ID</th>
+                        <th>Organisationsname</th>
+                        <th>Grund</th>
+                    </tr>
+                </thead>
+                <tbody id="excluded-table-body">
+                    <tr><td colspan="5" class="text-muted">Noch keine Daten geladen</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </section>
 
 </main>
+
+
 
 <div id="overlay">
   <div id="overlay-phase" style="font-weight:600"></div>
