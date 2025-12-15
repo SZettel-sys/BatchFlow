@@ -3769,7 +3769,7 @@ async def nachfass_page(request: Request):
 
 <style>
   /* --- GLOBAL LAYOUT MODERN --- */
-
+    
     body {
         margin: 0;
         background: #f6f8fb;
@@ -3789,7 +3789,7 @@ async def nachfass_page(request: Request):
     }
     
     main {
-        max-width: 1200px;
+        max-width: 900px;
         margin: 32px auto;
         padding: 0 20px;
     }
@@ -3798,9 +3798,14 @@ async def nachfass_page(request: Request):
         background: #ffffff;
         border: 1px solid #e2e8f0;
         border-radius: 16px;
-        padding: 26px;
+        padding: 28px 32px;
         box-shadow: 0 2px 8px rgba(15, 23, 42, 0.05);
         margin-bottom: 32px;
+    }
+    
+    .card h2 {
+        margin-top: 0;
+        margin-bottom: 20px;
     }
     
     label {
@@ -3827,20 +3832,27 @@ async def nachfass_page(request: Request):
         cursor: pointer;
         font-weight: 600;
         margin-top: 20px;
+        float: right;
     }
     .btn:hover {
         background: #0284c7;
     }
     
     /* Tabellen */
+    .table-card {
+        max-width: 1100px;
+        margin: 0 auto 40px auto;
+        background: #fff;
+        padding: 20px 24px;
+        border-radius: 16px;
+        border: 1px solid #e2e8f0;
+        box-shadow: 0 2px 8px rgba(15, 23, 42, 0.05);
+    }
+    
     table {
         width: 100%;
         border-collapse: collapse;
-        margin-top: 18px;
-        border: 1px solid #e2e8f0;
-        border-radius: 14px;
-        overflow: hidden;
-        background: #fff;
+        margin-top: 12px;
     }
     
     th, td {
@@ -3857,6 +3869,7 @@ async def nachfass_page(request: Request):
     tr:last-child td {
         border-bottom: none;
     }
+
    
 </style>
 
@@ -3873,7 +3886,7 @@ async def nachfass_page(request: Request):
 <main>
 
     <section class="card">
-        <div class="section-title">Nachfass – Einstellungen</div>
+        <h2>Nachfass – Einstellungen</h2>
 
         <div class="form-row">
             <label>Batch ID</label>
@@ -3891,31 +3904,28 @@ async def nachfass_page(request: Request):
         </div>
 
         <div style="text-align:right;margin-top:22px;">
-            <button class="btn-primary" id="btnNachfassStart">Abgleich & Download</button>
+            <button class="btn" id="btnNachfassStart">Abgleich & Download</button>
         </div>
     </section>
 
-    <section class="card">
-        <div class="section-title">Entfernte Datensätze</div>
-        <div id="excluded-summary-box"></div>
-
-        <div class="table-box">
-            <table>
-                <thead>
-                    <tr>
-                        <th>Kontakt ID</th>
-                        <th>Name</th>
-                        <th>Organisation ID</th>
-                        <th>Organisationsname</th>
-                        <th>Grund</th>
-                    </tr>
-                </thead>
-                <tbody id="excluded-table-body">
-                    <tr><td colspan="5" class="text-muted">Noch keine Daten geladen</td></tr>
-                </tbody>
-            </table>
-        </div>
-    </section>
+    <section class="table-card">
+        <h3>Entfernte Datensätze</h3>
+    
+        <table>
+          <thead>
+            <tr>
+              <th>Kontakt ID</th>
+              <th>Name</th>
+              <th>Organisation ID</th>
+              <th>Organisationsname</th>
+              <th>Grund</th>
+            </tr>
+          </thead>
+          <tbody id="excluded-table-body">
+            <tr><td colspan="5" style="text-align:center;color:#999">Noch keine Daten geladen</td></tr>
+          </tbody>
+        </table>
+      </section>
 
 </main>
 
@@ -4109,7 +4119,7 @@ async def refresh_page(request: Request):
 
 <style>
  /* --- GLOBAL LAYOUT MODERN --- */
-
+    
     body {
         margin: 0;
         background: #f6f8fb;
@@ -4129,7 +4139,7 @@ async def refresh_page(request: Request):
     }
     
     main {
-        max-width: 1200px;
+        max-width: 900px;
         margin: 32px auto;
         padding: 0 20px;
     }
@@ -4138,9 +4148,14 @@ async def refresh_page(request: Request):
         background: #ffffff;
         border: 1px solid #e2e8f0;
         border-radius: 16px;
-        padding: 26px;
+        padding: 28px 32px;
         box-shadow: 0 2px 8px rgba(15, 23, 42, 0.05);
         margin-bottom: 32px;
+    }
+    
+    .card h2 {
+        margin-top: 0;
+        margin-bottom: 20px;
     }
     
     label {
@@ -4167,20 +4182,27 @@ async def refresh_page(request: Request):
         cursor: pointer;
         font-weight: 600;
         margin-top: 20px;
+        float: right;
     }
     .btn:hover {
         background: #0284c7;
     }
     
     /* Tabellen */
+    .table-card {
+        max-width: 1100px;
+        margin: 0 auto 40px auto;
+        background: #fff;
+        padding: 20px 24px;
+        border-radius: 16px;
+        border: 1px solid #e2e8f0;
+        box-shadow: 0 2px 8px rgba(15, 23, 42, 0.05);
+    }
+    
     table {
         width: 100%;
         border-collapse: collapse;
-        margin-top: 18px;
-        border: 1px solid #e2e8f0;
-        border-radius: 14px;
-        overflow: hidden;
-        background: #fff;
+        margin-top: 12px;
     }
     
     th, td {
@@ -4212,7 +4234,7 @@ async def refresh_page(request: Request):
 <main>
 
     <section class="card">
-        <div class="section-title">Refresh – Kampagnen Einstellungen</div>
+        <h2>Refresh – Kampagnen Einstellungen</h2>
 
         <div class="form-row">
             <label>Fachbereich – Kampagne</label>
@@ -4237,31 +4259,27 @@ async def refresh_page(request: Request):
         </div>
 
         <div style="text-align:right;margin-top:22px;">
-            <button class="btn-primary" id="btnExportRf">Abgleich & Download</button>
+            <button class="btn" id="btnExportRf">Abgleich & Download</button>
         </div>
     </section>
-
-    <section class="card">
-        <div class="section-title">Entfernte Datensätze</div>
-        <div id="excluded-summary-box"></div>
-
-        <div class="table-box">
-            <table>
-                <thead>
-                    <tr>
-                        <th>Kontakt ID</th>
-                        <th>Name</th>
-                        <th>Organisation ID</th>
-                        <th>Organisationsname</th>
-                        <th>Grund</th>
-                    </tr>
-                </thead>
-                <tbody id="excluded-table-body">
-                    <tr><td colspan="5" class="text-muted">Noch keine Daten geladen</td></tr>
-                </tbody>
-            </table>
-        </div>
-    </section>
+    <section class="table-card">
+        <h3>Entfernte Datensätze</h3>
+    
+        <table>
+          <thead>
+            <tr>
+              <th>Kontakt ID</th>
+              <th>Name</th>
+              <th>Organisation ID</th>
+              <th>Organisationsname</th>
+              <th>Grund</th>
+            </tr>
+          </thead>
+          <tbody id="excluded-table-body">
+            <tr><td colspan="5" style="text-align:center;color:#999">Noch keine Daten geladen</td></tr>
+          </tbody>
+        </table>
+      </section>
 
 </main>
 
