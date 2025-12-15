@@ -3289,9 +3289,7 @@ async def export_start_nk(
     asyncio.create_task(_run())
     return JSONResponse({"job_id": job_id})
 
-# =============================================================================
-# EXPORT-FORTSCHRITT & DOWNLOAD-ENDPUNKTE REFRESH
-# =============================================================================
+
 # =============================================================================
 # EXPORT-FORTSCHRITT & DOWNLOAD-ENDPUNKTE REFRESH (KORRIGIERT)
 # =============================================================================
@@ -3950,70 +3948,91 @@ el("btnExportNf").onclick = startExport;
 # Frontend – Refresh (analog zu Nachfass)
 # =============================================================================
 @app.get("/refresh", response_class=HTMLResponse)
-async def refresh_page():
-    return HTMLResponse("""<!doctype html>
-<html lang="de">
+async def refresh_page(request: Request):
+    authed = True
+    auth_info = "<span class='muted'>angemeldet</span>" if authed else "<a href='/login'>Anmelden</a>"
+
+    return HTMLResponse(
+        r"""<!doctype html><html lang="de">
 <head>
 <meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>Refresh – BatchFlow</title>
 
 <style>
-    body{margin:0;background:#f6f8fb;color:#0f172a;font:16px/1.6 Inter,sans-serif;}
-    header{
-        background:#fff;border-bottom:1px solid #e2e8f0;
-        padding:14px 24px;font-size:20px;font-weight:600;
-        display:flex;justify-content:space-between;align-items:center;
-    }
-    main{max-width:900px;margin:32px auto;padding:0 20px;}
+  body{margin:0;background:#f6f8fb;color:#0f172a;font:16px/1.6 Inter,sans-serif}
+  header{
+    background:#fff;border-bottom:1px solid #e2e8f0;
+    padding:14px 24px;font-size:20px;font-weight:600;
+    display:flex;justify-content:space-between;align-items:center
+  }
+  main{max-width:900px;margin:32px auto;padding:0 20px}
 
-    .card{
-        background:#fff;border:1px solid #e2e8f0;border-radius:16px;
-        padding:28px 32px;box-shadow:0 2px 8px rgba(0,0,0,0.05);margin-bottom:32px;
-    }
-    label{display:block;font-weight:600;margin:14px 0 6px;}
-    input,select{
-        width:100%;padding:12px;border:1px solid #cbd5e1;border-radius:10px;
-        font-size:15px;background:#fff;
-    }
-    .btn{
-        background:#0ea5e9;border:none;color:#fff;border-radius:10px;
-        padding:12px 20px;cursor:pointer;font-weight:600;margin-top:20px;
-        float:right;
-    }
-    .btn:hover{background:#0284c7;}
+  .card{
+    background:#fff;border:1px solid #e2e8f0;border-radius:16px;
+    padding:28px 32px;margin-bottom:32px;
+    box-shadow:0 2px 8px rgba(0,0,0,.05)
+  }
 
-    .table-card{
-        max-width:1100px;margin:0 auto 40px auto;background:#fff;
-        padding:20px 24px;border-radius:16px;border:1px solid #e2e8f0;
-        box-shadow:0 2px 8px rgba(0,0,0,0.05);
-    }
-    table{width:100%;border-collapse:collapse;margin-top:12px;}
-    th,td{padding:10px 14px;border-bottom:1px solid #e2e8f0;text-align:left;}
-    th{background:#f8fafc;font-weight:700;}
-    tr:last-child td{border-bottom:none;}
+  label{display:block;font-weight:600;margin:14px 0 6px}
+  input,select{
+    width:100%;padding:12px;border:1px solid #cbd5e1;border-radius:10px;
+    background:#fff;font-size:15px
+  }
 
-    /* Overlay */
-    #overlay{
-        display:none;position:fixed;inset:0;background:rgba(255,255,255,.75);
-        backdrop-filter:blur(2px);z-index:9999;
-        align-items:center;justify-content:center;flex-direction:column;gap:12px;
-    }
-    .barwrap{
-        width:min(520px,90vw);height:10px;border-radius:999px;
-        background:#e2e8f0;overflow:hidden;
-    }
-    .bar{
-        height:100%;width:0%;background:#0ea5e9;transition:width .2s linear;
-    }
+  /* Ladebox */
+  #fb-loading-box{
+    display:none;margin-bottom:10px;padding:12px 0;
+  }
+  #fb-loading-text{
+    font-size:14px;color:#0a66c2;margin-bottom:6px;
+  }
+  #fb-loading-bar-wrap{
+    width:100%;max-width:400px;height:8px;background:#e2e8f0;
+    border-radius:4px;overflow:hidden
+  }
+  #fb-loading-bar{
+    width:0%;height:8px;background:#0ea5e9;transition:width .25s linear
+  }
+
+  .btn{
+    background:#0ea5e9;border:none;color:#fff;border-radius:10px;
+    padding:12px 20px;cursor:pointer;font-weight:600;margin-top:20px;float:right
+  }
+  .btn:hover{background:#0284c7}
+
+  /* Tabelle */
+  .table-card{
+    background:#fff;border:1px solid #e2e8f0;border-radius:16px;
+    padding:20px 24px;margin-top:20px;
+    box-shadow:0 2px 8px rgba(0,0,0,.05)
+  }
+  table{width:100%;border-collapse:collapse;margin-top:12px}
+  th,td{
+    padding:10px 14px;border-bottom:1px solid #e2e8f0;text-align:left
+  }
+  th{background:#f8fafc;font-weight:700}
+
+  /* Overlay */
+  #overlay{
+    display:none;position:fixed;inset:0;background:rgba(255,255,255,.75);
+    backdrop-filter:blur(2px);z-index:9999;
+    align-items:center;justify-content:center;flex-direction:column;gap:12px
+  }
+  .barwrap{
+    width:min(520px,90vw);height:10px;border-radius:999px;background:#e2e8f0;overflow:hidden
+  }
+  .bar{
+    height:100%;width:0%;background:#0ea5e9;transition:width .2s linear
+  }
 </style>
-
 </head>
+
 <body>
 
 <header>
   <div>Refresh</div>
-  <a href="/campaign" style="color:#0a66c2;text-decoration:none;font-size:15px;">Kampagne wählen</a>
+  <div>""" + auth_info + r"""</div>
 </header>
 
 <main>
@@ -4022,6 +4041,15 @@ async def refresh_page():
   <h2>Refresh – Kampagnen Einstellungen</h2>
 
   <label>Fachbereich – Kampagne</label>
+
+  <!-- 🔥 DEIN ALTER LADEBALKEN – WIEDER DRIN -->
+  <div id="fb-loading-box">
+    <div id="fb-loading-text">Fachbereiche werden geladen … bitte warten.</div>
+    <div id="fb-loading-bar-wrap">
+      <div id="fb-loading-bar"></div>
+    </div>
+  </div>
+
   <select id="fachbereich">
     <option value="">Bitte auswählen …</option>
   </select>
@@ -4055,6 +4083,7 @@ async def refresh_page():
 
 </main>
 
+<!-- Overlay -->
 <div id="overlay">
   <div id="overlay-phase" style="font-weight:600"></div>
   <div class="barwrap"><div class="bar" id="overlay-bar"></div></div>
@@ -4064,106 +4093,132 @@ async def refresh_page():
 const el = id => document.getElementById(id);
 
 function showOverlay(msg){
-    el("overlay-phase").textContent = msg;
-    el("overlay").style.display = "flex";
+  el("overlay-phase").textContent = msg;
+  el("overlay").style.display = "flex";
 }
 function hideOverlay(){ el("overlay").style.display = "none"; }
-function setProgress(p){ el("overlay-bar").style.width = p + "%"; }
+function setProgress(v){ el("overlay-bar").style.width = v + "%"; }
+
+//
+// ⭐ WICHTIG – Alter Ladebalken wieder aktiv!
+//
+async function loadFachbereiche(){
+  const box = el("fb-loading-box");
+  const bar = el("fb-loading-bar");
+
+  box.style.display = "block";
+  bar.style.width = "0%";
+
+  let progress = 0;
+  const interval = setInterval(()=>{
+    progress = Math.min(progress + 4, 90);
+    bar.style.width = progress + "%";
+  }, 200);
+
+  let data = null;
+  try {
+      const resp = await fetch("/refresh/options");
+      data = await resp.json();
+  } catch(e){
+      clearInterval(interval);
+      bar.style.width = "100%";
+      setTimeout(()=> box.style.display="none", 500);
+      alert("Fehler beim Laden der Fachbereiche.");
+      return;
+  }
+
+  clearInterval(interval);
+  bar.style.width = "100%";
+
+  const sel = el("fachbereich");
+  sel.innerHTML = '<option value="">Bitte auswählen …</option>';
+
+  (data.options || []).forEach(o=>{
+    const opt = document.createElement("option");
+    opt.value = o.value;
+    opt.textContent = `${o.label} (${o.count})`;
+    sel.appendChild(opt);
+  });
+
+  setTimeout(()=> box.style.display="none", 500);
+}
 
 async function loadExcluded(){
-    const r = await fetch("/refresh/excluded/json");
-    const data = await r.json();
+  const r = await fetch("/refresh/excluded/json");
+  const data = await r.json();
+  const body = el("excluded-table-body");
+  body.innerHTML = "";
 
-    const body = el("excluded-table-body");
-    body.innerHTML = "";
+  if(!data.rows || !data.rows.length){
+    body.innerHTML='<tr><td colspan="5" style="text-align:center;color:#999">Keine Treffer</td></tr>';
+    return;
+  }
 
-    if(!data.rows || !data.rows.length){
-        body.innerHTML = '<tr><td colspan="5" style="text-align:center;color:#999">Keine Treffer</td></tr>';
-        return;
-    }
-
-    for(const row of data.rows){
-        const tr = document.createElement("tr");
-        tr.innerHTML = `
-          <td>${row["Kontakt ID"]||""}</td>
-          <td>${row["Name"]||""}</td>
-          <td>${row["Organisation ID"]||""}</td>
-          <td>${row["Organisationsname"]||""}</td>
-          <td>${row["Grund"]||""}</td>
-        `;
-        body.appendChild(tr);
-    }
+  data.rows.forEach(rw=>{
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${rw["Kontakt ID"]||""}</td>
+      <td>${rw["Name"]||""}</td>
+      <td>${rw["Organisation ID"]||""}</td>
+      <td>${rw["Organisationsname"]||""}</td>
+      <td>${rw["Grund"]||""}</td>
+    `;
+    body.appendChild(tr);
+  });
 }
 
 async function poll(job_id){
-    while(true){
-        await new Promise(r=>setTimeout(r,500));
-        const res = await fetch("/refresh/export_progress?job_id="+job_id);
-        const s = await res.json();
+  while(true){
+    await new Promise(r=>setTimeout(r,500));
+    const res = await fetch("/refresh/export_progress?job_id="+job_id);
+    const s = await res.json();
 
-        el("overlay-phase").textContent = `${s.phase} (${s.percent}%)`;
-        setProgress(s.percent);
+    el("overlay-phase").textContent = `${s.phase} (${s.percent}%)`;
+    setProgress(s.percent);
 
-        if(s.error){
-            alert(s.error); hideOverlay(); return;
-        }
-        if(s.download_ready){
-            showOverlay("Download startet …");
-            setProgress(100);
+    if(s.error){ alert(s.error); hideOverlay(); return; }
+    if(s.download_ready){
+      showOverlay("Download startet …");
+      setProgress(100);
 
-            window.location.href="/refresh/export_download?job_id="+job_id;
+      window.location.href="/refresh/export_download?job_id="+job_id;
 
-            await loadExcluded();
-            hideOverlay();
-            return;
-        }
+      await loadExcluded();
+      hideOverlay();
+      return;
     }
-}
-
-async function loadFachbereiche(){
-    const res = await fetch("/refresh/options");
-    const data = await res.json();
-
-    const sel = el("fachbereich");
-    sel.innerHTML = '<option value="">Bitte auswählen …</option>';
-
-    (data.options || []).forEach(o=>{
-        const opt=document.createElement("option");
-        opt.value=o.value;
-        opt.textContent=`${o.label} (${o.count})`;
-        sel.appendChild(opt);
-    });
+  }
 }
 
 async function startExport(){
-    const fb = el("fachbereich").value;
-    if(!fb){ alert("Bitte Fachbereich auswählen."); return; }
+  const fb = el("fachbereich").value;
+  if(!fb){ alert("Bitte Fachbereich auswählen."); return; }
 
-    showOverlay("Starte Abgleich …");
-    setProgress(10);
+  showOverlay("Starte Abgleich …");
+  setProgress(10);
 
-    const r = await fetch("/refresh/export_start",{
-        method:"POST",
-        headers:{ "Content-Type":"application/json" },
-        body:JSON.stringify({
-            fachbereich:fb,
-            batch_id:el("batch_id").value,
-            campaign:el("campaign").value,
-            take_count:parseInt(el("take_count").value)||null
-        })
-    });
+  const r = await fetch("/refresh/export_start",{
+      method:"POST",
+      headers:{ "Content-Type":"application/json" },
+      body:JSON.stringify({
+          fachbereich:fb,
+          batch_id:el("batch_id").value,
+          campaign:el("campaign").value,
+          take_count:parseInt(el("take_count").value)||null
+      })
+  });
 
-    const j = await r.json();
-    await poll(j.job_id);
+  const j = await r.json();
+  await poll(j.job_id);
 }
 
 loadFachbereiche();
 el("btnExportRf").onclick = startExport;
 </script>
 
-</body>
-</html>
-""")
+</body></html>
+"""
+    )
 
 # =============================================================================
 # Refresh – Summary-Seite
