@@ -3456,43 +3456,121 @@ async def neukontakte_export_progress(job_id: str = Query(...)):
 
 
 # -------------------------------------------------------------------------
-# Download des erzeugten Nachfass-Exports
+# Startseite Frontend
 # -------------------------------------------------------------------------
 @app.get("/campaign", response_class=HTMLResponse)
 async def campaign_home():
-    return HTMLResponse("""<!doctype html><html lang="de">
-<head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>BatchFlow – Kampagnen</title>
+    return HTMLResponse("""<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>BatchFlow – Kampagne wählen</title>
+
 <style>
-  body{margin:0;background:#f6f8fb;font:16px/1.6 Inter,sans-serif;color:#0f172a}
-  header{background:#fff;border-bottom:1px solid #e2e8f0}
-  .hwrap{max-width:1100px;margin:0 auto;padding:14px 20px;display:flex;
-         justify-content:space-between;align-items:center}
-  main{max-width:1100px;margin:30px auto;padding:0 20px}
-  .grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:20px}
-  .card{background:#fff;border:1px solid #e2e8f0;border-radius:14px;padding:20px;
-        box-shadow:0 2px 8px rgba(2,8,23,.04)}
-  .title{font-weight:700;font-size:18px;margin-bottom:4px}
-  .desc{color:#64748b;min-height:48px}
-  .btn{display:inline-block;background:#0ea5e9;color:#fff;padding:10px 14px;
-       border-radius:10px;text-decoration:none}
-  .btn:hover{background:#0284c7}
-</style></head>
+    body {
+        margin: 0;
+        background: #f6f8fb;
+        color: #0f172a;
+        font: 16px/1.6 "Inter", sans-serif;
+    }
+
+    header {
+        background: #fff;
+        border-bottom: 1px solid #e2e8f0;
+        padding: 14px 24px;
+        font-size: 20px;
+        font-weight: 600;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+    }
+
+    .container {
+        max-width: 1200px;
+        margin: 40px auto;
+        padding: 20px;
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+        gap: 28px;
+    }
+
+    .card {
+        background: #ffffff;
+        border: 1px solid #e3e8f0;
+        border-radius: 16px;
+        padding: 28px;
+        box-shadow: 0 2px 8px rgba(15, 23, 42, 0.06);
+        transition: all 0.2s ease;
+    }
+
+    .card:hover {
+        transform: translateY(-4px);
+        box-shadow: 0 6px 20px rgba(0, 0, 0, 0.08);
+    }
+
+    .card h2 {
+        margin: 0 0 10px;
+        font-size: 20px;
+        font-weight: 700;
+        color: #0f172a;
+    }
+
+    .card p {
+        color: #475569;
+        margin-bottom: 24px;
+        line-height: 1.5;
+    }
+
+    .btn {
+        display: inline-block;
+        background: #0ea5e9;
+        padding: 12px 18px;
+        border-radius: 10px;
+        color: #fff;
+        font-weight: 600;
+        text-decoration: none;
+        transition: background .2s;
+    }
+
+    .btn:hover {
+        background: #0284c7;
+    }
+</style>
+
+</head>
 <body>
-<header><div class="hwrap"><div><b>BatchFlow</b></div><div>Kampagne auswählen</div></div></header>
-<main>
-  <div class="grid">
-    <div class="card"><div class="title">Neukontakte</div>
-      <div class="desc">Neue Leads aus Filter, Abgleich & Export.</div>
-      <a class="btn" href="/neukontakte">Öffnen</a></div>
-    <div class="card"><div class="title">Nachfass</div>
-      <div class="desc">Nachfassen anhand einer oder zwei Batch IDs (Filter 3024).</div>
-      <a class="btn" href="/nachfass">Öffnen</a></div>
-    <div class="card"><div class="title">Refresh</div>
-      <div class="desc">Kontaktdaten aktualisieren / ergänzen.</div>
-      <a class="btn" href="/refresh">Öffnen</a></div>
-  </div>
-</main></body></html>""")
+
+<header>
+    <div>BatchFlow</div>
+    <a href="/campaign" style="font-size:15px;color:#0a66c2;text-decoration:none;">Kampagne auswählen</a>
+</header>
+
+<div class="container">
+
+    <div class="card">
+        <h2>Neukontakte</h2>
+        <p>Noch nicht angeschriebene Kontakte auswählen</p>
+        <a class="btn" href="/neukontakte">Öffnen</a>
+    </div>
+
+    <div class="card">
+        <h2>Nachfass</h2>
+        <p>Nachfassen anhand einer Batch ID (Filter 3024).</p>
+        <a class="btn" href="/nachfass">Öffnen</a>
+    </div>
+
+    <div class="card">
+        <h2>Refresh</h2>
+        <p>Kontakte auswählen anhand eines Fachbereiches (Filter 4444).</p>
+        <a class="btn" href="/refresh">Öffnen</a>
+    </div>
+
+</div>
+
+</body>
+</html>
+""")
 
 # =============================================================================
 # Frontend – Neukontakte
@@ -3694,13 +3772,24 @@ async def nachfass_page(request: Request):
 
     body {
         margin: 0;
-        background: #f7f9fc;
+        background: #f6f8fb;
         color: #0f172a;
         font: 16px/1.6 "Inter", sans-serif;
     }
     
+    header {
+        background: #fff;
+        border-bottom: 1px solid #e2e8f0;
+        padding: 14px 24px;
+        font-size: 20px;
+        font-weight: 600;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+    }
+    
     main {
-        max-width: 720px;
+        max-width: 1200px;
         margin: 32px auto;
         padding: 0 20px;
     }
@@ -3708,89 +3797,67 @@ async def nachfass_page(request: Request):
     .card {
         background: #ffffff;
         border: 1px solid #e2e8f0;
-        border-radius: 14px;
-        padding: 24px;
-        margin-bottom: 28px;
-        box-shadow: 0 3px 12px rgba(0,0,0,0.04);
-    }
-    
-    .form-row {
-        margin-bottom: 18px;
+        border-radius: 16px;
+        padding: 26px;
+        box-shadow: 0 2px 8px rgba(15, 23, 42, 0.05);
+        margin-bottom: 32px;
     }
     
     label {
-        font-weight: 600;
         display: block;
-        margin-bottom: 6px;
+        font-weight: 600;
+        margin: 14px 0 6px;
     }
     
-    input, select, textarea {
+    input, textarea, select {
         width: 100%;
-        padding: 12px 14px;
+        padding: 12px;
         border: 1px solid #cbd5e1;
         border-radius: 10px;
-        background: #fff;
         font-size: 15px;
+        background: #fff;
     }
     
-    input:focus, select:focus, textarea:focus {
-        outline: none;
-        border-color: #0ea5e9;
-        box-shadow: 0 0 0 3px rgba(14,165,233,0.2);
-    }
-    
-    .btn-primary {
+    .btn {
         background: #0ea5e9;
         border: none;
         color: #fff;
-        padding: 12px 18px;
-        font-size: 15px;
         border-radius: 10px;
+        padding: 12px 20px;
         cursor: pointer;
         font-weight: 600;
+        margin-top: 20px;
     }
-    
-    .btn-primary:hover {
+    .btn:hover {
         background: #0284c7;
     }
     
-    .section-title {
-        font-size: 20px;
-        font-weight: 700;
-        margin-bottom: 16px;
-    }
-    
-    .table-box {
-        margin-top: 24px;
-    }
-    
+    /* Tabellen */
     table {
         width: 100%;
         border-collapse: collapse;
-        background: #fff;
-        border-radius: 12px;
+        margin-top: 18px;
+        border: 1px solid #e2e8f0;
+        border-radius: 14px;
         overflow: hidden;
-        box-shadow: 0 2px 6px rgba(0,0,0,0.05);
+        background: #fff;
+    }
+    
+    th, td {
+        padding: 10px 14px;
+        border-bottom: 1px solid #e2e8f0;
+        text-align: left;
     }
     
     th {
-        background: #f1f5f9;
-        padding: 10px;
-        text-align: left;
-        font-weight: 600;
+        background: #f8fafc;
+        font-weight: 700;
     }
     
-    td {
-        padding: 10px;
-        border-top: 1px solid #e2e8f0;
+    tr:last-child td {
+        border-bottom: none;
     }
-    
-    .text-muted {
-        color: #94a3b8;
-        text-align: center;
-        padding: 14px 0;
-    }
-
+   
 </style>
 
 </head>
@@ -4045,13 +4112,24 @@ async def refresh_page(request: Request):
 
     body {
         margin: 0;
-        background: #f7f9fc;
+        background: #f6f8fb;
         color: #0f172a;
         font: 16px/1.6 "Inter", sans-serif;
     }
     
+    header {
+        background: #fff;
+        border-bottom: 1px solid #e2e8f0;
+        padding: 14px 24px;
+        font-size: 20px;
+        font-weight: 600;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+    }
+    
     main {
-        max-width: 720px;
+        max-width: 1200px;
         margin: 32px auto;
         padding: 0 20px;
     }
@@ -4059,87 +4137,65 @@ async def refresh_page(request: Request):
     .card {
         background: #ffffff;
         border: 1px solid #e2e8f0;
-        border-radius: 14px;
-        padding: 24px;
-        margin-bottom: 28px;
-        box-shadow: 0 3px 12px rgba(0,0,0,0.04);
-    }
-    
-    .form-row {
-        margin-bottom: 18px;
+        border-radius: 16px;
+        padding: 26px;
+        box-shadow: 0 2px 8px rgba(15, 23, 42, 0.05);
+        margin-bottom: 32px;
     }
     
     label {
-        font-weight: 600;
         display: block;
-        margin-bottom: 6px;
+        font-weight: 600;
+        margin: 14px 0 6px;
     }
     
-    input, select, textarea {
+    input, textarea, select {
         width: 100%;
-        padding: 12px 14px;
+        padding: 12px;
         border: 1px solid #cbd5e1;
         border-radius: 10px;
-        background: #fff;
         font-size: 15px;
+        background: #fff;
     }
     
-    input:focus, select:focus, textarea:focus {
-        outline: none;
-        border-color: #0ea5e9;
-        box-shadow: 0 0 0 3px rgba(14,165,233,0.2);
-    }
-    
-    .btn-primary {
+    .btn {
         background: #0ea5e9;
         border: none;
         color: #fff;
-        padding: 12px 18px;
-        font-size: 15px;
         border-radius: 10px;
+        padding: 12px 20px;
         cursor: pointer;
         font-weight: 600;
+        margin-top: 20px;
     }
-    
-    .btn-primary:hover {
+    .btn:hover {
         background: #0284c7;
     }
     
-    .section-title {
-        font-size: 20px;
-        font-weight: 700;
-        margin-bottom: 16px;
-    }
-    
-    .table-box {
-        margin-top: 24px;
-    }
-    
+    /* Tabellen */
     table {
         width: 100%;
         border-collapse: collapse;
-        background: #fff;
-        border-radius: 12px;
+        margin-top: 18px;
+        border: 1px solid #e2e8f0;
+        border-radius: 14px;
         overflow: hidden;
-        box-shadow: 0 2px 6px rgba(0,0,0,0.05);
+        background: #fff;
+    }
+    
+    th, td {
+        padding: 10px 14px;
+        border-bottom: 1px solid #e2e8f0;
+        text-align: left;
     }
     
     th {
-        background: #f1f5f9;
-        padding: 10px;
-        text-align: left;
-        font-weight: 600;
+        background: #f8fafc;
+        font-weight: 700;
     }
     
-    td {
-        padding: 10px;
-        border-top: 1px solid #e2e8f0;
-    }
-    
-    .text-muted {
-        color: #94a3b8;
-        text-align: center;
-        padding: 14px 0;
+    tr:last-child td {
+        border-bottom: none;
     }
 
 </style>
@@ -4181,7 +4237,7 @@ async def refresh_page(request: Request):
         </div>
 
         <div style="text-align:right;margin-top:22px;">
-            <button class="btn-primary" id="btnExportRf">Export starten</button>
+            <button class="btn-primary" id="btnExportRf">Abgleich & Download</button>
         </div>
     </section>
 
