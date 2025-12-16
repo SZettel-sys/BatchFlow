@@ -3448,9 +3448,9 @@ async def neukontakte_export_progress(job_id: str = Query(...)):
 
 
 
-# -------------------------------------------------------------------------
-# Startseite Frontend
-# -------------------------------------------------------------------------
+# =============================================================================
+# Frontend - Startseite
+# =============================================================================
 @app.get("/campaign", response_class=HTMLResponse)
 async def campaign_home():
     return HTMLResponse("""<!doctype html>
@@ -3462,13 +3462,13 @@ async def campaign_home():
 
 <style>
 /* =========================
-   GLOBAL DESIGN (SAFE)
+   DESIGN ONLY – SAFE
    ========================= */
 body{
   margin:0;
   background:#f7f9fc;
   color:#0f172a;
-  font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+  font-family:Inter,system-ui,-apple-system,BlinkMacSystemFont,sans-serif;
 }
 
 /* Header */
@@ -3476,36 +3476,31 @@ header{
   background:#ffffff;
   border-bottom:1px solid #e5e9f0;
 }
-.header-inner{
+.hwrap{
   max-width:1200px;
   margin:0 auto;
-  padding:16px 24px;
+  padding:18px 24px;
   display:flex;
   align-items:center;
   justify-content:space-between;
 }
-.header-left{
+.hleft{
   display:flex;
   align-items:center;
-  gap:12px;
+  gap:16px;
 }
-.header-left img{
-  height:32px;
+.hleft img{
+  height:42px; /* bewusst größer */
 }
-.header-title{
+.hleft span{
   font-size:18px;
   font-weight:600;
 }
-.header-link{
-  font-size:14px;
-  color:#0a66c2;
-  text-decoration:none;
-}
 
-/* Layout */
+/* Content */
 .container{
-  max-width:1200px;
-  margin:56px auto;
+  max-width:1100px;
+  margin:72px auto;
   padding:0 24px;
   display:grid;
   grid-template-columns:repeat(auto-fit,minmax(280px,1fr));
@@ -3517,22 +3512,29 @@ header{
   background:#ffffff;
   border:1px solid #e5e9f0;
   border-radius:20px;
-  padding:28px;
+  padding:32px;
   box-shadow:
-    0 12px 30px rgba(15,23,42,.06),
-    0 4px 8px rgba(15,23,42,.04);
+    0 14px 32px rgba(15,23,42,.06),
+    0 6px 12px rgba(15,23,42,.04);
   display:flex;
   flex-direction:column;
   justify-content:space-between;
+  transition:transform .15s ease, box-shadow .15s ease;
+}
+.card:hover{
+  transform:translateY(-2px);
+  box-shadow:
+    0 20px 40px rgba(15,23,42,.08),
+    0 10px 18px rgba(15,23,42,.05);
 }
 .card h2{
-  margin:0 0 8px;
-  font-size:20px;
+  margin:0 0 10px;
+  font-size:22px;
 }
 .card p{
-  margin:0 0 20px;
+  margin:0 0 26px;
   color:#475569;
-  font-size:14px;
+  font-size:15px;
 }
 
 /* Button */
@@ -3540,9 +3542,9 @@ header{
   align-self:flex-start;
   background:#0ea5e9;
   color:#ffffff;
-  text-decoration:none;
-  padding:10px 18px;
+  padding:11px 20px;
   border-radius:999px;
+  text-decoration:none;
   font-size:14px;
   font-weight:600;
   transition:background .15s ease, transform .15s ease;
@@ -3557,12 +3559,11 @@ header{
 <body>
 
 <header>
-  <div class="header-inner">
-    <div class="header-left">
+  <div class="hwrap">
+    <div class="hleft">
       <img src="/static/bizforward-Logo-Clean-2024.svg" alt="bizforward">
-      <div class="header-title">BatchFlow</div>
+      <span>BatchFlow</span>
     </div>
-    <a class="header-link" href="/campaign">Kampagne auswählen</a>
   </div>
 </header>
 
@@ -3579,7 +3580,7 @@ header{
   <div class="card">
     <div>
       <h2>Nachfass</h2>
-      <p>Nachfassen anhand einer Batch ID (Filter 3024).</p>
+      <p>Nachfassen anhand einer Batch ID (Filter 3024)</p>
     </div>
     <a class="btn" href="/nachfass">Öffnen</a>
   </div>
@@ -3587,7 +3588,7 @@ header{
   <div class="card">
     <div>
       <h2>Refresh</h2>
-      <p>Kontakte auswählen anhand eines Fachbereiches (Filter 4444).</p>
+      <p>Kontakte anhand eines Fachbereiches auswählen (Filter 4444)</p>
     </div>
     <a class="btn" href="/refresh">Öffnen</a>
   </div>
@@ -3598,6 +3599,360 @@ header{
 </html>
 """)
 
+# =============================================================================
+# Frontend - Neukontakte
+# =============================================================================
+@app.get("/neukontakte", response_class=HTMLResponse)
+async def neukontakte_page(request: Request, mode: str = Query("new")):
+    authed = bool(user_tokens.get("default") or PD_API_TOKEN)
+    authed_html = "<span class='muted'>angemeldet</span>" if authed else "<a href='/login'>Anmelden</a>"
+
+    return HTMLResponse(
+        r"""<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Neukontakte – BatchFlow</title>
+
+<style>
+/* =========================
+   DESIGN ONLY – SAFE
+   ========================= */
+body{
+  margin:0;
+  background:#f7f9fc;
+  color:#0f172a;
+  font:16px/1.6 Inter,system-ui,-apple-system,BlinkMacSystemFont,sans-serif;
+}
+
+/* Header */
+header{
+  background:#ffffff;
+  border-bottom:1px solid #e5e9f0;
+}
+.hwrap{
+  max-width:1200px;
+  margin:0 auto;
+  padding:18px 24px;
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+}
+.hleft{
+  display:flex;
+  align-items:center;
+  gap:14px;
+}
+.hleft img{
+  height:42px;
+}
+.hcenter{
+  font-size:18px;
+  font-weight:600;
+}
+.hright{
+  font-size:14px;
+}
+
+/* Layout */
+main{
+  max-width:760px;
+  margin:48px auto;
+  padding:0 24px;
+}
+
+/* Card */
+.card{
+  background:#ffffff;
+  border:1px solid #e5e9f0;
+  border-radius:20px;
+  padding:32px;
+  box-shadow:
+    0 14px 32px rgba(15,23,42,.06),
+    0 6px 12px rgba(15,23,42,.04);
+}
+
+/* Grid */
+.grid{
+  display:grid;
+  grid-template-columns:repeat(12,1fr);
+  gap:20px;
+}
+
+/* Form */
+label{
+  display:block;
+  font-weight:600;
+  margin:14px 0 6px;
+  font-size:14px;
+}
+select,input{
+  width:100%;
+  padding:10px 12px;
+  border:1px solid #cbd5e1;
+  border-radius:12px;
+  background:#ffffff;
+  font-size:14px;
+}
+
+/* Button */
+.btn{
+  margin-top:28px;
+  background:#0ea5e9;
+  border:none;
+  color:#ffffff;
+  border-radius:12px;
+  padding:11px 20px;
+  font-weight:600;
+  cursor:pointer;
+}
+.btn:hover{background:#0284c7}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+
+/* Ladehinweis Fachbereiche */
+#fb-loading-box{
+  margin-bottom:12px;
+}
+#fb-loading-text{
+  font-size:13px;
+  color:#0a66c2;
+  margin-bottom:6px;
+}
+#fb-loading-bar-wrap{
+  width:100%;
+  height:8px;
+  background:#e5e9f0;
+  border-radius:999px;
+  overflow:hidden;
+}
+#fb-loading-bar{
+  height:8px;
+  width:0%;
+  background:linear-gradient(90deg,#0ea5e9,#38bdf8);
+}
+
+/* Overlay Export */
+#overlay{
+  display:none;
+  position:fixed;
+  inset:0;
+  background:rgba(247,249,252,.8);
+  backdrop-filter:blur(3px);
+  z-index:9999;
+  align-items:center;
+  justify-content:center;
+  flex-direction:column;
+  gap:12px;
+}
+.barwrap{
+  width:min(520px,90vw);
+  height:10px;
+  border-radius:999px;
+  background:#e5e9f0;
+  overflow:hidden;
+}
+.bar{
+  height:100%;
+  width:0%;
+  background:linear-gradient(90deg,#0ea5e9,#38bdf8);
+  transition:width .2s linear;
+}
+</style>
+</head>
+
+<body>
+
+<header>
+  <div class="hwrap">
+    <div class="hleft">
+      <img src="/static/bizforward-Logo-Clean-2024.svg" alt="bizforward">
+      <a href="/campaign" style="color:#0a66c2;text-decoration:none;font-size:14px">
+        Kampagne wählen
+      </a>
+    </div>
+    <div class="hcenter">Neukontakte</div>
+    <div class="hright">""" + authed_html + r"""</div>
+  </div>
+</header>
+
+<main>
+
+<section class="card">
+  <div class="grid">
+
+    <!-- Fachbereich -->
+    <div class="col-6">
+      <label>Fachbereich</label>
+
+      <div id="fb-loading-box">
+        <div id="fb-loading-text">Fachbereiche werden geladen … bitte warten.</div>
+        <div id="fb-loading-bar-wrap">
+          <div id="fb-loading-bar"></div>
+        </div>
+      </div>
+
+      <select id="fachbereich">
+        <option value="">– bitte auswählen –</option>
+      </select>
+    </div>
+
+    <!-- Anzahl Kontakte -->
+    <div class="col-6">
+      <label>Anzahl Kontakte (optional)</label>
+      <input
+        id="take_count"
+        type="number"
+        min="1"
+        placeholder="leer = alle verfügbaren"
+      />
+    </div>
+
+    <!-- Batch ID -->
+    <div class="col-6">
+      <label>Batch ID</label>
+      <input id="batch_id" placeholder="xxx"/>
+    </div>
+
+    <!-- Kampagne -->
+    <div class="col-6">
+      <label>Kampagne</label>
+      <input id="campaign" placeholder="z. B. Frühling 2025"/>
+    </div>
+
+    <!-- Button -->
+    <div class="col-12" style="display:flex;justify-content:flex-end">
+      <button class="btn" id="btnExport" disabled>
+        Abgleich & Download
+      </button>
+    </div>
+
+  </div>
+</section>
+
+</main>
+
+<!-- Overlay Export -->
+<div id="overlay">
+  <div id="phase"></div>
+  <div class="barwrap">
+    <div class="bar" id="bar"></div>
+  </div>
+</div>
+
+<script>
+// ---------------------------------------------------------------------
+// Sicherer Element-Getter
+// ---------------------------------------------------------------------
+const el = id => {
+    const n = document.getElementById(id);
+    if (!n) {
+        console.error("Element with ID", id, "not found");
+        return { textContent: "" };
+    }
+    return n;
+};
+
+// ---------------------------------------------------------------------
+// Overlay-Control
+// ---------------------------------------------------------------------
+function showOverlay(msg){
+    el('phase').textContent = msg;
+    el('overlay').style.display = 'flex';
+}
+function setProgress(p){
+    el('bar').style.width = Math.min(100, Math.max(0, p)) + '%';
+}
+
+// ---------------------------------------------------------------------
+// Optionen laden
+// ---------------------------------------------------------------------
+async function loadOptions(){
+    const box = el("fb-loading-box");
+    const bar = el("fb-loading-bar");
+
+    box.style.display = "block";
+    bar.style.width = "0%";
+
+    let progress = 0;
+    const interval = setInterval(()=>{
+        progress = Math.min(progress + 6, 90);
+        bar.style.width = progress + "%";
+    }, 180);
+
+    const r = await fetch('/neukontakte/options');
+    const data = await r.json();
+
+    clearInterval(interval);
+    bar.style.width = "100%";
+
+    const sel = el('fachbereich');
+    sel.innerHTML = '<option value="">– bitte auswählen –</option>';
+
+    data.options.forEach(o => {
+        const opt = document.createElement('option');
+        opt.value = o.value;
+        opt.textContent = o.label + ' (' + o.count + ')';
+        sel.appendChild(opt);
+    });
+
+    setTimeout(()=> box.style.display="none", 400);
+    sel.onchange = () => el('btnExport').disabled = !sel.value;
+}
+
+// ---------------------------------------------------------------------
+// Export starten (take_count ergänzt)
+// ---------------------------------------------------------------------
+async function startExport(){
+    const fb = el('fachbereich').value;
+    if (!fb) return alert('Bitte Fachbereich wählen');
+
+    showOverlay('Starte Export …');
+    setProgress(10);
+
+    const r = await fetch('/neukontakte/export_start', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({
+            fachbereich: fb,
+            batch_id: el('batch_id').value,
+            campaign: el('campaign').value,
+            take_count: parseInt(el('take_count').value) || null
+        })
+    });
+
+    if (!r.ok) return alert("Fehler beim Start");
+
+    const res = await r.json();
+    const job_id = res.job_id;
+
+    let done = false;
+    while (!done){
+        await new Promise(r => setTimeout(r, 500));
+        const pr = await fetch('/neukontakte/export_progress?job_id=' + job_id);
+        const s  = await pr.json();
+
+        el('phase').textContent = s.phase + ' (' + s.percent + '%)';
+        setProgress(s.percent);
+
+        done = s.done;
+    }
+
+    window.location.href =
+      '/neukontakte/export_download?job_id=' + job_id;
+}
+
+// ---------------------------------------------------------------------
+// Init
+// ---------------------------------------------------------------------
+el('btnExport').onclick = startExport;
+loadOptions();
+</script>
+
+</body>
+</html>
+"""
+    )
 
 # =============================================================================
 # Frontend – Nachfass
@@ -3608,7 +3963,7 @@ async def nachfass_page():
 <html lang="de">
 <head>
 <meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>Nachfass – BatchFlow</title>
 
 <style>
@@ -3630,15 +3985,20 @@ header{
 .hwrap{
   max-width:1200px;
   margin:0 auto;
-  padding:16px 24px;
+  padding:18px 24px;
   display:flex;
-  justify-content:space-between;
   align-items:center;
+  justify-content:space-between;
 }
 .hleft{
   display:flex;
   align-items:center;
-  gap:12px;
+  gap:14px;
+}
+.hleft img{
+  height:42px;
+}
+.hcenter{
   font-size:18px;
   font-weight:600;
 }
@@ -3650,8 +4010,8 @@ header{
 
 /* Layout */
 main{
-  max-width:900px;
-  margin:40px auto;
+  max-width:760px;
+  margin:48px auto;
   padding:0 24px;
 }
 
@@ -3662,8 +4022,8 @@ main{
   border-radius:20px;
   padding:32px;
   box-shadow:
-    0 12px 30px rgba(15,23,42,.06),
-    0 4px 8px rgba(15,23,42,.04);
+    0 14px 32px rgba(15,23,42,.06),
+    0 6px 12px rgba(15,23,42,.04);
   margin-bottom:32px;
 }
 
@@ -3672,43 +4032,39 @@ label{
   display:block;
   font-weight:600;
   margin:14px 0 6px;
+  font-size:14px;
 }
 input,textarea{
   width:100%;
-  padding:12px 14px;
+  padding:10px 12px;
   border:1px solid #cbd5e1;
   border-radius:12px;
-  font-size:15px;
   background:#ffffff;
+  font-size:14px;
 }
 
 /* Button */
 .btn{
+  margin-top:28px;
   background:#0ea5e9;
   border:none;
   color:#ffffff;
   border-radius:12px;
-  padding:12px 22px;
-  cursor:pointer;
+  padding:11px 20px;
   font-weight:600;
-  margin-top:24px;
-  float:right;
+  cursor:pointer;
 }
-.btn:hover{
-  background:#0284c7;
-}
+.btn:hover{background:#0284c7}
 
 /* Tabelle */
 .table-card{
-  max-width:1100px;
-  margin:0 auto 40px auto;
   background:#ffffff;
-  padding:24px 28px;
-  border-radius:20px;
   border:1px solid #e5e9f0;
+  border-radius:20px;
+  padding:28px;
   box-shadow:
-    0 12px 30px rgba(15,23,42,.06),
-    0 4px 8px rgba(15,23,42,.04);
+    0 14px 32px rgba(15,23,42,.06),
+    0 6px 12px rgba(15,23,42,.04);
 }
 table{
   width:100%;
@@ -3763,12 +4119,13 @@ tr:last-child td{
 <header>
   <div class="hwrap">
     <div class="hleft">
-      <img src="/static/bizforward-Logo-Clean-2024.svg" alt="bizforward" style="height:32px">
-      <span>Nachfass</span>
+      <img src="/static/bizforward-Logo-Clean-2024.svg" alt="bizforward">
+      <a href="/campaign" style="color:#0a66c2;text-decoration:none;font-size:14px">
+        Kampagne wählen
+      </a>
     </div>
-    <div class="hright">
-      <a href="/campaign">Kampagne wählen</a>
-    </div>
+    <div class="hcenter">Nachfass</div>
+    <div class="hright"></div>
   </div>
 </header>
 
@@ -3777,11 +4134,11 @@ tr:last-child td{
 <section class="card">
   <h2>Nachfass – Einstellungen</h2>
 
-  <label>Batch IDs (1–2 Werte)</label>
-  <textarea id="nf_batch_ids" rows="2" placeholder="B111, B222"></textarea>
+  <label>Batch ID</label>
+  <textarea id="nf_batch_ids" rows="2" placeholder="xxx"></textarea>
 
   <label>Export-Batch-ID</label>
-  <input id="batch_id" placeholder="B999"/>
+  <input id="batch_id" placeholder="999"/>
 
   <label>Kampagnenname</label>
   <input id="campaign" placeholder="z. B. Nachfass KW45"/>
@@ -3827,8 +4184,12 @@ function showOverlay(msg){
     el("overlay-phase").textContent = msg;
     el("overlay").style.display = "flex";
 }
-function hideOverlay(){ el("overlay").style.display = "none"; }
-function setProgress(p){ el("overlay-bar").style.width = p + "%"; }
+function hideOverlay(){
+    el("overlay").style.display = "none";
+}
+function setProgress(p){
+    el("overlay-bar").style.width = p + "%";
+}
 
 async function loadExcluded(){
     const r = await fetch("/nachfass/excluded/json");
@@ -3866,7 +4227,9 @@ async function poll(job_id){
         setProgress(s.percent);
 
         if(s.error){
-            alert(s.error); hideOverlay(); return;
+            alert(s.error);
+            hideOverlay();
+            return;
         }
         if(s.download_ready){
             showOverlay("Download startet …");
@@ -3884,7 +4247,10 @@ async function poll(job_id){
 
 async function startExport(){
     const ids = el("nf_batch_ids").value.trim();
-    if(!ids){ alert("Bitte Batch IDs eingeben."); return; }
+    if(!ids){
+        alert("Bitte Batch IDs eingeben.");
+        return;
+    }
 
     showOverlay("Starte Abgleich …");
     setProgress(10);
@@ -3909,308 +4275,6 @@ el("btnExportNf").onclick = startExport;
 </body>
 </html>
 """)
-
-# =============================================================================
-# Frontend – Neukontakte
-# =============================================================================
-@app.get("/neukontakte", response_class=HTMLResponse)
-async def neukontakte_page(request: Request, mode: str = Query("new")):
-    authed = bool(user_tokens.get("default") or PD_API_TOKEN)
-    authed_html = "<span class='muted'>angemeldet</span>" if authed else "<a href='/login'>Anmelden</a>"
-
-    return HTMLResponse(
-        r"""<!doctype html>
-<html lang="de">
-<head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>Neukontakte – BatchFlow</title>
-
-<style>
-/* =========================
-   DESIGN ONLY – SAFE
-   ========================= */
-body{
-  margin:0;
-  background:#f7f9fc;
-  color:#0f172a;
-  font:16px/1.6 Inter,system-ui,-apple-system,BlinkMacSystemFont,sans-serif;
-}
-
-/* Header */
-header{
-  background:#ffffff;
-  border-bottom:1px solid #e5e9f0;
-}
-.hwrap{
-  max-width:1200px;
-  margin:0 auto;
-  padding:14px 24px;
-  display:flex;
-  align-items:center;
-  justify-content:space-between;
-  gap:12px;
-}
-.hleft{
-  display:flex;
-  align-items:center;
-  gap:12px;
-}
-.hleft img{
-  height:32px;
-}
-.hcenter{
-  font-weight:600;
-}
-.hright{
-  font-size:14px;
-}
-
-/* Layout */
-main{
-  max-width:1200px;
-  margin:36px auto;
-  padding:0 24px;
-}
-
-/* Card */
-.card{
-  background:#ffffff;
-  border:1px solid #e5e9f0;
-  border-radius:20px;
-  padding:28px;
-  box-shadow:
-    0 12px 30px rgba(15,23,42,.06),
-    0 4px 8px rgba(15,23,42,.04);
-}
-
-/* Grid – vorhandene Struktur bleibt */
-.grid{
-  display:grid;
-  grid-template-columns:repeat(12,1fr);
-  gap:20px;
-}
-
-/* Labels & Inputs – IDs bleiben */
-label{
-  display:block;
-  font-weight:600;
-  margin:8px 0 6px;
-  font-size:14px;
-}
-select,input{
-  width:100%;
-  padding:12px 14px;
-  border:1px solid #cbd5e1;
-  border-radius:12px;
-  background:#ffffff;
-  font-size:14px;
-}
-
-/* Button */
-.btn{
-  background:#0ea5e9;
-  border:none;
-  color:#ffffff;
-  border-radius:12px;
-  padding:12px 18px;
-  font-weight:600;
-  cursor:pointer;
-}
-.btn:hover{
-  background:#0284c7;
-}
-.btn:disabled{
-  opacity:.5;
-  cursor:not-allowed;
-}
-
-/* Overlay */
-#overlay{
-  display:none;
-  position:fixed;
-  inset:0;
-  background:rgba(247,249,252,.8);
-  backdrop-filter:blur(3px);
-  z-index:9999;
-  align-items:center;
-  justify-content:center;
-  flex-direction:column;
-  gap:12px;
-}
-.barwrap{
-  width:min(520px,90vw);
-  height:10px;
-  border-radius:999px;
-  background:#e5e9f0;
-  overflow:hidden;
-}
-.bar{
-  height:100%;
-  width:0%;
-  background:linear-gradient(90deg,#0ea5e9,#38bdf8);
-  transition:width .2s linear;
-}
-</style>
-</head>
-
-<body>
-
-<header>
-  <div class="hwrap">
-    <div class="hleft">
-      <img src="/static/bizforward-Logo-Clean-2024.svg" alt="bizforward">
-      <a href="/campaign" style="color:#0a66c2;text-decoration:none;font-size:14px">
-        ← Kampagne wählen
-      </a>
-    </div>
-
-    <div class="hcenter">Neukontakte</div>
-
-    <div class="hright">""" + authed_html + r"""</div>
-  </div>
-</header>
-
-<main>
-<section class="card">
-  <div class="grid">
-    <div class="col-4">
-      <label>Fachbereich</label>
-      <select id="fachbereich">
-        <option value="">– bitte auswählen –</option>
-      </select>
-    </div>
-
-    <div class="col-3">
-      <label>Batch ID</label>
-      <input id="batch_id" placeholder="Bxxx"/>
-    </div>
-
-    <div class="col-3">
-      <label>Kampagne</label>
-      <input id="campaign" placeholder="z. B. Frühling 2025"/>
-    </div>
-
-    <div class="col-2" style="display:flex;align-items:flex-end;justify-content:flex-end">
-      <button class="btn" id="btnExport" disabled>
-        Abgleich & Download
-      </button>
-    </div>
-  </div>
-</section>
-</main>
-
-<div id="overlay">
-  <div id="phase"></div>
-  <div class="barwrap">
-    <div class="bar" id="bar"></div>
-  </div>
-</div>
-
-<script>
-// ---------------------------------------------------------------------
-// Sicherer Element-Getter
-// ---------------------------------------------------------------------
-const el = id => {
-    const n = document.getElementById(id);
-    if (!n) {
-        console.error("Element with ID", id, "not found");
-        return { textContent: "" };
-    }
-    return n;
-};
-
-// ---------------------------------------------------------------------
-// Overlay-Control
-// ---------------------------------------------------------------------
-function showOverlay(msg){
-    el('phase').textContent = msg;
-    el('overlay').style.display = 'flex';
-}
-
-function setProgress(p){
-    el('bar').style.width = Math.min(100, Math.max(0, p)) + '%';
-}
-
-// ---------------------------------------------------------------------
-// Optionen laden
-// ---------------------------------------------------------------------
-async function loadOptions(){
-    showOverlay('Lade Fachbereiche …');
-    setProgress(15);
-
-    const r = await fetch('/neukontakte/options');
-    const data = await r.json();
-
-    const sel = el('fachbereich');
-    sel.innerHTML = '<option value="">– bitte auswählen –</option>';
-
-    data.options.forEach(o => {
-        const opt = document.createElement('option');
-        opt.value = o.value;
-        opt.textContent = o.label + ' (' + o.count + ')';
-        sel.appendChild(opt);
-    });
-
-    el('overlay').style.display = 'none';
-    sel.onchange = () => el('btnExport').disabled = !sel.value;
-}
-
-// ---------------------------------------------------------------------
-// Export starten
-// ---------------------------------------------------------------------
-async function startExport(){
-    const fb   = el('fachbereich').value;
-    if (!fb) return alert('Bitte Fachbereich wählen');
-
-    const bid  = el('batch_id').value;
-    const camp = el('campaign').value;
-
-    showOverlay('Starte Export …');
-    setProgress(10);
-
-    const r = await fetch('/neukontakte/export_start', {
-        method: 'POST',
-        headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({
-            fachbereich: fb,
-            batch_id: bid,
-            campaign: camp
-        })
-    });
-
-    if (!r.ok) return alert("Fehler beim Start");
-
-    const res = await r.json();
-    const job_id = res.job_id;
-
-    let done = false;
-
-    while (!done){
-        await new Promise(r => setTimeout(r, 500));
-        const pr = await fetch('/neukontakte/export_progress?job_id=' + job_id);
-        const s  = await pr.json();
-
-        el('phase').textContent = s.phase + ' (' + s.percent + '%)';
-        setProgress(s.percent);
-
-        done = s.done;
-    }
-
-    window.location.href = '/neukontakte/export_download?job_id=' + job_id;
-}
-
-// ---------------------------------------------------------------------
-// Init
-// ---------------------------------------------------------------------
-el('btnExport').onclick = startExport;
-loadOptions();
-</script>
-
-</body>
-</html>
-"""
-    )
 
 # =============================================================================
 # Frontend – Refresh (analog zu Nachfass)
@@ -4247,15 +4311,20 @@ header{
 .hwrap{
   max-width:1200px;
   margin:0 auto;
-  padding:16px 24px;
+  padding:18px 24px;
   display:flex;
-  justify-content:space-between;
   align-items:center;
+  justify-content:space-between;
 }
 .hleft{
   display:flex;
   align-items:center;
-  gap:12px;
+  gap:14px;
+}
+.hleft img{
+  height:42px;
+}
+.hcenter{
   font-size:18px;
   font-weight:600;
 }
@@ -4265,8 +4334,8 @@ header{
 
 /* Layout */
 main{
-  max-width:900px;
-  margin:40px auto;
+  max-width:760px;
+  margin:48px auto;
   padding:0 24px;
 }
 
@@ -4278,8 +4347,8 @@ main{
   padding:32px;
   margin-bottom:32px;
   box-shadow:
-    0 12px 30px rgba(15,23,42,.06),
-    0 4px 8px rgba(15,23,42,.04);
+    0 14px 32px rgba(15,23,42,.06),
+    0 6px 12px rgba(15,23,42,.04);
 }
 
 /* Form */
@@ -4287,64 +4356,62 @@ label{
   display:block;
   font-weight:600;
   margin:14px 0 6px;
+  font-size:14px;
 }
 input,select{
   width:100%;
-  padding:12px 14px;
+  padding:10px 12px;
   border:1px solid #cbd5e1;
   border-radius:12px;
   background:#ffffff;
-  font-size:15px;
+  font-size:14px;
 }
 
-/* Ladebox – nur Optik */
+/* Fachbereich Ladebox */
 #fb-loading-box{
+  display:none;
   margin-bottom:14px;
 }
 #fb-loading-text{
-  font-size:14px;
+  font-size:13px;
   color:#0a66c2;
   margin-bottom:6px;
 }
 #fb-loading-bar-wrap{
   width:100%;
-  max-width:420px;
   height:8px;
   background:#e5e9f0;
   border-radius:999px;
   overflow:hidden;
 }
 #fb-loading-bar{
-  height:100%;
+  height:8px;
+  width:0%;
   background:linear-gradient(90deg,#0ea5e9,#38bdf8);
 }
 
 /* Button */
 .btn{
+  margin-top:28px;
   background:#0ea5e9;
   border:none;
   color:#ffffff;
   border-radius:12px;
-  padding:12px 22px;
-  cursor:pointer;
+  padding:11px 20px;
   font-weight:600;
-  margin-top:24px;
-  float:right;
+  cursor:pointer;
 }
-.btn:hover{
-  background:#0284c7;
-}
+.btn:hover{background:#0284c7}
 
 /* Tabelle */
 .table-card{
   background:#ffffff;
   border:1px solid #e5e9f0;
   border-radius:20px;
-  padding:24px 28px;
-  margin-top:24px;
+  padding:28px;
   box-shadow:
-    0 12px 30px rgba(15,23,42,.06),
-    0 4px 8px rgba(15,23,42,.04);
+    0 14px 32px rgba(15,23,42,.06),
+    0 6px 12px rgba(15,23,42,.04);
 }
 table{
   width:100%;
@@ -4396,9 +4463,12 @@ th{
 <header>
   <div class="hwrap">
     <div class="hleft">
-      <img src="/static/bizforward-Logo-Clean-2024.svg" alt="bizforward" style="height:32px">
-      <span>Refresh</span>
+      <img src="/static/bizforward-Logo-Clean-2024.svg" alt="bizforward">
+      <a href="/campaign" style="color:#0a66c2;text-decoration:none;font-size:14px">
+        Kampagne wählen
+      </a>
     </div>
+    <div class="hcenter">Refresh</div>
     <div class="hright">""" + auth_info + r"""</div>
   </div>
 </header>
@@ -4423,7 +4493,7 @@ th{
   </select>
 
   <label>Batch ID</label>
-  <input id="batch_id" placeholder="RF-2025-01"/>
+  <input id="batch_id" placeholder="xxx"/>
 
   <label>Kampagnenname</label>
   <input id="campaign" placeholder="z. B. Refresh Q1 / IT"/>
@@ -4473,12 +4543,14 @@ function showOverlay(msg){
   el("overlay-phase").textContent = msg;
   el("overlay").style.display = "flex";
 }
-function hideOverlay(){ el("overlay").style.display = "none"; }
-function setProgress(v){ el("overlay-bar").style.width = v + "%"; }
+function hideOverlay(){
+  el("overlay").style.display = "none";
+}
+function setProgress(v){
+  el("overlay-bar").style.width = v + "%";
+}
 
-//
-// ⭐ ALTER LADEBALKEN – UNVERÄNDERT
-//
+// ⭐ Fachbereiche laden – UNVERÄNDERT
 async function loadFachbereiche(){
   const box = el("fb-loading-box");
   const bar = el("fb-loading-bar");
@@ -4493,15 +4565,15 @@ async function loadFachbereiche(){
   }, 200);
 
   let data = null;
-  try {
-      const resp = await fetch("/refresh/options");
-      data = await resp.json();
-  } catch(e){
-      clearInterval(interval);
-      bar.style.width = "100%";
-      setTimeout(()=> box.style.display="none", 500);
-      alert("Fehler beim Laden der Fachbereiche.");
-      return;
+  try{
+    const resp = await fetch("/refresh/options");
+    data = await resp.json();
+  }catch(e){
+    clearInterval(interval);
+    bar.style.width = "100%";
+    setTimeout(()=> box.style.display="none", 500);
+    alert("Fehler beim Laden der Fachbereiche.");
+    return;
   }
 
   clearInterval(interval);
@@ -4554,7 +4626,11 @@ async function poll(job_id){
     el("overlay-phase").textContent = `${s.phase} (${s.percent}%)`;
     setProgress(s.percent);
 
-    if(s.error){ alert(s.error); hideOverlay(); return; }
+    if(s.error){
+      alert(s.error);
+      hideOverlay();
+      return;
+    }
     if(s.download_ready){
       showOverlay("Download startet …");
       setProgress(100);
@@ -4571,20 +4647,23 @@ async function poll(job_id){
 
 async function startExport(){
   const fb = el("fachbereich").value;
-  if(!fb){ alert("Bitte Fachbereich auswählen."); return; }
+  if(!fb){
+    alert("Bitte Fachbereich auswählen.");
+    return;
+  }
 
   showOverlay("Starte Abgleich …");
   setProgress(10);
 
   const r = await fetch("/refresh/export_start",{
-      method:"POST",
-      headers:{ "Content-Type":"application/json" },
-      body:JSON.stringify({
-          fachbereich:fb,
-          batch_id:el("batch_id").value,
-          campaign:el("campaign").value,
-          take_count:parseInt(el("take_count").value)||null
-      })
+    method:"POST",
+    headers:{ "Content-Type":"application/json" },
+    body:JSON.stringify({
+      fachbereich: fb,
+      batch_id: el("batch_id").value,
+      campaign: el("campaign").value,
+      take_count: parseInt(el("take_count").value) || null
+    })
   });
 
   const j = await r.json();
