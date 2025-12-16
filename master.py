@@ -3392,7 +3392,9 @@ async def neukontakte_export_start(
 
     async def _run():
         try:
+            # --------------------------------------------------
             # 1) Master bauen
+            # --------------------------------------------------
             job.phase = "Lade & filtere Neukontakte …"
             job.percent = 10
 
@@ -3405,23 +3407,38 @@ async def neukontakte_export_start(
                 job_obj=job,
             )
 
-            # 2) Master speichern
             t = tables("nk")
-            job.phase = "Speichere Master (DB) …"
-            job.percent = 55
+
+            # --------------------------------------------------
+            # 2) Master speichern
+            # --------------------------------------------------
+            job.phase = "Speichere Master …"
+            job.percent = 45
             await save_df_text(master_final, t["final"])
 
-            # 3) Abgleich
-            job.phase = "Abgleich (Regeln & Dubletten) …"
-            job.percent = 70
+            # --------------------------------------------------
+            # 3) Reconcile (erstellt ready + excluded!)
+            # --------------------------------------------------
+            job.phase = "Abgleich & Dublettenprüfung …"
+            job.percent = 65
             await _reconcile("nk")
 
-            # 4) Excel
+            # --------------------------------------------------
+            # 4) Ergebnisse laden
+            # --------------------------------------------------
+            ready_df = await load_df_text(t["ready"])
+            excluded_df = await load_df_text(t["excluded"])
+
+            job.total_rows = len(ready_df)
+            job.excluded_rows = len(excluded_df)
+
+            # --------------------------------------------------
+            # 5) Excel Export
+            # --------------------------------------------------
             job.phase = "Erzeuge Excel …"
             job.percent = 85
-            ready_df = await load_df_text(t["ready"])
-            export_df = build_nf_export(ready_df)
 
+            export_df = build_nf_export(ready_df)
             out_path = export_to_excel(
                 export_df,
                 prefix=job.filename_base,
@@ -3429,8 +3446,10 @@ async def neukontakte_export_start(
             )
 
             job.path = out_path
-            job.total_rows = len(export_df)
-            job.phase = f"Fertig – {job.total_rows} Zeilen"
+            job.phase = (
+                f"Fertig – {job.total_rows} exportiert, "
+                f"{job.excluded_rows} ausgeschlossen"
+            )
             job.percent = 100
             job.done = True
 
@@ -3442,8 +3461,6 @@ async def neukontakte_export_start(
 
     asyncio.create_task(_run())
     return JSONResponse({"job_id": job_id})
-
-
 
 # =============================================================================
 # EXPORT-FORTSCHRITT & DOWNLOAD-ENDPUNKTE REFRESH (KORRIGIERT)
@@ -3600,6 +3617,8 @@ async def neukontakte_export_progress(job_id: str = Query(...)):
         "percent": job.percent,
         "done": job.done,
         "error": job.error,
+        "total_rows": getattr(job, "total_rows", 0),
+        "excluded_rows": getattr(job, "excluded_rows", 0),
     })
 
 
@@ -3609,113 +3628,233 @@ async def neukontakte_export_progress(job_id: str = Query(...)):
 # -------------------------------------------------------------------------
 @app.get("/campaign", response_class=HTMLResponse)
 async def campaign_home():
-    return HTMLResponse("""<!doctype html>
+    return HTMLResponse(r"""<!doctype html>
 <html lang="de">
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>BatchFlow – Kampagne wählen</title>
+<title>BatchFlow – bizforward</title>
 
 <style>
-    body {
-        margin: 0;
-        background: #f6f8fb;
-        color: #0f172a;
-        font: 16px/1.6 "Inter", sans-serif;
-    }
+:root{
+  --bg:#f7f9fc;
+  --card:#ffffff;
+  --border:#e5e9f0;
+  --text:#0f172a;
+  --muted:#64748b;
+  --primary:#0ea5e9;
+  --primary-dark:#0284c7;
+}
 
-    header {
-        background: #fff;
-        border-bottom: 1px solid #e2e8f0;
-        padding: 14px 24px;
-        font-size: 20px;
-        font-weight: 600;
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-    }
+/* Reset */
+*{box-sizing:border-box}
+body{
+  margin:0;
+  background:var(--bg);
+  color:var(--text);
+  font:16px/1.6 Inter,system-ui,-apple-system,BlinkMacSystemFont,sans-serif;
+}
 
-    .container {
-        max-width: 1200px;
-        margin: 40px auto;
-        padding: 20px;
-        display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-        gap: 28px;
-    }
+/* Header */
+header{
+  background:#fff;
+  border-bottom:1px solid var(--border);
+}
+.header-inner{
+  max-width:1200px;
+  margin:0 auto;
+  padding:16px 32px;
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+}
+.header-left{
+  display:flex;
+  align-items:center;
+  gap:14px;
+}
+.header-left img{height:34px}
+.header-title{
+  font-size:20px;
+  font-weight:600;
+}
+.header-right{
+  font-size:14px;
+  color:var(--muted);
+}
 
-    .card {
-        background: #ffffff;
-        border: 1px solid #e3e8f0;
-        border-radius: 16px;
-        padding: 28px;
-        box-shadow: 0 2px 8px rgba(15, 23, 42, 0.06);
-        transition: all 0.2s ease;
-    }
+/* Hero */
+.hero{
+  max-width:900px;
+  margin:64px auto 48px;
+  padding:0 24px;
+  text-align:center;
+}
+.hero h1{
+  font-size:34px;
+  line-height:1.25;
+  margin:0 0 12px;
+}
+.hero p{
+  font-size:17px;
+  color:var(--muted);
+  margin:0;
+}
 
-    .card:hover {
-        transform: translateY(-4px);
-        box-shadow: 0 6px 20px rgba(0, 0, 0, 0.08);
-    }
+/* Cards */
+.cards{
+  max-width:1100px;
+  margin:0 auto 80px;
+  padding:0 24px;
+  display:grid;
+  grid-template-columns:repeat(auto-fit,minmax(280px,1fr));
+  gap:28px;
+}
 
-    .card h2 {
-        margin: 0 0 10px;
-        font-size: 20px;
-        font-weight: 700;
-        color: #0f172a;
-    }
+/* Animation – initial state */
+.card{
+  background:var(--card);
+  border:1px solid var(--border);
+  border-radius:20px;
+  padding:30px 32px;
+  box-shadow:
+    0 12px 30px rgba(15,23,42,.06),
+    0 4px 8px rgba(15,23,42,.04);
+  display:flex;
+  flex-direction:column;
+  justify-content:space-between;
 
-    .card p {
-        color: #475569;
-        margin-bottom: 24px;
-        line-height: 1.5;
-    }
+  opacity:0;
+  transform:translateY(12px);
+  animation:cardIn .6s ease forwards;
+}
+.card:nth-child(1){animation-delay:.05s}
+.card:nth-child(2){animation-delay:.15s}
+.card:nth-child(3){animation-delay:.25s}
 
-    .btn {
-        display: inline-block;
-        background: #0ea5e9;
-        padding: 12px 18px;
-        border-radius: 10px;
-        color: #fff;
-        font-weight: 600;
-        text-decoration: none;
-        transition: background .2s;
-    }
+@keyframes cardIn{
+  to{opacity:1;transform:translateY(0)}
+}
 
-    .btn:hover {
-        background: #0284c7;
-    }
+/* Respect reduced motion */
+@media (prefers-reduced-motion: reduce){
+  .card{animation:none;opacity:1;transform:none}
+}
+
+.card:hover{
+  transform:translateY(-4px);
+  box-shadow:
+    0 18px 40px rgba(15,23,42,.08),
+    0 6px 12px rgba(15,23,42,.05);
+}
+
+/* Card Header (Icon + Title) */
+.card-header{
+  display:flex;
+  align-items:center;
+  gap:10px;
+  margin-bottom:10px;
+}
+.card-header svg{
+  width:20px;
+  height:20px;
+  stroke:#334155;
+}
+.card h3{
+  margin:0;
+  font-size:20px;
+}
+.card p{
+  margin:0 0 22px;
+  color:var(--muted);
+  font-size:15px;
+}
+
+/* Button */
+.btn{
+  align-self:flex-start;
+  background:var(--primary);
+  color:#fff;
+  border:none;
+  border-radius:12px;
+  padding:12px 20px;
+  font-size:15px;
+  font-weight:600;
+  cursor:pointer;
+  text-decoration:none;
+}
+.btn:hover{background:var(--primary-dark)}
 </style>
-
 </head>
+
 <body>
 
 <header>
-    <div>BatchFlow</div>
-    <a href="/campaign" style="font-size:15px;color:#0a66c2;text-decoration:none;">Kampagne auswählen</a>
+  <div class="header-inner">
+    <div class="header-left">
+      <img src="/static/bizforward-Logo-Clean-2024.svg" alt="bizforward"/>
+      <div class="header-title">BatchFlow</div>
+    </div>
+    <div class="header-right">bizforward · Internal Tool</div>
+  </div>
 </header>
 
-<div class="container">
+<section class="hero">
+  <h1>Kontakte strukturiert und sicher verarbeiten</h1>
+  <p>BatchFlow unterstützt dich beim Auswählen, Abgleichen und Exportieren von Kontakten für Kampagnen.</p>
+</section>
 
-    <div class="card">
-        <h2>Neukontakte</h2>
-        <p>Noch nicht angeschriebene Kontakte auswählen</p>
-        <a class="btn" href="/neukontakte">Öffnen</a>
+<section class="cards">
+
+  <!-- Neukontakte -->
+  <div class="card">
+    <div>
+      <div class="card-header">
+        <!-- user-plus -->
+        <svg fill="none" viewBox="0 0 24 24" stroke-width="1.8">
+          <path stroke-linecap="round" stroke-linejoin="round"
+            d="M15 19a6 6 0 00-12 0M12 7a4 4 0 110-8 4 4 0 010 8zm7 2v4m2-2h-4"/>
+        </svg>
+        <h3>Neukontakte</h3>
+      </div>
+      <p>Noch nicht angeschriebene Kontakte auswählen und für den Erstkontakt vorbereiten.</p>
     </div>
+    <a class="btn" href="/neukontakte">Öffnen</a>
+  </div>
 
-    <div class="card">
-        <h2>Nachfass</h2>
-        <p>Nachfassen anhand einer Batch ID (Filter 3024).</p>
-        <a class="btn" href="/nachfass">Öffnen</a>
+  <!-- Nachfass -->
+  <div class="card">
+    <div>
+      <div class="card-header">
+        <!-- repeat -->
+        <svg fill="none" viewBox="0 0 24 24" stroke-width="1.8">
+          <path stroke-linecap="round" stroke-linejoin="round"
+            d="M17 1l4 4-4 4M3 11V9a4 4 0 014-4h14M7 23l-4-4 4-4m14-2v2a4 4 0 01-4 4H3"/>
+        </svg>
+        <h3>Nachfass</h3>
+      </div>
+      <p>Kontakte anhand einer bestehenden Batch ID erneut kontaktieren und sauber abgleichen.</p>
     </div>
+    <a class="btn" href="/nachfass">Öffnen</a>
+  </div>
 
-    <div class="card">
-        <h2>Refresh</h2>
-        <p>Kontakte auswählen anhand eines Fachbereiches (Filter 4444).</p>
-        <a class="btn" href="/refresh">Öffnen</a>
+  <!-- Refresh -->
+  <div class="card">
+    <div>
+      <div class="card-header">
+        <!-- refresh -->
+        <svg fill="none" viewBox="0 0 24 24" stroke-width="1.8">
+          <path stroke-linecap="round" stroke-linejoin="round"
+            d="M4 4v6h6M20 20v-6h-6M5 19a9 9 0 0014-7M19 5a9 9 0 00-14 7"/>
+        </svg>
+        <h3>Refresh</h3>
+      </div>
+      <p>Kontakte anhand eines Fachbereiches neu auswählen und für eine weitere Kampagne aufbereiten.</p>
     </div>
+    <a class="btn" href="/refresh">Öffnen</a>
+  </div>
 
-</div>
+</section>
 
 </body>
 </html>
@@ -3734,81 +3873,189 @@ async def neukontakte_page():
 <title>Neukontakte – BatchFlow</title>
 
 <style>
-    body{margin:0;background:#f6f8fb;color:#0f172a;font:16px/1.6 Inter,sans-serif;}
-    header{
-        background:#fff;border-bottom:1px solid #e2e8f0;
-        padding:14px 24px;font-size:20px;font-weight:600;
-        display:flex;justify-content:space-between;align-items:center;
-    }
-    main{max-width:900px;margin:32px auto;padding:0 20px;}
+:root{
+  --bg:#f7f9fc;
+  --card:#ffffff;
+  --border:#e5e9f0;
+  --text:#0f172a;
+  --muted:#64748b;
+  --primary:#0ea5e9;
+  --primary-dark:#0284c7;
+  --danger:#b91c1c;
+}
 
-    .card{
-        background:#fff;border:1px solid #e2e8f0;border-radius:16px;
-        padding:28px 32px;box-shadow:0 2px 8px rgba(0,0,0,0.05);margin-bottom:32px;
-    }
-    label{display:block;font-weight:600;margin:14px 0 6px;}
-    input,select{
-        width:100%;padding:12px;border:1px solid #cbd5e1;border-radius:10px;
-        font-size:15px;background:#fff;
-    }
-    .btn{
-        background:#0ea5e9;border:none;color:#fff;border-radius:10px;
-        padding:12px 20px;cursor:pointer;font-weight:600;margin-top:20px;
-        float:right;
-    }
-    .btn:hover{background:#0284c7;}
-    .btn:disabled{opacity:.5;cursor:not-allowed;}
+/* Reset */
+*{box-sizing:border-box}
+body{
+  margin:0;
+  background:var(--bg);
+  color:var(--text);
+  font:16px/1.6 Inter,system-ui,-apple-system,BlinkMacSystemFont,sans-serif;
+}
 
-    /* Ladebalken Fachbereiche */
-    #fb-loading-box{
-        display:none;margin-bottom:10px;padding:12px 0;
-    }
-    #fb-loading-text{
-        font-size:14px;color:#0a66c2;margin-bottom:6px;
-    }
-    #fb-loading-bar-wrap{
-        width:100%;max-width:400px;height:8px;background:#e2e8f0;
-        border-radius:4px;overflow:hidden;
-    }
-    #fb-loading-bar{
-        width:0%;height:8px;background:#0ea5e9;transition:width .25s linear;
-    }
+/* Header */
+header{
+  background:#fff;
+  border-bottom:1px solid var(--border);
+}
+.header-inner{
+  max-width:1200px;
+  margin:0 auto;
+  padding:16px 32px;
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+}
+.header-left{
+  display:flex;
+  align-items:center;
+  gap:14px;
+}
+.header-left img{height:34px}
+.header-title{
+  font-size:20px;
+  font-weight:600;
+}
+.header-action{
+  font-size:14px;
+  color:var(--primary);
+  text-decoration:none;
+}
+.header-action:hover{color:var(--primary-dark)}
 
-    /* Overlay / Fortschritt */
-    #overlay{
-        display:none;position:fixed;inset:0;background:rgba(255,255,255,.75);
-        backdrop-filter:blur(2px);z-index:9999;
-        align-items:center;justify-content:center;flex-direction:column;gap:12px;
-    }
-    .barwrap{
-        width:min(520px,90vw);height:10px;border-radius:999px;
-        background:#e2e8f0;overflow:hidden;
-    }
-    .bar{
-        height:100%;width:0%;background:#0ea5e9;transition:width .2s linear;
-    }
+/* Layout */
+main{
+  max-width:900px;
+  margin:48px auto;
+  padding:0 24px;
+}
+
+/* Card */
+.card{
+  background:var(--card);
+  border:1px solid var(--border);
+  border-radius:20px;
+  padding:32px 36px;
+  box-shadow:
+    0 12px 30px rgba(15,23,42,.06),
+    0 4px 8px rgba(15,23,42,.04);
+}
+
+/* Typography */
+h2{margin:0 0 22px;font-size:22px}
+label{
+  display:block;
+  font-weight:600;
+  margin:18px 0 6px;
+  font-size:14px;
+}
+input,select{
+  width:100%;
+  padding:13px 14px;
+  border:1px solid var(--border);
+  border-radius:12px;
+  font-size:15px;
+}
+input:focus,select:focus{
+  outline:none;
+  border-color:var(--primary);
+}
+
+/* Button */
+.btn{
+  margin-top:26px;
+  background:var(--primary);
+  border:none;
+  color:#fff;
+  border-radius:12px;
+  padding:14px 22px;
+  font-size:15px;
+  font-weight:600;
+  cursor:pointer;
+  float:right;
+}
+.btn:hover{background:var(--primary-dark)}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+
+/* Fachbereich Loader */
+#fb-loading-box{display:none;margin-bottom:10px}
+#fb-loading-text{font-size:13px;color:var(--muted);margin-bottom:6px}
+#fb-loading-bar-wrap{
+  width:100%;
+  max-width:420px;
+  height:8px;
+  background:#e5e9f0;
+  border-radius:6px;
+  overflow:hidden;
+}
+#fb-loading-bar{
+  width:0%;
+  height:100%;
+  background:linear-gradient(90deg,var(--primary),#38bdf8);
+  transition:width .25s linear;
+}
+
+/* Result + Excluded */
+#result-box,#excluded-box{display:none;margin-top:32px}
+table{
+  width:100%;
+  border-collapse:collapse;
+  font-size:14px;
+}
+th,td{padding:10px;text-align:left}
+thead{background:#f1f5f9}
+td.reason{color:var(--danger);font-weight:500}
+
+/* Overlay */
+#overlay{
+  display:none;
+  position:fixed;
+  inset:0;
+  background:rgba(247,249,252,.85);
+  backdrop-filter:blur(3px);
+  z-index:9999;
+  align-items:center;
+  justify-content:center;
+  flex-direction:column;
+  gap:14px;
+}
+.barwrap{
+  width:min(520px,90vw);
+  height:10px;
+  background:#e5e9f0;
+  border-radius:999px;
+  overflow:hidden;
+}
+.bar{
+  height:100%;
+  width:0%;
+  background:linear-gradient(90deg,var(--primary),#38bdf8);
+  transition:width .2s linear;
+}
 </style>
 </head>
 
 <body>
 
 <header>
-  <div>Neukontakte</div>
-  <a href="/campaign" style="color:#0a66c2;text-decoration:none;font-size:15px;">
-    Kampagne wählen
-  </a>
+  <div class="header-inner">
+    <div class="header-left">
+      <img src="/static/bizforward-Logo-Clean-2024.svg"/>
+      <div class="header-title">BatchFlow · Neukontakte</div>
+    </div>
+    <a class="header-action" href="/">Startseite</a>
+  </div>
 </header>
 
 <main>
 
 <section class="card">
-  <h2>Neukontakte – Einstellungen</h2>
+  <h2>Neukontakte auswählen</h2>
 
   <label>Fachbereich – Kampagne</label>
 
-  <!-- 🔄 Ladebalken wie beim Refresh -->
   <div id="fb-loading-box">
-    <div id="fb-loading-text">Fachbereiche werden geladen … bitte warten.</div>
+    <div id="fb-loading-text">Fachbereiche werden geladen …</div>
     <div id="fb-loading-bar-wrap">
       <div id="fb-loading-bar"></div>
     </div>
@@ -3819,16 +4066,40 @@ async def neukontakte_page():
   </select>
 
   <label>Anzahl Kontakte (optional)</label>
-  <input id="take_count" type="number" placeholder="leer = alle"/>
+  <input id="take_count" type="number"/>
 
   <label>Batch ID</label>
-  <input id="batch_id" placeholder="B1234"/>
+  <input id="batch_id"/>
 
   <label>Kampagnenname</label>
-  <input id="campaign" placeholder="z. B. Neukontakte Q2"/>
+  <input id="campaign"/>
 
   <button class="btn" id="btnExportNk" disabled>Abgleich & Download</button>
 </section>
+
+<!-- Ergebnis -->
+<div id="result-box">
+  <strong>Ergebnis</strong>
+  <div id="result-text"></div>
+</div>
+
+<!-- Excluded -->
+<div id="excluded-box">
+  <strong>Ausgeschlossene Datensätze</strong>
+  <div style="overflow:auto;border:1px solid var(--border);border-radius:12px;margin-top:8px">
+    <table>
+      <thead>
+        <tr>
+          <th>Name</th>
+          <th>Organisation</th>
+          <th>E-Mail</th>
+          <th>Grund</th>
+        </tr>
+      </thead>
+      <tbody id="excluded-body"></tbody>
+    </table>
+  </div>
+</div>
 
 </main>
 
@@ -3839,120 +4110,84 @@ async def neukontakte_page():
 </div>
 
 <script>
-const el = id => document.getElementById(id);
+const el=id=>document.getElementById(id);
+function showOverlay(t){el("overlay-phase").textContent=t;el("overlay").style.display="flex";}
+function hideOverlay(){el("overlay").style.display="none";}
+function setProgress(v){el("overlay-bar").style.width=v+"%";}
 
-function showOverlay(msg){
-    el("overlay-phase").textContent = msg;
-    el("overlay").style.display = "flex";
-}
-function hideOverlay(){ el("overlay").style.display = "none"; }
-function setProgress(v){ el("overlay-bar").style.width = v + "%"; }
-
-// ------------------------------------------------------------
-// Fachbereiche laden – MIT Ladebalken (identisch zu Refresh)
-// ------------------------------------------------------------
+/* Fachbereiche laden */
 async function loadFachbereiche(){
-  const box = el("fb-loading-box");
-  const bar = el("fb-loading-bar");
-  const sel = el("fachbereich");
-
-  box.style.display = "block";
-  bar.style.width = "0%";
-
-  let progress = 0;
-  const interval = setInterval(()=>{
-    progress = Math.min(progress + 4, 90);
-    bar.style.width = progress + "%";
-  }, 200);
-
-  let data = null;
-  try {
-    const resp = await fetch("/neukontakte/options");
-    data = await resp.json();
-  } catch(e){
-    clearInterval(interval);
-    bar.style.width = "100%";
-    setTimeout(()=> box.style.display="none", 500);
-    alert("Fehler beim Laden der Fachbereiche.");
-    return;
-  }
-
-  clearInterval(interval);
-  bar.style.width = "100%";
-
-  sel.innerHTML = '<option value="">Bitte auswählen …</option>';
-
-  (data.options || []).forEach(o=>{
-    const opt = document.createElement("option");
-    opt.value = o.value;
-    opt.textContent = `${o.label} (${o.count})`;
+  const box=el("fb-loading-box"),bar=el("fb-loading-bar"),sel=el("fachbereich");
+  box.style.display="block";bar.style.width="0%";
+  let p=0;const i=setInterval(()=>{p=Math.min(p+4,90);bar.style.width=p+"%";},200);
+  const d=await (await fetch("/neukontakte/options")).json();
+  clearInterval(i);bar.style.width="100%";
+  sel.innerHTML='<option value="">Bitte auswählen …</option>';
+  (d.options||[]).forEach(o=>{
+    const opt=document.createElement("option");
+    opt.value=o.value;opt.textContent=`${o.label} (${o.count})`;
     sel.appendChild(opt);
   });
-
-  setTimeout(()=> box.style.display="none", 500);
-
-  sel.onchange = () => {
-    el("btnExportNk").disabled = !sel.value;
-  };
+  setTimeout(()=>box.style.display="none",400);
+  sel.onchange=()=>el("btnExportNk").disabled=!sel.value;
 }
 
-// ------------------------------------------------------------
-// Export starten
-// ------------------------------------------------------------
-async function startExport(){
-  const fach = el("fachbereich").value;
-  if(!fach){ alert("Bitte Fachbereich auswählen."); return; }
-
-  showOverlay("Starte Export …");
-  setProgress(10);
-
-  const r = await fetch("/neukontakte/export_start", {
-    method:"POST",
-    headers:{ "Content-Type":"application/json" },
-    body:JSON.stringify({
-      fachbereich: fach,
-      take_count: el("take_count").value || null,
-      batch_id: el("batch_id").value,
-      campaign: el("campaign").value
-    })
+/* Excluded laden */
+async function loadExcluded(){
+  const rows=await (await fetch("/neukontakte/excluded")).json();
+  if(!rows||!rows.length)return;
+  const body=el("excluded-body");body.innerHTML="";
+  rows.forEach(r=>{
+    body.innerHTML+=`
+      <tr>
+        <td>${r.person_name||""}</td>
+        <td>${r.org_name||""}</td>
+        <td>${r.email||""}</td>
+        <td class="reason">${r.exclusion_reason||""}</td>
+      </tr>`;
   });
-
-  const j = await r.json();
-  await poll(j.job_id);
+  el("excluded-box").style.display="block";
 }
 
-// ------------------------------------------------------------
-// Fortschritt pollen
-// ------------------------------------------------------------
-async function poll(job_id){
+/* Export */
+async function startExport(){
+  showOverlay("Starte Export …");setProgress(10);
+  const r=await fetch("/neukontakte/export_start",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({
+      fachbereich:el("fachbereich").value,
+      take_count:el("take_count").value||null,
+      batch_id:el("batch_id").value,
+      campaign:el("campaign").value
+    })});
+  const j=await r.json();poll(j.job_id);
+}
+
+/* Poll */
+async function poll(id){
   while(true){
     await new Promise(r=>setTimeout(r,500));
-    const res = await fetch("/neukontakte/export_progress?job_id="+job_id);
-    const s = await res.json();
-
-    el("overlay-phase").textContent = `${s.phase} (${s.percent}%)`;
+    const s=await (await fetch("/neukontakte/export_progress?job_id="+id)).json();
+    el("overlay-phase").textContent=`${s.phase} (${s.percent}%)`;
     setProgress(s.percent);
-
-    if(s.error){
-      alert(s.error); hideOverlay(); return;
-    }
+    if(s.error){alert(s.error);hideOverlay();return;}
     if(s.done){
-      showOverlay("Download startet …");
-      setProgress(100);
-      window.location.href="/neukontakte/export_download?job_id="+job_id;
       hideOverlay();
+      el("result-text").textContent=
+        `${s.total_rows} exportiert · ${s.excluded_rows} ausgeschlossen`;
+      el("result-box").style.display="block";
+      await loadExcluded();
+      window.location.href="/neukontakte/export_download?job_id="+id;
       return;
     }
   }
 }
 
-el("btnExportNk").onclick = startExport;
+el("btnExportNk").onclick=startExport;
 loadFachbereiche();
 </script>
 
 </body>
-</html>
-""")
+</html>""")
 
 
 # =============================================================================
@@ -4551,6 +4786,14 @@ async def refresh_excluded():
       loadExcluded();
     </script></body></html>"""
     return HTMLResponse(html)
+
+# =============================================================================
+# Neukontakte Excluded
+# =============================================================================
+@app.get("/neukontakte/excluded")
+async def neukontakte_excluded():
+    df = await load_df_text(tables("nk")["excluded"])
+    return JSONResponse(df.to_dict(orient="records"))
 
 # =============================================================================
 # Summary-Seiten
