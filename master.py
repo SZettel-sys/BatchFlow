@@ -3528,7 +3528,7 @@ header{
     0 10px 18px rgba(15,23,42,.05);
 }
 .card h2{
-  margin:0 0 10px;
+  margin-bottom:24px;
   font-size:22px;
 }
 .card p{
@@ -3539,7 +3539,7 @@ header{
 
 /* Button */
 .btn{
-  margin-top:32px;
+  margin-top:36px;
   background:#0ea5e9;
   border:none;
   color:#ffffff;
@@ -3653,6 +3653,9 @@ header{
   align-items:center;
   gap:14px;
 }
+.card h2{
+  margin-bottom:24px;
+}
 .hleft img{
   height:48px;
 }
@@ -3663,10 +3666,17 @@ header{
 .hright{
   font-size:14px;
 }
+.table-card{
+  margin-top:48px;
+}
+
+.table-card h3{
+  margin-bottom:16px;
+}
 
 /* Layout */
 main{
-  max-width:560px;
+  max-width:720px;
   margin:48px auto;
   padding:0 24px;
 }
@@ -3687,6 +3697,7 @@ main{
   display:grid;
   grid-template-columns:repeat(12,1fr);
   gap:20px;
+  row-gap:28px;
 }
 .col-12{ grid-column: span 12; }
 .col-6 { grid-column: span 6; }
@@ -3698,8 +3709,10 @@ main{
 label{
   display:block;
   font-weight:600;
-  margin:14px 0 6px;
+  margin-top:20px;
+  margin-bottom:8px;
   font-size:14px;
+  font-weight:600;
 }
 select,input,textarea{
   padding:12px 14px;
@@ -3717,7 +3730,7 @@ textarea:focus{
 
 /* Button */
 .btn{
-  margin-top:32px;
+  margin-top:36px;
   background:#0ea5e9;
   border:none;
   color:#ffffff;
@@ -3754,7 +3767,29 @@ textarea:focus{
   width:0%;
   background:linear-gradient(90deg,#0ea5e9,#38bdf8);
 }
+table{
+  font-size:14px;
+}
 
+th{
+  white-space:nowrap;
+  font-size:13px;
+  letter-spacing:.02em;
+  text-transform:none;
+  color:#475569;
+}
+
+th, td{
+  padding:14px 16px;
+}
+
+thead{
+  background:#f8fafc;
+}
+
+tbody tr:hover{
+  background:#f1f5f9;
+}
 /* Overlay Export */
 #overlay{
   display:none;
@@ -4013,6 +4048,9 @@ header{
   align-items:center;
   justify-content:space-between;
 }
+.card h2{
+  margin-bottom:24px;
+}
 .hleft{
   display:flex;
   align-items:center;
@@ -4033,7 +4071,7 @@ header{
 
 /* Layout */
 main{
-  max-width:560px;
+  max-width:720px;
   margin:48px auto;
   padding:0 24px;
 }
@@ -4054,8 +4092,13 @@ main{
 label{
   display:block;
   font-weight:600;
-  margin:14px 0 6px;
+  margin-top:20px;
+  margin-bottom:8px;
   font-size:14px;
+  font-weight:600;
+}
+.grid{
+  row-gap:28px;
 }
 select,input,textarea{
   padding:12px 14px;
@@ -4074,7 +4117,7 @@ textarea:focus{
 
 /* Button */
 .btn{
-  margin-top:32px;
+  margin-top:36px;
   background:#0ea5e9;
   border:none;
   color:#ffffff;
@@ -4100,22 +4143,34 @@ textarea:focus{
     0 6px 12px rgba(15,23,42,.04);
 }
 table{
-  width:100%;
-  border-collapse:collapse;
-  margin-top:12px;
   font-size:14px;
 }
-th,td{
-  padding:10px 14px;
-  border-bottom:1px solid #e5e9f0;
-  text-align:left;
-}
+
 th{
-  background:#f8fafc;
-  font-weight:700;
+  white-space:nowrap;
+  font-size:13px;
+  letter-spacing:.02em;
+  text-transform:none;
+  color:#475569;
 }
-tr:last-child td{
-  border-bottom:none;
+
+th, td{
+  padding:14px 16px;
+}
+
+thead{
+  background:#f8fafc;
+}
+
+tbody tr:hover{
+  background:#f1f5f9;
+}
+.table-card{
+  margin-top:48px;
+}
+
+.table-card h3{
+  margin-bottom:16px;
 }
 
 /* Overlay */
@@ -4354,6 +4409,9 @@ header{
   align-items:center;
   gap:14px;
 }
+.card h2{
+  margin-bottom:24px;
+}
 .hleft img{
   height:48px;
 }
@@ -4364,10 +4422,12 @@ header{
 .hright{
   font-size:14px;
 }
-
+.grid{
+  row-gap:28px;
+}
 /* Layout */
 main{
-  max-width:560px;
+  max-width:720px;
   margin:48px auto;
   padding:0 24px;
 }
@@ -4388,8 +4448,10 @@ main{
 label{
   display:block;
   font-weight:600;
-  margin:14px 0 6px;
+  margin-top:20px;
+  margin-bottom:8px;
   font-size:14px;
+  font-weight:600;
 }
 select,input,textarea{
   padding:12px 14px;
@@ -4431,7 +4493,7 @@ textarea:focus{
 
 /* Button */
 .btn{
-  margin-top:32px;
+  margin-top:36px;
   background:#0ea5e9;
   border:none;
   color:#ffffff;
@@ -4458,19 +4520,34 @@ textarea:focus{
     0 6px 12px rgba(15,23,42,.04);
 }
 table{
-  width:100%;
-  border-collapse:collapse;
-  margin-top:12px;
   font-size:14px;
 }
-th,td{
-  padding:10px 14px;
-  border-bottom:1px solid #e5e9f0;
-  text-align:left;
-}
+
 th{
+  white-space:nowrap;
+  font-size:13px;
+  letter-spacing:.02em;
+  text-transform:none;
+  color:#475569;
+}
+
+th, td{
+  padding:14px 16px;
+}
+
+thead{
   background:#f8fafc;
-  font-weight:700;
+}
+
+tbody tr:hover{
+  background:#f1f5f9;
+}
+.table-card{
+  margin-top:48px;
+}
+
+.table-card h3{
+  margin-bottom:16px;
 }
 
 /* Overlay */
