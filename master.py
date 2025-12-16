@@ -2368,6 +2368,10 @@ async def fetch_orgs_bulk(org_ids: List[str], *, concurrency: int = 2) -> Dict[s
     await asyncio.gather(*(one(str(x)) for x in org_ids))
     return out
 
+# =============================================================================
+# Nachfass – Master Builder
+# =============================================================================
+
 async def _build_nf_master_final(
     selected: List[dict],
     campaign: str,
@@ -2617,6 +2621,78 @@ async def _build_refresh_master_final(
         batch_id=batch_id,
         job_obj=job_obj,
     )
+    return df
+
+# =============================================================================
+# Neukontakte – Master Builder
+# =============================================================================
+async def _build_nk_master_final(
+    fachbereich: str,
+    take_count: Optional[int],
+    batch_id: str,
+    campaign: str,
+    per_org_limit: int,
+    job_obj=None,
+) -> pd.DataFrame:
+
+    field_key = PD_PERSON_FIELDS.get("Fachbereich - Kampagne")
+    target_fach = sanitize(fachbereich)
+
+    # 1) Personen laden
+    persons_all = await fetch_persons_by_filter_id_v2(
+        filter_id=FILTER_NEUKONTAKTE,
+        limit=PAGE_LIMIT,
+        job_obj=job_obj,
+        max_pages=120,
+        max_empty_growth=2,
+    )
+
+    selected: list[dict] = []
+    org_counts: dict[str, int] = {}
+
+    total = len(persons_all) or 1
+
+    # 2) Filtern & begrenzen
+    for idx, p in enumerate(persons_all, start=1):
+
+        if job_obj and (idx == 1 or idx % 200 == 0 or idx == total):
+            job_obj.phase = f"Filtere Neukontakte ({idx}/{total})"
+            job_obj.percent = min(45, 15 + int(idx / total * 30))
+
+        if not isinstance(p, dict) or not field_key:
+            continue
+
+        fach_val = sanitize(cf_value_v2(p, field_key))
+        if fach_val != target_fach:
+            continue
+
+        org_id = extract_org_id_from_person(p)
+        if not org_id:
+            continue
+
+        next_date = sanitize(p.get("next_activity_date"))
+        if next_date and is_forbidden_activity_date(next_date):
+            continue
+
+        cur = org_counts.get(org_id, 0)
+        if cur >= int(per_org_limit or PER_ORG_DEFAULT_LIMIT or 2):
+            continue
+        org_counts[org_id] = cur + 1
+
+        selected.append(p)
+
+        if take_count and take_count > 0 and len(selected) >= take_count:
+            break
+
+    # 3) Master bauen (NF-Logik!)
+    df = await _build_nf_master_final(
+        selected,
+        campaign=sanitize(campaign),
+        batch_id_label=sanitize(batch_id),
+        batch_id=sanitize(batch_id),
+        job_obj=job_obj,
+    )
+
     return df
 
 
@@ -3229,14 +3305,77 @@ async def refresh_options():
     options.sort(key=lambda o: o["label"].lower())
     return JSONResponse({"options": options})
 
+# =============================================================================
+# /neukontakte/options – Fachbereiche mit bereinigten Counts
+# =============================================================================
+@app.get("/neukontakte/options")
+async def neukontakte_options():
+
+    field_key = PD_PERSON_FIELDS.get("Fachbereich - Kampagne")
+    if not field_key:
+        return JSONResponse({"options": []})
+
+    # 1) Personen laden
+    persons = await fetch_persons_by_filter_id_v2(
+        filter_id=FILTER_NEUKONTAKTE,
+        limit=500,
+        job_obj=None,
+        max_pages=80,
+        max_empty_growth=2,
+    )
+
+    # 2) Alle Fachbereich-Optionen laden
+    label_map = await get_fachbereich_label_map()
+    all_values = list(label_map.keys())
+
+    # Zähler
+    per_fach_counts: dict[str, int] = {k: 0 for k in all_values}
+    fach_org_counts: dict[str, dict[str, int]] = {k: {} for k in all_values}
+
+    # 3) Bereinigung (identisch zu Export!)
+    for p in persons:
+        if not isinstance(p, dict):
+            continue
+
+        fach_val = sanitize(cf_value_v2(p, field_key))
+        if not fach_val or fach_val not in all_values:
+            continue
+
+        org_id = extract_org_id_from_person(p)
+        if not org_id:
+            continue
+
+        next_date = sanitize(p.get("next_activity_date"))
+        if next_date and is_forbidden_activity_date(next_date):
+            continue
+
+        # max 2 Kontakte pro Organisation
+        orgs = fach_org_counts[fach_val]
+        if orgs.get(org_id, 0) >= PER_ORG_DEFAULT_LIMIT:
+            continue
+
+        orgs[org_id] = orgs.get(org_id, 0) + 1
+        per_fach_counts[fach_val] += 1
+
+    # 4) Ausgabe (auch 0-Werte!)
+    options = []
+    for v in all_values:
+        options.append({
+            "value": v,
+            "label": label_map.get(v) or v,
+            "count": per_fach_counts.get(v, 0),
+        })
+
+    options.sort(key=lambda o: o["label"].lower())
+    return JSONResponse({"options": options})
 
 
 
 # =============================================================================
-# EXPORT-START – NEUKONTAKTE
+# Neukontakte – Export starten
 # =============================================================================
 @app.post("/neukontakte/export_start")
-async def export_start_nk(
+async def neukontakte_export_start(
     fachbereich: str = Body(...),
     take_count: Optional[int] = Body(None),
     batch_id: Optional[str] = Body(None),
@@ -3246,48 +3385,64 @@ async def export_start_nk(
     job_id = str(uuid.uuid4())
     job = Job()
     JOBS[job_id] = job
-    job.phase = "Initialisiere …"
-    job.percent = 1
-    job.filename_base = slugify_filename(campaign or "BatchFlow_Export")
 
-    async def update_progress(phase: str, percent: int):
-        job.phase = phase
-        job.percent = min(100, max(0, percent))
-        await asyncio.sleep(2)
+    job.phase = "Initialisiere Neukontakte …"
+    job.percent = 1
+    job.filename_base = slugify_filename(campaign or "Neukontakte")
 
     async def _run():
         try:
-            # 1️⃣ Daten laden
-            await update_progress("Lade Neukontakte aus Pipedrive …", 5)
-            df = await _build_nk_master_final(fachbereich, take_count, batch_id, campaign, per_org_limit, job_obj=job)
+            # 1) Master bauen
+            job.phase = "Lade & filtere Neukontakte …"
+            job.percent = 10
 
-            # 2️⃣ Abgleich durchführen
-            await update_progress("Führe Abgleich (Orga & IDs) durch …", 55)
-            await reconcile_with_progress(job, "nk")
+            master_final = await _build_nk_master_final(
+                fachbereich=fachbereich,
+                take_count=take_count,
+                batch_id=batch_id or "",
+                campaign=campaign or "",
+                per_org_limit=per_org_limit,
+                job_obj=job,
+            )
 
-            # 3️⃣ Excel-Datei generieren
-            await update_progress("Erzeuge Excel-Datei …", 80)
-            ready = await load_df_text("nk_master_ready")
-            export_df = build_nf_export(ready)
-            data = _df_to_excel_bytes(export_df)
+            # 2) Master speichern
+            t = tables("nk")
+            job.phase = "Speichere Master (DB) …"
+            job.percent = 55
+            await save_df_text(master_final, t["final"])
 
-            # 4️⃣ Datei speichern
-            path = f"/tmp/{job.filename_base}.xlsx"
-            with open(path, "wb") as f:
-                f.write(data)
-            job.path = path
+            # 3) Abgleich
+            job.phase = "Abgleich (Regeln & Dubletten) …"
+            job.percent = 70
+            await _reconcile("nk")
+
+            # 4) Excel
+            job.phase = "Erzeuge Excel …"
+            job.percent = 85
+            ready_df = await load_df_text(t["ready"])
+            export_df = build_nf_export(ready_df)
+
+            out_path = export_to_excel(
+                export_df,
+                prefix=job.filename_base,
+                job_id=job_id,
+            )
+
+            job.path = out_path
             job.total_rows = len(export_df)
             job.phase = f"Fertig – {job.total_rows} Zeilen"
             job.percent = 100
             job.done = True
+
         except Exception as e:
-            job.error = f"Fehler: {e}"
+            job.error = f"{type(e).__name__}: {e}"
             job.phase = "Fehler"
             job.percent = 100
             job.done = True
 
     asyncio.create_task(_run())
     return JSONResponse({"job_id": job_id})
+
 
 
 # =============================================================================
@@ -3433,16 +3588,18 @@ async def refresh_export_start(
 # =============================================================================
 # EXPORT-FORTSCHRITT & DOWNLOAD-ENDPUNKTE NEUKONTAKTE
 # =============================================================================
+
 @app.get("/neukontakte/export_progress")
 async def neukontakte_export_progress(job_id: str = Query(...)):
     job = JOBS.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job nicht gefunden")
+
     return JSONResponse({
-        "phase": job.phase, "percent": job.percent,
-        "done": job.done, "error": job.error,
-        "note_org_limit": job.get("note_org_limit", 0),
-        "note_date_invalid": job.get("note_date_invalid", 0)
+        "phase": job.phase,
+        "percent": job.percent,
+        "done": job.done,
+        "error": job.error,
     })
 
 
@@ -3568,180 +3725,234 @@ async def campaign_home():
 # Frontend – Neukontakte
 # =============================================================================
 @app.get("/neukontakte", response_class=HTMLResponse)
-async def neukontakte_page(request: Request, mode: str = Query("new")):
-    authed = bool(user_tokens.get("default") or PD_API_TOKEN)
-    authed_html = "<span class='muted'>angemeldet</span>" if authed else "<a href='/login'>Anmelden</a>"
-
-    return HTMLResponse(
-        r"""<!doctype html><html lang="de">
+async def neukontakte_page():
+    return HTMLResponse(r"""<!doctype html>
+<html lang="de">
 <head>
 <meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>Neukontakte – BatchFlow</title>
 
 <style>
-  body{margin:0;background:#f6f8fb;color:#0f172a;font:16px/1.6 Inter,sans-serif}
-  header{background:#fff;border-bottom:1px solid #e2e8f0}
-  .hwrap{max-width:1120px;margin:0 auto;padding:14px 20px;display:flex;align-items:center;
-          justify-content:space-between;gap:12px}
-  main{max-width:1120px;margin:28px auto;padding:0 20px}
-  .card{background:#fff;border:1px solid #e2e8f0;border-radius:14px;padding:20px;
-         box-shadow:0 2px 8px rgba(2,8,23,.04)}
-  .grid{display:grid;grid-template-columns:repeat(12,1fr);gap:16px}
-  label{display:block;font-weight:600;margin:8px 0 6px}
-  select,input{width:100%;padding:10px 12px;border:1px solid #cbd5e1;border-radius:10px;background:#fff}
-  .btn{background:#0ea5e9;border:none;color:#fff;border-radius:10px;padding:12px 16px;cursor:pointer}
-  .btn:disabled{opacity:.5;cursor:not-allowed}
-  #overlay{display:none;position:fixed;inset:0;background:rgba(255,255,255,.7);backdrop-filter:blur(2px);
-            z-index:9999;align-items:center;justify-content:center;flex-direction:column;gap:10px}
-  .barwrap{width:min(520px,90vw);height:10px;border-radius:999px;background:#e2e8f0;overflow:hidden}
-  .bar{height:100%;width:0%;background:#0ea5e9;transition:width .2s linear}
+    body{margin:0;background:#f6f8fb;color:#0f172a;font:16px/1.6 Inter,sans-serif;}
+    header{
+        background:#fff;border-bottom:1px solid #e2e8f0;
+        padding:14px 24px;font-size:20px;font-weight:600;
+        display:flex;justify-content:space-between;align-items:center;
+    }
+    main{max-width:900px;margin:32px auto;padding:0 20px;}
+
+    .card{
+        background:#fff;border:1px solid #e2e8f0;border-radius:16px;
+        padding:28px 32px;box-shadow:0 2px 8px rgba(0,0,0,0.05);margin-bottom:32px;
+    }
+    label{display:block;font-weight:600;margin:14px 0 6px;}
+    input,select{
+        width:100%;padding:12px;border:1px solid #cbd5e1;border-radius:10px;
+        font-size:15px;background:#fff;
+    }
+    .btn{
+        background:#0ea5e9;border:none;color:#fff;border-radius:10px;
+        padding:12px 20px;cursor:pointer;font-weight:600;margin-top:20px;
+        float:right;
+    }
+    .btn:hover{background:#0284c7;}
+    .btn:disabled{opacity:.5;cursor:not-allowed;}
+
+    /* Ladebalken Fachbereiche */
+    #fb-loading-box{
+        display:none;margin-bottom:10px;padding:12px 0;
+    }
+    #fb-loading-text{
+        font-size:14px;color:#0a66c2;margin-bottom:6px;
+    }
+    #fb-loading-bar-wrap{
+        width:100%;max-width:400px;height:8px;background:#e2e8f0;
+        border-radius:4px;overflow:hidden;
+    }
+    #fb-loading-bar{
+        width:0%;height:8px;background:#0ea5e9;transition:width .25s linear;
+    }
+
+    /* Overlay / Fortschritt */
+    #overlay{
+        display:none;position:fixed;inset:0;background:rgba(255,255,255,.75);
+        backdrop-filter:blur(2px);z-index:9999;
+        align-items:center;justify-content:center;flex-direction:column;gap:12px;
+    }
+    .barwrap{
+        width:min(520px,90vw);height:10px;border-radius:999px;
+        background:#e2e8f0;overflow:hidden;
+    }
+    .bar{
+        height:100%;width:0%;background:#0ea5e9;transition:width .2s linear;
+    }
 </style>
 </head>
 
 <body>
+
 <header>
-  <div class="hwrap">
-    <div><a href="/campaign" style="color:#0a66c2;text-decoration:none">← Kampagne wählen</a></div>
-    <div><b>Neukontakte</b></div>
-    <div>""" + authed_html + r"""</div>
-  </div>
+  <div>Neukontakte</div>
+  <a href="/campaign" style="color:#0a66c2;text-decoration:none;font-size:15px;">
+    Kampagne wählen
+  </a>
 </header>
 
 <main>
+
 <section class="card">
-  <div class="grid">
-    <div class="col-4">
-      <label>Fachbereich</label>
-      <select id="fachbereich"><option value="">– bitte auswählen –</option></select>
-    </div>
+  <h2>Neukontakte – Einstellungen</h2>
 
-    <div class="col-3">
-      <label>Batch ID</label>
-      <input id="batch_id" placeholder="Bxxx"/>
-    </div>
+  <label>Fachbereich – Kampagne</label>
 
-    <div class="col-3">
-      <label>Kampagne</label>
-      <input id="campaign" placeholder="z. B. Frühling 2025"/>
-    </div>
-
-    <div class="col-2" style="display:flex;align-items:flex-end;justify-content:flex-end">
-      <button class="btn" id="btnExport" disabled>Abgleich & Download</button>
+  <!-- 🔄 Ladebalken wie beim Refresh -->
+  <div id="fb-loading-box">
+    <div id="fb-loading-text">Fachbereiche werden geladen … bitte warten.</div>
+    <div id="fb-loading-bar-wrap">
+      <div id="fb-loading-bar"></div>
     </div>
   </div>
+
+  <select id="fachbereich">
+    <option value="">Bitte auswählen …</option>
+  </select>
+
+  <label>Anzahl Kontakte (optional)</label>
+  <input id="take_count" type="number" placeholder="leer = alle"/>
+
+  <label>Batch ID</label>
+  <input id="batch_id" placeholder="B1234"/>
+
+  <label>Kampagnenname</label>
+  <input id="campaign" placeholder="z. B. Neukontakte Q2"/>
+
+  <button class="btn" id="btnExportNk" disabled>Abgleich & Download</button>
 </section>
+
 </main>
 
+<!-- Overlay -->
 <div id="overlay">
-  <div id="phase"></div>
-  <div class="barwrap"><div class="bar" id="bar"></div></div>
+  <div id="overlay-phase" style="font-weight:600"></div>
+  <div class="barwrap"><div class="bar" id="overlay-bar"></div></div>
 </div>
 
 <script>
-// ---------------------------------------------------------------------
-// Sicherer Element-Getter
-// ---------------------------------------------------------------------
-const el = id => {
-    const n = document.getElementById(id);
-    if (!n) {
-        console.error("Element with ID", id, "not found");
-        return { textContent: "" };
-    }
-    return n;
-};
+const el = id => document.getElementById(id);
 
-// ---------------------------------------------------------------------
-// Overlay-Control
-// ---------------------------------------------------------------------
 function showOverlay(msg){
-    el('phase').textContent = msg;
-    el('overlay').style.display = 'flex';
+    el("overlay-phase").textContent = msg;
+    el("overlay").style.display = "flex";
+}
+function hideOverlay(){ el("overlay").style.display = "none"; }
+function setProgress(v){ el("overlay-bar").style.width = v + "%"; }
+
+// ------------------------------------------------------------
+// Fachbereiche laden – MIT Ladebalken (identisch zu Refresh)
+// ------------------------------------------------------------
+async function loadFachbereiche(){
+  const box = el("fb-loading-box");
+  const bar = el("fb-loading-bar");
+  const sel = el("fachbereich");
+
+  box.style.display = "block";
+  bar.style.width = "0%";
+
+  let progress = 0;
+  const interval = setInterval(()=>{
+    progress = Math.min(progress + 4, 90);
+    bar.style.width = progress + "%";
+  }, 200);
+
+  let data = null;
+  try {
+    const resp = await fetch("/neukontakte/options");
+    data = await resp.json();
+  } catch(e){
+    clearInterval(interval);
+    bar.style.width = "100%";
+    setTimeout(()=> box.style.display="none", 500);
+    alert("Fehler beim Laden der Fachbereiche.");
+    return;
+  }
+
+  clearInterval(interval);
+  bar.style.width = "100%";
+
+  sel.innerHTML = '<option value="">Bitte auswählen …</option>';
+
+  (data.options || []).forEach(o=>{
+    const opt = document.createElement("option");
+    opt.value = o.value;
+    opt.textContent = `${o.label} (${o.count})`;
+    sel.appendChild(opt);
+  });
+
+  setTimeout(()=> box.style.display="none", 500);
+
+  sel.onchange = () => {
+    el("btnExportNk").disabled = !sel.value;
+  };
 }
 
-function setProgress(p){
-    el('bar').style.width = Math.min(100, Math.max(0, p)) + '%';
-}
-
-// ---------------------------------------------------------------------
-// Optionen laden
-// ---------------------------------------------------------------------
-async function loadOptions(){
-    showOverlay('Lade Fachbereiche …');
-    setProgress(15);
-
-    const r = await fetch('/neukontakte/options');
-    const data = await r.json();
-
-    const sel = el('fachbereich');
-    sel.innerHTML = '<option value="">– bitte auswählen –</option>';
-
-    data.options.forEach(o => {
-        const opt = document.createElement('option');
-        opt.value = o.value;
-        opt.textContent = o.label + ' (' + o.count + ')';
-        sel.appendChild(opt);
-    });
-
-    el('overlay').style.display = 'none';
-    sel.onchange = () => el('btnExport').disabled = !sel.value;
-}
-
-// ---------------------------------------------------------------------
+// ------------------------------------------------------------
 // Export starten
-// ---------------------------------------------------------------------
+// ------------------------------------------------------------
 async function startExport(){
-    const fb   = el('fachbereich').value;
-    if (!fb) return alert('Bitte Fachbereich wählen');
+  const fach = el("fachbereich").value;
+  if(!fach){ alert("Bitte Fachbereich auswählen."); return; }
 
-    const bid  = el('batch_id').value;
-    const camp = el('campaign').value;
+  showOverlay("Starte Export …");
+  setProgress(10);
 
-    showOverlay('Starte Export …');
-    setProgress(10);
+  const r = await fetch("/neukontakte/export_start", {
+    method:"POST",
+    headers:{ "Content-Type":"application/json" },
+    body:JSON.stringify({
+      fachbereich: fach,
+      take_count: el("take_count").value || null,
+      batch_id: el("batch_id").value,
+      campaign: el("campaign").value
+    })
+  });
 
-    const r = await fetch('/neukontakte/export_start', {
-        method: 'POST',
-        headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({
-            fachbereich: fb,
-            batch_id: bid,
-            campaign: camp
-        })
-    });
-
-    if (!r.ok) return alert("Fehler beim Start");
-
-    const res = await r.json();
-    const job_id = res.job_id;
-
-    let done = false;
-
-    while (!done){
-        await new Promise(r => setTimeout(r, 500));
-        const pr = await fetch('/neukontakte/export_progress?job_id=' + job_id);
-        const s  = await pr.json();
-
-        el('phase').textContent = s.phase + ' (' + s.percent + '%)';
-        setProgress(s.percent);
-
-        done = s.done;
-    }
-
-    window.location.href = '/neukontakte/export_download?job_id=' + job_id;
+  const j = await r.json();
+  await poll(j.job_id);
 }
 
-// ---------------------------------------------------------------------
-// Init
-// ---------------------------------------------------------------------
-el('btnExport').onclick = startExport;
-loadOptions();
+// ------------------------------------------------------------
+// Fortschritt pollen
+// ------------------------------------------------------------
+async function poll(job_id){
+  while(true){
+    await new Promise(r=>setTimeout(r,500));
+    const res = await fetch("/neukontakte/export_progress?job_id="+job_id);
+    const s = await res.json();
+
+    el("overlay-phase").textContent = `${s.phase} (${s.percent}%)`;
+    setProgress(s.percent);
+
+    if(s.error){
+      alert(s.error); hideOverlay(); return;
+    }
+    if(s.done){
+      showOverlay("Download startet …");
+      setProgress(100);
+      window.location.href="/neukontakte/export_download?job_id="+job_id;
+      hideOverlay();
+      return;
+    }
+  }
+}
+
+el("btnExportNk").onclick = startExport;
+loadFachbereiche();
 </script>
 
 </body>
 </html>
-"""
-    )
+""")
 
 
 # =============================================================================
@@ -5045,6 +5256,21 @@ async def refresh_export_download(job_id: str):
         job.path,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         filename=f"{slugify_filename(job.filename_base or 'Refresh_Export')}.xlsx"
+    )
+
+# =============================================================================
+# Download – Neukontakte (analog zu Nachfass)
+# =============================================================================
+@app.get("/neukontakte/export_download")
+async def neukontakte_export_download(job_id: str = Query(...)):
+    job = JOBS.get(job_id)
+    if not job or not job.path:
+        raise HTTPException(status_code=404, detail="Export nicht bereit")
+
+    return FileResponse(
+        job.path,
+        filename=os.path.basename(job.path),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
 
