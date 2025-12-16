@@ -651,7 +651,7 @@ async def load_df_text(table: str) -> pd.DataFrame:
     - JSON-Strings → decodieren
     - None/NaN → ""
     - verschachtelte Strukturen → vollständig flatten
-    API-v2-sicher & frontend-sicher.
+    API-v2-sicher & -sicher.
     """
 
     def flatten(v):
@@ -3454,7 +3454,7 @@ async def neukontakte_export_progress(job_id: str = Query(...)):
 @app.get("/campaign", response_class=HTMLResponse)
 async def campaign_home():
     return HTMLResponse("""<!doctype html>
-<html lang="de">
+<html lang="de" xmlns:mso="urn:schemas-microsoft-com:office:office" xmlns:msdt="uuid:C2F41010-65B3-11d1-A29F-00AA00C14882">
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
@@ -3479,7 +3479,7 @@ header{
 .hwrap{
   max-width:1200px;
   margin:0 auto;
-  padding:18px 24px;
+  padding:22px 24px;
   display:flex;
   align-items:center;
   justify-content:space-between;
@@ -3490,7 +3490,7 @@ header{
   gap:16px;
 }
 .hleft img{
-  height:42px; /* bewusst größer */
+  height:48px; /* bewusst größer */
 }
 .hleft span{
   font-size:18px;
@@ -3512,7 +3512,7 @@ header{
   background:#ffffff;
   border:1px solid #e5e9f0;
   border-radius:20px;
-  padding:32px;
+  padding:36px;
   box-shadow:
     0 14px 32px rgba(15,23,42,.06),
     0 6px 12px rgba(15,23,42,.04);
@@ -3539,21 +3539,30 @@ header{
 
 /* Button */
 .btn{
-  align-self:flex-start;
+  margin-top:32px;
   background:#0ea5e9;
+  border:none;
   color:#ffffff;
-  padding:11px 20px;
   border-radius:999px;
-  text-decoration:none;
-  font-size:14px;
+  padding:12px 24px;
   font-weight:600;
-  transition:background .15s ease, transform .15s ease;
+  font-size:14px;
+  cursor:pointer;
+  box-shadow:0 6px 14px rgba(14,165,233,.35);
 }
 .btn:hover{
   background:#0284c7;
-  transform:translateY(-1px);
 }
+
 </style>
+
+<!--[if gte mso 9]><xml>
+<mso:CustomDocumentProperties>
+<mso:_dlc_DocId msdt:dt="string">WETVQW7WMXWY-1237663653-109692</mso:_dlc_DocId>
+<mso:_dlc_DocIdItemGuid msdt:dt="string">b6722014-ecb9-4557-9bd3-8e7b4fb60a7c</mso:_dlc_DocIdItemGuid>
+<mso:_dlc_DocIdUrl msdt:dt="string">https://bizforward.sharepoint.com/sites/bizforwardintern/_layouts/15/DocIdRedir.aspx?ID=WETVQW7WMXWY-1237663653-109692, WETVQW7WMXWY-1237663653-109692</mso:_dlc_DocIdUrl>
+</mso:CustomDocumentProperties>
+</xml><![endif]-->
 </head>
 
 <body>
@@ -3634,7 +3643,7 @@ header{
 .hwrap{
   max-width:1200px;
   margin:0 auto;
-  padding:18px 24px;
+  padding:22px 24px;
   display:flex;
   align-items:center;
   justify-content:space-between;
@@ -3645,7 +3654,7 @@ header{
   gap:14px;
 }
 .hleft img{
-  height:42px;
+  height:48px;
 }
 .hcenter{
   font-size:18px;
@@ -3657,7 +3666,7 @@ header{
 
 /* Layout */
 main{
-  max-width:760px;
+  max-width:560px;
   margin:48px auto;
   padding:0 24px;
 }
@@ -3667,7 +3676,7 @@ main{
   background:#ffffff;
   border:1px solid #e5e9f0;
   border-radius:20px;
-  padding:32px;
+  padding:36px;
   box-shadow:
     0 14px 32px rgba(15,23,42,.06),
     0 6px 12px rgba(15,23,42,.04);
@@ -3679,6 +3688,11 @@ main{
   grid-template-columns:repeat(12,1fr);
   gap:20px;
 }
+.col-12{ grid-column: span 12; }
+.col-6 { grid-column: span 6; }
+.col-4 { grid-column: span 4; }
+.col-3 { grid-column: span 3; }
+.col-2 { grid-column: span 2; }
 
 /* Form */
 label{
@@ -3687,31 +3701,40 @@ label{
   margin:14px 0 6px;
   font-size:14px;
 }
-select,input{
-  width:100%;
-  padding:10px 12px;
-  border:1px solid #cbd5e1;
-  border-radius:12px;
+select,input,textarea{
+  padding:12px 14px;
+  background:#f8fafc;
+  border:1px solid #dbe3ec;
+}
+select:focus,
+input:focus,
+textarea:focus{
+  outline:none;
+  border-color:#0ea5e9;
   background:#ffffff;
-  font-size:14px;
+  box-shadow:0 0 0 3px rgba(14,165,233,.15);
 }
 
 /* Button */
 .btn{
-  margin-top:28px;
+  margin-top:32px;
   background:#0ea5e9;
   border:none;
   color:#ffffff;
-  border-radius:12px;
-  padding:11px 20px;
+  border-radius:999px;
+  padding:12px 24px;
   font-weight:600;
+  font-size:14px;
   cursor:pointer;
+  box-shadow:0 6px 14px rgba(14,165,233,.35);
 }
-.btn:hover{background:#0284c7}
-.btn:disabled{opacity:.5;cursor:not-allowed}
+.btn:hover{
+  background:#0284c7;
+}
 
 /* Ladehinweis Fachbereiche */
 #fb-loading-box{
+  display:none;
   margin-bottom:12px;
 }
 #fb-loading-text{
@@ -3985,7 +4008,7 @@ header{
 .hwrap{
   max-width:1200px;
   margin:0 auto;
-  padding:18px 24px;
+  padding:24px 24px;
   display:flex;
   align-items:center;
   justify-content:space-between;
@@ -3996,7 +4019,7 @@ header{
   gap:14px;
 }
 .hleft img{
-  height:42px;
+  height:48px;
 }
 .hcenter{
   font-size:18px;
@@ -4010,7 +4033,7 @@ header{
 
 /* Layout */
 main{
-  max-width:760px;
+  max-width:560px;
   margin:48px auto;
   padding:0 24px;
 }
@@ -4020,7 +4043,7 @@ main{
   background:#ffffff;
   border:1px solid #e5e9f0;
   border-radius:20px;
-  padding:32px;
+  padding:36px;
   box-shadow:
     0 14px 32px rgba(15,23,42,.06),
     0 6px 12px rgba(15,23,42,.04);
@@ -4034,27 +4057,37 @@ label{
   margin:14px 0 6px;
   font-size:14px;
 }
-input,textarea{
-  width:100%;
-  padding:10px 12px;
-  border:1px solid #cbd5e1;
-  border-radius:12px;
-  background:#ffffff;
-  font-size:14px;
+select,input,textarea{
+  padding:12px 14px;
+  background:#f8fafc;
+  border:1px solid #dbe3ec;
 }
+select:focus,
+input:focus,
+textarea:focus{
+  outline:none;
+  border-color:#0ea5e9;
+  background:#ffffff;
+  box-shadow:0 0 0 3px rgba(14,165,233,.15);
+}
+
 
 /* Button */
 .btn{
-  margin-top:28px;
+  margin-top:32px;
   background:#0ea5e9;
   border:none;
   color:#ffffff;
-  border-radius:12px;
-  padding:11px 20px;
+  border-radius:999px;
+  padding:12px 24px;
   font-weight:600;
+  font-size:14px;
   cursor:pointer;
+  box-shadow:0 6px 14px rgba(14,165,233,.35);
 }
-.btn:hover{background:#0284c7}
+.btn:hover{
+  background:#0284c7;
+}
 
 /* Tabelle */
 .table-card{
@@ -4311,7 +4344,7 @@ header{
 .hwrap{
   max-width:1200px;
   margin:0 auto;
-  padding:18px 24px;
+  padding:22px 24px;
   display:flex;
   align-items:center;
   justify-content:space-between;
@@ -4322,7 +4355,7 @@ header{
   gap:14px;
 }
 .hleft img{
-  height:42px;
+  height:48px;
 }
 .hcenter{
   font-size:18px;
@@ -4334,7 +4367,7 @@ header{
 
 /* Layout */
 main{
-  max-width:760px;
+  max-width:560px;
   margin:48px auto;
   padding:0 24px;
 }
@@ -4344,7 +4377,7 @@ main{
   background:#ffffff;
   border:1px solid #e5e9f0;
   border-radius:20px;
-  padding:32px;
+  padding:36px;
   margin-bottom:32px;
   box-shadow:
     0 14px 32px rgba(15,23,42,.06),
@@ -4358,14 +4391,20 @@ label{
   margin:14px 0 6px;
   font-size:14px;
 }
-input,select{
-  width:100%;
-  padding:10px 12px;
-  border:1px solid #cbd5e1;
-  border-radius:12px;
-  background:#ffffff;
-  font-size:14px;
+select,input,textarea{
+  padding:12px 14px;
+  background:#f8fafc;
+  border:1px solid #dbe3ec;
 }
+select:focus,
+input:focus,
+textarea:focus{
+  outline:none;
+  border-color:#0ea5e9;
+  background:#ffffff;
+  box-shadow:0 0 0 3px rgba(14,165,233,.15);
+}
+
 
 /* Fachbereich Ladebox */
 #fb-loading-box{
@@ -4392,16 +4431,21 @@ input,select{
 
 /* Button */
 .btn{
-  margin-top:28px;
+  margin-top:32px;
   background:#0ea5e9;
   border:none;
   color:#ffffff;
-  border-radius:12px;
-  padding:11px 20px;
+  border-radius:999px;
+  padding:12px 24px;
   font-weight:600;
+  font-size:14px;
   cursor:pointer;
+  box-shadow:0 6px 14px rgba(14,165,233,.35);
 }
-.btn:hover{background:#0284c7}
+.btn:hover{
+  background:#0284c7;
+}
+
 
 /* Tabelle */
 .table-card{
