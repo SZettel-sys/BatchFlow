@@ -3628,233 +3628,41 @@ async def neukontakte_export_progress(job_id: str = Query(...)):
 # -------------------------------------------------------------------------
 @app.get("/campaign", response_class=HTMLResponse)
 async def campaign_home():
-    return HTMLResponse(r"""<!doctype html>
+    return HTMLResponse("""
+<!doctype html>
 <html lang="de">
 <head>
 <meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>BatchFlow – bizforward</title>
+<title>BatchFlow</title>
 
+<!-- HIER: CSS -->
 <style>
-:root{
-  --bg:#f7f9fc;
-  --card:#ffffff;
-  --border:#e5e9f0;
-  --text:#0f172a;
-  --muted:#64748b;
-  --primary:#0ea5e9;
-  --primary-dark:#0284c7;
-}
-
-/* Reset */
-*{box-sizing:border-box}
-body{
-  margin:0;
-  background:var(--bg);
-  color:var(--text);
-  font:16px/1.6 Inter,system-ui,-apple-system,BlinkMacSystemFont,sans-serif;
-}
-
-/* Header */
-header{
-  background:#fff;
-  border-bottom:1px solid var(--border);
-}
-.header-inner{
-  max-width:1200px;
-  margin:0 auto;
-  padding:16px 32px;
-  display:flex;
-  align-items:center;
-  justify-content:space-between;
-}
-.header-left{
-  display:flex;
-  align-items:center;
-  gap:14px;
-}
-.header-left img{height:34px}
-.header-title{
-  font-size:20px;
-  font-weight:600;
-}
-.header-right{
-  font-size:14px;
-  color:var(--muted);
-}
-
-/* Hero */
-.hero{
-  max-width:900px;
-  margin:64px auto 48px;
-  padding:0 24px;
-  text-align:center;
-}
-.hero h1{
-  font-size:34px;
-  line-height:1.25;
-  margin:0 0 12px;
-}
-.hero p{
-  font-size:17px;
-  color:var(--muted);
-  margin:0;
-}
-
-/* Cards */
-.cards{
-  max-width:1100px;
-  margin:0 auto 80px;
-  padding:0 24px;
-  display:grid;
-  grid-template-columns:repeat(auto-fit,minmax(280px,1fr));
-  gap:28px;
-}
-
-/* Animation – initial state */
-.card{
-  background:var(--card);
-  border:1px solid var(--border);
-  border-radius:20px;
-  padding:30px 32px;
-  box-shadow:
-    0 12px 30px rgba(15,23,42,.06),
-    0 4px 8px rgba(15,23,42,.04);
-  display:flex;
-  flex-direction:column;
-  justify-content:space-between;
-
-  opacity:0;
-  transform:translateY(12px);
-  animation:cardIn .6s ease forwards;
-}
-.card:nth-child(1){animation-delay:.05s}
-.card:nth-child(2){animation-delay:.15s}
-.card:nth-child(3){animation-delay:.25s}
-
-@keyframes cardIn{
-  to{opacity:1;transform:translateY(0)}
-}
-
-/* Respect reduced motion */
-@media (prefers-reduced-motion: reduce){
-  .card{animation:none;opacity:1;transform:none}
-}
-
-.card:hover{
-  transform:translateY(-4px);
-  box-shadow:
-    0 18px 40px rgba(15,23,42,.08),
-    0 6px 12px rgba(15,23,42,.05);
-}
-
-/* Card Header (Icon + Title) */
-.card-header{
-  display:flex;
-  align-items:center;
-  gap:10px;
-  margin-bottom:10px;
-}
-.card-header svg{
-  width:20px;
-  height:20px;
-  stroke:#334155;
-}
-.card h3{
-  margin:0;
-  font-size:20px;
-}
-.card p{
-  margin:0 0 22px;
-  color:var(--muted);
-  font-size:15px;
-}
-
-/* Button */
-.btn{
-  align-self:flex-start;
-  background:var(--primary);
-  color:#fff;
-  border:none;
-  border-radius:12px;
-  padding:12px 20px;
-  font-size:15px;
-  font-weight:600;
-  cursor:pointer;
-  text-decoration:none;
-}
-.btn:hover{background:var(--primary-dark)}
+/* >>> HIER DAS KOMPLETTE GEMEINSAME CSS EINFÜGEN <<< */
 </style>
-</head>
 
+</head>
 <body>
 
+<!-- HEADER -->
 <header>
   <div class="header-inner">
     <div class="header-left">
-      <img src="/static/bizforward-Logo-Clean-2024.svg" alt="bizforward"/>
+      <img src="/static/bizforward-Logo-Clean-2024.svg">
       <div class="header-title">BatchFlow</div>
     </div>
-    <div class="header-right">bizforward · Internal Tool</div>
   </div>
 </header>
 
-<section class="hero">
-  <h1>Kontakte strukturiert und sicher verarbeiten</h1>
-  <p>BatchFlow unterstützt dich beim Auswählen, Abgleichen und Exportieren von Kontakten für Kampagnen.</p>
-</section>
-
-<section class="cards">
-
-  <!-- Neukontakte -->
-  <div class="card">
-    <div>
-      <div class="card-header">
-        <!-- user-plus -->
-        <svg fill="none" viewBox="0 0 24 24" stroke-width="1.8">
-          <path stroke-linecap="round" stroke-linejoin="round"
-            d="M15 19a6 6 0 00-12 0M12 7a4 4 0 110-8 4 4 0 010 8zm7 2v4m2-2h-4"/>
-        </svg>
-        <h3>Neukontakte</h3>
-      </div>
-      <p>Noch nicht angeschriebene Kontakte auswählen und für den Erstkontakt vorbereiten.</p>
+<main>
+  <section class="card">
+    <h2>Aktionen</h2>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:24px">
+      <a class="card" href="/neukontakte">Neukontakte</a>
+      <a class="card" href="/nachfass">Nachfass</a>
+      <a class="card" href="/refresh">Refresh</a>
     </div>
-    <a class="btn" href="/neukontakte">Öffnen</a>
-  </div>
-
-  <!-- Nachfass -->
-  <div class="card">
-    <div>
-      <div class="card-header">
-        <!-- repeat -->
-        <svg fill="none" viewBox="0 0 24 24" stroke-width="1.8">
-          <path stroke-linecap="round" stroke-linejoin="round"
-            d="M17 1l4 4-4 4M3 11V9a4 4 0 014-4h14M7 23l-4-4 4-4m14-2v2a4 4 0 01-4 4H3"/>
-        </svg>
-        <h3>Nachfass</h3>
-      </div>
-      <p>Kontakte anhand einer bestehenden Batch ID erneut kontaktieren und sauber abgleichen.</p>
-    </div>
-    <a class="btn" href="/nachfass">Öffnen</a>
-  </div>
-
-  <!-- Refresh -->
-  <div class="card">
-    <div>
-      <div class="card-header">
-        <!-- refresh -->
-        <svg fill="none" viewBox="0 0 24 24" stroke-width="1.8">
-          <path stroke-linecap="round" stroke-linejoin="round"
-            d="M4 4v6h6M20 20v-6h-6M5 19a9 9 0 0014-7M19 5a9 9 0 00-14 7"/>
-        </svg>
-        <h3>Refresh</h3>
-      </div>
-      <p>Kontakte anhand eines Fachbereiches neu auswählen und für eine weitere Kampagne aufbereiten.</p>
-    </div>
-    <a class="btn" href="/refresh">Öffnen</a>
-  </div>
-
-</section>
+  </section>
+</main>
 
 </body>
 </html>
@@ -3865,173 +3673,51 @@ header{
 # =============================================================================
 @app.get("/neukontakte", response_class=HTMLResponse)
 async def neukontakte_page():
-    return HTMLResponse(r"""<!doctype html>
+    return HTMLResponse("""
+<!doctype html>
 <html lang="de">
 <head>
 <meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>Neukontakte – BatchFlow</title>
 
 <style>
 :root{
-  --bg:#f7f9fc;
-  --card:#ffffff;
-  --border:#e5e9f0;
-  --text:#0f172a;
-  --muted:#64748b;
-  --primary:#0ea5e9;
-  --primary-dark:#0284c7;
-  --danger:#b91c1c;
+  --bg:#f7f9fc;--card:#fff;--border:#e5e9f0;
+  --text:#0f172a;--muted:#64748b;
+  --primary:#0ea5e9;--primary-dark:#0284c7;
+  --danger:#b91c1c;--warning:#f59e0b;--info:#6366f1;
 }
-
-/* Reset */
 *{box-sizing:border-box}
-body{
-  margin:0;
-  background:var(--bg);
-  color:var(--text);
-  font:16px/1.6 Inter,system-ui,-apple-system,BlinkMacSystemFont,sans-serif;
-}
-
-/* Header */
-header{
-  background:#fff;
-  border-bottom:1px solid var(--border);
-}
-.header-inner{
-  max-width:1200px;
-  margin:0 auto;
-  padding:16px 32px;
-  display:flex;
-  align-items:center;
-  justify-content:space-between;
-}
-.header-left{
-  display:flex;
-  align-items:center;
-  gap:14px;
-}
+body{margin:0;background:var(--bg);font:16px/1.6 Inter,sans-serif;color:var(--text)}
+header{background:#fff;border-bottom:1px solid var(--border)}
+.header-inner{max-width:1200px;margin:auto;padding:16px 32px;display:flex;justify-content:space-between;align-items:center}
+.header-left{display:flex;gap:14px;align-items:center}
 .header-left img{height:34px}
-.header-title{
-  font-size:20px;
-  font-weight:600;
-}
-.header-action{
-  font-size:14px;
-  color:var(--primary);
-  text-decoration:none;
-}
-.header-action:hover{color:var(--primary-dark)}
+.header-title{font-size:20px;font-weight:600}
+.header-link{font-size:14px;color:var(--primary);text-decoration:none}
 
-/* Layout */
-main{
-  max-width:900px;
-  margin:48px auto;
-  padding:0 24px;
-}
+main{max-width:960px;margin:48px auto;padding:0 24px}
+.card{background:#fff;border:1px solid var(--border);border-radius:20px;
+padding:32px;margin-bottom:36px;
+box-shadow:0 12px 30px rgba(15,23,42,.06)}
 
-/* Card */
-.card{
-  background:var(--card);
-  border:1px solid var(--border);
-  border-radius:20px;
-  padding:32px 36px;
-  box-shadow:
-    0 12px 30px rgba(15,23,42,.06),
-    0 4px 8px rgba(15,23,42,.04);
-}
-
-/* Typography */
-h2{margin:0 0 22px;font-size:22px}
-label{
-  display:block;
-  font-weight:600;
-  margin:18px 0 6px;
-  font-size:14px;
-}
-input,select{
-  width:100%;
-  padding:13px 14px;
-  border:1px solid var(--border);
-  border-radius:12px;
-  font-size:15px;
-}
-input:focus,select:focus{
-  outline:none;
-  border-color:var(--primary);
-}
-
-/* Button */
-.btn{
-  margin-top:26px;
-  background:var(--primary);
-  border:none;
-  color:#fff;
-  border-radius:12px;
-  padding:14px 22px;
-  font-size:15px;
-  font-weight:600;
-  cursor:pointer;
-  float:right;
-}
+label{display:block;font-weight:600;margin:18px 0 6px;font-size:14px}
+input,select{width:100%;padding:12px;border:1px solid var(--border);border-radius:12px}
+.btn{margin-top:26px;background:var(--primary);color:#fff;border:none;
+border-radius:12px;padding:14px 22px;font-weight:600;cursor:pointer}
 .btn:hover{background:var(--primary-dark)}
-.btn:disabled{opacity:.5;cursor:not-allowed}
 
-/* Fachbereich Loader */
-#fb-loading-box{display:none;margin-bottom:10px}
-#fb-loading-text{font-size:13px;color:var(--muted);margin-bottom:6px}
-#fb-loading-bar-wrap{
-  width:100%;
-  max-width:420px;
-  height:8px;
-  background:#e5e9f0;
-  border-radius:6px;
-  overflow:hidden;
-}
-#fb-loading-bar{
-  width:0%;
-  height:100%;
-  background:linear-gradient(90deg,var(--primary),#38bdf8);
-  transition:width .25s linear;
-}
-
-/* Result + Excluded */
-#result-box,#excluded-box{display:none;margin-top:32px}
-table{
-  width:100%;
-  border-collapse:collapse;
-  font-size:14px;
-}
-th,td{padding:10px;text-align:left}
+.table-wrap{overflow:auto;border:1px solid var(--border);border-radius:14px}
+table{width:100%;border-collapse:collapse;font-size:14px}
 thead{background:#f1f5f9}
-td.reason{color:var(--danger);font-weight:500}
+th,td{padding:10px;text-align:left}
+.empty{color:var(--muted);text-align:center}
 
-/* Overlay */
-#overlay{
-  display:none;
-  position:fixed;
-  inset:0;
-  background:rgba(247,249,252,.85);
-  backdrop-filter:blur(3px);
-  z-index:9999;
-  align-items:center;
-  justify-content:center;
-  flex-direction:column;
-  gap:14px;
-}
-.barwrap{
-  width:min(520px,90vw);
-  height:10px;
-  background:#e5e9f0;
-  border-radius:999px;
-  overflow:hidden;
-}
-.bar{
-  height:100%;
-  width:0%;
-  background:linear-gradient(90deg,var(--primary),#38bdf8);
-  transition:width .2s linear;
-}
+.badge{display:inline-flex;gap:6px;padding:4px 10px;border-radius:999px;
+font-size:12px;font-weight:600}
+.badge-danger{background:#fee2e2;color:#991b1b}
+.badge-warning{background:#fef3c7;color:#92400e}
+.badge-info{background:#e0e7ff;color:#3730a3}
 </style>
 </head>
 
@@ -4040,631 +3726,316 @@ td.reason{color:var(--danger);font-weight:500}
 <header>
   <div class="header-inner">
     <div class="header-left">
-      <img src="/static/bizforward-Logo-Clean-2024.svg"/>
+      <img src="/static/bizforward-Logo-Clean-2024.svg">
       <div class="header-title">BatchFlow · Neukontakte</div>
     </div>
-    <a class="header-action" href="/">Startseite</a>
+    <a class="header-link" href="/">Startseite</a>
   </div>
 </header>
 
 <main>
 
 <section class="card">
-  <h2>Neukontakte auswählen</h2>
+  <h2>Neukontakte</h2>
 
   <label>Fachbereich – Kampagne</label>
-
-  <div id="fb-loading-box">
-    <div id="fb-loading-text">Fachbereiche werden geladen …</div>
-    <div id="fb-loading-bar-wrap">
-      <div id="fb-loading-bar"></div>
-    </div>
-  </div>
-
-  <select id="fachbereich">
-    <option value="">Bitte auswählen …</option>
-  </select>
+  <select id="fachbereich"></select>
 
   <label>Anzahl Kontakte (optional)</label>
-  <input id="take_count" type="number"/>
+  <input id="take_count" type="number">
 
   <label>Batch ID</label>
-  <input id="batch_id"/>
+  <input id="batch_id">
 
   <label>Kampagnenname</label>
-  <input id="campaign"/>
+  <input id="campaign">
 
-  <button class="btn" id="btnExportNk" disabled>Abgleich & Download</button>
+  <button class="btn" onclick="startExport()">Export starten</button>
 </section>
-
-<!-- Ergebnis -->
-<div id="result-box">
-  <strong>Ergebnis</strong>
-  <div id="result-text"></div>
-</div>
-
-<!-- Excluded -->
-<div id="excluded-box">
-  <strong>Ausgeschlossene Datensätze</strong>
-  <div style="overflow:auto;border:1px solid var(--border);border-radius:12px;margin-top:8px">
-    <table>
-      <thead>
-        <tr>
-          <th>Name</th>
-          <th>Organisation</th>
-          <th>E-Mail</th>
-          <th>Grund</th>
-        </tr>
-      </thead>
-      <tbody id="excluded-body"></tbody>
-    </table>
-  </div>
-</div>
-
-</main>
-
-<!-- Overlay -->
-<div id="overlay">
-  <div id="overlay-phase" style="font-weight:600"></div>
-  <div class="barwrap"><div class="bar" id="overlay-bar"></div></div>
-</div>
-
-<script>
-const el=id=>document.getElementById(id);
-function showOverlay(t){el("overlay-phase").textContent=t;el("overlay").style.display="flex";}
-function hideOverlay(){el("overlay").style.display="none";}
-function setProgress(v){el("overlay-bar").style.width=v+"%";}
-
-/* Fachbereiche laden */
-async function loadFachbereiche(){
-  const box=el("fb-loading-box"),bar=el("fb-loading-bar"),sel=el("fachbereich");
-  box.style.display="block";bar.style.width="0%";
-  let p=0;const i=setInterval(()=>{p=Math.min(p+4,90);bar.style.width=p+"%";},200);
-  const d=await (await fetch("/neukontakte/options")).json();
-  clearInterval(i);bar.style.width="100%";
-  sel.innerHTML='<option value="">Bitte auswählen …</option>';
-  (d.options||[]).forEach(o=>{
-    const opt=document.createElement("option");
-    opt.value=o.value;opt.textContent=`${o.label} (${o.count})`;
-    sel.appendChild(opt);
-  });
-  setTimeout(()=>box.style.display="none",400);
-  sel.onchange=()=>el("btnExportNk").disabled=!sel.value;
-}
-
-/* Excluded laden */
-async function loadExcluded(){
-  const rows=await (await fetch("/neukontakte/excluded")).json();
-  if(!rows||!rows.length)return;
-  const body=el("excluded-body");body.innerHTML="";
-  rows.forEach(r=>{
-    body.innerHTML+=`
-      <tr>
-        <td>${r.person_name||""}</td>
-        <td>${r.org_name||""}</td>
-        <td>${r.email||""}</td>
-        <td class="reason">${r.exclusion_reason||""}</td>
-      </tr>`;
-  });
-  el("excluded-box").style.display="block";
-}
-
-/* Export */
-async function startExport(){
-  showOverlay("Starte Export …");setProgress(10);
-  const r=await fetch("/neukontakte/export_start",{method:"POST",headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({
-      fachbereich:el("fachbereich").value,
-      take_count:el("take_count").value||null,
-      batch_id:el("batch_id").value,
-      campaign:el("campaign").value
-    })});
-  const j=await r.json();poll(j.job_id);
-}
-
-/* Poll */
-async function poll(id){
-  while(true){
-    await new Promise(r=>setTimeout(r,500));
-    const s=await (await fetch("/neukontakte/export_progress?job_id="+id)).json();
-    el("overlay-phase").textContent=`${s.phase} (${s.percent}%)`;
-    setProgress(s.percent);
-    if(s.error){alert(s.error);hideOverlay();return;}
-    if(s.done){
-      hideOverlay();
-      el("result-text").textContent=
-        `${s.total_rows} exportiert · ${s.excluded_rows} ausgeschlossen`;
-      el("result-box").style.display="block";
-      await loadExcluded();
-      window.location.href="/neukontakte/export_download?job_id="+id;
-      return;
-    }
-  }
-}
-
-el("btnExportNk").onclick=startExport;
-loadFachbereiche();
-</script>
-
-</body>
-</html>""")
-
-
-# =============================================================================
-# Frontend – Nachfass (stabil, modern, sauber)
-# =============================================================================
-@app.get("/nachfass", response_class=HTMLResponse)
-async def nachfass_page():
-    return HTMLResponse("""<!doctype html>
-<html lang="de">
-<head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>Nachfass – BatchFlow</title>
-
-<style>
-    body{margin:0;background:#f6f8fb;color:#0f172a;font:16px/1.6 Inter,sans-serif;}
-    header{
-        background:#fff;border-bottom:1px solid #e2e8f0;
-        padding:14px 24px;font-size:20px;font-weight:600;
-        display:flex;justify-content:space-between;align-items:center;
-    }
-    main{max-width:900px;margin:32px auto;padding:0 20px;}
-
-    .card{
-        background:#fff;border:1px solid #e2e8f0;border-radius:16px;
-        padding:28px 32px;box-shadow:0 2px 8px rgba(0,0,0,0.05);margin-bottom:32px;
-    }
-    label{display:block;font-weight:600;margin:14px 0 6px;}
-    input,textarea{
-        width:100%;padding:12px;border:1px solid #cbd5e1;border-radius:10px;
-        font-size:15px;background:#fff;
-    }
-    .btn{
-        background:#0ea5e9;border:none;color:#fff;border-radius:10px;
-        padding:12px 20px;cursor:pointer;font-weight:600;margin-top:20px;
-        float:right;
-    }
-    .btn:hover{background:#0284c7;}
-
-    /* Tabelle */
-    .table-card{
-        max-width:1100px;margin:0 auto 40px auto;background:#fff;
-        padding:20px 24px;border-radius:16px;border:1px solid #e2e8f0;
-        box-shadow:0 2px 8px rgba(0,0,0,0.05);
-    }
-    table{width:100%;border-collapse:collapse;margin-top:12px;}
-    th,td{padding:10px 14px;border-bottom:1px solid #e2e8f0;text-align:left;}
-    th{background:#f8fafc;font-weight:700;}
-    tr:last-child td{border-bottom:none;}
-
-    /* Overlay / Fortschritt */
-    #overlay{
-        display:none;position:fixed;inset:0;background:rgba(255,255,255,.75);
-        backdrop-filter:blur(2px);z-index:9999;
-        align-items:center;justify-content:center;flex-direction:column;gap:12px;
-    }
-    .barwrap{
-        width:min(520px,90vw);height:10px;border-radius:999px;
-        background:#e2e8f0;overflow:hidden;
-    }
-    .bar{
-        height:100%;width:0%;background:#0ea5e9;transition:width .2s linear;
-    }
-</style>
-
-</head>
-<body>
-
-<header>
-  <div>Nachfass</div>
-  <a href="/campaign" style="color:#0a66c2;text-decoration:none;font-size:15px;">Kampagne wählen</a>
-</header>
-
-<main>
 
 <section class="card">
-  <h2>Nachfass – Einstellungen</h2>
-
-  <label>Batch IDs (1–2 Werte)</label>
-  <textarea id="nf_batch_ids" rows="2" placeholder="B111, B222"></textarea>
-
-  <label>Export-Batch-ID</label>
-  <input id="batch_id" placeholder="B999"/>
-
-  <label>Kampagnenname</label>
-  <input id="campaign" placeholder="z. B. Nachfass KW45"/>
-
-  <button class="btn" id="btnExportNf">Abgleich & Download</button>
+  <h2>Entfernte Datensätze</h2>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>ID</th><th>Name</th><th>Organisation</th><th>Grund</th></tr>
+      </thead>
+      <tbody id="excluded-body">
+        <tr><td colspan="4" class="empty">Noch keine Daten geladen</td></tr>
+      </tbody>
+    </table>
+  </div>
 </section>
-
-<section class="table-card">
-  <h3>Entfernte Datensätze</h3>
-  <table>
-    <thead>
-      <tr>
-        <th>Kontakt ID</th><th>Name</th><th>Organisation ID</th>
-        <th>Organisationsname</th><th>Grund</th>
-      </tr>
-    </thead>
-    <tbody id="excluded-table-body">
-      <tr><td colspan="5" style="text-align:center;color:#999">Noch keine Daten geladen</td></tr>
-    </tbody>
-  </table>
-</section>
-
-</main>
-
-<div id="overlay">
-  <div id="overlay-phase" style="font-weight:600"></div>
-  <div class="barwrap"><div class="bar" id="overlay-bar"></div></div>
-</div>
 
 <script>
-const el = id => document.getElementById(id);
-
-function showOverlay(msg){
-    el("overlay-phase").textContent = msg;
-    el("overlay").style.display = "flex";
+function exclusionBadge(r){
+  r=r?.toLowerCase()||"";
+  if(r.includes("kontaktiert")) return '<span class="badge badge-danger">Kontaktiert</span>';
+  if(r.includes("duble")) return '<span class="badge badge-warning">Dublette</span>';
+  if(r.includes("aktiv")) return '<span class="badge badge-info">Aktivität</span>';
+  return '<span class="badge badge-warning">Sonstiges</span>';
 }
-function hideOverlay(){ el("overlay").style.display = "none"; }
-function setProgress(p){ el("overlay-bar").style.width = p + "%"; }
 
 async function loadExcluded(){
-    const r = await fetch("/nachfass/excluded/json");
-    const data = await r.json();
-
-    const body = el("excluded-table-body");
-    body.innerHTML = "";
-
-    if(!data.rows || !data.rows.length){
-        body.innerHTML = '<tr><td colspan="5" style="text-align:center;color:#999">Keine Treffer</td></tr>';
-        return;
-    }
-
-    for(const row of data.rows){
-        const tr = document.createElement("tr");
-        tr.innerHTML = `
-          <td>${row["Kontakt ID"]||""}</td>
-          <td>${row["Name"]||""}</td>
-          <td>${row["Organisation ID"]||""}</td>
-          <td>${row["Organisationsname"]||""}</td>
-          <td>${row["Grund"]||""}</td>
-        `;
-        body.appendChild(tr);
-    }
+  const rows = await (await fetch("/neukontakte/excluded")).json();
+  const b = document.getElementById("excluded-body");
+  b.innerHTML="";
+  if(!rows.length){
+    b.innerHTML='<tr><td colspan="4" class="empty">Keine entfernten Datensätze</td></tr>';
+    return;
+  }
+  rows.forEach(r=>{
+    b.innerHTML+=`
+      <tr>
+        <td>${r.person_id}</td>
+        <td>${r.person_name}</td>
+        <td>${r.org_name}</td>
+        <td>${exclusionBadge(r.exclusion_reason)}</td>
+      </tr>`;
+  });
 }
-
-async function poll(job_id){
-    while(true){
-        await new Promise(r=>setTimeout(r,500));
-        const res = await fetch("/nachfass/export_progress?job_id="+job_id);
-        const s = await res.json();
-
-        el("overlay-phase").textContent = `${s.phase} (${s.percent}%)`;
-        setProgress(s.percent);
-
-        if(s.error){
-            alert(s.error); hideOverlay(); return;
-        }
-        if(s.download_ready){
-            showOverlay("Download startet …");
-            setProgress(100);
-
-            window.location.href="/nachfass/export_download?job_id="+job_id;
-
-            await loadExcluded();
-            hideOverlay();
-            return;
-        }
-    }
-}
-
-async function startExport(){
-    const ids = el("nf_batch_ids").value.trim();
-    if(!ids){ alert("Bitte Batch IDs eingeben."); return; }
-
-    showOverlay("Starte Abgleich …");
-    setProgress(10);
-
-    const r = await fetch("/nachfass/export_start", {
-        method:"POST",
-        headers:{ "Content-Type":"application/json" },
-        body:JSON.stringify({
-            nf_batch_ids: ids.split(/[\\n,;]/).map(s=>s.trim()).filter(Boolean),
-            batch_id: el("batch_id").value,
-            campaign: el("campaign").value
-        })
-    });
-
-    const j = await r.json();
-    await poll(j.job_id);
-}
-
-el("btnExportNf").onclick = startExport;
 </script>
 
 </body>
 </html>
 """)
 
-
-
 # =============================================================================
-# Frontend – Refresh (analog zu Nachfass)
+# Frontend – Nachfass (stabil, modern, sauber)
 # =============================================================================
-@app.get("/refresh", response_class=HTMLResponse)
-async def refresh_page(request: Request):
-    authed = True
-    auth_info = "<span class='muted'>angemeldet</span>" if authed else "<a href='/login'>Anmelden</a>"
 
-    return HTMLResponse(
-        r"""<!doctype html><html lang="de">
+@app.get("/nachfass", response_class=HTMLResponse)
+async def nachfass_page():
+    return HTMLResponse("""
+<!doctype html>
+<html lang="de">
 <head>
 <meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>Refresh – BatchFlow</title>
-
+<title>Nachfass – BatchFlow</title>
 <style>
-  body{margin:0;background:#f6f8fb;color:#0f172a;font:16px/1.6 Inter,sans-serif}
-  header{
-    background:#fff;border-bottom:1px solid #e2e8f0;
-    padding:14px 24px;font-size:20px;font-weight:600;
-    display:flex;justify-content:space-between;align-items:center
-  }
-  main{max-width:900px;margin:32px auto;padding:0 20px}
+:root{
+  --bg:#f7f9fc;--card:#fff;--border:#e5e9f0;
+  --text:#0f172a;--muted:#64748b;
+  --primary:#0ea5e9;--primary-dark:#0284c7;
+  --danger:#b91c1c;--warning:#f59e0b;--info:#6366f1;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);font:16px/1.6 Inter,sans-serif;color:var(--text)}
+header{background:#fff;border-bottom:1px solid var(--border)}
+.header-inner{max-width:1200px;margin:auto;padding:16px 32px;display:flex;justify-content:space-between;align-items:center}
+.header-left{display:flex;gap:14px;align-items:center}
+.header-left img{height:34px}
+.header-title{font-size:20px;font-weight:600}
+.header-link{font-size:14px;color:var(--primary);text-decoration:none}
 
-  .card{
-    background:#fff;border:1px solid #e2e8f0;border-radius:16px;
-    padding:28px 32px;margin-bottom:32px;
-    box-shadow:0 2px 8px rgba(0,0,0,.05)
-  }
+main{max-width:960px;margin:48px auto;padding:0 24px}
+.card{background:#fff;border:1px solid var(--border);border-radius:20px;
+padding:32px;margin-bottom:36px;
+box-shadow:0 12px 30px rgba(15,23,42,.06)}
 
-  label{display:block;font-weight:600;margin:14px 0 6px}
-  input,select{
-    width:100%;padding:12px;border:1px solid #cbd5e1;border-radius:10px;
-    background:#fff;font-size:15px
-  }
+label{display:block;font-weight:600;margin:18px 0 6px;font-size:14px}
+input,select{width:100%;padding:12px;border:1px solid var(--border);border-radius:12px}
+.btn{margin-top:26px;background:var(--primary);color:#fff;border:none;
+border-radius:12px;padding:14px 22px;font-weight:600;cursor:pointer}
+.btn:hover{background:var(--primary-dark)}
 
-  /* Ladebox */
-  #fb-loading-box{
-    display:none;margin-bottom:10px;padding:12px 0;
-  }
-  #fb-loading-text{
-    font-size:14px;color:#0a66c2;margin-bottom:6px;
-  }
-  #fb-loading-bar-wrap{
-    width:100%;max-width:400px;height:8px;background:#e2e8f0;
-    border-radius:4px;overflow:hidden
-  }
-  #fb-loading-bar{
-    width:0%;height:8px;background:#0ea5e9;transition:width .25s linear
-  }
+.table-wrap{overflow:auto;border:1px solid var(--border);border-radius:14px}
+table{width:100%;border-collapse:collapse;font-size:14px}
+thead{background:#f1f5f9}
+th,td{padding:10px;text-align:left}
+.empty{color:var(--muted);text-align:center}
 
-  .btn{
-    background:#0ea5e9;border:none;color:#fff;border-radius:10px;
-    padding:12px 20px;cursor:pointer;font-weight:600;margin-top:20px;float:right
-  }
-  .btn:hover{background:#0284c7}
-
-  /* Tabelle */
-  .table-card{
-    background:#fff;border:1px solid #e2e8f0;border-radius:16px;
-    padding:20px 24px;margin-top:20px;
-    box-shadow:0 2px 8px rgba(0,0,0,.05)
-  }
-  table{width:100%;border-collapse:collapse;margin-top:12px}
-  th,td{
-    padding:10px 14px;border-bottom:1px solid #e2e8f0;text-align:left
-  }
-  th{background:#f8fafc;font-weight:700}
-
-  /* Overlay */
-  #overlay{
-    display:none;position:fixed;inset:0;background:rgba(255,255,255,.75);
-    backdrop-filter:blur(2px);z-index:9999;
-    align-items:center;justify-content:center;flex-direction:column;gap:12px
-  }
-  .barwrap{
-    width:min(520px,90vw);height:10px;border-radius:999px;background:#e2e8f0;overflow:hidden
-  }
-  .bar{
-    height:100%;width:0%;background:#0ea5e9;transition:width .2s linear
-  }
+.badge{display:inline-flex;gap:6px;padding:4px 10px;border-radius:999px;
+font-size:12px;font-weight:600}
+.badge-danger{background:#fee2e2;color:#991b1b}
+.badge-warning{background:#fef3c7;color:#92400e}
+.badge-info{background:#e0e7ff;color:#3730a3}
 </style>
 </head>
-
 <body>
 
 <header>
-  <div>Refresh</div>
-  <div>""" + auth_info + r"""</div>
+  <div class="header-inner">
+    <div class="header-left">
+      <img src="/static/bizforward-Logo-Clean-2024.svg">
+      <div class="header-title">BatchFlow · Nachfass</div>
+    </div>
+    <a class="header-link" href="/">Startseite</a>
+  </div>
 </header>
 
 <main>
 
 <section class="card">
-  <h2>Refresh – Kampagnen Einstellungen</h2>
+  <h2>Nachfass</h2>
+  <label>Batch ID auswählen</label>
+  <select id="batch_id"></select>
+  <button class="btn" onclick="startExport()">Export starten</button>
+</section>
 
-  <label>Fachbereich – Kampagne</label>
-
-  <!-- 🔥 DEIN ALTER LADEBALKEN – WIEDER DRIN -->
-  <div id="fb-loading-box">
-    <div id="fb-loading-text">Fachbereiche werden geladen … bitte warten.</div>
-    <div id="fb-loading-bar-wrap">
-      <div id="fb-loading-bar"></div>
-    </div>
+<section class="card">
+  <h2>Entfernte Datensätze</h2>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>ID</th><th>Name</th><th>Organisation</th><th>Grund</th></tr>
+      </thead>
+      <tbody id="excluded-body">
+        <tr><td colspan="4" class="empty">Noch keine Daten geladen</td></tr>
+      </tbody>
+    </table>
   </div>
-
-  <select id="fachbereich">
-    <option value="">Bitte auswählen …</option>
-  </select>
-
-  <label>Batch ID</label>
-  <input id="batch_id" placeholder="RF-2025-01"/>
-
-  <label>Kampagnenname</label>
-  <input id="campaign" placeholder="z. B. Refresh Q1 / IT"/>
-
-  <label>Anzahl Kontakte (optional)</label>
-  <input id="take_count" type="number" placeholder="leer = alle"/>
-
-  <button class="btn" id="btnExportRf">Abgleich & Download</button>
 </section>
-
-<section class="table-card">
-  <h3>Entfernte Datensätze</h3>
-  <table>
-    <thead>
-      <tr>
-        <th>Kontakt ID</th><th>Name</th><th>Organisation ID</th>
-        <th>Organisationsname</th><th>Grund</th>
-      </tr>
-    </thead>
-    <tbody id="excluded-table-body">
-      <tr><td colspan="5" style="text-align:center;color:#999">Noch keine Daten geladen</td></tr>
-    </tbody>
-  </table>
-</section>
-
-</main>
-
-<!-- Overlay -->
-<div id="overlay">
-  <div id="overlay-phase" style="font-weight:600"></div>
-  <div class="barwrap"><div class="bar" id="overlay-bar"></div></div>
-</div>
 
 <script>
-const el = id => document.getElementById(id);
-
-function showOverlay(msg){
-  el("overlay-phase").textContent = msg;
-  el("overlay").style.display = "flex";
+function exclusionBadge(r){
+  r=r?.toLowerCase()||"";
+  if(r.includes("kontaktiert")) return '<span class="badge badge-danger">Kontaktiert</span>';
+  if(r.includes("duble")) return '<span class="badge badge-warning">Dublette</span>';
+  if(r.includes("aktiv")) return '<span class="badge badge-info">Aktivität</span>';
+  return '<span class="badge badge-warning">Sonstiges</span>';
 }
-function hideOverlay(){ el("overlay").style.display = "none"; }
-function setProgress(v){ el("overlay-bar").style.width = v + "%"; }
-
-//
-// ⭐ WICHTIG – Alter Ladebalken wieder aktiv!
-//
-async function loadFachbereiche(){
-  const box = el("fb-loading-box");
-  const bar = el("fb-loading-bar");
-
-  box.style.display = "block";
-  bar.style.width = "0%";
-
-  let progress = 0;
-  const interval = setInterval(()=>{
-    progress = Math.min(progress + 4, 90);
-    bar.style.width = progress + "%";
-  }, 200);
-
-  let data = null;
-  try {
-      const resp = await fetch("/refresh/options");
-      data = await resp.json();
-  } catch(e){
-      clearInterval(interval);
-      bar.style.width = "100%";
-      setTimeout(()=> box.style.display="none", 500);
-      alert("Fehler beim Laden der Fachbereiche.");
-      return;
-  }
-
-  clearInterval(interval);
-  bar.style.width = "100%";
-
-  const sel = el("fachbereich");
-  sel.innerHTML = '<option value="">Bitte auswählen …</option>';
-
-  (data.options || []).forEach(o=>{
-    const opt = document.createElement("option");
-    opt.value = o.value;
-    opt.textContent = `${o.label} (${o.count})`;
-    sel.appendChild(opt);
-  });
-
-  setTimeout(()=> box.style.display="none", 500);
-}
-
 async function loadExcluded(){
-  const r = await fetch("/refresh/excluded/json");
-  const data = await r.json();
-  const body = el("excluded-table-body");
-  body.innerHTML = "";
-
-  if(!data.rows || !data.rows.length){
-    body.innerHTML='<tr><td colspan="5" style="text-align:center;color:#999">Keine Treffer</td></tr>';
+  const rows = await (await fetch("/nachfass/excluded")).json();
+  const b = document.getElementById("excluded-body");
+  b.innerHTML="";
+  if(!rows.length){
+    b.innerHTML='<tr><td colspan="4" class="empty">Keine entfernten Datensätze</td></tr>';
     return;
   }
-
-  data.rows.forEach(rw=>{
-    const tr = document.createElement("tr");
-    tr.innerHTML = `
-      <td>${rw["Kontakt ID"]||""}</td>
-      <td>${rw["Name"]||""}</td>
-      <td>${rw["Organisation ID"]||""}</td>
-      <td>${rw["Organisationsname"]||""}</td>
-      <td>${rw["Grund"]||""}</td>
-    `;
-    body.appendChild(tr);
+  rows.forEach(r=>{
+    b.innerHTML+=`
+      <tr>
+        <td>${r.person_id}</td>
+        <td>${r.person_name}</td>
+        <td>${r.org_name}</td>
+        <td><span class="badge badge-danger">${r.exclusion_reason}</span></td>
+      </tr>`;
   });
 }
-
-async function poll(job_id){
-  while(true){
-    await new Promise(r=>setTimeout(r,500));
-    const res = await fetch("/refresh/export_progress?job_id="+job_id);
-    const s = await res.json();
-
-    el("overlay-phase").textContent = `${s.phase} (${s.percent}%)`;
-    setProgress(s.percent);
-
-    if(s.error){ alert(s.error); hideOverlay(); return; }
-    if(s.download_ready){
-      showOverlay("Download startet …");
-      setProgress(100);
-
-      window.location.href="/refresh/export_download?job_id="+job_id;
-
-      await loadExcluded();
-      hideOverlay();
-      return;
-    }
-  }
-}
-
-async function startExport(){
-  const fb = el("fachbereich").value;
-  if(!fb){ alert("Bitte Fachbereich auswählen."); return; }
-
-  showOverlay("Starte Abgleich …");
-  setProgress(10);
-
-  const r = await fetch("/refresh/export_start",{
-      method:"POST",
-      headers:{ "Content-Type":"application/json" },
-      body:JSON.stringify({
-          fachbereich:fb,
-          batch_id:el("batch_id").value,
-          campaign:el("campaign").value,
-          take_count:parseInt(el("take_count").value)||null
-      })
-  });
-
-  const j = await r.json();
-  await poll(j.job_id);
-}
-
-loadFachbereiche();
-el("btnExportRf").onclick = startExport;
 </script>
 
-</body></html>
-"""
-    )
+</body>
+</html>
+""")
+
+# =============================================================================
+# Frontend – Refresh (analog zu Nachfass)
+# =============================================================================
+@app.get("/refresh", response_class=HTMLResponse)
+async def refresh_page():
+    return HTMLResponse("""
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8"/>
+<title>Refresh – BatchFlow</title>
+<style>
+:root{
+  --bg:#f7f9fc;--card:#fff;--border:#e5e9f0;
+  --text:#0f172a;--muted:#64748b;
+  --primary:#0ea5e9;--primary-dark:#0284c7;
+  --danger:#b91c1c;--warning:#f59e0b;--info:#6366f1;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);font:16px/1.6 Inter,sans-serif;color:var(--text)}
+header{background:#fff;border-bottom:1px solid var(--border)}
+.header-inner{max-width:1200px;margin:auto;padding:16px 32px;display:flex;justify-content:space-between;align-items:center}
+.header-left{display:flex;gap:14px;align-items:center}
+.header-left img{height:34px}
+.header-title{font-size:20px;font-weight:600}
+.header-link{font-size:14px;color:var(--primary);text-decoration:none}
+
+main{max-width:960px;margin:48px auto;padding:0 24px}
+.card{background:#fff;border:1px solid var(--border);border-radius:20px;
+padding:32px;margin-bottom:36px;
+box-shadow:0 12px 30px rgba(15,23,42,.06)}
+
+label{display:block;font-weight:600;margin:18px 0 6px;font-size:14px}
+input,select{width:100%;padding:12px;border:1px solid var(--border);border-radius:12px}
+.btn{margin-top:26px;background:var(--primary);color:#fff;border:none;
+border-radius:12px;padding:14px 22px;font-weight:600;cursor:pointer}
+.btn:hover{background:var(--primary-dark)}
+
+.table-wrap{overflow:auto;border:1px solid var(--border);border-radius:14px}
+table{width:100%;border-collapse:collapse;font-size:14px}
+thead{background:#f1f5f9}
+th,td{padding:10px;text-align:left}
+.empty{color:var(--muted);text-align:center}
+
+.badge{display:inline-flex;gap:6px;padding:4px 10px;border-radius:999px;
+font-size:12px;font-weight:600}
+.badge-danger{background:#fee2e2;color:#991b1b}
+.badge-warning{background:#fef3c7;color:#92400e}
+.badge-info{background:#e0e7ff;color:#3730a3}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="header-inner">
+    <div class="header-left">
+      <img src="/static/bizforward-Logo-Clean-2024.svg">
+      <div class="header-title">BatchFlow · Refresh</div>
+    </div>
+    <a class="header-link" href="/">Startseite</a>
+  </div>
+</header>
+
+<main>
+
+<section class="card">
+  <h2>Refresh</h2>
+  <label>Fachbereich – Kampagne</label>
+  <select id="fachbereich"></select>
+  <button class="btn" onclick="startExport()">Export starten</button>
+</section>
+
+<section class="card">
+  <h2>Entfernte Datensätze</h2>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>ID</th><th>Name</th><th>Organisation</th><th>Grund</th></tr>
+      </thead>
+      <tbody id="excluded-body">
+        <tr><td colspan="4" class="empty">Noch keine Daten geladen</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<script>
+function exclusionBadge(r){
+  r=r?.toLowerCase()||"";
+  if(r.includes("kontaktiert")) return '<span class="badge badge-danger">Kontaktiert</span>';
+  if(r.includes("duble")) return '<span class="badge badge-warning">Dublette</span>';
+  if(r.includes("aktiv")) return '<span class="badge badge-info">Aktivität</span>';
+  return '<span class="badge badge-warning">Sonstiges</span>';
+}
+async function loadExcluded(){
+  const rows = await (await fetch("/refresh/excluded")).json();
+  const b = document.getElementById("excluded-body");
+  b.innerHTML="";
+  if(!rows.length){
+    b.innerHTML='<tr><td colspan="4" class="empty">Keine entfernten Datensätze</td></tr>';
+    return;
+  }
+  rows.forEach(r=>{
+    b.innerHTML+=`
+      <tr>
+        <td>${r.person_id}</td>
+        <td>${r.person_name}</td>
+        <td>${r.org_name}</td>
+        <td><span class="badge badge-danger">${r.exclusion_reason}</span></td>
+      </tr>`;
+  });
+}
+</script>
+
+</body>
+</html>
+""")
 
 # =============================================================================
 # Refresh – Summary-Seite
