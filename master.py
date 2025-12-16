@@ -3626,7 +3626,7 @@ async def neukontakte_page(request: Request, mode: str = Query("new")):
 
 <style>
 /* =========================
-   DESIGN ONLY – SAFE
+   BASE
    ========================= */
 body{
   margin:0;
@@ -3635,7 +3635,9 @@ body{
   font:16px/1.6 Inter,system-ui,-apple-system,BlinkMacSystemFont,sans-serif;
 }
 
-/* Header */
+/* =========================
+   HEADER
+   ========================= */
 header{
   background:#ffffff;
   border-bottom:1px solid #e5e9f0;
@@ -3653,103 +3655,121 @@ header{
   align-items:center;
   gap:14px;
 }
-.card h2{
-  margin-bottom:24px;
-}
-.hleft img{
-  height:48px;
-}
+.hleft img{ height:48px; }
 .hcenter{
   font-size:18px;
   font-weight:600;
 }
-.hright{
-  font-size:14px;
-}
-.table-card{
-  margin-top:48px;
-}
+.hright{ font-size:14px; }
 
-.table-card h3{
-  margin-bottom:16px;
-}
-
-/* Layout */
+/* =========================
+   LAYOUT
+   ========================= */
 main{
-  max-width:720px;
-  margin:48px auto;
+  max-width:760px;
+  margin:56px auto;
   padding:0 24px;
 }
 
-/* Card */
+/* =========================
+   CARD
+   ========================= */
 .card{
   background:#ffffff;
   border:1px solid #e5e9f0;
-  border-radius:20px;
-  padding:36px;
+  border-radius:24px;
+  padding:40px;
   box-shadow:
-    0 14px 32px rgba(15,23,42,.06),
-    0 6px 12px rgba(15,23,42,.04);
+    0 20px 40px rgba(15,23,42,.06),
+    0 8px 16px rgba(15,23,42,.04);
+}
+.card h2{
+  margin:0 0 6px 0;
+}
+.card p.lead{
+  margin:0 0 32px 0;
+  color:#475569;
+  font-size:15px;
 }
 
-/* Grid */
+/* =========================
+   GRID
+   ========================= */
 .grid{
   display:grid;
   grid-template-columns:repeat(12,1fr);
-  gap:20px;
-  row-gap:28px;
+  gap:24px;
 }
 .col-12{ grid-column: span 12; }
 .col-6 { grid-column: span 6; }
-.col-4 { grid-column: span 4; }
-.col-3 { grid-column: span 3; }
-.col-2 { grid-column: span 2; }
 
-/* Form */
+/* =========================
+   FORM
+   ========================= */
 label{
   display:block;
   font-weight:600;
-  margin-top:20px;
   margin-bottom:8px;
   font-size:14px;
-  font-weight:600;
 }
-select,input,textarea{
-  padding:12px 14px;
-  background:#f8fafc;
+small{
+  display:block;
+  margin-top:6px;
+  font-size:13px;
+  color:#64748b;
+}
+
+input,select{
+  width:100%;
+  padding:14px 16px;
+  border-radius:14px;
   border:1px solid #dbe3ec;
+  background:#f8fafc;
+  font-size:15px;
 }
-select:focus,
-input:focus,
-textarea:focus{
+input:focus,select:focus{
   outline:none;
-  border-color:#0ea5e9;
   background:#ffffff;
+  border-color:#0ea5e9;
   box-shadow:0 0 0 3px rgba(14,165,233,.15);
 }
 
-/* Button */
-.btn{
+/* Fachbereich priorisieren */
+.fachbereich select{
+  font-size:16px;
+}
+
+/* =========================
+   CTA
+   ========================= */
+.cta-row{
   margin-top:36px;
+  padding-top:28px;
+  border-top:1px solid #e5e9f0;
+  display:flex;
+  justify-content:flex-end;
+}
+.btn{
   background:#0ea5e9;
   border:none;
   color:#ffffff;
   border-radius:999px;
-  padding:12px 24px;
+  padding:14px 28px;
   font-weight:600;
-  font-size:14px;
+  font-size:15px;
   cursor:pointer;
-  box-shadow:0 6px 14px rgba(14,165,233,.35);
+  box-shadow:0 10px 20px rgba(14,165,233,.35);
 }
-.btn:hover{
-  background:#0284c7;
+.btn:hover{ background:#0284c7; }
+.btn:disabled{
+  opacity:.5;
+  cursor:not-allowed;
 }
 
-/* Ladehinweis Fachbereiche */
-#fb-loading-box{
-  display:none;
-  margin-bottom:12px;
-}
+/* =========================
+   LOADER FACHBEREICH
+   ========================= */
+#fb-loading-box{ display:none; margin-bottom:14px; }
 #fb-loading-text{
   font-size:13px;
   color:#0a66c2;
@@ -3767,30 +3787,10 @@ textarea:focus{
   width:0%;
   background:linear-gradient(90deg,#0ea5e9,#38bdf8);
 }
-table{
-  font-size:14px;
-}
 
-th{
-  white-space:nowrap;
-  font-size:13px;
-  letter-spacing:.02em;
-  text-transform:none;
-  color:#475569;
-}
-
-th, td{
-  padding:14px 16px;
-}
-
-thead{
-  background:#f8fafc;
-}
-
-tbody tr:hover{
-  background:#f1f5f9;
-}
-/* Overlay Export */
+/* =========================
+   OVERLAY
+   ========================= */
 #overlay{
   display:none;
   position:fixed;
@@ -3814,7 +3814,6 @@ tbody tr:hover{
   height:100%;
   width:0%;
   background:linear-gradient(90deg,#0ea5e9,#38bdf8);
-  transition:width .2s linear;
 }
 </style>
 </head>
@@ -3837,10 +3836,15 @@ tbody tr:hover{
 <main>
 
 <section class="card">
+  <h2>Schritt 1 – Neukontakte auswählen</h2>
+  <p class="lead">
+    Wähle einen Fachbereich und definiere, wie viele neue Kontakte für den Erstkontakt exportiert werden sollen.
+  </p>
+
   <div class="grid">
 
     <!-- Fachbereich -->
-    <div class="col-6">
+    <div class="col-12 fachbereich">
       <label>Fachbereich</label>
 
       <div id="fb-loading-box">
@@ -3858,151 +3862,121 @@ tbody tr:hover{
     <!-- Anzahl Kontakte -->
     <div class="col-6">
       <label>Anzahl Kontakte (optional)</label>
-      <input
-        id="take_count"
-        type="number"
-        min="1"
-        placeholder="leer = alle verfügbaren"
-      />
+      <input id="take_count" type="number" min="1" placeholder="leer = alle verfügbaren"/>
+      <small>Optional – leer lassen, um alle verfügbaren Kontakte zu exportieren.</small>
     </div>
 
-    <!-- Batch ID -->
+    <!-- Batch -->
     <div class="col-6">
-      <label>Batch ID</label>
-      <input id="batch_id" placeholder="xxx"/>
+      <label>Batch ID (intern)</label>
+      <input id="batch_id" placeholder="z. B. NK-2025-01"/>
     </div>
 
     <!-- Kampagne -->
-    <div class="col-6">
-      <label>Kampagne</label>
+    <div class="col-12">
+      <label>Kampagnenname (für Cold Mailing)</label>
       <input id="campaign" placeholder="z. B. Frühling 2025"/>
     </div>
 
-    <!-- Button -->
-    <div class="col-12" style="display:flex;justify-content:flex-end">
-      <button class="btn" id="btnExport" disabled>
-        Abgleich & Download
-      </button>
-    </div>
-
   </div>
+
+  <div class="cta-row">
+    <button class="btn" id="btnExport" disabled>
+      Export starten & CSV herunterladen
+    </button>
+  </div>
+
 </section>
 
 </main>
 
-<!-- Overlay Export -->
+<!-- Overlay -->
 <div id="overlay">
   <div id="phase"></div>
-  <div class="barwrap">
-    <div class="bar" id="bar"></div>
-  </div>
+  <div class="barwrap"><div class="bar" id="bar"></div></div>
 </div>
 
 <script>
-// ---------------------------------------------------------------------
-// Sicherer Element-Getter
-// ---------------------------------------------------------------------
-const el = id => {
-    const n = document.getElementById(id);
-    if (!n) {
-        console.error("Element with ID", id, "not found");
-        return { textContent: "" };
-    }
-    return n;
-};
+const el = id => document.getElementById(id);
 
-// ---------------------------------------------------------------------
-// Overlay-Control
-// ---------------------------------------------------------------------
 function showOverlay(msg){
-    el('phase').textContent = msg;
-    el('overlay').style.display = 'flex';
+  el('phase').textContent = msg;
+  el('overlay').style.display = 'flex';
 }
 function setProgress(p){
-    el('bar').style.width = Math.min(100, Math.max(0, p)) + '%';
+  el('bar').style.width = Math.min(100, Math.max(0, p)) + '%';
 }
 
-// ---------------------------------------------------------------------
-// Optionen laden
-// ---------------------------------------------------------------------
 async function loadOptions(){
-    const box = el("fb-loading-box");
-    const bar = el("fb-loading-bar");
+  const box = el("fb-loading-box");
+  const bar = el("fb-loading-bar");
 
-    box.style.display = "block";
-    bar.style.width = "0%";
+  box.style.display = "block";
+  bar.style.width = "0%";
 
-    let progress = 0;
-    const interval = setInterval(()=>{
-        progress = Math.min(progress + 6, 90);
-        bar.style.width = progress + "%";
-    }, 180);
+  let progress = 0;
+  const interval = setInterval(()=>{
+    progress = Math.min(progress + 6, 90);
+    bar.style.width = progress + "%";
+  }, 180);
 
-    const r = await fetch('/neukontakte/options');
-    const data = await r.json();
+  const r = await fetch('/neukontakte/options');
+  const data = await r.json();
 
-    clearInterval(interval);
-    bar.style.width = "100%";
+  clearInterval(interval);
+  bar.style.width = "100%";
 
-    const sel = el('fachbereich');
-    sel.innerHTML = '<option value="">– bitte auswählen –</option>';
+  const sel = el('fachbereich');
+  sel.innerHTML = '<option value="">– bitte auswählen –</option>';
 
-    data.options.forEach(o => {
-        const opt = document.createElement('option');
-        opt.value = o.value;
-        opt.textContent = o.label + ' (' + o.count + ')';
-        sel.appendChild(opt);
-    });
+  data.options.forEach(o=>{
+    const opt = document.createElement('option');
+    opt.value = o.value;
+    opt.textContent = `${o.label} (${o.count})`;
+    sel.appendChild(opt);
+  });
 
-    setTimeout(()=> box.style.display="none", 400);
-    sel.onchange = () => el('btnExport').disabled = !sel.value;
+  setTimeout(()=> box.style.display="none", 400);
+  sel.onchange = ()=> el('btnExport').disabled = !sel.value;
 }
 
-// ---------------------------------------------------------------------
-// Export starten (take_count ergänzt)
-// ---------------------------------------------------------------------
 async function startExport(){
-    const fb = el('fachbereich').value;
-    if (!fb) return alert('Bitte Fachbereich wählen');
+  const fb = el('fachbereich').value;
+  if (!fb) return alert('Bitte Fachbereich wählen');
 
-    showOverlay('Starte Export …');
-    setProgress(10);
+  showOverlay('Starte Export …');
+  setProgress(10);
 
-    const r = await fetch('/neukontakte/export_start', {
-        method: 'POST',
-        headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({
-            fachbereich: fb,
-            batch_id: el('batch_id').value,
-            campaign: el('campaign').value,
-            take_count: parseInt(el('take_count').value) || null
-        })
-    });
+  const r = await fetch('/neukontakte/export_start',{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({
+      fachbereich: fb,
+      batch_id: el('batch_id').value,
+      campaign: el('campaign').value,
+      take_count: parseInt(el('take_count').value) || null
+    })
+  });
 
-    if (!r.ok) return alert("Fehler beim Start");
+  const res = await r.json();
+  const job_id = res.job_id;
 
-    const res = await r.json();
-    const job_id = res.job_id;
+  while(true){
+    await new Promise(r=>setTimeout(r,500));
+    const pr = await fetch('/neukontakte/export_progress?job_id='+job_id);
+    const s  = await pr.json();
 
-    let done = false;
-    while (!done){
-        await new Promise(r => setTimeout(r, 500));
-        const pr = await fetch('/neukontakte/export_progress?job_id=' + job_id);
-        const s  = await pr.json();
+    el('phase').textContent = `${s.phase} (${s.percent}%)`;
+    setProgress(s.percent);
 
-        el('phase').textContent = s.phase + ' (' + s.percent + '%)';
-        setProgress(s.percent);
-
-        done = s.done;
+    if(s.done){
+      window.location.href =
+        '/neukontakte/export_download?job_id='+job_id;
+      return;
     }
-
-    window.location.href =
-      '/neukontakte/export_download?job_id=' + job_id;
+  }
 }
 
-// ---------------------------------------------------------------------
-// Init
-// ---------------------------------------------------------------------
 el('btnExport').onclick = startExport;
 loadOptions();
 </script>
@@ -4011,6 +3985,7 @@ loadOptions();
 </html>
 """
     )
+
 
 # =============================================================================
 # Frontend – Nachfass
