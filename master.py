@@ -3150,6 +3150,41 @@ async def reconcile_with_progress(job: "Job", prefix: str):
 
 
 # =============================================================================
+# /neukontakte/options
+# =============================================================================
+@app.get("/neukontakte/options")
+async def neukontakte_options():
+    """
+    Liefert Fachbereiche für Neukontakte
+    Filter: FILTER_NEUKONTAKTE
+    """
+    options = []
+
+    # hier exakt dieselbe Logik wie bei /refresh/options,
+    # nur mit anderem Filter
+    data = pipedrive_get_filtered_persons(
+        filter_id=FILTER_NEUKONTAKTE
+    )
+
+    # gruppieren nach Fachbereich (custom field)
+    counts = {}
+    for p in data:
+        fb = p.get("fachbereich")
+        if not fb:
+            continue
+        counts[fb] = counts.get(fb, 0) + 1
+
+    for fb, cnt in sorted(counts.items()):
+        options.append({
+            "value": fb,
+            "label": fb,
+            "count": cnt
+        })
+
+    return {"options": options}
+
+
+# =============================================================================
 # /refresh/options – Variante B (zeigt auch Fachbereiche mit count = 0)
 # =============================================================================
 @app.get("/refresh/options")
@@ -3612,12 +3647,12 @@ header{
 # Frontend - Neukontakte
 # =============================================================================
 @app.get("/neukontakte", response_class=HTMLResponse)
-async def neukontakte_page(request: Request, mode: str = Query("new")):
+async def neukontakte_page(request: Request):
     authed = bool(user_tokens.get("default") or PD_API_TOKEN)
     authed_html = "<span class='muted'>angemeldet</span>" if authed else "<a href='/login'>Anmelden</a>"
 
     return HTMLResponse(
-        r"""<!doctype html>
+r"""<!doctype html>
 <html lang="de">
 <head>
 <meta charset="utf-8"/>
@@ -3639,7 +3674,7 @@ body{
    HEADER
    ========================= */
 header{
-  background:#ffffff;
+  background:#fff;
   border-bottom:1px solid #e5e9f0;
 }
 .hwrap{
@@ -3656,19 +3691,8 @@ header{
   gap:14px;
 }
 .hleft img{ height:48px; }
-.hcenter{
-  font-size:18px;
-  font-weight:600;
-}
+.hcenter{ font-size:18px;font-weight:600; }
 .hright{ font-size:14px; }
-
-.fachbereich{
-  padding:24px;
-  border-radius:18px;
-  background:#f8fafc;
-  border:1px dashed #cbd5e1;
-}
-
 
 /* =========================
    LAYOUT
@@ -3683,17 +3707,16 @@ main{
    CARD
    ========================= */
 .card{
-  background:#ffffff;
+  background:#fff;
   border:1px solid #e5e9f0;
   border-radius:24px;
   padding:40px;
   box-shadow:
     0 20px 40px rgba(15,23,42,.06),
     0 8px 16px rgba(15,23,42,.04);
+  margin-bottom:48px;
 }
-.card h2{
-  margin:0 0 6px 0;
-}
+.card h2{ margin:0 0 6px 0; }
 .card p.lead{
   margin:0 0 32px 0;
   color:#475569;
@@ -3701,21 +3724,14 @@ main{
 }
 
 /* =========================
-   GRID
+   GRID (ruhig & harmonisch)
    ========================= */
 .grid{
   display:grid;
-  grid-template-columns:repeat(12,1fr);
-  gap:24px;
+  grid-template-columns:1fr 1fr;
+  gap:32px;
 }
-.col-12{ grid-column: span 12; }
-.col-6 label{
-  color:#334155;
-}
-small{
-  max-width:420px;
-}
-
+.col-12{ grid-column: span 2; }
 
 /* =========================
    FORM
@@ -3743,21 +3759,24 @@ input,select{
 }
 input:focus,select:focus{
   outline:none;
-  background:#ffffff;
+  background:#fff;
   border-color:#0ea5e9;
   box-shadow:0 0 0 3px rgba(14,165,233,.15);
 }
 
-/* Fachbereich priorisieren */
-.fachbereich select{
-  font-size:16px;
+/* Fachbereich hervorheben */
+.fachbereich{
+  padding:24px;
+  border-radius:18px;
+  background:#f8fafc;
+  border:1px dashed #cbd5e1;
 }
 
 /* =========================
    CTA
    ========================= */
 .cta-row{
-  margin-top:36px;
+  margin-top:48px;
   padding-top:28px;
   border-top:1px solid #e5e9f0;
   display:flex;
@@ -3766,7 +3785,7 @@ input:focus,select:focus{
 .btn{
   background:#0ea5e9;
   border:none;
-  color:#ffffff;
+  color:#fff;
   border-radius:999px;
   padding:14px 28px;
   font-weight:600;
@@ -3775,32 +3794,39 @@ input:focus,select:focus{
   box-shadow:0 10px 20px rgba(14,165,233,.35);
 }
 .btn:hover{ background:#0284c7; }
-.btn:disabled{
-  opacity:.5;
-  cursor:not-allowed;
-}
+.btn:disabled{ opacity:.5; cursor:not-allowed; }
 
 /* =========================
    LOADER FACHBEREICH
    ========================= */
 #fb-loading-box{ display:none; margin-bottom:14px; }
-#fb-loading-text{
-  font-size:13px;
-  color:#0a66c2;
-  margin-bottom:6px;
-}
+#fb-loading-text{ font-size:13px;color:#0a66c2;margin-bottom:6px; }
 #fb-loading-bar-wrap{
-  width:100%;
-  height:8px;
-  background:#e5e9f0;
-  border-radius:999px;
-  overflow:hidden;
+  width:100%;height:8px;background:#e5e9f0;border-radius:999px;overflow:hidden;
 }
 #fb-loading-bar{
-  height:8px;
-  width:0%;
+  height:8px;width:0%;
   background:linear-gradient(90deg,#0ea5e9,#38bdf8);
 }
+
+/* =========================
+   TABLE
+   ========================= */
+table{ width:100%; border-collapse:collapse; }
+thead{ background:#f8fafc; }
+th{
+  font-size:12px;
+  font-weight:600;
+  color:#64748b;
+  padding:14px 16px;
+  text-align:left;
+}
+td{
+  padding:14px 16px;
+  border-top:1px solid #e5e9f0;
+  font-size:14px;
+}
+tbody tr:hover{ background:#f1f5f9; }
 
 /* =========================
    OVERLAY
@@ -3829,10 +3855,6 @@ input:focus,select:focus{
   width:0%;
   background:linear-gradient(90deg,#0ea5e9,#38bdf8);
 }
-.cta-row{
-  margin-top:48px;
-}
-
 </style>
 </head>
 
@@ -3853,6 +3875,9 @@ input:focus,select:focus{
 
 <main>
 
+<!-- =========================
+     FORM
+     ========================= -->
 <section class="card">
   <h2>Schritt 1 – Neukontakte auswählen</h2>
   <p class="lead">
@@ -3861,39 +3886,35 @@ input:focus,select:focus{
 
   <div class="grid">
 
-    <!-- Fachbereich -->
     <div class="col-12 fachbereich">
       <label>Fachbereich</label>
 
       <div id="fb-loading-box">
         <div id="fb-loading-text">Fachbereiche werden geladen … bitte warten.</div>
-        <div id="fb-loading-bar-wrap">
-          <div id="fb-loading-bar"></div>
-        </div>
+        <div id="fb-loading-bar-wrap"><div id="fb-loading-bar"></div></div>
       </div>
 
       <select id="fachbereich">
         <option value="">– bitte auswählen –</option>
       </select>
+
+      <small>Quelle aus Pipedrive – nur noch nicht kontaktierte Personen.</small>
     </div>
 
-    <!-- Anzahl Kontakte -->
-    <div class="col-6">
+    <div>
       <label>Anzahl Kontakte (optional)</label>
-      <input id="take_count" type="number" min="1" placeholder="leer = alle verfügbaren"/>
-      <small>Optional – leer lassen, um alle verfügbaren Kontakte zu exportieren.</small>
+      <input id="take_count" type="number" min="1" placeholder="leer = alle verfügbaren">
+      <small>Leer lassen, um alle verfügbaren Kontakte zu exportieren.</small>
     </div>
 
-    <!-- Batch -->
-    <div class="col-6">
+    <div>
       <label>Batch ID (intern)</label>
-      <input id="batch_id" placeholder="z. B. NK-2025-01"/>
+      <input id="batch_id" placeholder="z. B. NK-2025-01">
     </div>
 
-    <!-- Kampagne -->
     <div class="col-12">
       <label>Kampagnenname (für Cold Mailing)</label>
-      <input id="campaign" placeholder="z. B. Frühling 2025"/>
+      <input id="campaign" placeholder="z. B. Frühling 2025">
     </div>
 
   </div>
@@ -3903,9 +3924,12 @@ input:focus,select:focus{
       Export starten & CSV herunterladen
     </button>
   </div>
-
 </section>
-<section class="card" style="margin-top:48px">
+
+<!-- =========================
+     EXCLUDED
+     ========================= -->
+<section class="card">
   <h3>Entfernte Datensätze</h3>
 
   <table>
@@ -3930,7 +3954,9 @@ input:focus,select:focus{
 
 </main>
 
-<!-- Overlay -->
+<!-- =========================
+     OVERLAY
+     ========================= -->
 <div id="overlay">
   <div id="phase"></div>
   <div class="barwrap"><div class="bar" id="bar"></div></div>
@@ -3947,6 +3973,7 @@ function setProgress(p){
   el('bar').style.width = Math.min(100, Math.max(0, p)) + '%';
 }
 
+/* ---------- Optionen laden (robust) ---------- */
 async function loadOptions(){
   const box = el("fb-loading-box");
   const bar = el("fb-loading-bar");
@@ -3966,7 +3993,6 @@ async function loadOptions(){
     if(!r.ok) throw new Error("HTTP " + r.status);
     data = await r.json();
   }catch(e){
-    console.error("Fehler beim Laden der Fachbereiche:", e);
     clearInterval(interval);
     bar.style.width = "100%";
     setTimeout(()=> box.style.display="none", 300);
@@ -3991,7 +4017,7 @@ async function loadOptions(){
   sel.onchange = ()=> el('btnExport').disabled = !sel.value;
 }
 
-
+/* ---------- Export ---------- */
 async function startExport(){
   const fb = el('fachbereich').value;
   if (!fb) return alert('Bitte Fachbereich wählen');
@@ -4028,31 +4054,6 @@ async function startExport(){
     }
   }
 }
-async function loadExcluded(){
-  const r = await fetch("/neukontakte/excluded/json");
-  const data = await r.json();
-  const body = el("excluded-table-body");
-  body.innerHTML = "";
-
-  if(!data.rows || !data.rows.length){
-    body.innerHTML =
-      '<tr><td colspan="5" style="text-align:center;color:#94a3b8">Keine Treffer</td></tr>';
-    return;
-  }
-
-  data.rows.forEach(row=>{
-    const tr = document.createElement("tr");
-    tr.innerHTML = `
-      <td>${row["Kontakt ID"]||""}</td>
-      <td>${row["Name"]||""}</td>
-      <td>${row["Organisation ID"]||""}</td>
-      <td>${row["Organisationsname"]||""}</td>
-      <td>${row["Grund"]||""}</td>
-    `;
-    body.appendChild(tr);
-  });
-}
-
 
 el('btnExport').onclick = startExport;
 loadOptions();
@@ -4062,7 +4063,6 @@ loadOptions();
 </html>
 """
     )
-
 
 # =============================================================================
 # Frontend – Nachfass
