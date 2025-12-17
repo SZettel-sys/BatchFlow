@@ -3662,6 +3662,14 @@ header{
 }
 .hright{ font-size:14px; }
 
+.fachbereich{
+  padding:24px;
+  border-radius:18px;
+  background:#f8fafc;
+  border:1px dashed #cbd5e1;
+}
+
+
 /* =========================
    LAYOUT
    ========================= */
@@ -3701,7 +3709,13 @@ main{
   gap:24px;
 }
 .col-12{ grid-column: span 12; }
-.col-6 { grid-column: span 6; }
+.col-6 label{
+  color:#334155;
+}
+small{
+  max-width:420px;
+}
+
 
 /* =========================
    FORM
@@ -3815,6 +3829,10 @@ input:focus,select:focus{
   width:0%;
   background:linear-gradient(90deg,#0ea5e9,#38bdf8);
 }
+.cta-row{
+  margin-top:48px;
+}
+
 </style>
 </head>
 
@@ -3887,6 +3905,28 @@ input:focus,select:focus{
   </div>
 
 </section>
+<section class="card" style="margin-top:48px">
+  <h3>Entfernte Datensätze</h3>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Kontakt ID</th>
+        <th>Name</th>
+        <th>Organisation ID</th>
+        <th>Organisationsname</th>
+        <th>Grund</th>
+      </tr>
+    </thead>
+    <tbody id="excluded-table-body">
+      <tr>
+        <td colspan="5" style="text-align:center;color:#94a3b8">
+          Noch keine Daten geladen
+        </td>
+      </tr>
+    </tbody>
+  </table>
+</section>
 
 </main>
 
@@ -3920,8 +3960,19 @@ async function loadOptions(){
     bar.style.width = progress + "%";
   }, 180);
 
-  const r = await fetch('/neukontakte/options');
-  const data = await r.json();
+  let data;
+  try{
+    const r = await fetch('/neukontakte/options');
+    if(!r.ok) throw new Error("HTTP " + r.status);
+    data = await r.json();
+  }catch(e){
+    console.error("Fehler beim Laden der Fachbereiche:", e);
+    clearInterval(interval);
+    bar.style.width = "100%";
+    setTimeout(()=> box.style.display="none", 300);
+    alert("Fachbereiche konnten nicht geladen werden.");
+    return;
+  }
 
   clearInterval(interval);
   bar.style.width = "100%";
@@ -3929,16 +3980,17 @@ async function loadOptions(){
   const sel = el('fachbereich');
   sel.innerHTML = '<option value="">– bitte auswählen –</option>';
 
-  data.options.forEach(o=>{
+  (data.options || []).forEach(o=>{
     const opt = document.createElement('option');
     opt.value = o.value;
     opt.textContent = `${o.label} (${o.count})`;
     sel.appendChild(opt);
   });
 
-  setTimeout(()=> box.style.display="none", 400);
+  setTimeout(()=> box.style.display="none", 300);
   sel.onchange = ()=> el('btnExport').disabled = !sel.value;
 }
+
 
 async function startExport(){
   const fb = el('fachbereich').value;
@@ -3976,6 +4028,31 @@ async function startExport(){
     }
   }
 }
+async function loadExcluded(){
+  const r = await fetch("/neukontakte/excluded/json");
+  const data = await r.json();
+  const body = el("excluded-table-body");
+  body.innerHTML = "";
+
+  if(!data.rows || !data.rows.length){
+    body.innerHTML =
+      '<tr><td colspan="5" style="text-align:center;color:#94a3b8">Keine Treffer</td></tr>';
+    return;
+  }
+
+  data.rows.forEach(row=>{
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${row["Kontakt ID"]||""}</td>
+      <td>${row["Name"]||""}</td>
+      <td>${row["Organisation ID"]||""}</td>
+      <td>${row["Organisationsname"]||""}</td>
+      <td>${row["Grund"]||""}</td>
+    `;
+    body.appendChild(tr);
+  });
+}
+
 
 el('btnExport').onclick = startExport;
 loadOptions();
