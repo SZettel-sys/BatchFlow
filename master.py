@@ -4181,146 +4181,48 @@ async def nachfass_page():
 <title>Nachfass – BatchFlow</title>
 
 <style>
-/* =========================
-   DESIGN – IDENTISCH ZU NK
-   ========================= */
-body{
-  margin:0;
-  background:#f7f9fc;
-  color:#0f172a;
-  font:16px/1.6 Inter,system-ui,-apple-system,BlinkMacSystemFont,sans-serif;
-}
-
-/* Header */
-header{
-  background:#ffffff;
-  border-bottom:1px solid #e5e9f0;
-}
-.hwrap{
-  max-width:1200px;
-  margin:0 auto;
-  padding:22px 24px;
-  display:flex;
-  align-items:center;
-  justify-content:space-between;
-}
-.hleft{
-  display:flex;
-  align-items:center;
-  gap:14px;
-}
-.hleft img{height:48px;}
+/* ===== IDENTISCH ZU NEUKONTAKTE ===== */
+body{margin:0;background:#f7f9fc;color:#0f172a;font:16px/1.6 Inter,sans-serif}
+header{background:#fff;border-bottom:1px solid #e5e9f0}
+.hwrap{max-width:1200px;margin:0 auto;padding:22px 24px;display:flex;align-items:center;justify-content:space-between}
+.hleft{display:flex;align-items:center;gap:14px}
+.hleft img{height:48px}
 .hcenter{font-size:18px;font-weight:600}
+main{max-width:720px;margin:48px auto;padding:0 24px}
 
-/* Layout */
-main{
-  max-width:720px;
-  margin:56px auto;
-  padding:0 24px;
-}
-
-/* Card */
 .card{
-  background:#ffffff;
-  border:1px solid #e5e9f0;
-  border-radius:24px;
-  padding:40px;
-  box-shadow:
-    0 20px 40px rgba(15,23,42,.06),
-    0 8px 16px rgba(15,23,42,.04);
-  margin-bottom:48px;
-}
-.card h2{margin:0 0 28px 0}
-
-/* Grid */
-.grid{
-  display:grid;
-  grid-template-columns:1fr 1fr;
-  gap:32px;
-}
-.col-12{grid-column:span 2}
-
-/* Form */
-label{
-  display:block;
-  font-weight:600;
-  margin-bottom:8px;
-  font-size:14px;
-}
-input,textarea{
-  width:100%;
-  padding:14px 16px;
-  border-radius:14px;
-  border:1px solid #dbe3ec;
-  background:#f8fafc;
-}
-input:focus,textarea:focus{
-  outline:none;
-  background:#ffffff;
-  border-color:#0ea5e9;
-  box-shadow:0 0 0 3px rgba(14,165,233,.15);
-}
-
-/* CTA */
-.cta-row{
-  margin-top:48px;
-  padding-top:28px;
-  border-top:1px solid #e5e9f0;
-  display:flex;
-  justify-content:flex-end;
-}
-.btn{
-  background:#0ea5e9;
-  border:none;
-  color:#ffffff;
-  border-radius:999px;
-  padding:14px 28px;
-  font-weight:600;
-  font-size:15px;
-  cursor:pointer;
-  box-shadow:0 10px 20px rgba(14,165,233,.35);
-}
-.btn:hover{background:#0284c7}
-
-/* Tabelle */
-.table-card{
-  background:#ffffff;
-  border:1px solid #e5e9f0;
-  border-radius:24px;
+  background:#fff;border:1px solid #e5e9f0;border-radius:20px;
   padding:36px;
+  box-shadow:0 14px 32px rgba(15,23,42,.06),0 6px 12px rgba(15,23,42,.04)
+}
+
+.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:20px 28px}
+.col-12{grid-column:span 12}
+.col-6{grid-column:span 6}
+
+label{display:block;font-size:14px;font-weight:600;margin-bottom:8px}
+input,textarea{
+  width:100%;padding:12px 14px;border-radius:12px;
+  background:#f8fafc;border:1px solid #dbe3ec
+}
+
+.btn{
+  margin-top:36px;
+  background:#0ea5e9;color:#fff;border:none;
+  border-radius:999px;padding:12px 28px;
+  font-weight:600;cursor:pointer;
+  box-shadow:0 6px 14px rgba(14,165,233,.35)
+}
+
+.table-card{
+  margin-top:48px;
+  background:#fff;border:1px solid #e5e9f0;border-radius:20px;
+  padding:24px
 }
 table{width:100%;border-collapse:collapse;font-size:14px}
-thead{background:#f8fafc}
 th,td{padding:14px 16px}
-th{font-size:12px;font-weight:600;color:#64748b}
-tbody tr:hover{background:#f1f5f9}
-
-/* Overlay – unverändert */
-#overlay{
-  display:none;
-  position:fixed;
-  inset:0;
-  background:rgba(247,249,252,.8);
-  backdrop-filter:blur(3px);
-  z-index:9999;
-  align-items:center;
-  justify-content:center;
-  flex-direction:column;
-  gap:12px;
-}
-.barwrap{
-  width:min(520px,90vw);
-  height:10px;
-  border-radius:999px;
-  background:#e5e9f0;
-  overflow:hidden;
-}
-.bar{
-  height:100%;
-  width:0%;
-  background:linear-gradient(90deg,#0ea5e9,#38bdf8);
-  transition:width .2s linear;
-}
+thead{background:#f8fafc}
+th{white-space:nowrap;color:#475569}
 </style>
 </head>
 
@@ -4330,12 +4232,10 @@ tbody tr:hover{background:#f1f5f9}
   <div class="hwrap">
     <div class="hleft">
       <img src="/static/bizforward-Logo-Clean-2024.svg">
-      <a href="/campaign" style="color:#0a66c2;text-decoration:none;font-size:14px">
-        Kampagne wählen
-      </a>
+      <a href="/campaign" style="color:#0a66c2;text-decoration:none;font-size:14px">Kampagne wählen</a>
     </div>
     <div class="hcenter">Nachfass</div>
-    <div></div>
+    <div>angemeldet</div>
   </div>
 </header>
 
@@ -4351,20 +4251,20 @@ tbody tr:hover{background:#f1f5f9}
       <textarea id="nf_batch_ids" rows="2" placeholder="B111, B222"></textarea>
     </div>
 
-    <div>
+    <div class="col-6">
       <label>Export-Batch-ID</label>
       <input id="batch_id" placeholder="B999">
     </div>
 
-    <div>
+    <div class="col-6">
       <label>Kampagnenname</label>
       <input id="campaign" placeholder="z. B. Nachfass KW45">
     </div>
 
-  </div>
+    <div class="col-12" style="display:flex;justify-content:flex-end">
+      <button class="btn" id="btnExportNf">Abgleich & Download</button>
+    </div>
 
-  <div class="cta-row">
-    <button class="btn" id="btnExportNf">Abgleich & Download</button>
   </div>
 </section>
 
@@ -4381,16 +4281,13 @@ tbody tr:hover{background:#f1f5f9}
       </tr>
     </thead>
     <tbody id="excluded-table-body">
-      <tr>
-        <td colspan="5" style="text-align:center;color:#94a3b8">
-          Noch keine Daten geladen
-        </td>
-      </tr>
+      <tr><td colspan="5" style="text-align:center;color:#999">Noch keine Daten geladen</td></tr>
     </tbody>
   </table>
 </section>
 
 </main>
+
 
 <!-- JS & Overlay bleiben UNVERÄNDERT -->
 <div id="overlay">
@@ -4500,10 +4397,7 @@ el("btnExportNf").onclick = startExport;
 # Frontend – Refresh (Layout 1:1 wie Neukontakte, Logik unverändert)
 # =============================================================================
 @app.get("/refresh", response_class=HTMLResponse)
-async def refresh_page(request: Request):
-    authed = True
-    auth_info = "<span class='muted'>angemeldet</span>" if authed else "<a href='/login'>Anmelden</a>"
-
+async def refresh_page():
     return HTMLResponse(r"""<!doctype html>
 <html lang="de">
 <head>
@@ -4512,34 +4406,48 @@ async def refresh_page(request: Request):
 <title>Refresh – BatchFlow</title>
 
 <style>
-/* IDENTISCH ZU /neukontakte */
-body{margin:0;background:#f7f9fc;color:#0f172a;font:16px/1.6 Inter,system-ui,sans-serif}
+/* ===== IDENTISCH ZU NEUKONTAKTE ===== */
+body{margin:0;background:#f7f9fc;color:#0f172a;font:16px/1.6 Inter,sans-serif}
 header{background:#fff;border-bottom:1px solid #e5e9f0}
 .hwrap{max-width:1200px;margin:0 auto;padding:22px 24px;display:flex;align-items:center;justify-content:space-between}
-.hleft{display:flex;gap:14px;align-items:center}
+.hleft{display:flex;align-items:center;gap:14px}
 .hleft img{height:48px}
 .hcenter{font-size:18px;font-weight:600}
-main{max-width:720px;margin:56px auto;padding:0 24px}
-.card{background:#fff;border:1px solid #e5e9f0;border-radius:24px;padding:40px;margin-bottom:48px;
-box-shadow:0 20px 40px rgba(15,23,42,.06)}
-.grid{display:grid;grid-template-columns:1fr 1fr;gap:32px}
-.col-12{grid-column:span 2}
-label{display:block;font-weight:600;margin-bottom:8px;font-size:14px}
-input,select{
-  width:100%;padding:14px 16px;border-radius:14px;
-  border:1px solid #dbe3ec;background:#f8fafc
-}
-.cta-row{
-  margin-top:48px;padding-top:28px;border-top:1px solid #e5e9f0;
-  display:flex;justify-content:flex-end
-}
-.btn{
-  background:#0ea5e9;color:#fff;border:none;border-radius:999px;
-  padding:14px 28px;font-weight:600;font-size:15px;
-  box-shadow:0 10px 20px rgba(14,165,233,.35)
+main{max-width:720px;margin:48px auto;padding:0 24px}
+
+.card{
+  background:#fff;border:1px solid #e5e9f0;border-radius:20px;
+  padding:36px;
+  box-shadow:0 14px 32px rgba(15,23,42,.06),0 6px 12px rgba(15,23,42,.04)
 }
 
-/* Tabelle & Overlay: unverändert */
+.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:20px 28px}
+.col-12{grid-column:span 12}
+.col-6{grid-column:span 6}
+
+label{display:block;font-size:14px;font-weight:600;margin-bottom:8px}
+input,select{
+  width:100%;padding:12px 14px;border-radius:12px;
+  background:#f8fafc;border:1px solid #dbe3ec
+}
+
+.btn{
+  margin-top:36px;
+  background:#0ea5e9;color:#fff;border:none;
+  border-radius:999px;padding:12px 28px;
+  font-weight:600;cursor:pointer;
+  box-shadow:0 6px 14px rgba(14,165,233,.35)
+}
+
+.table-card{
+  margin-top:48px;
+  background:#fff;border:1px solid #e5e9f0;border-radius:20px;
+  padding:24px
+}
+table{width:100%;border-collapse:collapse;font-size:14px}
+th,td{padding:14px 16px}
+thead{background:#f8fafc}
+th{white-space:nowrap;color:#475569}
 </style>
 </head>
 
@@ -4549,12 +4457,10 @@ input,select{
   <div class="hwrap">
     <div class="hleft">
       <img src="/static/bizforward-Logo-Clean-2024.svg">
-      <a href="/campaign" style="color:#0a66c2;text-decoration:none;font-size:14px">
-        Kampagne wählen
-      </a>
+      <a href="/campaign" style="color:#0a66c2;text-decoration:none;font-size:14px">Kampagne wählen</a>
     </div>
     <div class="hcenter">Refresh</div>
-    <div class="hright">""" + auth_info + r"""</div>
+    <div>angemeldet</div>
   </div>
 </header>
 
@@ -4568,10 +4474,12 @@ input,select{
     <div class="col-12">
       <label>Fachbereich – Kampagne</label>
 
-      <!-- Ladebalken UNVERÄNDERT -->
+      <!-- ALTER LADEBALKEN – UNVERÄNDERT -->
       <div id="fb-loading-box">
         <div id="fb-loading-text">Fachbereiche werden geladen …</div>
-        <div id="fb-loading-bar-wrap"><div id="fb-loading-bar"></div></div>
+        <div id="fb-loading-bar-wrap">
+          <div id="fb-loading-bar"></div>
+        </div>
       </div>
 
       <select id="fachbereich">
@@ -4579,25 +4487,25 @@ input,select{
       </select>
     </div>
 
-    <div>
+    <div class="col-6">
       <label>Batch ID</label>
       <input id="batch_id" placeholder="RF-2025-01">
     </div>
 
-    <div>
+    <div class="col-6">
       <label>Kampagnenname</label>
       <input id="campaign" placeholder="z. B. Refresh Q1 / IT">
     </div>
 
-    <div>
+    <div class="col-6">
       <label>Anzahl Kontakte (optional)</label>
-      <input id="take_count" type="number" placeholder="leer = alle">
+      <input id="take_count" placeholder="leer = alle">
     </div>
 
-  </div>
+    <div class="col-12" style="display:flex;justify-content:flex-end">
+      <button class="btn" id="btnExportRf">Abgleich & Download</button>
+    </div>
 
-  <div class="cta-row">
-    <button class="btn" id="btnExportRf">Abgleich & Download</button>
   </div>
 </section>
 
@@ -4614,17 +4522,12 @@ input,select{
       </tr>
     </thead>
     <tbody id="excluded-table-body">
-      <tr>
-        <td colspan="5" style="text-align:center;color:#94a3b8">
-          Noch keine Daten geladen
-        </td>
-      </tr>
+      <tr><td colspan="5" style="text-align:center;color:#999">Noch keine Daten geladen</td></tr>
     </tbody>
   </table>
 </section>
 
 </main>
-
 <!-- Overlay -->
 <div id="overlay">
   <div id="overlay-phase" style="font-weight:600"></div>
