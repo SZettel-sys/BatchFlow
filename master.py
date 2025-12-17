@@ -3510,20 +3510,28 @@ async def refresh_export_start(
     return JSONResponse({"job_id": job_id})
 
 
-
 # =============================================================================
 # EXPORT-FORTSCHRITT & DOWNLOAD-ENDPUNKTE NEUKONTAKTE
 # =============================================================================
 @app.get("/neukontakte/export_progress")
 async def neukontakte_export_progress(job_id: str = Query(...)):
+
     job = JOBS.get(job_id)
     if not job:
-        raise HTTPException(status_code=404, detail="Job nicht gefunden")
+        return JSONResponse(
+            {"error": "Job nicht gefunden"},
+            status_code=404
+        )
+
     return JSONResponse({
-        "phase": job.phase, "percent": job.percent,
-        "done": job.done, "error": job.error,
-        "note_org_limit": job.get("note_org_limit", 0),
-        "note_date_invalid": job.get("note_date_invalid", 0)
+        "phase": str(job.phase),
+        "percent": int(job.percent),
+        "done": bool(job.done),
+        "error": str(job.error) if job.error else None,
+
+        # 👇 KORREKT: Attribut-Zugriff
+        "note_org_limit": getattr(job, "note_org_limit", 0),
+        "note_date_invalid": getattr(job, "note_date_invalid", 0),
     })
 
 
@@ -3777,6 +3785,28 @@ main{
   gap:32px;
 }
 .col-12{ grid-column: span 2; }
+/* =========================
+   META ROW (Anzahl + Batch)
+   ========================= */
+.meta-row{
+  grid-column: span 2;
+  display:flex;
+  gap:24px;
+  align-items:flex-start;
+}
+
+.meta-field{
+  flex:1;
+}
+
+.meta-field input{
+  max-width:240px;
+}
+
+.meta-field small{
+  font-size:12px;
+  color:#94a3b8;
+}
 
 /* =========================
    FORM
@@ -3945,17 +3975,21 @@ tbody tr:hover{ background:#f1f5f9; }
 
       <small>Quelle aus Pipedrive – nur noch nicht kontaktierte Personen.</small>
     </div>
-
-    <div>
-      <label>Anzahl Kontakte (optional)</label>
-      <input id="take_count" type="number" min="1" placeholder="leer = alle verfügbaren">
-      <small>Leer lassen, um alle verfügbaren Kontakte zu exportieren.</small>
+    <div class="meta-row">
+      <div class="meta-field">
+        <label>Anzahl Kontakte</label>
+        <input id="take_count" type="number" min="1" placeholder="alle">
+        <small>Optional</small>
+      </div>
+    
+      <div class="meta-field">
+        <label>Batch ID</label>
+        <input id="batch_id" placeholder="xxx">
+        <small>Intern</small>
+      </div>
     </div>
 
-    <div>
-      <label>Batch ID (intern)</label>
-      <input id="batch_id" placeholder="z. B. NK-2025-01">
-    </div>
+
 
     <div class="col-12">
       <label>Kampagnenname (für Cold Mailing)</label>
@@ -3966,7 +4000,7 @@ tbody tr:hover{ background:#f1f5f9; }
 
   <div class="cta-row">
     <button class="btn" id="btnExport" disabled>
-      Export starten & CSV herunterladen
+      Abgleich & Download
     </button>
   </div>
 </section>
