@@ -4354,13 +4354,13 @@ th{
   <div class="grid">
 
     <!-- Batch IDs -->
-    <div class="col-6">
+    <div class="col-12">
       <label>Batch ID</label>
       <textarea id="nf_batch_ids" rows="2" placeholder="xxx"></textarea>
     </div>
 
     <!-- Export Batch -->
-    <div class="col-6">
+    <div class="col-12">
       <label>Export-Batch-ID</label>
       <input id="batch_id" placeholder="xxx">
     </div>
@@ -4677,19 +4677,19 @@ th{
     </div>
 
     <!-- Batch ID -->
-    <div class="col-6">
+    <div class="col-12">
       <label>Batch ID</label>
       <input id="batch_id" placeholder="xxx">
     </div>
 
     <!-- Kampagnenname -->
-    <div class="col-6">
+    <div class="col-12">
       <label>Kampagnenname</label>
       <input id="campaign" placeholder="z. B. Refresh Q1 / IT">
     </div>
 
     <!-- Anzahl Kontakte -->
-    <div class="col-6">
+    <div class="col-12">
       <label>Anzahl Kontakte (optional)</label>
       <input id="take_count" placeholder="leer = alle">
     </div>
