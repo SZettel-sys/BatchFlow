@@ -4263,6 +4263,11 @@ input:focus,textarea:focus{
   grid-column:1 / -1;
 }
 
+.form-narrow {
+  max-width: 520px;
+   margin-top: 24px;
+}
+
 
 /* Button */
 .btn{
@@ -4350,33 +4355,32 @@ th{
 <main>
 <section class="card">
   <h2>Nachfass – Einstellungen</h2>
-
-  <div class="grid">
-
-    <!-- Batch IDs -->
-    <div class="col-12">
-      <label>Batch ID</label>
-      <textarea id="nf_batch_ids" rows="2" placeholder="xxx"></textarea>
-    </div>
-
-    <!-- Export Batch -->
-    <div class="col-12">
-      <label>Export-Batch-ID</label>
-      <input id="batch_id" placeholder="xxx">
-    </div>
-
-    <!-- Kampagne -->
-    <div class="col-12">
-      <label>Kampagnenname</label>
-      <input id="campaign" placeholder="z. B. import_nachfass_xxx">
-    </div>
-
-    <!-- Button -->
-    <div class="col-12" style="display:flex;justify-content:flex-end">
-      <button class="btn" id="btnExportNf">Abgleich & Download</button>
-    </div>
-
-  </div>
+    <div class="form-narrow">
+      <div class="grid">
+    
+        <!-- Batch IDs -->
+        <div class="col-12">
+          <label>Batch ID</label>
+          <textarea id="nf_batch_ids" rows="2" placeholder="xxx"></textarea>
+        </div>
+    
+        <!-- Export Batch -->
+        <div class="col-12">
+          <label>Export-Batch-ID</label>
+          <input id="batch_id" placeholder="xxx">
+        </div>
+    
+        <!-- Kampagne -->
+        <div class="col-12">
+          <label>Kampagnenname</label>
+          <input id="campaign" placeholder="z. B. import_nachfass_xxx">
+        </div>
+    
+        <!-- Button -->
+        <div class="col-12" style="display:flex;justify-content:flex-end">
+          <button class="btn" id="btnExportNf">Abgleich & Download</button>
+        </div>
+      </div></div>
 </section>
 
 <!-- Tabelle: Entfernte Datensätze -->
