@@ -3511,7 +3511,7 @@ async def refresh_export_start(
 
 
 # =============================================================================
-# EXPORT-FORTSCHRITT & DOWNLOAD-ENDPUNKTE NEUKONTAKTE
+# EXPORT-FORTSCHRITT – NEUKONTAKTE (FINAL & KORREKT)
 # =============================================================================
 @app.get("/neukontakte/export_progress")
 async def neukontakte_export_progress(job_id: str = Query(...)):
@@ -3529,12 +3529,36 @@ async def neukontakte_export_progress(job_id: str = Query(...)):
         "done": bool(job.done),
         "error": str(job.error) if job.error else None,
 
-        # 👇 KORREKT: Attribut-Zugriff
+        # optional – falls später genutzt
         "note_org_limit": getattr(job, "note_org_limit", 0),
         "note_date_invalid": getattr(job, "note_date_invalid", 0),
     })
 
 
+# =============================================================================
+# EXPORT-DOWNLOAD – NEUKONTAKTE (FEHLTE → JETZT FINAL)
+# =============================================================================
+@app.get("/neukontakte/export_download")
+async def neukontakte_export_download(job_id: str = Query(...)):
+
+    job = JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job nicht gefunden")
+
+    if not job.done:
+        raise HTTPException(status_code=400, detail="Export noch nicht abgeschlossen")
+
+    if job.error:
+        raise HTTPException(status_code=400, detail=job.error)
+
+    if not job.path or not os.path.exists(job.path):
+        raise HTTPException(status_code=404, detail="Exportdatei nicht gefunden")
+
+    return FileResponse(
+        path=job.path,
+        filename=os.path.basename(job.path),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
 
 # =============================================================================
 # Frontend - Startseite
