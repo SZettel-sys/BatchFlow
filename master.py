@@ -4532,6 +4532,11 @@ main{
 .form-full{
   grid-column:1 / -1;
 }
+
+.form-narrow {
+  max-width: 520px;
+  margin-top: 24px;
+}
 /* Form */
 label{
   display:block;
@@ -4655,55 +4660,55 @@ th{
 <main>
 <section class="card">
   <h2>Refresh – Kampagnen Einstellungen</h2>
+    <div class="form-narrow">
+      <div class="grid">
 
-  <div class="grid">
-
-    <!-- Fachbereich -->
-    <div class="col-12">
-      <div style="border:1px dashed #cbd5e1;border-radius:16px;padding:20px;background:#f8fafc;">
-        <label>Fachbereich – Kampagne</label>
-
-        <div id="fb-loading-box">
-          <div id="fb-loading-text">Fachbereiche werden geladen … bitte warten.</div>
-          <div id="fb-loading-bar-wrap">
-            <div id="fb-loading-bar"></div>
+        <!-- Fachbereich -->
+        <div class="col-12">
+          <div style="border:1px dashed #cbd5e1;border-radius:16px;padding:20px;background:#f8fafc;">
+            <label>Fachbereich – Kampagne</label>
+    
+            <div id="fb-loading-box">
+              <div id="fb-loading-text">Fachbereiche werden geladen … bitte warten.</div>
+              <div id="fb-loading-bar-wrap">
+                <div id="fb-loading-bar"></div>
+              </div>
+            </div>
+    
+            <select id="fachbereich">
+              <option value="">– bitte auswählen –</option>
+            </select>
+    
+            <div style="margin-top:8px;font-size:13px;color:#64748b">
+              Quelle aus Pipedrive – bestehende Kontakte
+            </div>
           </div>
         </div>
 
-        <select id="fachbereich">
-          <option value="">– bitte auswählen –</option>
-        </select>
-
-        <div style="margin-top:8px;font-size:13px;color:#64748b">
-          Quelle aus Pipedrive – bestehende Kontakte
+        <!-- Batch ID -->
+        <div class="col-12">
+          <label>Batch ID</label>
+          <input id="batch_id" placeholder="xxx">
         </div>
-      </div>
-    </div>
-
-    <!-- Batch ID -->
-    <div class="col-12">
-      <label>Batch ID</label>
-      <input id="batch_id" placeholder="xxx">
-    </div>
-
-    <!-- Kampagnenname -->
-    <div class="col-12">
-      <label>Kampagnenname</label>
-      <input id="campaign" placeholder="z. B. Refresh Q1 / IT">
-    </div>
-
-    <!-- Anzahl Kontakte -->
-    <div class="col-12">
-      <label>Anzahl Kontakte (optional)</label>
-      <input id="take_count" placeholder="leer = alle">
-    </div>
-
-    <!-- Button -->
-    <div class="col-12" style="display:flex;justify-content:flex-end">
-      <button class="btn" id="btnExportRf">Abgleich & Download</button>
-    </div>
-
-  </div>
+    
+        <!-- Kampagnenname -->
+        <div class="col-12">
+          <label>Kampagnenname</label>
+          <input id="campaign" placeholder="z. B. Refresh Q1 / IT">
+        </div>
+    
+        <!-- Anzahl Kontakte -->
+        <div class="col-12">
+          <label>Anzahl Kontakte (optional)</label>
+          <input id="take_count" placeholder="leer = alle">
+        </div>
+    
+        <!-- Button -->
+        <div class="col-12" style="display:flex;justify-content:flex-end">
+          <button class="btn" id="btnExportRf">Abgleich & Download</button>
+        </div>
+    
+      </div></div>
 </section>
 
 
