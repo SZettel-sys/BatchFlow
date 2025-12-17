@@ -4255,14 +4255,14 @@ input:focus,textarea:focus{
 }
 .form-grid{
   display:grid;
-  grid-template-columns:1fr 1fr;
-  gap:24px 28px;
-  align-items:start;
+  grid-template-columns:repeat(2, minmax(0, 1fr));
+  gap:24px;
 }
 
 .form-full{
   grid-column:1 / -1;
 }
+
 
 /* Button */
 .btn{
@@ -4354,38 +4354,39 @@ th{
 
   <div class="form-grid">
 
-    <div>
-      <label>Batch ID</label>
-      <textarea
-        id="nf_batch_ids"
-        rows="2"
-        placeholder="xxx"
-      ></textarea>
-    </div>
-
-    <div>
-      <label>Export-Batch-ID</label>
-      <input
-        id="batch_id"
-        placeholder="z. B. B999"
-        />
-    </div>
-    <div class="form-full">
-      <label>Kampagnenname</label>
-      <input
-        id="campaign"
-        placeholder="z. B. Nachfass KW45"
-      />
-    </div>
-
-
-    <div class="form-full" style="display:flex;justify-content:flex-end">
-      <button class="btn" id="btnExportNf">
-        Abgleich & Download
-      </button>
-    </div>
-
+  <div>
+    <label>Batch ID</label>
+    <textarea
+      id="nf_batch_ids"
+      rows="2"
+      placeholder="xxx"
+    ></textarea>
   </div>
+
+  <div>
+    <label>Export-Batch-ID</label>
+    <input
+      id="batch_id"
+      placeholder="xxx"
+    />
+  </div>
+
+  <div class="form-full">
+    <label>Kampagnenname</label>
+    <input
+      id="campaign"
+      placeholder="z. B. Nachfass KW45"
+    />
+  </div>
+
+  <div class="form-full" style="display:flex;justify-content:flex-end">
+    <button class="btn" id="btnExportNf">
+      Abgleich & Download
+    </button>
+  </div>
+
+</div>
+
 </section>
 
 <section class="table-card">
@@ -4524,6 +4525,15 @@ main{
 .col-12{grid-column:span 12;}
 .col-6{grid-column:span 6;}
 
+.form-grid{
+  display:grid;
+  grid-template-columns:repeat(2, minmax(0, 1fr));
+  gap:24px;
+}
+
+.form-full{
+  grid-column:1 / -1;
+}
 /* Form */
 label{
   display:block;
@@ -4682,26 +4692,25 @@ th{
       </div>
     </div>
 
-    <!-- ===============================
-         Batch ID + Kampagnenname
-         =============================== -->
-    <div class="col-6">
-      <label>Batch ID</label>
-      <input id="batch_id" placeholder="RF-2025-01">
+    <div class="form-grid">
+
+      <div>
+        <label>Batch ID</label>
+        <input id="batch_id" placeholder="xxx">
+      </div>
+    
+      <div>
+        <label>Kampagnenname</label>
+        <input id="campaign" placeholder="z. B. Refresh Q1 / IT">
+      </div>
+    
+      <div class="form-full">
+        <label>Anzahl Kontakte (optional)</label>
+        <input id="take_count" placeholder="leer = alle">
+      </div>
+    
     </div>
 
-    <div class="col-6">
-      <label>Kampagnenname</label>
-      <input id="campaign" placeholder="z. B. Refresh Q1 / IT">
-    </div>
-
-    <!-- ===============================
-         Anzahl Kontakte – volle Breite
-         =============================== -->
-    <div class="col-12">
-      <label>Anzahl Kontakte (optional)</label>
-      <input id="take_count" type="number" placeholder="leer = alle">
-    </div>
 
     <!-- ===============================
          Button
