@@ -4253,6 +4253,16 @@ input:focus,textarea:focus{
   background:#fff;
   box-shadow:0 0 0 3px rgba(14,165,233,.15);
 }
+.form-grid{
+  display:grid;
+  grid-template-columns:1fr 1fr;
+  gap:24px 28px;
+  align-items:start;
+}
+
+.form-full{
+  grid-column:1 / -1;
+}
 
 /* Button */
 .btn{
@@ -4342,25 +4352,37 @@ th{
 <section class="card">
   <h2>Nachfass – Einstellungen</h2>
 
-  <div class="grid">
+  <div class="form-grid">
 
-    <div class="col-6">
+    <div>
       <label>Batch ID</label>
-      <textarea id="nf_batch_ids" rows="2" placeholder="xxx"></textarea>
+      <textarea
+        id="nf_batch_ids"
+        rows="2"
+        placeholder="xxx"
+      ></textarea>
     </div>
 
-    <div class="col-6">
+    <div>
       <label>Export-Batch-ID</label>
-      <input id="batch_id" placeholder="xxx">
+      <input
+        id="batch_id"
+        placeholder="z. B. B999"
+        />
     </div>
-
-    <div class="col-6">
+    <div class="form-full">
       <label>Kampagnenname</label>
-      <input id="campaign" placeholder="z. B. Nachfass KW45">
+      <input
+        id="campaign"
+        placeholder="z. B. Nachfass KW45"
+      />
     </div>
 
-    <div class="col-12" style="display:flex;justify-content:flex-end">
-      <button class="btn" id="btnExportNf">Abgleich & Download</button>
+
+    <div class="form-full" style="display:flex;justify-content:flex-end">
+      <button class="btn" id="btnExportNf">
+        Abgleich & Download
+      </button>
     </div>
 
   </div>
@@ -4629,24 +4651,43 @@ th{
 
   <div class="grid">
 
+    <!-- ===============================
+         Fachbereich – IDENTISCH NK
+         =============================== -->
     <div class="col-12">
-      <label>Fachbereich – Kampagne</label>
+      <div style="
+        border:1px dashed #cbd5e1;
+        border-radius:16px;
+        padding:20px;
+        background:#f8fafc;
+      ">
+        <label>Fachbereich – Kampagne</label>
 
-      <div id="fb-loading-box">
-        <div id="fb-loading-text">Fachbereiche werden geladen … bitte warten.</div>
-        <div id="fb-loading-bar-wrap">
-          <div id="fb-loading-bar"></div>
+        <div id="fb-loading-box">
+          <div id="fb-loading-text">
+            Fachbereiche werden geladen … bitte warten.
+          </div>
+          <div id="fb-loading-bar-wrap">
+            <div id="fb-loading-bar"></div>
+          </div>
+        </div>
+
+        <select id="fachbereich">
+          <option value="">– bitte auswählen –</option>
+        </select>
+
+        <div style="margin-top:8px;font-size:13px;color:#64748b">
+          Quelle aus Pipedrive – bestehende Kontakte
         </div>
       </div>
-
-      <select id="fachbereich">
-        <option value="">– bitte auswählen –</option>
-      </select>
     </div>
 
+    <!-- ===============================
+         Batch ID + Kampagnenname
+         =============================== -->
     <div class="col-6">
       <label>Batch ID</label>
-      <input id="batch_id" placeholder="xxx">
+      <input id="batch_id" placeholder="RF-2025-01">
     </div>
 
     <div class="col-6">
@@ -4654,17 +4695,26 @@ th{
       <input id="campaign" placeholder="z. B. Refresh Q1 / IT">
     </div>
 
-    <div class="col-6">
+    <!-- ===============================
+         Anzahl Kontakte – volle Breite
+         =============================== -->
+    <div class="col-12">
       <label>Anzahl Kontakte (optional)</label>
       <input id="take_count" type="number" placeholder="leer = alle">
     </div>
 
+    <!-- ===============================
+         Button
+         =============================== -->
     <div class="col-12" style="display:flex;justify-content:flex-end">
-      <button class="btn" id="btnExportRf">Abgleich & Download</button>
+      <button class="btn" id="btnExportRf">
+        Abgleich & Download
+      </button>
     </div>
 
   </div>
 </section>
+
 
 <section class="table-card">
   <h3>Entfernte Datensätze</h3>
