@@ -4348,7 +4348,6 @@ th{
 </header>
 
 <main>
-
 <section class="card">
   <h2>Nachfass – Einstellungen</h2>
 
@@ -4357,39 +4356,50 @@ th{
     <!-- Batch IDs -->
     <div class="col-6">
       <label>Batch ID</label>
-      <textarea
-        id="nf_batch_ids"
-        rows="2"
-        placeholder="xxx"
-      ></textarea>
+      <textarea id="nf_batch_ids" rows="2" placeholder="xxx"></textarea>
     </div>
 
-    <!-- Export Batch ID -->
+    <!-- Export Batch -->
     <div class="col-6">
       <label>Export-Batch-ID</label>
-      <input
-        id="batch_id"
-        placeholder="xxx"
-      />
+      <input id="batch_id" placeholder="xxx">
     </div>
 
-    <!-- Kampagnenname volle Breite -->
+    <!-- Kampagne -->
     <div class="col-12">
       <label>Kampagnenname</label>
-      <input
-        id="campaign"
-        placeholder="z. B. import_nachfass_xxx"
-      />
+      <input id="campaign" placeholder="z. B. import_nachfass_xxx">
     </div>
 
     <!-- Button -->
     <div class="col-12" style="display:flex;justify-content:flex-end">
-      <button class="btn" id="btnExportNf">
-        Abgleich & Download
-      </button>
+      <button class="btn" id="btnExportNf">Abgleich & Download</button>
     </div>
 
   </div>
+</section>
+
+<!-- Tabelle: Entfernte Datensätze -->
+<section class="table-card">
+  <h3>Entfernte Datensätze</h3>
+  <table>
+    <thead>
+      <tr>
+        <th>Kontakt ID</th>
+        <th>Name</th>
+        <th>Organisation ID</th>
+        <th>Organisationsname</th>
+        <th>Grund</th>
+      </tr>
+    </thead>
+    <tbody id="excluded-table-body">
+      <tr>
+        <td colspan="5" style="text-align:center;color:#94a3b8">
+          Noch keine Daten geladen
+        </td>
+      </tr>
+    </tbody>
+  </table>
 </section>
 
 
@@ -4644,14 +4654,9 @@ th{
 
   <div class="grid">
 
-    <!-- Fachbereich (1:1 wie NK) -->
+    <!-- Fachbereich -->
     <div class="col-12">
-      <div style="
-        border:1px dashed #cbd5e1;
-        border-radius:16px;
-        padding:20px;
-        background:#f8fafc;
-      ">
+      <div style="border:1px dashed #cbd5e1;border-radius:16px;padding:20px;background:#f8fafc;">
         <label>Fachbereich – Kampagne</label>
 
         <div id="fb-loading-box">
@@ -4680,7 +4685,7 @@ th{
     <!-- Kampagnenname -->
     <div class="col-6">
       <label>Kampagnenname</label>
-      <input id="campaign" placeholder="import_refresh_xxx">
+      <input id="campaign" placeholder="z. B. Refresh Q1 / IT">
     </div>
 
     <!-- Anzahl Kontakte -->
@@ -4691,9 +4696,7 @@ th{
 
     <!-- Button -->
     <div class="col-12" style="display:flex;justify-content:flex-end">
-      <button class="btn" id="btnExportRf">
-        Abgleich & Download
-      </button>
+      <button class="btn" id="btnExportRf">Abgleich & Download</button>
     </div>
 
   </div>
