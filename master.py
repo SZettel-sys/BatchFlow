@@ -4354,40 +4354,26 @@ th{
 
   <div class="grid">
 
-    <!-- VISUELLER BLOCK (wie NK) -->
-    <div class="col-12">
-      <div style="
-        border:1px dashed #cbd5e1;
-        border-radius:16px;
-        padding:20px;
-        background:#f8fafc;
-      ">
-
-        <div class="grid">
-
-          <div class="col-6">
-            <label>Batch ID</label>
-            <textarea
-              id="nf_batch_ids"
-              rows="2"
-              placeholder="xxx"
-            ></textarea>
-          </div>
-
-          <div class="col-6">
-            <label>Export-Batch-ID</label>
-            <input
-              id="batch_id"
-              placeholder="xxx"
-            />
-          </div>
-
-        </div>
-
-      </div>
+    <!-- Batch IDs -->
+    <div class="col-6">
+      <label>Batch ID</label>
+      <textarea
+        id="nf_batch_ids"
+        rows="2"
+        placeholder="xxx"
+      ></textarea>
     </div>
 
-    <!-- Kampagnenname -->
+    <!-- Export Batch ID -->
+    <div class="col-6">
+      <label>Export-Batch-ID</label>
+      <input
+        id="batch_id"
+        placeholder="xxx"
+      />
+    </div>
+
+    <!-- Kampagnenname volle Breite -->
     <div class="col-12">
       <label>Kampagnenname</label>
       <input
@@ -4658,9 +4644,7 @@ th{
 
   <div class="grid">
 
-    <!-- ===============================
-         Fachbereich – IDENTISCH NK
-         =============================== -->
+    <!-- Fachbereich (1:1 wie NK) -->
     <div class="col-12">
       <div style="
         border:1px dashed #cbd5e1;
@@ -4671,9 +4655,7 @@ th{
         <label>Fachbereich – Kampagne</label>
 
         <div id="fb-loading-box">
-          <div id="fb-loading-text">
-            Fachbereiche werden geladen … bitte warten.
-          </div>
+          <div id="fb-loading-text">Fachbereiche werden geladen … bitte warten.</div>
           <div id="fb-loading-bar-wrap">
             <div id="fb-loading-bar"></div>
           </div>
@@ -4689,33 +4671,25 @@ th{
       </div>
     </div>
 
-    <!-- ===============================
-         Batch + Kampagne (2-spaltig)
-         =============================== -->
+    <!-- Batch ID -->
     <div class="col-6">
       <label>Batch ID</label>
       <input id="batch_id" placeholder="xxx">
     </div>
 
+    <!-- Kampagnenname -->
     <div class="col-6">
       <label>Kampagnenname</label>
       <input id="campaign" placeholder="import_refresh_xxx">
     </div>
 
-    <!-- ===============================
-         Anzahl Kontakte
-         =============================== -->
+    <!-- Anzahl Kontakte -->
     <div class="col-6">
       <label>Anzahl Kontakte (optional)</label>
       <input id="take_count" placeholder="leer = alle">
     </div>
 
-    <!-- Spacer für sauberes Raster -->
-    <div class="col-6"></div>
-
-    <!-- ===============================
-         Button
-         =============================== -->
+    <!-- Button -->
     <div class="col-12" style="display:flex;justify-content:flex-end">
       <button class="btn" id="btnExportRf">
         Abgleich & Download
