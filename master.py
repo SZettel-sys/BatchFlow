@@ -4352,9 +4352,9 @@ th{
 <section class="card">
   <h2>Nachfass – Einstellungen</h2>
 
-  <div class="form-grid">
+  <div class="grid">
 
-  <div>
+  <div class="col-6">
     <label>Batch ID</label>
     <textarea
       id="nf_batch_ids"
@@ -4363,7 +4363,7 @@ th{
     ></textarea>
   </div>
 
-  <div>
+  <div class="col-6">
     <label>Export-Batch-ID</label>
     <input
       id="batch_id"
@@ -4371,7 +4371,7 @@ th{
     />
   </div>
 
-  <div class="form-full">
+  <div class="col-12">
     <label>Kampagnenname</label>
     <input
       id="campaign"
@@ -4379,7 +4379,7 @@ th{
     />
   </div>
 
-  <div class="form-full" style="display:flex;justify-content:flex-end">
+  <div class="col-12" style="display:flex;justify-content:flex-end">
     <button class="btn" id="btnExportNf">
       Abgleich & Download
     </button>
@@ -4692,19 +4692,19 @@ th{
       </div>
     </div>
 
-    <div class="form-grid">
+    <div class="grid">
 
-      <div>
+      <div class="col-6">
         <label>Batch ID</label>
         <input id="batch_id" placeholder="xxx">
       </div>
     
-      <div>
+      <div class="col-6">
         <label>Kampagnenname</label>
         <input id="campaign" placeholder="z. B. Refresh Q1 / IT">
       </div>
     
-      <div class="form-full">
+      <div class="col-6">
         <label>Anzahl Kontakte (optional)</label>
         <input id="take_count" placeholder="leer = alle">
       </div>
