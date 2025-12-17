@@ -4168,7 +4168,7 @@ loadOptions();
     )
 
 # =============================================================================
-# Frontend – Nachfass (Design wie Neukontakte, Logik unverändert)
+# Frontend – Nachfass (DESIGN identisch zu Neukontakte)
 # =============================================================================
 @app.get("/nachfass", response_class=HTMLResponse)
 async def nachfass_page():
@@ -4176,15 +4176,18 @@ async def nachfass_page():
 <html lang="de">
 <head>
 <meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>Nachfass – BatchFlow</title>
 
 <style>
+/* =========================
+   BASIS (identisch NK)
+   ========================= */
 body{
   margin:0;
   background:#f7f9fc;
   color:#0f172a;
-  font:16px/1.6 Inter,system-ui,sans-serif;
+  font:16px/1.6 Inter,system-ui,-apple-system,BlinkMacSystemFont,sans-serif;
 }
 header{
   background:#fff;
@@ -4195,45 +4198,75 @@ header{
   margin:0 auto;
   padding:22px 24px;
   display:flex;
-  justify-content:space-between;
   align-items:center;
+  justify-content:space-between;
 }
+.hleft{display:flex;align-items:center;gap:14px;}
+.hleft img{height:48px;}
+.hcenter{font-size:18px;font-weight:600;}
+.hright{font-size:14px;}
+
 main{
-  max-width:760px;
+  max-width:720px;
   margin:48px auto;
   padding:0 24px;
 }
+
+/* Card */
 .card{
   background:#fff;
   border:1px solid #e5e9f0;
   border-radius:20px;
   padding:36px;
-  box-shadow:0 14px 32px rgba(15,23,42,.06);
+  box-shadow:
+    0 14px 32px rgba(15,23,42,.06),
+    0 6px 12px rgba(15,23,42,.04);
 }
+
+/* Grid */
+.grid{
+  display:grid;
+  grid-template-columns:repeat(12,1fr);
+  gap:20px;
+  row-gap:28px;
+}
+.col-12{grid-column:span 12;}
+.col-6{grid-column:span 6;}
+
+/* Form */
 label{
   display:block;
   font-weight:600;
-  margin:22px 0 8px;
+  margin-bottom:8px;
+  font-size:14px;
 }
 input,textarea{
   width:100%;
   padding:12px 14px;
-  border:1px solid #dbe3ec;
   border-radius:12px;
+  border:1px solid #dbe3ec;
   background:#f8fafc;
 }
+input:focus,textarea:focus{
+  outline:none;
+  border-color:#0ea5e9;
+  background:#fff;
+  box-shadow:0 0 0 3px rgba(14,165,233,.15);
+}
+
+/* Button */
 .btn{
   margin-top:36px;
-  float:right;
   background:#0ea5e9;
   color:#fff;
   border:none;
   border-radius:999px;
-  padding:12px 28px;
+  padding:14px 28px;
   font-weight:600;
   cursor:pointer;
+  box-shadow:0 6px 14px rgba(14,165,233,.35);
 }
-.btn:hover{ background:#0284c7; }
+.btn:hover{background:#0284c7}
 
 /* Tabelle */
 .table-card{
@@ -4246,20 +4279,21 @@ input,textarea{
 table{
   width:100%;
   border-collapse:collapse;
-  margin-top:16px;
+  margin-top:12px;
+  font-size:14px;
 }
+thead{background:#f8fafc;}
 th,td{
   padding:14px 16px;
   border-bottom:1px solid #e5e9f0;
 }
 th{
-  background:#f8fafc;
-  font-size:13px;
+  font-weight:600;
   color:#475569;
   white-space:nowrap;
 }
 
-/* Overlay – FIX */
+/* Overlay – sichtbar & zentriert */
 #overlay{
   display:none;
   position:fixed;
@@ -4269,28 +4303,21 @@ th{
   z-index:9999;
   align-items:center;
   justify-content:center;
-}
-#overlay-box{
-  background:#fff;
-  border-radius:20px;
-  padding:32px 36px;
-  width:min(420px,90vw);
-  box-shadow:0 20px 40px rgba(15,23,42,.12);
-  text-align:center;
+  flex-direction:column;
+  gap:12px;
 }
 .barwrap{
-  margin-top:16px;
-  width:100%;
+  width:520px;
+  max-width:90vw;
   height:10px;
-  background:#e5e9f0;
   border-radius:999px;
-  overflow:hidden;
+  background:#e5e9f0;
 }
 .bar{
   height:100%;
   width:0%;
   background:linear-gradient(90deg,#0ea5e9,#38bdf8);
-  transition:width .25s ease;
+  transition:width .25s linear;
 }
 </style>
 </head>
@@ -4299,8 +4326,14 @@ th{
 
 <header>
   <div class="hwrap">
-    <div>Nachfass</div>
-    <a href="/campaign" style="font-size:14px;color:#0a66c2;text-decoration:none">Kampagne wählen</a>
+    <div class="hleft">
+      <img src="/static/bizforward-Logo-Clean-2024.svg">
+      <a href="/campaign" style="font-size:14px;color:#0a66c2;text-decoration:none">
+        Kampagne wählen
+      </a>
+    </div>
+    <div class="hcenter">Nachfass</div>
+    <div class="hright">angemeldet</div>
   </div>
 </header>
 
@@ -4309,16 +4342,28 @@ th{
 <section class="card">
   <h2>Nachfass – Einstellungen</h2>
 
-  <label>Batch IDs (1–2 Werte)</label>
-  <textarea id="nf_batch_ids" rows="2" placeholder="B111, B222"></textarea>
+  <div class="grid">
 
-  <label>Export-Batch-ID</label>
-  <input id="batch_id" placeholder="B999"/>
+    <div class="col-12">
+      <label>Batch IDs (1–2 Werte)</label>
+      <textarea id="nf_batch_ids" rows="2" placeholder="B111, B222"></textarea>
+    </div>
 
-  <label>Kampagnenname</label>
-  <input id="campaign" placeholder="z. B. Nachfass KW45"/>
+    <div class="col-6">
+      <label>Export-Batch-ID</label>
+      <input id="batch_id" placeholder="B999">
+    </div>
 
-  <button class="btn" id="btnExportNf">Abgleich & Download</button>
+    <div class="col-6">
+      <label>Kampagnenname</label>
+      <input id="campaign" placeholder="z. B. Nachfass KW45">
+    </div>
+
+    <div class="col-12" style="display:flex;justify-content:flex-end">
+      <button class="btn" id="btnExportNf">Abgleich & Download</button>
+    </div>
+
+  </div>
 </section>
 
 <section class="table-card">
@@ -4334,7 +4379,9 @@ th{
       </tr>
     </thead>
     <tbody id="excluded-table-body">
-      <tr><td colspan="5" style="text-align:center;color:#94a3b8">Noch keine Daten geladen</td></tr>
+      <tr><td colspan="5" style="text-align:center;color:#94a3b8">
+        Noch keine Daten geladen
+      </td></tr>
     </tbody>
   </table>
 </section>
@@ -4342,46 +4389,40 @@ th{
 </main>
 
 <div id="overlay">
-  <div id="overlay-box">
-    <div id="overlay-phase" style="font-weight:600">Bitte warten …</div>
-    <div class="barwrap"><div class="bar" id="overlay-bar"></div></div>
-  </div>
+  <div id="overlay-phase" style="font-weight:600"></div>
+  <div class="barwrap"><div class="bar" id="overlay-bar"></div></div>
 </div>
 
 <script>
 const el = id => document.getElementById(id);
-function showOverlay(msg){
-  el("overlay-phase").textContent = msg;
-  el("overlay").style.display = "flex";
-}
-function hideOverlay(){ el("overlay").style.display = "none"; }
-function setProgress(p){ el("overlay-bar").style.width = p + "%"; }
+function showOverlay(t){el("overlay-phase").textContent=t;el("overlay").style.display="flex";}
+function hideOverlay(){el("overlay").style.display="none";}
+function setProgress(p){el("overlay-bar").style.width=p+"%";}
 
-/* LOGIK UNVERÄNDERT */
 async function poll(job_id){
   while(true){
     await new Promise(r=>setTimeout(r,500));
     const s = await (await fetch("/nachfass/export_progress?job_id="+job_id)).json();
-    showOverlay(`${s.phase} (${s.percent}%)`);
+    el("overlay-phase").textContent = `${s.phase} (${s.percent}%)`;
     setProgress(s.percent);
+    if(s.error){alert(s.error);hideOverlay();return;}
     if(s.download_ready){
-      setProgress(100);
       window.location.href="/nachfass/export_download?job_id="+job_id;
-      hideOverlay();
-      return;
+      hideOverlay(); return;
     }
-    if(s.error){ alert(s.error); hideOverlay(); return; }
   }
 }
 
 el("btnExportNf").onclick = async ()=>{
   showOverlay("Starte Abgleich …");
   setProgress(10);
-  const r = await fetch("/nachfass/export_start",{method:"POST",headers:{"Content-Type":"application/json"},
+  const r = await fetch("/nachfass/export_start",{
+    method:"POST",
+    headers:{"Content-Type":"application/json"},
     body:JSON.stringify({
-      nf_batch_ids: el("nf_batch_ids").value.split(/[,\n;]/).map(s=>s.trim()).filter(Boolean),
-      batch_id: el("batch_id").value,
-      campaign: el("campaign").value
+      nf_batch_ids:el("nf_batch_ids").value.split(/[,\n;]/).map(s=>s.trim()).filter(Boolean),
+      batch_id:el("batch_id").value,
+      campaign:el("campaign").value
     })
   });
   const j = await r.json();
@@ -4393,10 +4434,13 @@ el("btnExportNf").onclick = async ()=>{
 </html>""")
 
 # =============================================================================
-# Frontend – Refresh (Design identisch zu Neukontakte)
+# Frontend – Refresh (DESIGN exakt wie Neukontakte)
 # =============================================================================
 @app.get("/refresh", response_class=HTMLResponse)
-async def refresh_page():
+async def refresh_page(request: Request):
+    authed = True
+    auth_info = "<span class='muted'>angemeldet</span>" if authed else "<a href='/login'>Anmelden</a>"
+
     return HTMLResponse(r"""<!doctype html>
 <html lang="de">
 <head>
@@ -4405,7 +4449,161 @@ async def refresh_page():
 <title>Refresh – BatchFlow</title>
 
 <style>
-""" + """(identisch zu /nachfass, inkl. Overlay-CSS)""" + r"""
+/* =========================
+   BASIS – IDENTISCH NK
+   ========================= */
+body{
+  margin:0;
+  background:#f7f9fc;
+  color:#0f172a;
+  font:16px/1.6 Inter,system-ui,-apple-system,BlinkMacSystemFont,sans-serif;
+}
+header{
+  background:#fff;
+  border-bottom:1px solid #e5e9f0;
+}
+.hwrap{
+  max-width:1200px;
+  margin:0 auto;
+  padding:22px 24px;
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+}
+.hleft{display:flex;align-items:center;gap:14px;}
+.hleft img{height:48px;}
+.hcenter{font-size:18px;font-weight:600;}
+.hright{font-size:14px;}
+
+main{
+  max-width:720px;
+  margin:48px auto;
+  padding:0 24px;
+}
+
+/* Card */
+.card{
+  background:#fff;
+  border:1px solid #e5e9f0;
+  border-radius:20px;
+  padding:36px;
+  box-shadow:
+    0 14px 32px rgba(15,23,42,.06),
+    0 6px 12px rgba(15,23,42,.04);
+}
+
+/* Grid */
+.grid{
+  display:grid;
+  grid-template-columns:repeat(12,1fr);
+  gap:20px;
+  row-gap:28px;
+}
+.col-12{grid-column:span 12;}
+.col-6{grid-column:span 6;}
+
+/* Form */
+label{
+  display:block;
+  font-weight:600;
+  margin-bottom:8px;
+  font-size:14px;
+}
+input,select{
+  width:100%;
+  padding:12px 14px;
+  border-radius:12px;
+  border:1px solid #dbe3ec;
+  background:#f8fafc;
+}
+input:focus,select:focus{
+  outline:none;
+  border-color:#0ea5e9;
+  background:#fff;
+  box-shadow:0 0 0 3px rgba(14,165,233,.15);
+}
+
+/* Ladebalken Fachbereich – IDENTISCH NK */
+#fb-loading-box{margin-bottom:12px;display:none;}
+#fb-loading-text{font-size:13px;color:#0a66c2;margin-bottom:6px;}
+#fb-loading-bar-wrap{
+  width:100%;
+  height:8px;
+  background:#e5e9f0;
+  border-radius:999px;
+  overflow:hidden;
+}
+#fb-loading-bar{
+  height:8px;
+  width:0%;
+  background:linear-gradient(90deg,#0ea5e9,#38bdf8);
+}
+
+/* Button */
+.btn{
+  margin-top:36px;
+  background:#0ea5e9;
+  color:#fff;
+  border:none;
+  border-radius:999px;
+  padding:14px 28px;
+  font-weight:600;
+  cursor:pointer;
+  box-shadow:0 6px 14px rgba(14,165,233,.35);
+}
+.btn:hover{background:#0284c7}
+
+/* Tabelle */
+.table-card{
+  margin-top:48px;
+  background:#fff;
+  border:1px solid #e5e9f0;
+  border-radius:20px;
+  padding:28px;
+}
+table{
+  width:100%;
+  border-collapse:collapse;
+  margin-top:12px;
+  font-size:14px;
+}
+thead{background:#f8fafc;}
+th,td{
+  padding:14px 16px;
+  border-bottom:1px solid #e5e9f0;
+}
+th{
+  font-weight:600;
+  color:#475569;
+  white-space:nowrap;
+}
+
+/* Overlay – ZENTRIERT & SICHTBAR */
+#overlay{
+  display:none;
+  position:fixed;
+  inset:0;
+  background:rgba(247,249,252,.85);
+  backdrop-filter:blur(3px);
+  z-index:9999;
+  align-items:center;
+  justify-content:center;
+  flex-direction:column;
+  gap:12px;
+}
+.barwrap{
+  width:520px;
+  max-width:90vw;
+  height:10px;
+  border-radius:999px;
+  background:#e5e9f0;
+}
+.bar{
+  height:100%;
+  width:0%;
+  background:linear-gradient(90deg,#0ea5e9,#38bdf8);
+  transition:width .25s linear;
+}
 </style>
 </head>
 
@@ -4413,8 +4611,14 @@ async def refresh_page():
 
 <header>
   <div class="hwrap">
-    <div>Refresh</div>
-    <a href="/campaign" style="font-size:14px;color:#0a66c2;text-decoration:none">Kampagne wählen</a>
+    <div class="hleft">
+      <img src="/static/bizforward-Logo-Clean-2024.svg">
+      <a href="/campaign" style="font-size:14px;color:#0a66c2;text-decoration:none">
+        Kampagne wählen
+      </a>
+    </div>
+    <div class="hcenter">Refresh</div>
+    <div class="hright">""" + auth_info + r"""</div>
   </div>
 </header>
 
@@ -4423,29 +4627,43 @@ async def refresh_page():
 <section class="card">
   <h2>Refresh – Kampagnen Einstellungen</h2>
 
-  <label>Fachbereich – Kampagne</label>
+  <div class="grid">
 
-  <div id="fb-loading-box">
-    <div style="font-size:13px;color:#0a66c2;margin-bottom:6px">
-      Fachbereiche werden geladen …
+    <div class="col-12">
+      <label>Fachbereich – Kampagne</label>
+
+      <div id="fb-loading-box">
+        <div id="fb-loading-text">Fachbereiche werden geladen … bitte warten.</div>
+        <div id="fb-loading-bar-wrap">
+          <div id="fb-loading-bar"></div>
+        </div>
+      </div>
+
+      <select id="fachbereich">
+        <option value="">– bitte auswählen –</option>
+      </select>
     </div>
-    <div class="barwrap"><div class="bar" id="fb-loading-bar"></div></div>
+
+    <div class="col-6">
+      <label>Batch ID</label>
+      <input id="batch_id" placeholder="RF-2025-01">
+    </div>
+
+    <div class="col-6">
+      <label>Kampagnenname</label>
+      <input id="campaign" placeholder="z. B. Refresh Q1 / IT">
+    </div>
+
+    <div class="col-6">
+      <label>Anzahl Kontakte (optional)</label>
+      <input id="take_count" type="number" placeholder="leer = alle">
+    </div>
+
+    <div class="col-12" style="display:flex;justify-content:flex-end">
+      <button class="btn" id="btnExportRf">Abgleich & Download</button>
+    </div>
+
   </div>
-
-  <select id="fachbereich">
-    <option value="">– bitte auswählen –</option>
-  </select>
-
-  <label>Batch ID</label>
-  <input id="batch_id" placeholder="RF-2025-01"/>
-
-  <label>Kampagnenname</label>
-  <input id="campaign" placeholder="z. B. Refresh Q1 / IT"/>
-
-  <label>Anzahl Kontakte (optional)</label>
-  <input id="take_count" type="number" placeholder="leer = alle"/>
-
-  <button class="btn" id="btnExportRf">Abgleich & Download</button>
 </section>
 
 <section class="table-card">
@@ -4461,7 +4679,9 @@ async def refresh_page():
       </tr>
     </thead>
     <tbody id="excluded-table-body">
-      <tr><td colspan="5" style="text-align:center;color:#94a3b8">Noch keine Daten geladen</td></tr>
+      <tr><td colspan="5" style="text-align:center;color:#94a3b8">
+        Noch keine Daten geladen
+      </td></tr>
     </tbody>
   </table>
 </section>
@@ -4469,19 +4689,74 @@ async def refresh_page():
 </main>
 
 <div id="overlay">
-  <div id="overlay-box">
-    <div id="overlay-phase" style="font-weight:600">Bitte warten …</div>
-    <div class="barwrap"><div class="bar" id="overlay-bar"></div></div>
-  </div>
+  <div id="overlay-phase" style="font-weight:600"></div>
+  <div class="barwrap"><div class="bar" id="overlay-bar"></div></div>
 </div>
 
 <script>
-/* LOGIK 1:1 wie vorher – nur Overlay korrekt sichtbar */
+const el = id => document.getElementById(id);
+function showOverlay(t){el("overlay-phase").textContent=t;el("overlay").style.display="flex";}
+function hideOverlay(){el("overlay").style.display="none";}
+function setProgress(p){el("overlay-bar").style.width=p+"%";}
+
+async function loadFachbereiche(){
+  const box=el("fb-loading-box"), bar=el("fb-loading-bar");
+  box.style.display="block"; bar.style.width="0%";
+  let p=0;
+  const iv=setInterval(()=>{p=Math.min(p+6,90);bar.style.width=p+"%";},180);
+
+  const r=await fetch("/refresh/options");
+  const data=await r.json();
+  clearInterval(iv); bar.style.width="100%";
+
+  const sel=el("fachbereich");
+  sel.innerHTML='<option value="">– bitte auswählen –</option>';
+  (data.options||[]).forEach(o=>{
+    const opt=document.createElement("option");
+    opt.value=o.value;
+    opt.textContent=o.label+" ("+o.count+")";
+    sel.appendChild(opt);
+  });
+  setTimeout(()=>box.style.display="none",400);
+}
+
+async function poll(job_id){
+  while(true){
+    await new Promise(r=>setTimeout(r,500));
+    const s=await (await fetch("/refresh/export_progress?job_id="+job_id)).json();
+    el("overlay-phase").textContent=`${s.phase} (${s.percent}%)`;
+    setProgress(s.percent);
+    if(s.error){alert(s.error);hideOverlay();return;}
+    if(s.download_ready){
+      window.location.href="/refresh/export_download?job_id="+job_id;
+      hideOverlay(); return;
+    }
+  }
+}
+
+el("btnExportRf").onclick=async ()=>{
+  if(!el("fachbereich").value) return alert("Bitte Fachbereich auswählen");
+  showOverlay("Starte Abgleich …");
+  setProgress(10);
+  const r=await fetch("/refresh/export_start",{
+    method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({
+      fachbereich:el("fachbereich").value,
+      batch_id:el("batch_id").value,
+      campaign:el("campaign").value,
+      take_count:parseInt(el("take_count").value)||null
+    })
+  });
+  const j=await r.json();
+  poll(j.job_id);
+};
+
+loadFachbereiche();
 </script>
 
 </body>
 </html>""")
-
 
 # =============================================================================
 # Refresh – Summary-Seite
