@@ -3150,41 +3150,6 @@ async def reconcile_with_progress(job: "Job", prefix: str):
 
 
 # =============================================================================
-# /neukontakte/options
-# =============================================================================
-@app.get("/neukontakte/options")
-async def neukontakte_options():
-    """
-    Liefert Fachbereiche für Neukontakte
-    Filter: FILTER_NEUKONTAKTE
-    """
-    options = []
-
-    # hier exakt dieselbe Logik wie bei /refresh/options,
-    # nur mit anderem Filter
-    data = pipedrive_get_filtered_persons(
-        filter_id=FILTER_NEUKONTAKTE
-    )
-
-    # gruppieren nach Fachbereich (custom field)
-    counts = {}
-    for p in data:
-        fb = p.get("fachbereich")
-        if not fb:
-            continue
-        counts[fb] = counts.get(fb, 0) + 1
-
-    for fb, cnt in sorted(counts.items()):
-        options.append({
-            "value": fb,
-            "label": fb,
-            "count": cnt
-        })
-
-    return {"options": options}
-
-
-# =============================================================================
 # /refresh/options – Variante B (zeigt auch Fachbereiche mit count = 0)
 # =============================================================================
 @app.get("/refresh/options")
@@ -3265,7 +3230,83 @@ async def refresh_options():
     options.sort(key=lambda o: o["label"].lower())
     return JSONResponse({"options": options})
 
+# =============================================================================
+# NEUKONTAKTE - OPTIONS
+# =============================================================================
+# =============================================================================
+# /neukontakte/options – identisch zu /refresh/options
+# =============================================================================
+@app.get("/neukontakte/options")
+async def neukontakte_options():
 
+    field_key = PD_PERSON_FIELDS.get("Fachbereich - Kampagne")
+    if not field_key:
+        return JSONResponse({"options": []})
+
+    # -------------------------------------------------------------------------
+    # 1) Personen laden (identisch zu Refresh, anderer Filter)
+    # -------------------------------------------------------------------------
+    persons = await fetch_persons_by_filter_id_v2(
+        filter_id=FILTER_NEUKONTAKTE,
+        limit=500,
+        job_obj=None,
+        max_pages=60,
+        max_empty_growth=2,
+    )
+
+    # -------------------------------------------------------------------------
+    # 2) Alle möglichen Fachbereichs-Labels laden
+    # -------------------------------------------------------------------------
+    label_map = await get_fachbereich_label_map()
+    all_possible_values = list(label_map.keys())
+
+    per_fach_counts: Dict[str, int] = {k: 0 for k in all_possible_values}
+    fach_org_counts: Dict[str, Dict[str, int]] = {k: {} for k in all_possible_values}
+
+    # -------------------------------------------------------------------------
+    # 3) Personen bereinigen (EXAKT wie bei Refresh!)
+    # -------------------------------------------------------------------------
+    for p in persons:
+        if not isinstance(p, dict):
+            continue
+
+        fach_val = sanitize(cf_value_v2(p, field_key))
+        if not fach_val:
+            continue
+        if fach_val not in all_possible_values:
+            continue
+
+        org_id = extract_org_id_from_person(p)
+        if not org_id:
+            continue
+
+        next_date = sanitize(p.get("next_activity_date"))
+        if next_date and is_forbidden_activity_date(next_date):
+            continue
+
+        # Organisationslimit: max 2 Kontakte
+        orgs = fach_org_counts[fach_val]
+        if orgs.get(org_id, 0) >= PER_ORG_DEFAULT_LIMIT:
+            continue
+
+        orgs[org_id] = orgs.get(org_id, 0) + 1
+        per_fach_counts[fach_val] += 1
+
+    # -------------------------------------------------------------------------
+    # 4) Ausgabe – sortiert, inkl. 0-Werte
+    # -------------------------------------------------------------------------
+    options = []
+    for fach_val in all_possible_values:
+        label = label_map.get(fach_val) or fach_val
+        count = per_fach_counts.get(fach_val, 0)
+        options.append({
+            "value": fach_val,
+            "label": label,
+            "count": count,
+        })
+
+    options.sort(key=lambda o: o["label"].lower())
+    return JSONResponse({"options": options})
 
 
 # =============================================================================
@@ -3325,6 +3366,10 @@ async def export_start_nk(
     asyncio.create_task(_run())
     return JSONResponse({"job_id": job_id})
 
+
+# =============================================================================
+# Neukontakte - OPTIONS
+# =============================================================================
 
 # =============================================================================
 # EXPORT-FORTSCHRITT & DOWNLOAD-ENDPUNKTE REFRESH (KORRIGIERT)
