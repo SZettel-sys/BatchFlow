@@ -4344,14 +4344,14 @@ th{
 
   <div class="grid">
 
-    <div class="col-12">
-      <label>Batch IDs (1–2 Werte)</label>
-      <textarea id="nf_batch_ids" rows="2" placeholder="B111, B222"></textarea>
+    <div class="col-6">
+      <label>Batch ID</label>
+      <textarea id="nf_batch_ids" rows="2" placeholder="xxx"></textarea>
     </div>
 
     <div class="col-6">
       <label>Export-Batch-ID</label>
-      <input id="batch_id" placeholder="B999">
+      <input id="batch_id" placeholder="xxx">
     </div>
 
     <div class="col-6">
@@ -4646,7 +4646,7 @@ th{
 
     <div class="col-6">
       <label>Batch ID</label>
-      <input id="batch_id" placeholder="RF-2025-01">
+      <input id="batch_id" placeholder="xxx">
     </div>
 
     <div class="col-6">
@@ -4695,6 +4695,36 @@ th{
 
 <script>
 const el = id => document.getElementById(id);
+// ---------------------------------------------------------------------
+// UX: Lade-Text rotieren lassen (nur Anzeige, keine Logik)
+// ---------------------------------------------------------------------
+let fbTextInterval = null;
+
+function startFachbereichLoadingText(){
+  const steps = [
+    "Suche Personen …",
+    "Lade Fachbereiche …",
+    "Aggregiere Ergebnisse …",
+    "Bereite Auswahl vor …"
+  ];
+  let i = 0;
+
+  fbTextInterval = setInterval(()=>{
+    const t = el("fb-loading-text");
+    if(t){
+      t.textContent = steps[i % steps.length];
+      i++;
+    }
+  }, 1200);
+}
+
+function stopFachbereichLoadingText(){
+  if(fbTextInterval){
+    clearInterval(fbTextInterval);
+    fbTextInterval = null;
+  }
+}
+
 function showOverlay(t){el("overlay-phase").textContent=t;el("overlay").style.display="flex";}
 function hideOverlay(){el("overlay").style.display="none";}
 function setProgress(p){el("overlay-bar").style.width=p+"%";}
@@ -4702,12 +4732,14 @@ function setProgress(p){el("overlay-bar").style.width=p+"%";}
 async function loadFachbereiche(){
   const box=el("fb-loading-box"), bar=el("fb-loading-bar");
   box.style.display="block"; bar.style.width="0%";
+  startFachbereichLoadingText();
   let p=0;
   const iv=setInterval(()=>{p=Math.min(p+6,90);bar.style.width=p+"%";},180);
 
   const r=await fetch("/refresh/options");
   const data=await r.json();
   clearInterval(iv); bar.style.width="100%";
+  stopFachbereichLoadingText();
 
   const sel=el("fachbereich");
   sel.innerHTML='<option value="">– bitte auswählen –</option>';
