@@ -1,4 +1,5 @@
 
+
 import logging
 
 
@@ -2306,7 +2307,7 @@ async def fetch_org_details(org_ids: list[str]) -> dict[str, dict]:
 import pandas as pd
 from typing import Dict, List
 NF_EXPORT_COLUMNS = [
-    "Batch ID",
+    "Export Batch ID",
     "Channel",
     "Cold-Mailing Import",
     "Prospect ID",
@@ -2529,12 +2530,12 @@ async def _build_nf_master_final(
 
         gender = GENDER_OPTION_MAP.get(gender_raw, gender_raw)
 
-        batch_from_person = sanitize(cf_value(p, FIELD_BATCH_ID))
-        batch_out = batch_from_person or sanitize(batch_id_label)
+        # Für den Export soll immer die vom Nutzer angegebene Export-Batch-ID verwendet werden
+        batch_out = sanitize(batch_id_label or (batch_id or ""))
 
         rows.append({
             # Export-Spalten
-            "Batch ID": batch_out,
+            "Export Batch ID": batch_out,
             "Channel": DEFAULT_CHANNEL,
             "Cold-Mailing Import": sanitize(campaign),
             "Prospect ID": prospect_id,
@@ -2669,7 +2670,7 @@ async def _reconcile(prefix: str) -> None:
         await save_df_text(pd.DataFrame([
             {"Grund": "Max 2 Kontakte pro Organisation", "Anzahl": 0},
             {"Grund": "Datum nächste Aktivität steht an bzw. liegt in naher Vergangenheit", "Anzahl": 0},
-        ]), "nf_excluded")
+        ]), t["excluded"])
         return
 
     def flatten(v):
@@ -2726,7 +2727,7 @@ async def _reconcile(prefix: str) -> None:
         mask = df[col_orgtype].astype(str).str.strip() != ""
         removed = df[mask]
         for _, r in removed.iterrows():
-            log_drop(r, "org_type_present", "Organisationsart ist gesetzt")
+            log_drop(r, "org_art_not_empty", "Organisationsart ist gesetzt")
         df = df[~mask]
 
     # (5) Datum nächste Aktivität -> raus
@@ -2734,7 +2735,7 @@ async def _reconcile(prefix: str) -> None:
         mask = df[col_next].astype(str).map(lambda x: is_forbidden_activity_date(x if x else None))
         removed = df[mask]
         for _, r in removed.iterrows():
-            log_drop(r, "next_activity_blocked", f"Datum nächste Aktivität gesperrt: {flatten(r.get(col_next))}")
+            log_drop(r, "forbidden_activity_date", f"Datum nächste Aktivität gesperrt: {flatten(r.get(col_next))}")
         df = df[~mask]
 
     # (3) FUZZY Orga >=95% -> raus
@@ -2811,12 +2812,12 @@ async def _reconcile(prefix: str) -> None:
 
     summary_rows = [
         {"Grund": "Max 2 Kontakte pro Organisation", "Anzahl": cnt("per_org_limit")},
-        {"Grund": "Organisationsart ist gesetzt", "Anzahl": cnt("org_type_present")},
-        {"Grund": "Datum nächste Aktivität steht an bzw. liegt in naher Vergangenheit", "Anzahl": cnt("next_activity_blocked")},
+        {"Grund": "Organisationsart ist gesetzt", "Anzahl": cnt("org_art_not_empty")},
+        {"Grund": "Datum nächste Aktivität steht an bzw. liegt in naher Vergangenheit", "Anzahl": cnt("forbidden_activity_date")},
         {"Grund": "Organisation ähnlich ≥95%", "Anzahl": cnt("org_match_95")},
         {"Grund": "Person bereits kontaktiert (Filter 1216/1708)", "Anzahl": cnt("person_id_match")},
     ]
-    await save_df_text(pd.DataFrame(summary_rows), "nf_excluded")
+    await save_df_text(pd.DataFrame(summary_rows), t["excluded"])
 
 # =============================================================================
 # NACHFASS - LOGIK
@@ -3027,7 +3028,7 @@ async def run_nachfass_job(
 import pandas as pd
 
 NF_EXPORT_COLUMNS = [
-    "Batch ID",
+    "Export Batch ID",
     "Channel",
     "Cold-Mailing Import",
     "Prospect ID",
@@ -4420,6 +4421,57 @@ function showOverlay(t){el("overlay-phase").textContent=t;el("overlay").style.di
 function hideOverlay(){el("overlay").style.display="none";}
 function setProgress(p){el("overlay-bar").style.width=p+"%";}
 
+async function loadExcluded(){
+  try{
+    const r = await fetch("/nachfass/excluded/json");
+    const data = await r.json();
+
+    // Summary anzeigen (nf_excluded)
+    const card = document.querySelector("section.table-card");
+    if(card){
+      let box = document.getElementById("excluded-summary");
+      if(!box){
+        box = document.createElement("div");
+        box.id = "excluded-summary";
+        box.style.margin = "10px 0 14px 0";
+        box.style.color = "#334155";
+        box.style.fontSize = "14px";
+        const h3 = card.querySelector("h3");
+        if(h3 && h3.nextSibling) card.insertBefore(box, h3.nextSibling);
+        else card.prepend(box);
+      }
+      if(data.summary && data.summary.length){
+        const items = data.summary
+          .filter(x => (x.Anzahl||0) > 0)
+          .map(x => `<li><b>${x.Anzahl}</b> – ${x.Grund}</li>`)
+          .join("");
+        box.innerHTML = items ? `<ul style="margin:0;padding-left:18px">${items}</ul>`
+                              : `<div style="color:#64748b">Keine Datensätze ausgeschlossen</div>`;
+      }
+    }
+
+    // Detailtabelle (nf_delete_log)
+    const body = document.getElementById("excluded-table-body");
+    if(!body) return;
+    body.innerHTML = "";
+    if(!data.rows || !data.rows.length){
+      body.innerHTML = '<tr><td colspan="5" style="text-align:center;color:#94a3b8">Keine Datensätze ausgeschlossen</td></tr>';
+      return;
+    }
+    for(const row of data.rows){
+      const tr = document.createElement("tr");
+      tr.innerHTML = `<td>${row["Kontakt ID"]||""}</td>
+                      <td>${row["Name"]||""}</td>
+                      <td>${row["Organisation ID"]||""}</td>
+                      <td>${row["Organisationsname"]||""}</td>
+                      <td>${row["Grund"]||""}</td>`;
+      body.appendChild(tr);
+    }
+  }catch(e){
+    console.warn("loadExcluded failed", e);
+  }
+}
+
 async function poll(job_id){
   while(true){
     await new Promise(r=>setTimeout(r,500));
@@ -4428,11 +4480,19 @@ async function poll(job_id){
     setProgress(s.percent);
     if(s.error){alert(s.error);hideOverlay();return;}
     if(s.download_ready){
-      window.location.href="/nachfass/export_download?job_id="+job_id;
-      hideOverlay(); return;
+      // Download im neuen Tab starten, Seite bleibt sichtbar für Excluded-Tabelle
+      window.open("/nachfass/export_download?job_id="+job_id, "_blank");
+      hideOverlay();
+      await loadExcluded();
+      // zum Excluded-Bereich scrollen
+      const card = document.querySelector("section.table-card");
+      if(card) card.scrollIntoView({behavior:"smooth"});
+      return;
     }
   }
 }
+
+window.addEventListener("load", loadExcluded);
 
 el("btnExportNf").onclick = async ()=>{
   showOverlay("Starte Abgleich …");
@@ -4441,7 +4501,7 @@ el("btnExportNf").onclick = async ()=>{
     method:"POST",
     headers:{"Content-Type":"application/json"},
     body:JSON.stringify({
-      nf_batch_ids:el("nf_batch_ids").value.split(/[,\n;]/).map(s=>s.trim()).filter(Boolean),
+      nf_batch_ids:el("nf_batch_ids").value.split(/[\,\n;]/).map(s=>s.trim()).filter(Boolean),
       batch_id:el("batch_id").value,
       campaign:el("campaign").value
     })
@@ -4806,8 +4866,12 @@ async function poll(job_id){
     setProgress(s.percent);
     if(s.error){alert(s.error);hideOverlay();return;}
     if(s.download_ready){
-      window.location.href="/refresh/export_download?job_id="+job_id;
-      hideOverlay(); return;
+      window.open("/refresh/export_download?job_id="+job_id, "_blank");
+      hideOverlay();
+      if(typeof loadExcluded==="function"){ await loadExcluded(); }
+      const card=document.querySelector("section.table-card");
+      if(card) card.scrollIntoView({behavior:"smooth"});
+      return;
     }
   }
 }
@@ -5076,7 +5140,7 @@ async def nachfass_excluded_json():
                 "Name":              flat(r.get("name") or r.get("Name")),
                 "Organisation ID":   flat(r.get("org_id") or r.get("Organisation ID")),
                 "Organisationsname": flat(r.get("org_name") or r.get("Organisationsname")),
-                "Grund":             flat(r.get("reason")),
+                "Grund":             flat(r.get("Grund") or r.get("extra") or r.get("reason")),
             })
 
         # Gründe zählen
@@ -5330,7 +5394,7 @@ async def refresh_summary(job_id: str = Query(...)):
 # =============================================================================
 # REFRESH – Excluded JSON
 # =============================================================================
-@app.get("/refresh/excluded/json")
+@app.get("/refresh/excluded/json2")
 async def refresh_excluded_json():
 
     # -----------------------------------------------------
@@ -5377,7 +5441,7 @@ async def refresh_excluded_json():
                 "Name":              flat(r.get("name") or r.get("Name")),
                 "Organisation ID":   flat(r.get("org_id") or r.get("Organisation ID")),
                 "Organisationsname": flat(r.get("org_name") or r.get("Organisationsname")),
-                "Grund":             flat(r.get("reason")),
+                "Grund":             flat(r.get("Grund") or r.get("extra") or r.get("reason")),
             })
 
         # Gruppierung nach Gründen
