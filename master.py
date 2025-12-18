@@ -1,3 +1,5 @@
+
+
 import logging
 
 
@@ -3160,17 +3162,15 @@ async def reconcile_with_progress(job: "Job", prefix: str, start_percent: int = 
         await _reconcile(prefix)
 
         # --- UI-Infos (Entfernte Datensätze / Export-Menge) ---
-        try:
-            excl = await load_df_text(f"{prefix}_excluded")
-            job.stats["excluded"] = int(len(excl))
-        except Exception:
-            job.stats["excluded"] = int(job.stats.get("excluded", 0) or 0)
-
+        # WICHTIG: "excluded" = Anzahl ENTFERNTER DATENSÄTZE (nicht Summary-Zeilen)
         try:
             dlog = await load_df_text(f"{prefix}_delete_log")
-            job.stats["delete_log"] = int(len(dlog))
+            removed_n = int(len(dlog))
         except Exception:
-            job.stats["delete_log"] = int(job.stats.get("delete_log", 0) or 0)
+            removed_n = int(job.stats.get("delete_log", 0) or 0)
+
+        job.stats["excluded"] = removed_n
+        job.stats["delete_log"] = removed_n
 
         try:
             t = tables(prefix)
@@ -5045,9 +5045,20 @@ async def refresh_excluded_json():
     deleted_df  = await load_df_text("rf_delete_log")
 
     excluded_summary=[]
-    if not excluded_df.empty:
+    # Summary wird aus dem Delete-Log berechnet (das sind die tatsächlich entfernten Datensätze)
+    if not deleted_df.empty:
+        base_col = "Grund" if "Grund" in deleted_df.columns else ("extra" if "extra" in deleted_df.columns else ("reason" if "reason" in deleted_df.columns else None))
+        if base_col:
+            s = deleted_df[base_col].fillna("").astype(str).map(lambda x: x.strip())
+            s = s[(s != "") & (s.str.lower() != "nan")]
+            for grund, cnt in s.value_counts().items():
+                excluded_summary.append({"Grund": flatten(grund), "Anzahl": int(cnt)})
+
+    # Fallback: gespeicherte Summary-Tabelle (falls Delete-Log leer)
+    if (not excluded_summary) and (not excluded_df.empty):
         for _,r in excluded_df.iterrows():
             excluded_summary.append({"Grund":flatten(r.get("Grund")),"Anzahl":int(r.get("Anzahl") or 0)})
+
 
     rows=[]
     if not deleted_df.empty:
@@ -5229,30 +5240,13 @@ async def nachfass_excluded_json():
                 "Grund":             flat(r.get("Grund") or r.get("extra") or r.get("reason")),
             })
 
-        # Gründe zählen
-        reason_counts = (
-            delete_df["reason"]
-            .fillna("")
-            .astype(str)
-            .str.lower()
-            .value_counts()
-        )
-
-        def add_reason(label, keys):
-            count = int(sum(reason_counts.get(k.lower(), 0) for k in keys))
-            if count > 0:
-                summary.append({"Grund": label, "Anzahl": count})
-
-        add_reason("Fuzzy Orga ≥95%", ["org_match_95"])
-        add_reason("Personen-ID Dublette", ["person_id_match"])
-        add_reason("Nächste Aktivität blockiert", ["forbidden_activity_date"])
-        add_reason("Organisationsart gefüllt", ["org_art_not_empty"])
-
-    # -----------------------------------------------------
-    # Nichts ausgeschlossen?
-    # -----------------------------------------------------
-    if not summary:
-        summary.append({"Grund": "Keine Datensätze ausgeschlossen", "Anzahl": 0})
+        # Summary aus dem Text-Feld "Grund" ableiten (konsistent zur Tabelle)
+        base_col = "Grund" if "Grund" in delete_df.columns else ("extra" if "extra" in delete_df.columns else ("reason" if "reason" in delete_df.columns else None))
+        if base_col:
+            s = delete_df[base_col].fillna("").astype(str).str.strip()
+            s = s[(s != "") & (s.str.lower() != "nan")]
+            for grund, cnt in s.value_counts().items():
+                summary.append({"Grund": grund, "Anzahl": int(cnt)})
 
     return JSONResponse({
         "summary": summary,
@@ -5709,7 +5703,7 @@ async def nachfass_export_progress(job_id: str):
     if not job:
         return JSONResponse({"error": "Job nicht gefunden"}, status_code=404)
 
-    has_file = bool(getattr(job, "path", None))
+    has_file = bool(getattr(job, "path", None)) and os.path.exists(str(getattr(job, "path", "")))
 
     return JSONResponse({
         "phase": str(job.phase),
@@ -5758,7 +5752,7 @@ async def refresh_export_progress(job_id: str = Query(...)):
     if not job:
         return JSONResponse({"error": "Job nicht gefunden"}, status_code=404)
 
-    has_file = bool(getattr(job, "path", None))
+    has_file = bool(getattr(job, "path", None)) and os.path.exists(str(getattr(job, "path", "")))
 
     return JSONResponse({
         "phase": str(job.phase),
