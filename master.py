@@ -1,4 +1,5 @@
 
+
 import logging
 
 
@@ -2530,7 +2531,8 @@ async def _build_nf_master_final(
         gender = GENDER_OPTION_MAP.get(gender_raw, gender_raw)
 
         batch_from_person = sanitize(cf_value(p, FIELD_BATCH_ID))
-        batch_out = batch_from_person or sanitize(batch_id_label)
+        # Spaltenname MUSS "Batch ID" bleiben; Wert ist die Export-Batch-ID aus dem UI.
+        batch_out = sanitize(batch_id_label) or sanitize(batch_id or "")
 
         rows.append({
             # Export-Spalten
@@ -2669,7 +2671,7 @@ async def _reconcile(prefix: str) -> None:
         await save_df_text(pd.DataFrame([
             {"Grund": "Max 2 Kontakte pro Organisation", "Anzahl": 0},
             {"Grund": "Datum nächste Aktivität steht an bzw. liegt in naher Vergangenheit", "Anzahl": 0},
-        ]), "nf_excluded")
+        ]), t["excluded"])
         return
 
     def flatten(v):
@@ -2816,7 +2818,7 @@ async def _reconcile(prefix: str) -> None:
         {"Grund": "Organisation ähnlich ≥95%", "Anzahl": cnt("org_match_95")},
         {"Grund": "Person bereits kontaktiert (Filter 1216/1708)", "Anzahl": cnt("person_id_match")},
     ]
-    await save_df_text(pd.DataFrame(summary_rows), "nf_excluded")
+    await save_df_text(pd.DataFrame(summary_rows), t["excluded"])
 
 # =============================================================================
 # NACHFASS - LOGIK
@@ -2932,6 +2934,8 @@ async def run_nachfass_job(
 
         print(f"[NF] Personen mit irgendeiner Batch-ID im Filter {filter_id}: {has_batch_count}")
         print(f"[NF] Treffer nach Batch-ID-Filter ({sorted(user_batch_set)}): {len(selected)}")
+        job_obj.stats.update({"modus":"nachfass", "batch_ids": len(user_batch_set), "ausgewählt": len(selected)})
+        job_obj.updated_at = datetime.now(timezone.utc)
 
         # Top 10 Batch-Werte im Filter für Debug
         if batch_counter:
@@ -2977,6 +2981,12 @@ async def run_nachfass_job(
         job_obj.percent = 80
 
         await _reconcile("nf")
+        try:
+            lg = await load_df_text("nf_delete_log")
+            job_obj.stats.update({"entfernt": int(lg.shape[0]) if not lg.empty else 0})
+        except Exception:
+            pass
+        job_obj.updated_at = datetime.now(timezone.utc)
 
         # ------------------------------
         # G) Excel aus Ready-Tabelle
@@ -3120,10 +3130,17 @@ class Job:
         self.percent = 0
         self.done = False
         self.error: Optional[str] = None
+
+        # Export-Datei
         self.path: Optional[str] = None
         self.total_rows: int = 0
         self.filename_base: str = "BatchFlow_Export"
         self.excel_bytes: Optional[bytes] = None
+
+        # UI-Live-Infos
+        self.stats: Dict[str, Any] = {}
+        self.started_at = datetime.now(timezone.utc)
+        self.updated_at = self.started_at
 
 JOBS: Dict[str, Job] = {}
 
@@ -3335,6 +3352,8 @@ async def export_start_nk(
     async def _run():
         try:
             # 1️⃣ Daten laden
+            job.stats.update({"modus":"neukontakte", "fachbereich": fachbereich, "angefordert": take_count if take_count else "alle"})
+            job.updated_at = datetime.now(timezone.utc)
             await update_progress("Lade Neukontakte aus Pipedrive …", 5)
             df = await _build_nk_master_final(fachbereich, take_count, batch_id, campaign, per_org_limit, job_obj=job)
 
@@ -3354,6 +3373,10 @@ async def export_start_nk(
                 f.write(data)
             job.path = path
             job.total_rows = len(export_df)
+            job.stats.update({"exportiert": job.total_rows})
+            job.updated_at = datetime.now(timezone.utc)
+            job.stats.update({"exportiert": job.total_rows})
+            job.updated_at = datetime.now(timezone.utc)
             job.phase = f"Fertig – {job.total_rows} Zeilen"
             job.percent = 100
             job.done = True
@@ -3455,6 +3478,8 @@ async def refresh_export_start(
             # 2️⃣ Master erstellen
             job.phase = f"Baue Master (Auswahl={len(selected)})"
             job.percent = 60
+            job.stats.update({"modus":"refresh", "fachbereich": target_fach, "ausgewählt": len(selected)})
+            job.updated_at = datetime.now(timezone.utc)
 
             batch = sanitize(batch_id or "")
             camp = sanitize(campaign or "")
@@ -3476,6 +3501,15 @@ async def refresh_export_start(
             job.phase = "Abgleich (rf -> ready/log)"
             job.percent = 80
             await _reconcile("rf")
+            # Stats nach Abgleich
+            try:
+                ex = await load_df_text("rf_excluded")
+                lg = await load_df_text("rf_delete_log")
+                removed = int(lg.shape[0]) if not lg.empty else 0
+                job.stats.update({"entfernt": removed})
+            except Exception:
+                pass
+            job.updated_at = datetime.now(timezone.utc)
 
             # 5️⃣ Excel-Export OHNE Hyperlinks — exakt wie Nachfass
             job.phase = "Erzeuge Excel-Datei …"
@@ -3495,6 +3529,10 @@ async def refresh_export_start(
             out_path = export_to_excel(export_df, prefix="refresh_export", job_id=job_id)
             job.path = out_path
             job.total_rows = len(export_df)
+            job.stats.update({"exportiert": job.total_rows})
+            job.updated_at = datetime.now(timezone.utc)
+            job.stats.update({"exportiert": job.total_rows})
+            job.updated_at = datetime.now(timezone.utc)
 
             job.phase = f"Fertig – {job.total_rows} Zeilen"
             job.percent = 100
@@ -3532,6 +3570,9 @@ async def neukontakte_export_progress(job_id: str = Query(...)):
         # optional – falls später genutzt
         "note_org_limit": getattr(job, "note_org_limit", 0),
         "note_date_invalid": getattr(job, "note_date_invalid", 0),
+        "stats": getattr(job, "stats", {}),
+        "download_url": "/neukontakte/export_download?job_id=" + str(job_id)
+
     })
 
 
@@ -3728,14 +3769,1185 @@ async def neukontakte_page(request: Request):
     authed = bool(user_tokens.get("default") or PD_API_TOKEN)
     authed_html = "<span class='muted'>angemeldet</span>" if authed else "<a href='/login'>Anmelden</a>"
 
-    return HTMLResponse(
-r"""<!doctype html>
+    html = r"""<!doctype html>
 <html lang="de">
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>Neukontakte – BatchFlow</title>
+<style>
+/* =========================
+   BASE
+   ========================= */
+body{
+  margin:0;
+  background:#f7f9fc;
+  color:#0f172a;
+  font:16px/1.6 Inter,system-ui,-apple-system,BlinkMacSystemFont,sans-serif;
+}
 
+/* =========================
+   HEADER
+   ========================= */
+header{
+  background:#fff;
+  border-bottom:1px solid #e5e9f0;
+}
+.hwrap{
+  max-width:1200px;
+  margin:0 auto;
+  padding:22px 24px;
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+}
+.hleft{
+  display:flex;
+  align-items:center;
+  gap:14px;
+}
+.hleft img{ height:48px; }
+.hcenter{ font-size:18px;font-weight:600; }
+.hright{ font-size:14px; }
+
+/* =========================
+   LAYOUT
+   ========================= */
+main{
+  max-width:760px;
+  margin:56px auto;
+  padding:0 24px;
+}
+
+/* =========================
+   CARD
+   ========================= */
+.card{
+  background:#fff;
+  border:1px solid #e5e9f0;
+  border-radius:24px;
+  padding:40px;
+  box-shadow:
+    0 20px 40px rgba(15,23,42,.06),
+    0 8px 16px rgba(15,23,42,.04);
+  margin-bottom:48px;
+}
+.card h2{ margin:0 0 6px 0; }
+.card p.lead{
+  margin:0 0 32px 0;
+  color:#475569;
+  font-size:15px;
+}
+
+/* =========================
+   GRID (ruhig & harmonisch)
+   ========================= */
+.grid{
+  display:grid;
+  grid-template-columns:1fr 1fr;
+  gap:32px;
+}
+.col-12{ grid-column: span 2; }
+/* =========================
+   META ROW (Anzahl + Batch)
+   ========================= */
+.meta-row{
+  grid-column: span 2;
+  display:flex;
+  gap:24px;
+  align-items:flex-start;
+}
+
+.meta-field{
+  flex:1;
+}
+
+.meta-field input{
+  max-width:240px;
+}
+
+.meta-field small{
+  font-size:12px;
+  color:#94a3b8;
+}
+
+/* =========================
+   FORM
+   ========================= */
+label{
+  display:block;
+  font-weight:600;
+  margin-bottom:8px;
+  font-size:14px;
+}
+small{
+  display:block;
+  margin-top:6px;
+  font-size:13px;
+  color:#64748b;
+}
+
+input,select{
+  width:100%;
+  padding:14px 16px;
+  border-radius:14px;
+  border:1px solid #dbe3ec;
+  background:#f8fafc;
+  font-size:15px;
+}
+input:focus,select:focus{
+  outline:none;
+  background:#fff;
+  border-color:#0ea5e9;
+  box-shadow:0 0 0 3px rgba(14,165,233,.15);
+}
+
+/* Fachbereich hervorheben */
+.fachbereich{
+  padding:24px;
+  border-radius:18px;
+  background:#f8fafc;
+  border:1px dashed #cbd5e1;
+}
+
+/* =========================
+   CTA
+   ========================= */
+.cta-row{
+  margin-top:48px;
+  padding-top:28px;
+  border-top:1px solid #e5e9f0;
+  display:flex;
+  justify-content:flex-end;
+}
+.btn{
+  background:#0ea5e9;
+  border:none;
+  color:#fff;
+  border-radius:999px;
+  padding:14px 28px;
+  font-weight:600;
+  font-size:15px;
+  cursor:pointer;
+  box-shadow:0 10px 20px rgba(14,165,233,.35);
+}
+.btn:hover{ background:#0284c7; }
+.btn:disabled{ opacity:.5; cursor:not-allowed; }
+
+/* =========================
+   LOADER FACHBEREICH
+   ========================= */
+#fb-loading-box{ display:none; margin-bottom:14px; }
+#fb-loading-text{ font-size:13px;color:#0a66c2;margin-bottom:6px; }
+#fb-loading-bar-wrap{
+  width:100%;height:8px;background:#e5e9f0;border-radius:999px;overflow:hidden;
+}
+#fb-loading-bar{
+  height:8px;width:0%;
+  background:linear-gradient(90deg,#0ea5e9,#38bdf8);
+}
+
+/* =========================
+   TABLE
+   ========================= */
+table{ width:100%; border-collapse:collapse; }
+thead{ background:#f8fafc; }
+th{
+  font-size:12px;
+  font-weight:600;
+  color:#64748b;
+  padding:14px 16px;
+  text-align:left;
+}
+td{
+  padding:14px 16px;
+  border-top:1px solid #e5e9f0;
+  font-size:14px;
+}
+tbody tr:hover{ background:#f1f5f9; }
+
+/* =========================
+   OVERLAY
+   ========================= */
+#overlay{
+  display:none;
+  position:fixed;
+  inset:0;
+  background:rgba(247,249,252,.8);
+  backdrop-filter:blur(3px);
+  z-index:9999;
+  align-items:center;
+  justify-content:center;
+  flex-direction:column;
+  gap:12px;
+}
+.barwrap{
+  width:min(520px,90vw);
+  height:10px;
+  border-radius:999px;
+  background:#e5e9f0;
+  overflow:hidden;
+}
+.bar{
+  height:100%;
+  width:0%;
+  background:linear-gradient(90deg,#0ea5e9,#38bdf8);
+}
+</style>
+</head>
+
+<body>
+
+<header>
+  <div class="hwrap">
+    <div class="hleft">
+      <img src="/static/bizforward-Logo-Clean-2024.svg" alt="bizforward">
+      <a href="/campaign" style="color:#0a66c2;text-decoration:none;font-size:14px">
+        Kampagne wählen
+      </a>
+    </div>
+    <div class="hcenter">Neukontakte</div>
+    <div class="hright">""" + authed_html + r"""</div>
+  </div>
+</header>
+
+<main>
+
+<!-- =========================
+     FORM
+     ========================= -->
+<section class="card">
+  <h2>Schritt 1 – Neukontakte auswählen</h2>
+  <p class="lead">
+    Wähle einen Fachbereich und definiere, wie viele neue Kontakte für den Erstkontakt exportiert werden sollen.
+  </p>
+
+  <div class="grid">
+
+    <div class="col-12 fachbereich">
+      <label>Fachbereich</label>
+
+      <div id="fb-loading-box">
+        <div id="fb-loading-text">Fachbereiche werden geladen … bitte warten.</div>
+        <div id="fb-loading-bar-wrap"><div id="fb-loading-bar"></div></div>
+      </div>
+
+      <select id="fachbereich">
+        <option value="">– bitte auswählen –</option>
+      </select>
+
+      <small>Quelle aus Pipedrive – nur noch nicht kontaktierte Personen.</small>
+    </div>
+    <div class="meta-row">
+      <div class="meta-field">
+        <label>Anzahl Kontakte</label>
+        <input id="take_count" type="number" min="1" placeholder="alle">
+        <small>Optional</small>
+      </div>
+    
+      <div class="meta-field">
+        <label>Batch ID</label>
+        <input id="batch_id" placeholder="xxx">
+        <small>Intern</small>
+      </div>
+    </div>
+
+
+
+    <div class="col-12">
+      <label>Kampagnenname (für Cold Mailing)</label>
+      <input id="campaign" placeholder="z. B. Frühling 2025">
+    </div>
+
+  </div>
+
+  <div class="cta-row">
+    <button class="btn" id="btnExport" disabled>
+      Abgleich & Download
+    </button>
+  </div>
+</section>
+
+<!-- =========================
+     EXCLUDED
+     ========================= -->
+<section class="card">
+  <h3>Entfernte Datensätze</h3>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Kontakt ID</th>
+        <th>Name</th>
+        <th>Organisation ID</th>
+        <th>Organisationsname</th>
+        <th>Grund</th>
+      </tr>
+    </thead>
+    <tbody id="excluded-table-body">
+      <tr>
+        <td colspan="5" style="text-align:center;color:#94a3b8">
+          Noch keine Daten geladen
+        </td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+
+</main>
+
+<!-- =========================
+     OVERLAY
+     ========================= -->
+<div id="overlay">
+  <div id="phase"></div>
+  <div class="barwrap"><div class="bar" id="bar"></div></div>
+</div>
+
+<script>
+const el = id => document.getElementById(id);
+
+function showOverlay(msg){
+  el('phase').textContent = msg;
+  el('overlay').style.display = 'flex';
+}
+function setProgress(p){
+  el('bar').style.width = Math.min(100, Math.max(0, p)) + '%';
+}
+
+/* ---------- Optionen laden (robust) ---------- */
+async function loadOptions(){
+  const box = el("fb-loading-box");
+  const bar = el("fb-loading-bar");
+
+  box.style.display = "block";
+  bar.style.width = "0%";
+
+  let progress = 0;
+  const interval = setInterval(()=>{
+    progress = Math.min(progress + 6, 90);
+    bar.style.width = progress + "%";
+  }, 180);
+
+  let data;
+  try{
+    const r = await fetch('/neukontakte/options');
+    if(!r.ok) throw new Error("HTTP " + r.status);
+    data = await r.json();
+  }catch(e){
+    clearInterval(interval);
+    bar.style.width = "100%";
+    setTimeout(()=> box.style.display="none", 300);
+    alert("Fachbereiche konnten nicht geladen werden.");
+    return;
+  }
+
+  clearInterval(interval);
+  bar.style.width = "100%";
+
+  const sel = el('fachbereich');
+  sel.innerHTML = '<option value="">– bitte auswählen –</option>';
+
+  (data.options || []).forEach(o=>{
+    const opt = document.createElement('option');
+    opt.value = o.value;
+    opt.textContent = `${o.label} (${o.count})`;
+    sel.appendChild(opt);
+  });
+
+  setTimeout(()=> box.style.display="none", 300);
+  sel.onchange = ()=> el('btnExport').disabled = !sel.value;
+}
+
+/* ---------- Export ---------- */
+async function startExport(){
+  const fb = el('fachbereich').value;
+  if (!fb) return alert('Bitte Fachbereich wählen');
+
+  showOverlay('Starte Export …');
+  setProgress(10);
+
+  const r = await fetch('/neukontakte/export_start',{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({
+      fachbereich: fb,
+      batch_id: el('batch_id').value,
+      campaign: el('campaign').value,
+      take_count: parseInt(el('take_count').value) || null
+    })
+  });
+
+  const res = await r.json();
+  const job_id = res.job_id;
+
+  while(true){
+    await new Promise(r=>setTimeout(r,500));
+    const pr = await fetch('/neukontakte/export_progress?job_id='+job_id);
+    const s  = await pr.json();
+
+    el('phase').textContent = `${s.phase} (${s.percent}%)`;
+    setProgress(s.percent);
+
+    if(s.done){
+      window.location.href =
+        '/neukontakte/export_download?job_id='+job_id;
+      return;
+    }
+  }
+}
+
+el('btnExport').onclick = startExport;
+loadOptions();
+</script>
+
+</body>
+</html>
+"""
+    return HTMLResponse(html.replace("{{AUTH_HTML}}", authed_html))
+# =============================================================================
+# Frontend – Nachfass (DESIGN identisch zu Neukontakte)
+# =============================================================================
+@app.get("/nachfass", response_class=HTMLResponse)
+async def nachfass_page():
+    return HTMLResponse(r"""<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Nachfass – BatchFlow</title>
+<style>
+/* =========================
+   BASE
+   ========================= */
+body{
+  margin:0;
+  background:#f7f9fc;
+  color:#0f172a;
+  font:16px/1.6 Inter,system-ui,-apple-system,BlinkMacSystemFont,sans-serif;
+}
+
+/* =========================
+   HEADER
+   ========================= */
+header{
+  background:#fff;
+  border-bottom:1px solid #e5e9f0;
+}
+.hwrap{
+  max-width:1200px;
+  margin:0 auto;
+  padding:22px 24px;
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+}
+.hleft{
+  display:flex;
+  align-items:center;
+  gap:14px;
+}
+.hleft img{ height:48px; }
+.hcenter{ font-size:18px;font-weight:600; }
+.hright{ font-size:14px; }
+
+/* =========================
+   LAYOUT
+   ========================= */
+main{
+  max-width:760px;
+  margin:56px auto;
+  padding:0 24px;
+}
+
+/* =========================
+   CARD
+   ========================= */
+.card{
+  background:#fff;
+  border:1px solid #e5e9f0;
+  border-radius:24px;
+  padding:40px;
+  box-shadow:
+    0 20px 40px rgba(15,23,42,.06),
+    0 8px 16px rgba(15,23,42,.04);
+  margin-bottom:48px;
+}
+.card h2{ margin:0 0 6px 0; }
+.card p.lead{
+  margin:0 0 32px 0;
+  color:#475569;
+  font-size:15px;
+}
+
+/* =========================
+   GRID (ruhig & harmonisch)
+   ========================= */
+.grid{
+  display:grid;
+  grid-template-columns:1fr 1fr;
+  gap:32px;
+}
+.col-12{ grid-column: span 2; }
+/* =========================
+   META ROW (Anzahl + Batch)
+   ========================= */
+.meta-row{
+  grid-column: span 2;
+  display:flex;
+  gap:24px;
+  align-items:flex-start;
+}
+
+.meta-field{
+  flex:1;
+}
+
+.meta-field input{
+  max-width:240px;
+}
+
+.meta-field small{
+  font-size:12px;
+  color:#94a3b8;
+}
+
+/* =========================
+   FORM
+   ========================= */
+label{
+  display:block;
+  font-weight:600;
+  margin-bottom:8px;
+  font-size:14px;
+}
+small{
+  display:block;
+  margin-top:6px;
+  font-size:13px;
+  color:#64748b;
+}
+
+input,select{
+  width:100%;
+  padding:14px 16px;
+  border-radius:14px;
+  border:1px solid #dbe3ec;
+  background:#f8fafc;
+  font-size:15px;
+}
+input:focus,select:focus{
+  outline:none;
+  background:#fff;
+  border-color:#0ea5e9;
+  box-shadow:0 0 0 3px rgba(14,165,233,.15);
+}
+
+/* Fachbereich hervorheben */
+.fachbereich{
+  padding:24px;
+  border-radius:18px;
+  background:#f8fafc;
+  border:1px dashed #cbd5e1;
+}
+
+/* =========================
+   CTA
+   ========================= */
+.cta-row{
+  margin-top:48px;
+  padding-top:28px;
+  border-top:1px solid #e5e9f0;
+  display:flex;
+  justify-content:flex-end;
+}
+.btn{
+  background:#0ea5e9;
+  border:none;
+  color:#fff;
+  border-radius:999px;
+  padding:14px 28px;
+  font-weight:600;
+  font-size:15px;
+  cursor:pointer;
+  box-shadow:0 10px 20px rgba(14,165,233,.35);
+}
+.btn:hover{ background:#0284c7; }
+.btn:disabled{ opacity:.5; cursor:not-allowed; }
+
+/* =========================
+   LOADER FACHBEREICH
+   ========================= */
+#fb-loading-box{ display:none; margin-bottom:14px; }
+#fb-loading-text{ font-size:13px;color:#0a66c2;margin-bottom:6px; }
+#fb-loading-bar-wrap{
+  width:100%;height:8px;background:#e5e9f0;border-radius:999px;overflow:hidden;
+}
+#fb-loading-bar{
+  height:8px;width:0%;
+  background:linear-gradient(90deg,#0ea5e9,#38bdf8);
+}
+
+/* =========================
+   TABLE
+   ========================= */
+table{ width:100%; border-collapse:collapse; }
+thead{ background:#f8fafc; }
+th{
+  font-size:12px;
+  font-weight:600;
+  color:#64748b;
+  padding:14px 16px;
+  text-align:left;
+}
+td{
+  padding:14px 16px;
+  border-top:1px solid #e5e9f0;
+  font-size:14px;
+}
+tbody tr:hover{ background:#f1f5f9; }
+
+/* =========================
+   OVERLAY
+   ========================= */
+#overlay{
+  display:none;
+  position:fixed;
+  inset:0;
+  background:rgba(247,249,252,.8);
+  backdrop-filter:blur(3px);
+  z-index:9999;
+  align-items:center;
+  justify-content:center;
+  flex-direction:column;
+  gap:12px;
+}
+.barwrap{
+  width:min(520px,90vw);
+  height:10px;
+  border-radius:999px;
+  background:#e5e9f0;
+  overflow:hidden;
+}
+.bar{
+  height:100%;
+  width:0%;
+  background:linear-gradient(90deg,#0ea5e9,#38bdf8);
+}
+</style>
+</head>
+
+<body>
+
+<header>
+  <div class="hwrap">
+    <div class="hleft">
+      <img src="/static/bizforward-Logo-Clean-2024.svg" alt="bizforward">
+      <a href="/campaign" style="color:#0a66c2;text-decoration:none;font-size:14px">
+        Kampagne wählen
+      </a>
+    </div>
+    <div class="hcenter">Neukontakte</div>
+    <div class="hright">""" + authed_html + r"""</div>
+  </div>
+</header>
+
+<main>
+
+<!-- =========================
+     FORM
+     ========================= -->
+<section class="card">
+  <h2>Schritt 1 – Neukontakte auswählen</h2>
+  <p class="lead">
+    Wähle einen Fachbereich und definiere, wie viele neue Kontakte für den Erstkontakt exportiert werden sollen.
+  </p>
+
+  <div class="grid">
+
+    <div class="col-12 fachbereich">
+      <label>Fachbereich</label>
+
+      <div id="fb-loading-box">
+        <div id="fb-loading-text">Fachbereiche werden geladen … bitte warten.</div>
+        <div id="fb-loading-bar-wrap"><div id="fb-loading-bar"></div></div>
+      </div>
+
+      <select id="fachbereich">
+        <option value="">– bitte auswählen –</option>
+      </select>
+
+      <small>Quelle aus Pipedrive – nur noch nicht kontaktierte Personen.</small>
+    </div>
+    <div class="meta-row">
+      <div class="meta-field">
+        <label>Anzahl Kontakte</label>
+        <input id="take_count" type="number" min="1" placeholder="alle">
+        <small>Optional</small>
+      </div>
+    
+      <div class="meta-field">
+        <label>Batch ID</label>
+        <input id="batch_id" placeholder="xxx">
+        <small>Intern</small>
+      </div>
+    </div>
+
+
+
+    <div class="col-12">
+      <label>Kampagnenname (für Cold Mailing)</label>
+      <input id="campaign" placeholder="z. B. Frühling 2025">
+    </div>
+
+  </div>
+
+  <div class="cta-row">
+    <button class="btn" id="btnExport" disabled>
+      Abgleich & Download
+    </button>
+  </div>
+</section>
+
+<!-- =========================
+     EXCLUDED
+     ========================= -->
+<section class="card">
+  <h3>Entfernte Datensätze</h3>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Kontakt ID</th>
+        <th>Name</th>
+        <th>Organisation ID</th>
+        <th>Organisationsname</th>
+        <th>Grund</th>
+      </tr>
+    </thead>
+    <tbody id="excluded-table-body">
+      <tr>
+        <td colspan="5" style="text-align:center;color:#94a3b8">
+          Noch keine Daten geladen
+        </td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+
+</main>
+
+<!-- =========================
+     OVERLAY
+     ========================= -->
+<div id="overlay">
+  <div id="phase"></div>
+  <div class="barwrap"><div class="bar" id="bar"></div></div>
+</div>
+
+<script>
+const el = id => document.getElementById(id);
+
+function showOverlay(msg){
+  el('phase').textContent = msg;
+  el('overlay').style.display = 'flex';
+}
+function setProgress(p){
+  el('bar').style.width = Math.min(100, Math.max(0, p)) + '%';
+}
+
+/* ---------- Optionen laden (robust) ---------- */
+async function loadOptions(){
+  const box = el("fb-loading-box");
+  const bar = el("fb-loading-bar");
+
+  box.style.display = "block";
+  bar.style.width = "0%";
+
+  let progress = 0;
+  const interval = setInterval(()=>{
+    progress = Math.min(progress + 6, 90);
+    bar.style.width = progress + "%";
+  }, 180);
+
+  let data;
+  try{
+    const r = await fetch('/neukontakte/options');
+    if(!r.ok) throw new Error("HTTP " + r.status);
+    data = await r.json();
+  }catch(e){
+    clearInterval(interval);
+    bar.style.width = "100%";
+    setTimeout(()=> box.style.display="none", 300);
+    alert("Fachbereiche konnten nicht geladen werden.");
+    return;
+  }
+
+  clearInterval(interval);
+  bar.style.width = "100%";
+
+  const sel = el('fachbereich');
+  sel.innerHTML = '<option value="">– bitte auswählen –</option>';
+
+  (data.options || []).forEach(o=>{
+    const opt = document.createElement('option');
+    opt.value = o.value;
+    opt.textContent = `${o.label} (${o.count})`;
+    sel.appendChild(opt);
+  });
+
+  setTimeout(()=> box.style.display="none", 300);
+  sel.onchange = ()=> el('btnExport').disabled = !sel.value;
+}
+
+/* ---------- Export ---------- */
+async function startExport(){
+  const fb = el('fachbereich').value;
+  if (!fb) return alert('Bitte Fachbereich wählen');
+
+  showOverlay('Starte Export …');
+  setProgress(10);
+
+  const r = await fetch('/neukontakte/export_start',{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({
+      fachbereich: fb,
+      batch_id: el('batch_id').value,
+      campaign: el('campaign').value,
+      take_count: parseInt(el('take_count').value) || null
+    })
+  });
+
+  const res = await r.json();
+  const job_id = res.job_id;
+
+  while(true){
+    await new Promise(r=>setTimeout(r,500));
+    const pr = await fetch('/neukontakte/export_progress?job_id='+job_id);
+    const s  = await pr.json();
+
+    el('phase').textContent = `${s.phase} (${s.percent}%)`;
+    setProgress(s.percent);
+
+    if(s.done){
+      window.location.href =
+        '/neukontakte/export_download?job_id='+job_id;
+      return;
+    }
+  }
+}
+
+el('btnExport').onclick = startExport;
+loadOptions();
+</script>
+
+</body>
+</html>
+"""
+    )
+
+# =============================================================================
+# Frontend – Nachfass (DESIGN identisch zu Neukontakte)
+# =============================================================================
+@app.get("/nachfass", response_class=HTMLResponse)
+async def nachfass_page():
+    return HTMLResponse(r"""<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Nachfass – BatchFlow</title>
+
+<style>
+/* =========================
+   BASIS (identisch NK)
+   ========================= */
+body{
+  margin:0;
+  background:#f7f9fc;
+  color:#0f172a;
+  font:16px/1.6 Inter,system-ui,-apple-system,BlinkMacSystemFont,sans-serif;
+}
+header{
+  background:#fff;
+  border-bottom:1px solid #e5e9f0;
+}
+.hwrap{
+  max-width:1200px;
+  margin:0 auto;
+  padding:22px 24px;
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+}
+.hleft{display:flex;align-items:center;gap:14px;}
+.hleft img{height:48px;}
+.hcenter{font-size:18px;font-weight:600;}
+.hright{font-size:14px;}
+
+main{
+  max-width:720px;
+  margin:48px auto;
+  padding:0 24px;
+}
+
+/* Card */
+.card{
+  background:#fff;
+  border:1px solid #e5e9f0;
+  border-radius:20px;
+  padding:36px;
+  box-shadow:
+    0 14px 32px rgba(15,23,42,.06),
+    0 6px 12px rgba(15,23,42,.04);
+}
+
+/* Grid */
+.grid{
+  display:grid;
+  grid-template-columns:repeat(12,1fr);
+  gap:20px;
+  row-gap:28px;
+}
+.col-12{grid-column:span 12;}
+.col-6{grid-column:span 6;}
+
+/* Form */
+label{
+  display:block;
+  font-weight:600;
+  margin-bottom:8px;
+  font-size:14px;
+}
+input,textarea{
+  width:100%;
+  padding:12px 14px;
+  border-radius:12px;
+  border:1px solid #dbe3ec;
+  background:#f8fafc;
+}
+input:focus,textarea:focus{
+  outline:none;
+  border-color:#0ea5e9;
+  background:#fff;
+  box-shadow:0 0 0 3px rgba(14,165,233,.15);
+}
+.form-grid{
+  display:grid;
+  grid-template-columns:repeat(2, minmax(0, 1fr));
+  gap:24px;
+}
+
+.form-full{
+  grid-column:1 / -1;
+}
+
+.form-narrow {
+  max-width: 520px;
+   margin-top: 24px;
+}
+
+
+/* Button */
+.btn{
+  margin-top:36px;
+  background:#0ea5e9;
+  color:#fff;
+  border:none;
+  border-radius:999px;
+  padding:14px 28px;
+  font-weight:600;
+  cursor:pointer;
+  box-shadow:0 6px 14px rgba(14,165,233,.35);
+}
+.btn:hover{background:#0284c7}
+
+/* Tabelle */
+.table-card{
+  margin-top:48px;
+  background:#fff;
+  border:1px solid #e5e9f0;
+  border-radius:20px;
+  padding:28px;
+}
+table{
+  width:100%;
+  border-collapse:collapse;
+  margin-top:12px;
+  font-size:14px;
+}
+thead{background:#f8fafc;}
+th,td{
+  padding:14px 16px;
+  border-bottom:1px solid #e5e9f0;
+}
+th{
+  font-weight:600;
+  color:#475569;
+  white-space:nowrap;
+}
+
+/* Overlay – sichtbar & zentriert */
+#overlay{
+  display:none;
+  position:fixed;
+  inset:0;
+  background:rgba(247,249,252,.85);
+  backdrop-filter:blur(3px);
+  z-index:9999;
+  align-items:center;
+  justify-content:center;
+  flex-direction:column;
+  gap:12px;
+}
+.barwrap{
+  width:520px;
+  max-width:90vw;
+  height:10px;
+  border-radius:999px;
+  background:#e5e9f0;
+}
+.bar{
+  height:100%;
+  width:0%;
+  background:linear-gradient(90deg,#0ea5e9,#38bdf8);
+  transition:width .25s linear;
+}
+</style>
+</head>
+
+<body>
+
+<header>
+  <div class="hwrap">
+    <div class="hleft">
+      <img src="/static/bizforward-Logo-Clean-2024.svg">
+      <a href="/campaign" style="font-size:14px;color:#0a66c2;text-decoration:none">
+        Kampagne wählen
+      </a>
+    </div>
+    <div class="hcenter">Nachfass</div>
+    <div class="hright">angemeldet</div>
+  </div>
+</header>
+
+<main>
+<section class="card">
+  <h2>Nachfass – Einstellungen</h2>
+    <div class="form-narrow">
+      <div class="grid">
+    
+        <!-- Batch IDs -->
+        <div class="col-12">
+          <label>Batch ID</label>
+          <textarea id="nf_batch_ids" rows="2" placeholder="xxx"></textarea>
+        </div>
+    
+        <!-- Export Batch -->
+        <div class="col-12">
+          <label>Export-Batch-ID</label>
+          <input id="batch_id" placeholder="xxx">
+        </div>
+    
+        <!-- Kampagne -->
+        <div class="col-12">
+          <label>Kampagnenname</label>
+          <input id="campaign" placeholder="z. B. import_nachfass_xxx">
+        </div>
+    
+        <!-- Button -->
+        <div class="col-12" style="display:flex;justify-content:flex-end">
+          <button class="btn" id="btnExportNf">Abgleich & Download</button>
+        </div>
+      </div></div>
+</section>
+
+<!-- Tabelle: Entfernte Datensätze -->
+<section class="table-card">
+  <h3>Entfernte Datensätze</h3>
+  <table>
+    <thead>
+      <tr>
+        <th>Kontakt ID</th>
+        <th>Name</th>
+        <th>Organisation ID</th>
+        <th>Organisationsname</th>
+        <th>Grund</th>
+      </tr>
+    </thead>
+    <tbody id="excluded-table-body">
+      <tr>
+        <td colspan="5" style="text-align:center;color:#94a3b8">
+          Noch keine Daten geladen
+        </td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+
+
+</main>
+
+<div id="overlay">
+  <div id="overlay-phase" style="font-weight:600"></div>
+  <div class="barwrap"><div class="bar" id="overlay-bar"></div></div>
+</div>
+
+<script>
+const el = id => document.getElementById(id);
+function showOverlay(t){el("overlay-phase").textContent=t;el("overlay").style.display="flex";}
+function hideOverlay(){el("overlay").style.display="none";}
+function setProgress(p){el("overlay-bar").style.width=p+"%";}
+
+async function poll(job_id){
+  while(true){
+    await new Promise(r=>setTimeout(r,500));
+    const s = await (await fetch("/nachfass/export_progress?job_id="+job_id)).json();
+    el("overlay-phase").textContent = `${s.phase} (${s.percent}%)`;
+    setProgress(s.percent);
+    if(s.error){alert(s.error);hideOverlay();return;}
+    if(s.download_ready){
+      window.location.href="/nachfass/export_download?job_id="+job_id;
+      hideOverlay(); return;
+    }
+  }
+}
+
+el("btnExportNf").onclick = async ()=>{
+  showOverlay("Starte Abgleich …");
+  setProgress(10);
+  const r = await fetch("/nachfass/export_start",{
+    method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({
+      nf_batch_ids:el("nf_batch_ids").value.split(/[,\n;]/).map(s=>s.trim()).filter(Boolean),
+      batch_id:el("batch_id").value,
+      campaign:el("campaign").value
+    })
+  });
+  const j = await r.json();
+  poll(j.job_id);
+};
+</script>
+
+</body>
+</html>""")
+
+# =============================================================================
+# Frontend – Refresh (DESIGN exakt wie Neukontakte)
+# =============================================================================
+@app.get("/refresh", response_class=HTMLResponse)
+async def refresh_page(request: Request):
+    authed = True
+    auth_info = "<span class='muted'>angemeldet</span>" if authed else "<a href='/login'>Anmelden</a>"
+
+    return HTMLResponse(r"""<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Refresh – BatchFlow</title>
 <style>
 /* =========================
    BASE
@@ -4639,6 +5851,1330 @@ th{
   background:linear-gradient(90deg,#0ea5e9,#38bdf8);
   transition:width .25s linear;
 }
+
+/* =========================
+   STATUSBAR (sticky)
+   ========================= */
+.statusbar{
+  position:fixed;
+  left:50%;
+  bottom:18px;
+  transform:translateX(-50%);
+  width:min(980px, calc(100% - 32px));
+  background:#ffffff;
+  border:1px solid #e5e9f0;
+  border-radius:18px;
+  box-shadow:0 16px 36px rgba(15,23,42,.10), 0 6px 14px rgba(15,23,42,.06);
+  padding:14px 16px 12px 16px;
+  opacity:0;
+  pointer-events:none;
+  transition:opacity .18s ease, transform .18s ease;
+  z-index:50;
+}
+.statusbar.show{ opacity:1; pointer-events:auto; }
+.statusbar .row{
+  display:flex;
+  align-items:flex-start;
+  justify-content:space-between;
+  gap:14px;
+}
+.statusbar .phase{ font-weight:700; font-size:14px; }
+.statusbar .meta{
+  margin-top:2px;
+  font-size:12px;
+  color:#64748b;
+}
+.statusbar .meta span + span::before{ content:" · "; }
+.statusbar .barwrap{
+  height:8px;
+  background:#eef2ff;
+  border-radius:999px;
+  overflow:hidden;
+  margin-top:10px;
+}
+.statusbar .bar{
+  height:100%;
+  width:0%;
+  background:linear-gradient(90deg,#38bdf8,#3b82f6);
+}
+.btn.small{ padding:8px 12px; font-size:13px; border-radius:12px; }
+
+/* =========================
+   EXCLUDED TABLE
+   ========================= */
+.kpis{
+  display:flex;
+  flex-wrap:wrap;
+  gap:10px;
+  margin:12px 0 18px 0;
+}
+.kpi{
+  background:#f8fafc;
+  border:1px solid #e5e9f0;
+  border-radius:14px;
+  padding:10px 12px;
+  font-size:13px;
+  color:#334155;
+}
+.table{
+  width:100%;
+  border-collapse:separate;
+  border-spacing:0;
+  overflow:hidden;
+  border:1px solid #e5e9f0;
+  border-radius:16px;
+}
+.table th, .table td{
+  padding:10px 12px;
+  border-bottom:1px solid #eef2f7;
+  font-size:13px;
+  vertical-align:top;
+}
+.table th{
+  background:#f1f5f9;
+  font-weight:700;
+  color:#0f172a;
+}
+.table tr:last-child td{ border-bottom:none; }
+.center{ text-align:center; color:#94a3b8; }
+
+</style>
+</head>
+<body>
+
+<header>
+  <div class="hwrap">
+    <div class="hleft">
+      <img src="/static/bizforward-Logo-Clean-2024.svg" alt="bizforward">
+      <span>BatchFlow</span>
+    </div>
+    <div class="hright">
+      <a class="hlink" href="/campaign">Kampagne wählen</a>
+      <span class="muted">angemeldet</span>
+    </div>
+  </div>
+</header>
+
+<div class="container">
+  <section class="card">
+    <h2>Schritt 1 – Refresh auswählen</h2>
+    <p class="lead">Wähle einen Fachbereich und definiere, wie viele Kontakte exportiert werden sollen. Der Prozess zeigt jederzeit den aktuellen Status.</p>
+
+    <div class="grid">
+      <div class="col-12">
+        <div class="selectbox" id="fb-loading-box" style="display:none">
+          <label>Fachbereich</label>
+          <div class="muted" id="fb-loading-text">Fachbereiche werden geladen … bitte warten.</div>
+          <div class="barwrap"><div class="bar" id="fb-loading-bar" style="width:0%"></div></div>
+        </div>
+
+        <label for="fachbereich">Fachbereich</label>
+        <select id="fachbereich">
+          <option value="">– bitte auswählen –</option>
+        </select>
+        <small>Quelle aus Pipedrive – Kontakte nach Fachbereich.</small>
+      </div>
+
+      <div class="col-6">
+        <label for="take_count">Anzahl Kontakte</label>
+        <input id="take_count" placeholder="alle"/>
+        <small>Optional</small>
+      </div>
+
+      <div class="col-6">
+        <label for="batch_id">Batch ID</label>
+        <input id="batch_id" placeholder="xxx"/>
+        <small>Intern</small>
+      </div>
+
+      <div class="col-12">
+        <label for="campaign">Kampagnenname (für Cold Mailing)</label>
+        <input id="campaign" placeholder="z. B. Frühling 2025"/>
+      </div>
+
+      <div class="col-12" style="display:flex;justify-content:flex-end">
+        <button class="btn" id="btnExportRf">Abgleich &amp; Download</button>
+      </div>
+    </div>
+  </section>
+
+  <section class="card" id="excludedCard" style="display:none;">
+    <h2>Entfernte Datensätze</h2>
+    <p class="lead">Diese Datensätze wurden beim Refresh-Abgleich entfernt.</p>
+    <div class="kpis" id="excludedKpis"></div>
+    <table class="table">
+      <thead>
+        <tr>
+          <th>Kontakt ID</th><th>Name</th><th>Organisation ID</th><th>Organisationsname</th><th>Grund</th>
+        </tr>
+      </thead>
+      <tbody id="excludedBody">
+        <tr><td colspan="5" class="center">Noch keine Daten geladen</td></tr>
+      </tbody>
+    </table>
+  </section>
+</div>
+
+
+<div id="statusbar" class="statusbar" aria-live="polite">
+  <div class="row">
+    <div>
+      <div class="phase" id="sb-phase">Bereit</div>
+      <div class="meta">
+        <span id="sb-percent">0%</span>
+        <span id="sb-stats"></span>
+      </div>
+    </div>
+    <div>
+      <a id="sb-download" class="btn small" href="#" target="_blank" style="display:none">Download</a>
+    </div>
+  </div>
+  <div class="barwrap"><div class="bar" id="sb-bar"></div></div>
+</div>
+
+
+<script>
+
+const el = (id)=>document.getElementById(id);
+
+function showStatus(){
+  el("statusbar").classList.add("show");
+}
+function setStatus(phase, percent, stats){
+  el("sb-phase").textContent = phase || "";
+  el("sb-percent").textContent = (percent ?? 0) + "%";
+  el("sb-bar").style.width = (percent ?? 0) + "%";
+  const st = (stats && typeof stats === "object") ? stats : {};
+  const parts = [];
+  for(const [k,v] of Object.entries(st)){
+    if(v === null || v === undefined || v === "") continue;
+    parts.push(`${k}: ${v}`);
+  }
+  el("sb-stats").textContent = parts.join(" · ");
+}
+
+async function poll(job_id, progress_url, download_url, excluded_url){
+  showStatus();
+  const dl = el("sb-download");
+  dl.href = download_url;
+  dl.style.display = "inline-flex";
+
+  while(true){
+    const r = await fetch(progress_url + "?job_id=" + encodeURIComponent(job_id));
+    const s = await r.json();
+    setStatus(s.phase, s.percent, s.stats || {});
+    if(s.done){
+      if(s.error){
+        setStatus("Fehler", 100, {Fehler: s.error});
+      }else{
+        setStatus(s.phase || "Fertig", 100, s.stats || {});
+        // Download automatisch öffnen, ohne Seite zu verlassen
+        window.open(download_url, "_blank");
+        if(excluded_url){
+          await loadExcluded(excluded_url);
+        }
+      }
+      break;
+    }
+    await new Promise(res=>setTimeout(res, 900));
+  }
+}
+
+async function loadExcluded(excluded_url){
+  const card = el("excludedCard");
+  if(!card) return;
+  try{
+    const r = await fetch(excluded_url);
+    const data = await r.json();
+
+    // Summary
+    const kpis = el("excludedKpis");
+    kpis.innerHTML = "";
+    (data.summary || []).forEach(s=>{
+      const div = document.createElement("div");
+      div.className = "kpi";
+      div.textContent = `${s.Grund}: ${s.Anzahl}`;
+      kpis.appendChild(div);
+    });
+
+    // Rows
+    const body = el("excludedBody");
+    body.innerHTML = "";
+    if(data.rows && data.rows.length){
+      data.rows.forEach(row=>{
+        const tr = document.createElement("tr");
+        tr.innerHTML = `
+          <td>${row["Kontakt ID"] ?? ""}</td>
+          <td>${row["Name"] ?? ""}</td>
+          <td>${row["Organisation ID"] ?? ""}</td>
+          <td>${row["Organisationsname"] ?? ""}</td>
+          <td>${row["Grund"] ?? ""}</td>
+        `;
+        body.appendChild(tr);
+      });
+    }else{
+      body.innerHTML = `<tr><td colspan="5" class="center">Keine Datensätze entfernt</td></tr>`;
+    }
+
+    card.style.display = "block";
+  }catch(e){
+    el("excludedBody").innerHTML = `<tr><td colspan="5" class="center">Konnte entfernte Datensätze nicht laden</td></tr>`;
+    el("excludedCard").style.display = "block";
+  }
+}
+
+
+async function loadOptions(){
+  const box = el("fb-loading-box");
+  const bar = el("fb-loading-bar");
+  const txt = el("fb-loading-text");
+  box.style.display = "block";
+  bar.style.width = "0%";
+  let p=0;
+  const iv=setInterval(()=>{ p=Math.min(p+6,90); bar.style.width=p+"%"; },180);
+
+  try{
+    const r = await fetch("/refresh/options");
+    const data = await r.json();
+    clearInterval(iv); bar.style.width="100%";
+    const sel = el("fachbereich");
+    sel.innerHTML = '<option value="">– bitte auswählen –</option>';
+    (data.options||[]).forEach(o=>{
+      const opt=document.createElement("option");
+      opt.value=o.value; opt.textContent=o.label;
+      sel.appendChild(opt);
+    });
+    txt.textContent = "Fachbereiche geladen.";
+    setTimeout(()=> box.style.display="none", 700);
+  } catch(e){
+    clearInterval(iv);
+    txt.textContent = "Fehler beim Laden der Fachbereiche.";
+  }
+}
+
+el("btnExportRf").onclick = async () => {
+  const fach = el("fachbereich").value;
+  if(!fach){ alert("Bitte zuerst einen Fachbereich auswählen."); return; }
+
+  let take = el("take_count").value.trim();
+  let take_count = null;
+  if(take && take.toLowerCase() !== "alle") {
+    const n = parseInt(take,10);
+    if(!isNaN(n) && n>0) take_count = n;
+  }
+
+  showStatus();
+  setStatus("Starte Refresh …", 2, {Fachbereich: fach, Anzahl: (take_count ?? "alle")});
+
+  const r = await fetch("/refresh/export_start", {
+    method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({
+      fachbereich: fach,
+      take_count: take_count,
+      batch_id: el("batch_id").value,
+      campaign: el("campaign").value
+    })
+  });
+  const j = await r.json();
+  await poll(
+    j.job_id,
+    "/refresh/export_progress",
+    "/refresh/export_download?job_id=" + encodeURIComponent(j.job_id),
+    "/refresh/excluded/json"
+  );
+};
+
+loadOptions();
+</script>
+
+</body>
+</html>
+""")
+
+# =============================================================================
+# Frontend – Refresh (DESIGN exakt wie Neukontakte)
+# =============================================================================
+@app.get("/refresh", response_class=HTMLResponse)
+async def refresh_page(request: Request):
+    authed = True
+    auth_info = "<span class='muted'>angemeldet</span>" if authed else "<a href='/login'>Anmelden</a>"
+
+    return HTMLResponse(r"""<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Refresh – BatchFlow</title>
+
+<style>
+/* =========================
+   BASIS – IDENTISCH NK
+   ========================= */
+body{
+  margin:0;
+  background:#f7f9fc;
+  color:#0f172a;
+  font:16px/1.6 Inter,system-ui,-apple-system,BlinkMacSystemFont,sans-serif;
+}
+header{
+  background:#fff;
+  border-bottom:1px solid #e5e9f0;
+}
+.hwrap{
+  max-width:1200px;
+  margin:0 auto;
+  padding:22px 24px;
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+}
+.hleft{display:flex;align-items:center;gap:14px;}
+.hleft img{height:48px;}
+.hcenter{font-size:18px;font-weight:600;}
+.hright{font-size:14px;}
+
+main{
+  max-width:720px;
+  margin:48px auto;
+  padding:0 24px;
+}
+
+/* Card */
+.card{
+  background:#fff;
+  border:1px solid #e5e9f0;
+  border-radius:20px;
+  padding:36px;
+  box-shadow:
+    0 14px 32px rgba(15,23,42,.06),
+    0 6px 12px rgba(15,23,42,.04);
+}
+
+/* Grid */
+.grid{
+  display:grid;
+  grid-template-columns:repeat(12,1fr);
+  gap:20px;
+  row-gap:28px;
+}
+.col-12{grid-column:span 12;}
+.col-6{grid-column:span 6;}
+
+.form-grid{
+  display:grid;
+  grid-template-columns:repeat(2, minmax(0, 1fr));
+  gap:24px;
+}
+
+.form-full{
+  grid-column:1 / -1;
+}
+
+.form-narrow {
+  max-width: 520px;
+  margin-top: 24px;
+}
+/* Form */
+label{
+  display:block;
+  font-weight:600;
+  margin-bottom:8px;
+  font-size:14px;
+}
+input,select{
+  width:100%;
+  padding:12px 14px;
+  border-radius:12px;
+  border:1px solid #dbe3ec;
+  background:#f8fafc;
+}
+input:focus,select:focus{
+  outline:none;
+  border-color:#0ea5e9;
+  background:#fff;
+  box-shadow:0 0 0 3px rgba(14,165,233,.15);
+}
+
+/* Ladebalken Fachbereich – IDENTISCH NK */
+#fb-loading-box{margin-bottom:12px;display:none;}
+#fb-loading-text{font-size:13px;color:#0a66c2;margin-bottom:6px;}
+#fb-loading-bar-wrap{
+  width:100%;
+  height:8px;
+  background:#e5e9f0;
+  border-radius:999px;
+  overflow:hidden;
+}
+#fb-loading-bar{
+  height:8px;
+  width:0%;
+  background:linear-gradient(90deg,#0ea5e9,#38bdf8);
+}
+
+/* Button */
+.btn{
+  margin-top:36px;
+  background:#0ea5e9;
+  color:#fff;
+  border:none;
+  border-radius:999px;
+  padding:14px 28px;
+  font-weight:600;
+  cursor:pointer;
+  box-shadow:0 6px 14px rgba(14,165,233,.35);
+}
+.btn:hover{background:#0284c7}
+
+/* Tabelle */
+.table-card{
+  margin-top:48px;
+  background:#fff;
+  border:1px solid #e5e9f0;
+  border-radius:20px;
+  padding:28px;
+}
+table{
+  width:100%;
+  border-collapse:collapse;
+  margin-top:12px;
+  font-size:14px;
+}
+thead{background:#f8fafc;}
+th,td{
+  padding:14px 16px;
+  border-bottom:1px solid #e5e9f0;
+}
+th{
+  font-weight:600;
+  color:#475569;
+  white-space:nowrap;
+}
+
+/* Overlay – ZENTRIERT & SICHTBAR */
+#overlay{
+  display:none;
+  position:fixed;
+  inset:0;
+  background:rgba(247,249,252,.85);
+  backdrop-filter:blur(3px);
+  z-index:9999;
+  align-items:center;
+  justify-content:center;
+  flex-direction:column;
+  gap:12px;
+}
+.barwrap{
+  width:520px;
+  max-width:90vw;
+  height:10px;
+  border-radius:999px;
+  background:#e5e9f0;
+}
+.bar{
+  height:100%;
+  width:0%;
+  background:linear-gradient(90deg,#0ea5e9,#38bdf8);
+  transition:width .25s linear;
+}
+
+/* =========================
+   STATUSBAR (sticky)
+   ========================= */
+.statusbar{
+  position:fixed;
+  left:50%;
+  bottom:18px;
+  transform:translateX(-50%);
+  width:min(980px, calc(100% - 32px));
+  background:#ffffff;
+  border:1px solid #e5e9f0;
+  border-radius:18px;
+  box-shadow:0 16px 36px rgba(15,23,42,.10), 0 6px 14px rgba(15,23,42,.06);
+  padding:14px 16px 12px 16px;
+  opacity:0;
+  pointer-events:none;
+  transition:opacity .18s ease, transform .18s ease;
+  z-index:50;
+}
+.statusbar.show{ opacity:1; pointer-events:auto; }
+.statusbar .row{
+  display:flex;
+  align-items:flex-start;
+  justify-content:space-between;
+  gap:14px;
+}
+.statusbar .phase{ font-weight:700; font-size:14px; }
+.statusbar .meta{
+  margin-top:2px;
+  font-size:12px;
+  color:#64748b;
+}
+.statusbar .meta span + span::before{ content:" · "; }
+.statusbar .barwrap{
+  height:8px;
+  background:#eef2ff;
+  border-radius:999px;
+  overflow:hidden;
+  margin-top:10px;
+}
+.statusbar .bar{
+  height:100%;
+  width:0%;
+  background:linear-gradient(90deg,#38bdf8,#3b82f6);
+}
+.btn.small{ padding:8px 12px; font-size:13px; border-radius:12px; }
+
+/* =========================
+   EXCLUDED TABLE
+   ========================= */
+.kpis{
+  display:flex;
+  flex-wrap:wrap;
+  gap:10px;
+  margin:12px 0 18px 0;
+}
+.kpi{
+  background:#f8fafc;
+  border:1px solid #e5e9f0;
+  border-radius:14px;
+  padding:10px 12px;
+  font-size:13px;
+  color:#334155;
+}
+.table{
+  width:100%;
+  border-collapse:separate;
+  border-spacing:0;
+  overflow:hidden;
+  border:1px solid #e5e9f0;
+  border-radius:16px;
+}
+.table th, .table td{
+  padding:10px 12px;
+  border-bottom:1px solid #eef2f7;
+  font-size:13px;
+  vertical-align:top;
+}
+.table th{
+  background:#f1f5f9;
+  font-weight:700;
+  color:#0f172a;
+}
+.table tr:last-child td{ border-bottom:none; }
+.center{ text-align:center; color:#94a3b8; }
+
+</style>
+</head>
+<body>
+
+<header>
+  <div class="hwrap">
+    <div class="hleft">
+      <img src="/static/bizforward-Logo-Clean-2024.svg" alt="bizforward">
+      <span>BatchFlow</span>
+    </div>
+    <div class="hright">
+      <a class="hlink" href="/campaign">Kampagne wählen</a>
+      {AUTH_HTML}
+    </div>
+  </div>
+</header>
+
+<div class="container">
+  <section class="card">
+    <h2>Schritt 1 – Neukontakte auswählen</h2>
+    <p class="lead">Wähle einen Fachbereich und definiere, wie viele neue Kontakte für den Erstkontakt exportiert werden sollen.</p>
+
+    <div class="grid">
+      <div class="col-12">
+        <div class="selectbox" id="fb-loading-box" style="display:none">
+          <label>Fachbereich</label>
+          <div class="muted" id="fb-loading-text">Fachbereiche werden geladen … bitte warten.</div>
+          <div class="barwrap"><div class="bar" id="fb-loading-bar" style="width:0%"></div></div>
+        </div>
+
+        <label for="fachbereich">Fachbereich</label>
+        <select id="fachbereich">
+          <option value="">– bitte auswählen –</option>
+        </select>
+        <small>Quelle aus Pipedrive – nur noch nicht kontaktierte Personen.</small>
+      </div>
+
+      <div class="col-6">
+        <label for="take_count">Anzahl Kontakte</label>
+        <input id="take_count" placeholder="alle"/>
+        <small>Optional</small>
+      </div>
+
+      <div class="col-6">
+        <label for="batch_id">Batch ID</label>
+        <input id="batch_id" placeholder="xxx"/>
+        <small>Intern</small>
+      </div>
+
+      <div class="col-12">
+        <label for="campaign">Kampagnenname (für Cold Mailing)</label>
+        <input id="campaign" placeholder="z. B. Frühling 2025"/>
+      </div>
+
+      <div class="col-12" style="display:flex;justify-content:flex-end">
+        <button class="btn" id="btnExportNk">Abgleich &amp; Download</button>
+      </div>
+    </div>
+  </section>
+</div>
+
+
+<div id="statusbar" class="statusbar" aria-live="polite">
+  <div class="row">
+    <div>
+      <div class="phase" id="sb-phase">Bereit</div>
+      <div class="meta">
+        <span id="sb-percent">0%</span>
+        <span id="sb-stats"></span>
+      </div>
+    </div>
+    <div>
+      <a id="sb-download" class="btn small" href="#" target="_blank" style="display:none">Download</a>
+    </div>
+  </div>
+  <div class="barwrap"><div class="bar" id="sb-bar"></div></div>
+</div>
+
+
+<script>
+
+const el = (id)=>document.getElementById(id);
+
+function showStatus(){
+  el("statusbar").classList.add("show");
+}
+function setStatus(phase, percent, stats){
+  el("sb-phase").textContent = phase || "";
+  el("sb-percent").textContent = (percent ?? 0) + "%";
+  el("sb-bar").style.width = (percent ?? 0) + "%";
+  const st = (stats && typeof stats === "object") ? stats : {};
+  const parts = [];
+  for(const [k,v] of Object.entries(st)){
+    if(v === null || v === undefined || v === "") continue;
+    parts.push(`${k}: ${v}`);
+  }
+  el("sb-stats").textContent = parts.join(" · ");
+}
+
+async function poll(job_id, progress_url, download_url, excluded_url){
+  showStatus();
+  const dl = el("sb-download");
+  dl.href = download_url;
+  dl.style.display = "inline-flex";
+
+  while(true){
+    const r = await fetch(progress_url + "?job_id=" + encodeURIComponent(job_id));
+    const s = await r.json();
+    setStatus(s.phase, s.percent, s.stats || {});
+    if(s.done){
+      if(s.error){
+        setStatus("Fehler", 100, {Fehler: s.error});
+      }else{
+        setStatus(s.phase || "Fertig", 100, s.stats || {});
+        // Download automatisch öffnen, ohne Seite zu verlassen
+        window.open(download_url, "_blank");
+        if(excluded_url){
+          await loadExcluded(excluded_url);
+        }
+      }
+      break;
+    }
+    await new Promise(res=>setTimeout(res, 900));
+  }
+}
+
+async function loadExcluded(excluded_url){
+  const card = el("excludedCard");
+  if(!card) return;
+  try{
+    const r = await fetch(excluded_url);
+    const data = await r.json();
+
+    // Summary
+    const kpis = el("excludedKpis");
+    kpis.innerHTML = "";
+    (data.summary || []).forEach(s=>{
+      const div = document.createElement("div");
+      div.className = "kpi";
+      div.textContent = `${s.Grund}: ${s.Anzahl}`;
+      kpis.appendChild(div);
+    });
+
+    // Rows
+    const body = el("excludedBody");
+    body.innerHTML = "";
+    if(data.rows && data.rows.length){
+      data.rows.forEach(row=>{
+        const tr = document.createElement("tr");
+        tr.innerHTML = `
+          <td>${row["Kontakt ID"] ?? ""}</td>
+          <td>${row["Name"] ?? ""}</td>
+          <td>${row["Organisation ID"] ?? ""}</td>
+          <td>${row["Organisationsname"] ?? ""}</td>
+          <td>${row["Grund"] ?? ""}</td>
+        `;
+        body.appendChild(tr);
+      });
+    }else{
+      body.innerHTML = `<tr><td colspan="5" class="center">Keine Datensätze entfernt</td></tr>`;
+    }
+
+    card.style.display = "block";
+  }catch(e){
+    el("excludedBody").innerHTML = `<tr><td colspan="5" class="center">Konnte entfernte Datensätze nicht laden</td></tr>`;
+    el("excludedCard").style.display = "block";
+  }
+}
+
+
+async function loadOptions(){
+  const box = el("fb-loading-box");
+  const bar = el("fb-loading-bar");
+  const txt = el("fb-loading-text");
+  box.style.display = "block";
+  bar.style.width = "0%";
+  let p=0;
+  const iv=setInterval(()=>{ p=Math.min(p+6,90); bar.style.width=p+"%"; },180);
+
+  try{
+    const r = await fetch("/neukontakte/options");
+    const data = await r.json();
+    clearInterval(iv); bar.style.width="100%";
+    const sel = el("fachbereich");
+    sel.innerHTML = '<option value="">– bitte auswählen –</option>';
+    (data.options||[]).forEach(o=>{
+      const opt=document.createElement("option");
+      opt.value=o.value; opt.textContent=o.label;
+      sel.appendChild(opt);
+    });
+    txt.textContent = "Fachbereiche geladen.";
+    setTimeout(()=> box.style.display="none", 700);
+  } catch(e){
+    clearInterval(iv);
+    txt.textContent = "Fehler beim Laden der Fachbereiche.";
+  }
+}
+
+el("btnExportNk").onclick = async () => {
+  const fach = el("fachbereich").value;
+  if(!fach){ alert("Bitte zuerst einen Fachbereich auswählen."); return; }
+
+  let take = el("take_count").value.trim();
+  let take_count = null;
+  if(take && take.toLowerCase() !== "alle") {
+    const n = parseInt(take,10);
+    if(!isNaN(n) && n>0) take_count = n;
+  }
+
+  showStatus();
+  setStatus("Starte Export …", 2, {Fachbereich: fach, Anzahl: (take_count ?? "alle")});
+
+  const r = await fetch("/neukontakte/export_start", {
+    method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({
+      fachbereich: fach,
+      take_count: take_count,
+      batch_id: el("batch_id").value,
+      campaign: el("campaign").value
+    })
+  });
+  const j = await r.json();
+  await poll(
+    j.job_id,
+    "/neukontakte/export_progress",
+    "/neukontakte/export_download?job_id=" + encodeURIComponent(j.job_id),
+    null
+  );
+};
+
+loadOptions();
+</script>
+
+</body>
+</html>
+"""
+    )
+
+# =============================================================================
+# Frontend – Nachfass (DESIGN identisch zu Neukontakte)
+# =============================================================================
+@app.get("/nachfass", response_class=HTMLResponse)
+async def nachfass_page():
+    return HTMLResponse(r"""<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Nachfass – BatchFlow</title>
+
+<style>
+/* =========================
+   BASIS (identisch NK)
+   ========================= */
+body{
+  margin:0;
+  background:#f7f9fc;
+  color:#0f172a;
+  font:16px/1.6 Inter,system-ui,-apple-system,BlinkMacSystemFont,sans-serif;
+}
+header{
+  background:#fff;
+  border-bottom:1px solid #e5e9f0;
+}
+.hwrap{
+  max-width:1200px;
+  margin:0 auto;
+  padding:22px 24px;
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+}
+.hleft{display:flex;align-items:center;gap:14px;}
+.hleft img{height:48px;}
+.hcenter{font-size:18px;font-weight:600;}
+.hright{font-size:14px;}
+
+main{
+  max-width:720px;
+  margin:48px auto;
+  padding:0 24px;
+}
+
+/* Card */
+.card{
+  background:#fff;
+  border:1px solid #e5e9f0;
+  border-radius:20px;
+  padding:36px;
+  box-shadow:
+    0 14px 32px rgba(15,23,42,.06),
+    0 6px 12px rgba(15,23,42,.04);
+}
+
+/* Grid */
+.grid{
+  display:grid;
+  grid-template-columns:repeat(12,1fr);
+  gap:20px;
+  row-gap:28px;
+}
+.col-12{grid-column:span 12;}
+.col-6{grid-column:span 6;}
+
+/* Form */
+label{
+  display:block;
+  font-weight:600;
+  margin-bottom:8px;
+  font-size:14px;
+}
+input,textarea{
+  width:100%;
+  padding:12px 14px;
+  border-radius:12px;
+  border:1px solid #dbe3ec;
+  background:#f8fafc;
+}
+input:focus,textarea:focus{
+  outline:none;
+  border-color:#0ea5e9;
+  background:#fff;
+  box-shadow:0 0 0 3px rgba(14,165,233,.15);
+}
+.form-grid{
+  display:grid;
+  grid-template-columns:repeat(2, minmax(0, 1fr));
+  gap:24px;
+}
+
+.form-full{
+  grid-column:1 / -1;
+}
+
+.form-narrow {
+  max-width: 520px;
+   margin-top: 24px;
+}
+
+
+/* Button */
+.btn{
+  margin-top:36px;
+  background:#0ea5e9;
+  color:#fff;
+  border:none;
+  border-radius:999px;
+  padding:14px 28px;
+  font-weight:600;
+  cursor:pointer;
+  box-shadow:0 6px 14px rgba(14,165,233,.35);
+}
+.btn:hover{background:#0284c7}
+
+/* Tabelle */
+.table-card{
+  margin-top:48px;
+  background:#fff;
+  border:1px solid #e5e9f0;
+  border-radius:20px;
+  padding:28px;
+}
+table{
+  width:100%;
+  border-collapse:collapse;
+  margin-top:12px;
+  font-size:14px;
+}
+thead{background:#f8fafc;}
+th,td{
+  padding:14px 16px;
+  border-bottom:1px solid #e5e9f0;
+}
+th{
+  font-weight:600;
+  color:#475569;
+  white-space:nowrap;
+}
+
+/* Overlay – sichtbar & zentriert */
+#overlay{
+  display:none;
+  position:fixed;
+  inset:0;
+  background:rgba(247,249,252,.85);
+  backdrop-filter:blur(3px);
+  z-index:9999;
+  align-items:center;
+  justify-content:center;
+  flex-direction:column;
+  gap:12px;
+}
+.barwrap{
+  width:520px;
+  max-width:90vw;
+  height:10px;
+  border-radius:999px;
+  background:#e5e9f0;
+}
+.bar{
+  height:100%;
+  width:0%;
+  background:linear-gradient(90deg,#0ea5e9,#38bdf8);
+  transition:width .25s linear;
+}
+</style>
+</head>
+
+<body>
+
+<header>
+  <div class="hwrap">
+    <div class="hleft">
+      <img src="/static/bizforward-Logo-Clean-2024.svg">
+      <a href="/campaign" style="font-size:14px;color:#0a66c2;text-decoration:none">
+        Kampagne wählen
+      </a>
+    </div>
+    <div class="hcenter">Nachfass</div>
+    <div class="hright">angemeldet</div>
+  </div>
+</header>
+
+<main>
+<section class="card">
+  <h2>Nachfass – Einstellungen</h2>
+    <div class="form-narrow">
+      <div class="grid">
+    
+        <!-- Batch IDs -->
+        <div class="col-12">
+          <label>Batch ID</label>
+          <textarea id="nf_batch_ids" rows="2" placeholder="xxx"></textarea>
+        </div>
+    
+        <!-- Export Batch -->
+        <div class="col-12">
+          <label>Export-Batch-ID</label>
+          <input id="batch_id" placeholder="xxx">
+        </div>
+    
+        <!-- Kampagne -->
+        <div class="col-12">
+          <label>Kampagnenname</label>
+          <input id="campaign" placeholder="z. B. import_nachfass_xxx">
+        </div>
+    
+        <!-- Button -->
+        <div class="col-12" style="display:flex;justify-content:flex-end">
+          <button class="btn" id="btnExportNf">Abgleich & Download</button>
+        </div>
+      </div></div>
+</section>
+
+<!-- Tabelle: Entfernte Datensätze -->
+<section class="table-card">
+  <h3>Entfernte Datensätze</h3>
+  <table>
+    <thead>
+      <tr>
+        <th>Kontakt ID</th>
+        <th>Name</th>
+        <th>Organisation ID</th>
+        <th>Organisationsname</th>
+        <th>Grund</th>
+      </tr>
+    </thead>
+    <tbody id="excluded-table-body">
+      <tr>
+        <td colspan="5" style="text-align:center;color:#94a3b8">
+          Noch keine Daten geladen
+        </td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+
+
+</main>
+
+<div id="overlay">
+  <div id="overlay-phase" style="font-weight:600"></div>
+  <div class="barwrap"><div class="bar" id="overlay-bar"></div></div>
+</div>
+
+<script>
+const el = id => document.getElementById(id);
+function showOverlay(t){el("overlay-phase").textContent=t;el("overlay").style.display="flex";}
+function hideOverlay(){el("overlay").style.display="none";}
+function setProgress(p){el("overlay-bar").style.width=p+"%";}
+
+async function poll(job_id){
+  while(true){
+    await new Promise(r=>setTimeout(r,500));
+    const s = await (await fetch("/nachfass/export_progress?job_id="+job_id)).json();
+    el("overlay-phase").textContent = `${s.phase} (${s.percent}%)`;
+    setProgress(s.percent);
+    if(s.error){alert(s.error);hideOverlay();return;}
+    if(s.download_ready){
+      window.location.href="/nachfass/export_download?job_id="+job_id;
+      hideOverlay(); return;
+    }
+  }
+}
+
+el("btnExportNf").onclick = async ()=>{
+  showOverlay("Starte Abgleich …");
+  setProgress(10);
+  const r = await fetch("/nachfass/export_start",{
+    method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({
+      nf_batch_ids:el("nf_batch_ids").value.split(/[,\n;]/).map(s=>s.trim()).filter(Boolean),
+      batch_id:el("batch_id").value,
+      campaign:el("campaign").value
+    })
+  });
+  const j = await r.json();
+  poll(j.job_id);
+};
+</script>
+
+</body>
+</html>""")
+
+# =============================================================================
+# Frontend – Refresh (DESIGN exakt wie Neukontakte)
+# =============================================================================
+@app.get("/refresh", response_class=HTMLResponse)
+async def refresh_page(request: Request):
+    authed = True
+    auth_info = "<span class='muted'>angemeldet</span>" if authed else "<a href='/login'>Anmelden</a>"
+
+    return HTMLResponse(r"""<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Refresh – BatchFlow</title>
+
+<style>
+/* =========================
+   BASIS – IDENTISCH NK
+   ========================= */
+body{
+  margin:0;
+  background:#f7f9fc;
+  color:#0f172a;
+  font:16px/1.6 Inter,system-ui,-apple-system,BlinkMacSystemFont,sans-serif;
+}
+header{
+  background:#fff;
+  border-bottom:1px solid #e5e9f0;
+}
+.hwrap{
+  max-width:1200px;
+  margin:0 auto;
+  padding:22px 24px;
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+}
+.hleft{display:flex;align-items:center;gap:14px;}
+.hleft img{height:48px;}
+.hcenter{font-size:18px;font-weight:600;}
+.hright{font-size:14px;}
+
+main{
+  max-width:720px;
+  margin:48px auto;
+  padding:0 24px;
+}
+
+/* Card */
+.card{
+  background:#fff;
+  border:1px solid #e5e9f0;
+  border-radius:20px;
+  padding:36px;
+  box-shadow:
+    0 14px 32px rgba(15,23,42,.06),
+    0 6px 12px rgba(15,23,42,.04);
+}
+
+/* Grid */
+.grid{
+  display:grid;
+  grid-template-columns:repeat(12,1fr);
+  gap:20px;
+  row-gap:28px;
+}
+.col-12{grid-column:span 12;}
+.col-6{grid-column:span 6;}
+
+.form-grid{
+  display:grid;
+  grid-template-columns:repeat(2, minmax(0, 1fr));
+  gap:24px;
+}
+
+.form-full{
+  grid-column:1 / -1;
+}
+
+.form-narrow {
+  max-width: 520px;
+  margin-top: 24px;
+}
+/* Form */
+label{
+  display:block;
+  font-weight:600;
+  margin-bottom:8px;
+  font-size:14px;
+}
+input,select{
+  width:100%;
+  padding:12px 14px;
+  border-radius:12px;
+  border:1px solid #dbe3ec;
+  background:#f8fafc;
+}
+input:focus,select:focus{
+  outline:none;
+  border-color:#0ea5e9;
+  background:#fff;
+  box-shadow:0 0 0 3px rgba(14,165,233,.15);
+}
+
+/* Ladebalken Fachbereich – IDENTISCH NK */
+#fb-loading-box{margin-bottom:12px;display:none;}
+#fb-loading-text{font-size:13px;color:#0a66c2;margin-bottom:6px;}
+#fb-loading-bar-wrap{
+  width:100%;
+  height:8px;
+  background:#e5e9f0;
+  border-radius:999px;
+  overflow:hidden;
+}
+#fb-loading-bar{
+  height:8px;
+  width:0%;
+  background:linear-gradient(90deg,#0ea5e9,#38bdf8);
+}
+
+/* Button */
+.btn{
+  margin-top:36px;
+  background:#0ea5e9;
+  color:#fff;
+  border:none;
+  border-radius:999px;
+  padding:14px 28px;
+  font-weight:600;
+  cursor:pointer;
+  box-shadow:0 6px 14px rgba(14,165,233,.35);
+}
+.btn:hover{background:#0284c7}
+
+/* Tabelle */
+.table-card{
+  margin-top:48px;
+  background:#fff;
+  border:1px solid #e5e9f0;
+  border-radius:20px;
+  padding:28px;
+}
+table{
+  width:100%;
+  border-collapse:collapse;
+  margin-top:12px;
+  font-size:14px;
+}
+thead{background:#f8fafc;}
+th,td{
+  padding:14px 16px;
+  border-bottom:1px solid #e5e9f0;
+}
+th{
+  font-weight:600;
+  color:#475569;
+  white-space:nowrap;
+}
+
+/* Overlay – ZENTRIERT & SICHTBAR */
+#overlay{
+  display:none;
+  position:fixed;
+  inset:0;
+  background:rgba(247,249,252,.85);
+  backdrop-filter:blur(3px);
+  z-index:9999;
+  align-items:center;
+  justify-content:center;
+  flex-direction:column;
+  gap:12px;
+}
+.barwrap{
+  width:520px;
+  max-width:90vw;
+  height:10px;
+  border-radius:999px;
+  background:#e5e9f0;
+}
+.bar{
+  height:100%;
+  width:0%;
+  background:linear-gradient(90deg,#0ea5e9,#38bdf8);
+  transition:width .25s linear;
+}
 </style>
 </head>
 
@@ -4839,7 +7375,7 @@ loadFachbereiche();
 # =============================================================================
 # Refresh – Summary-Seite
 # =============================================================================
-@app.get("/refresh/summary", response_class=HTMLResponse)
+@app.get("/refresh/summary_legacy", response_class=HTMLResponse)
 async def refresh_summary(job_id: str = Query(...)):
     ready = await load_df_text("rf_master_ready")
     log   = await load_df_text("rf_delete_log")
@@ -4882,7 +7418,7 @@ async def refresh_summary(job_id: str = Query(...)):
 # =============================================================================
 # Refresh – Excluded JSON / HTML
 # =============================================================================
-@app.get("/refresh/excluded/json")
+@app.get("/refresh/excluded/json_legacy")
 async def refresh_excluded_json():
     def flatten(v):
         if v is None or (isinstance(v,float) and pd.isna(v)): return ""
@@ -4914,7 +7450,7 @@ async def refresh_excluded_json():
     return JSONResponse({"summary":excluded_summary,"total":len(rows),"rows":rows})
 
 
-@app.get("/refresh/excluded", response_class=HTMLResponse)
+@app.get("/refresh/excluded_legacy", response_class=HTMLResponse)
 async def refresh_excluded():
     html = r"""
     <!DOCTYPE html><html lang="de"><head><meta charset="UTF-8">
@@ -4987,7 +7523,7 @@ async def neukontakte_summary(job_id: str = Query(...)):
     <a href='/campaign'>Zur Übersicht</a></main></body></html>"""
     return HTMLResponse(html)
 
-@app.get("/nachfass/summary", response_class=HTMLResponse)
+@app.get("/nachfass/summary_legacy", response_class=HTMLResponse)
 async def nachfass_summary(job_id: str = Query(...)):
     ready = await load_df_text("nf_master_ready")
     log   = await load_df_text("nf_delete_log")
@@ -5567,7 +8103,10 @@ async def nachfass_export_progress(job_id: str):
         "done": bool(job.done),
         "error": str(job.error) if job.error else None,
         "has_file": has_file,
-        "download_ready": bool(job.done) and (job.error is None) and has_file
+        "download_ready": bool(job.done) and (job.error is None) and has_file,
+        "stats": getattr(job, "stats", {}),
+        "download_url": "/nachfass/export_download?job_id=" + str(job_id)
+
     })
 
 
@@ -5615,7 +8154,10 @@ async def refresh_export_progress(job_id: str = Query(...)):
         "done": bool(job.done),
         "error": str(job.error) if job.error else None,
         "has_file": has_file,
-        "download_ready": bool(job.done) and (job.error is None) and has_file
+        "download_ready": bool(job.done) and (job.error is None) and has_file,
+        "stats": getattr(job, "stats", {}),
+        "download_url": "/refresh/export_download?job_id=" + str(job_id)
+
     })
 
 
