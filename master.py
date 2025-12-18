@@ -3361,6 +3361,10 @@ async def export_start_nk(
     job_id = str(uuid.uuid4())
     job = Job()
     JOBS[job_id] = job
+    # Reset entfernte Datensätze / Löschlog für neuen Lauf
+    t = tables("rf")
+    await save_df_text(pd.DataFrame(), t["log"])
+    await save_df_text(pd.DataFrame(), t["excluded"])
     job.phase = "Initialisiere …"
     job.percent = 1
     job.filename_base = slugify_filename(campaign or "BatchFlow_Export")
@@ -4481,6 +4485,11 @@ function parseBatchIds(raw){
     .filter(Boolean);
 }
 
+function resetExcludedUI(msg){
+  el("excluded-summary").innerHTML = `<span class='muted'>${msg||"Noch kein Abgleich gestartet."}</span>`;
+  el("excluded-table-body").innerHTML = `<tr><td colspan="5" style="text-align:center;color:#94a3b8">${msg||"Noch kein Abgleich gestartet."}</td></tr>`;
+}
+
 async function loadExcluded(){
   try{
     const res = await fetch("/nachfass/excluded/json");
@@ -4564,7 +4573,7 @@ async function startExport(){
   }
 }
 
-window.addEventListener("load", loadExcluded);
+window.addEventListener("load", ()=>resetExcludedUI("Noch kein Abgleich gestartet."));
 el("btnExportNf").onclick = startExport;
 </script>
 
@@ -4977,9 +4986,14 @@ async function startExport(){
   }
 }
 
+function resetExcludedUI(msg){
+  el("excluded-summary").innerHTML = `<span class='muted'>${msg||"Noch kein Abgleich gestartet."}</span>`;
+  el("excluded-table-body").innerHTML = `<tr><td colspan="5" style="text-align:center;color:#94a3b8">${msg||"Noch kein Abgleich gestartet."}</td></tr>`;
+}
+
 window.addEventListener("load", async ()=>{
   await loadOptions();
-  await loadExcluded();
+  resetExcludedUI("Noch kein Abgleich gestartet.");
 });
 el("btnExportRf").onclick = startExport;
 </script>
@@ -5673,6 +5687,10 @@ async def nachfass_export_start(req: Request):
     job_id = str(uuid4())
     job = Job()
     JOBS[job_id] = job
+    # Reset entfernte Datensätze / Löschlog für neuen Lauf
+    t = tables("nf")
+    await save_df_text(pd.DataFrame(), t["log"])
+    await save_df_text(pd.DataFrame(), t["excluded"])
 
     # Job-Inputs speichern (optional, aber ok)
     job.nf_batch_ids = nf_batch_ids
