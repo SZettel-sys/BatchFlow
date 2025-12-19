@@ -1,3 +1,5 @@
+
+
 import logging
 
 
@@ -793,7 +795,16 @@ async def fetch_persons_by_filter_id_v2(
         if cursor:
             url += f"&cursor={cursor}"
 
-        # ✅ FIX: richtiger Call (statt 'await ( ... )' )
+        
+        # Heartbeat/Detail für UI (auch wenn % lange gleich bleibt)
+        if job_obj:
+            job_obj.phase = f"Suche Personen (Filter {filter_id})"
+            job_obj.detail = f"Seite {pages} · Anfrage an Pipedrive …"
+# ✅ FIX: richtiger Call (statt 'await ( ... )' )
+
+        if job_obj:
+            job_obj.phase = f"Lade IDs ({label} {filter_id})"
+            job_obj.detail = f"Seite · Anfrage an Pipedrive …"
         r = await pd_get_with_retry(
             http_client(),
             url,
@@ -836,6 +847,7 @@ async def fetch_persons_by_filter_id_v2(
         # Fortschritt (optional)
         if job_obj:
             job_obj.phase = f"Suche Personen (Filter {filter_id})"
+            job_obj.detail = f"Seite {pages} · geladen {len(out)}"
             job_obj.percent = min(22, max(int(getattr(job_obj, "percent", 0) or 0), 12 + min(10, pages)))
 
         if added == 0:
@@ -1266,6 +1278,8 @@ from typing import AsyncGenerator, List, Optional
 async def stream_person_ids_by_filter_cursor(
     filter_id: int,
     page_limit: int = 200,
+    job_obj=None,
+    label: str = "Filter",
 ) -> AsyncGenerator[List[str], None]:
     """
     Streamt Personen-IDs eines Pipedrive-Filters seitenweise (API v2, cursor-basiert).
@@ -1306,6 +1320,8 @@ async def stream_person_ids_by_filter_cursor(
             if isinstance(p, dict) and p.get("id") is not None:
                 ids.append(str(p["id"]))
 
+        if job_obj:
+            job_obj.detail = f"IDs geladen: +{len(ids)}"
         if ids:
             yield ids
 
@@ -2664,7 +2680,7 @@ DELETE_LOG_COLUMNS = [
     "org_name",
 ]
 
-async def _reconcile(prefix: str) -> None:
+async def _reconcile(prefix: str, job_obj=None) -> None:
     """
     Abgleich:
       1) max 2 Kontakte pro Organisation
@@ -2679,6 +2695,8 @@ async def _reconcile(prefix: str) -> None:
       - nf_excluded (Summary für Bulletpoints)
     """
     t = tables(prefix)
+    if job_obj:
+        job_obj.detail = f"Abgleich gestartet ({prefix})"
     df = await load_df_text(t["final"])
 
     # erwartete Spalten im nf_master_final
@@ -2767,11 +2785,18 @@ async def _reconcile(prefix: str) -> None:
     buckets_all = await _fetch_org_names_for_filter_capped(PAGE_LIMIT, MAX_ORG_NAMES, MAX_ORG_BUCKET)
 
     drop_idx = []
+    fuzzy_checked = 0
+    if job_obj:
+        job_obj.detail = "Fuzzy-Abgleich Organisationen (>=95%) …"
     for idx, row in df.iterrows():
         name_clean = flatten(row.get(col_orgname))
         norm = normalize_name(name_clean)
         if not norm:
             continue
+
+        fuzzy_checked += 1
+        if job_obj and (fuzzy_checked % 200 == 0):
+            job_obj.detail = f"Fuzzy-Abgleich … geprüft {fuzzy_checked}" 
 
         key = bucket_key(norm)
         bucket = buckets_all.get(key)
@@ -2793,12 +2818,18 @@ async def _reconcile(prefix: str) -> None:
 
     if drop_idx:
         df = df.drop(drop_idx)
+    if job_obj:
+        try:
+            job_obj.stats["fuzzy_checked"] = int(fuzzy_checked)
+            job_obj.stats["fuzzy_removed"] = int(len(drop_idx))
+        except Exception:
+            pass
 
     # (4) Person-ID bereits in Filtern 1216/1708 -> raus
   
     suspect_ids: set[str] = set()
     for fid in (1216, 1708):
-        async for ids in stream_person_ids_by_filter_cursor(fid, page_limit=PAGE_LIMIT):
+        async for ids in stream_person_ids_by_filter_cursor(fid, page_limit=PAGE_LIMIT, job_obj=job_obj, label="Kontaktierte Personen"):
             suspect_ids.update(map(str, ids))
 
     if col_pid in df.columns and suspect_ids:
@@ -3147,8 +3178,17 @@ def export_to_excel(df: pd.DataFrame, prefix: str, job_id: str) -> str:
 # =============================================================================
 class Job:
     def __init__(self) -> None:
-        self.phase = "Warten …"
-        self.percent = 0
+        now_ms = int(time.time() * 1000)
+
+        # intern (mit "touch" auf Setter)
+        self._phase = "Warten …"
+        self._percent = 0
+        self._detail = ""
+
+        # Heartbeat / UI
+        self.last_update_ms: int = now_ms
+        self.heartbeat: int = 0
+
         self.done = False
         self.error: Optional[str] = None
         self.path: Optional[str] = None
@@ -3159,6 +3199,41 @@ class Job:
 
         self.filename_base: str = "BatchFlow_Export"
         self.excel_bytes: Optional[bytes] = None
+
+    def _touch(self):
+        self.last_update_ms = int(time.time() * 1000)
+        self.heartbeat += 1
+
+    @property
+    def phase(self) -> str:
+        return self._phase
+
+    @phase.setter
+    def phase(self, v: str):
+        self._phase = str(v) if v is not None else ""
+        self._touch()
+
+    @property
+    def percent(self) -> int:
+        return int(self._percent or 0)
+
+    @percent.setter
+    def percent(self, v):
+        try:
+            self._percent = int(v or 0)
+        except Exception:
+            self._percent = 0
+        self._touch()
+
+    @property
+    def detail(self) -> str:
+        return self._detail
+
+    @detail.setter
+    def detail(self, v: str):
+        self._detail = str(v) if v is not None else ""
+        self._touch()
+
 
 JOBS: Dict[str, Job] = {}
 
@@ -3188,7 +3263,8 @@ async def reconcile_with_progress(job: "Job", prefix: str, start_percent: int = 
         job.percent = max(job.percent, p(0.35))
         await asyncio.sleep(0)  # Yield
 
-        await _reconcile(prefix)
+        job.detail = f"Regeln anwenden ({prefix}) …"
+        await _reconcile(prefix, job_obj=job)
 
         # --- UI-Infos (Entfernte Datensätze / Export-Menge) ---
         # WICHTIG: "excluded" = Anzahl ENTFERNTER DATENSÄTZE (nicht Summary-Zeilen)
@@ -3401,33 +3477,106 @@ async def export_start_nk(
     async def update_progress(phase: str, percent: int):
         job.phase = phase
         job.percent = min(100, max(0, percent))
-        await asyncio.sleep(2)
+        await asyncio.sleep(0)
 
     async def _run():
         try:
-            # 1️⃣ Daten laden
-            await update_progress("Lade Neukontakte aus Pipedrive …", 5)
-            df = await _build_nk_master_final(fachbereich, take_count, batch_id, campaign, per_org_limit, job_obj=job)
+            # 1️⃣ Personen aus Filter laden
+            job.phase = f"Lade Neukontakte-Kandidaten (Filter {FILTER_NEUKONTAKTE})"
+            job.percent = 5
+            job.detail = "Starte Abruf …"
 
-            # 2️⃣ Abgleich durchführen
-            await update_progress("Führe Abgleich (Orga & IDs) durch …", 55)
-            await reconcile_with_progress(job, "nk", start_percent=55, end_percent=75)
+            persons_all = await fetch_persons_by_filter_id_v2(
+                filter_id=FILTER_NEUKONTAKTE,
+                limit=PAGE_LIMIT,
+                job_obj=job,
+                max_pages=120,
+                max_empty_growth=2,
+            )
 
-            # 3️⃣ Excel-Datei generieren
-            await update_progress("Erzeuge Excel-Datei …", 80)
-            ready = await load_df_text("nk_master_ready")
-            export_df = build_nf_export(ready)
-            data = _df_to_excel_bytes(export_df)
+            field_key = PD_PERSON_FIELDS.get("Fachbereich - Kampagne")
+            target_fach = sanitize(fachbereich)
 
-            # 4️⃣ Datei speichern
-            path = f"/tmp/{job.filename_base}.xlsx"
-            with open(path, "wb") as f:
-                f.write(data)
-            job.path = path
+            job.phase = "Filtere nach Fachbereich / Regeln …"
+            job.percent = 35
+            job.detail = f"Fachbereich: {target_fach or '–'}"
+
+            selected: List[dict] = []
+            org_counts: Dict[str, int] = {}
+
+            for p in persons_all:
+                if not isinstance(p, dict) or not field_key:
+                    continue
+
+                fach_val = sanitize(cf_value_v2(p, field_key))
+                if not fach_val or fach_val != target_fach:
+                    continue
+
+                org_id = extract_org_id_from_person(p)
+                if not org_id:
+                    continue
+
+                # Datum nächste Aktivität blockieren
+                next_date = sanitize(p.get("next_activity_date"))
+                if next_date and is_forbidden_activity_date(next_date):
+                    continue
+
+                # Max Kontakte pro Organisation
+                cur = org_counts.get(org_id, 0)
+                if cur >= int(per_org_limit or PER_ORG_DEFAULT_LIMIT or 2):
+                    continue
+                org_counts[org_id] = cur + 1
+
+                selected.append(p)
+
+                if take_count is not None and take_count > 0 and len(selected) >= take_count:
+                    break
+
+            job.stats["selected"] = int(len(selected))
+
+            # 2️⃣ Master erstellen
+            job.phase = f"Baue Master (Auswahl={len(selected)})"
+            job.percent = 55
+            job.detail = "Erzeuge nk_master_final …"
+
+            batch = sanitize(batch_id or "")
+            camp = sanitize(campaign or "")
+
+            master_final = await _build_refresh_master_final(
+                selected,
+                campaign=camp,
+                batch_id=batch,
+                job_obj=job,
+            )
+
+            # 3️⃣ Master speichern
+            job.phase = "Speichere Master (DB)"
+            job.percent = 65
+            t = tables("nk")
+            await save_df_text(master_final, t["final"])
+
+            # 4️⃣ Abgleich wie Refresh/Nachfass
+            job.phase = "Abgleich (nk -> ready/log)"
+            job.percent = 75
+            job.detail = "Regeln anwenden …"
+            await reconcile_with_progress(job, "nk", start_percent=60, end_percent=78)
+
+            # 5️⃣ Excel-Export (ohne Hyperlinks)
+            job.phase = "Erzeuge Excel-Datei …"
+            job.percent = 90
+            job.detail = "Bereite Export-Datei vor …"
+
+            ready_df = await load_df_text(t["ready"])
+            export_df = build_nf_export(ready_df)
+
+            out_path = export_to_excel(export_df, prefix="neukontakte_export", job_id=job_id)
+            job.path = out_path
             job.total_rows = len(export_df)
+
             job.phase = f"Fertig – {job.total_rows} Zeilen"
             job.percent = 100
             job.done = True
+
         except Exception as e:
             job.error = f"Fehler: {e}"
             job.phase = "Fehler"
@@ -3606,6 +3755,9 @@ async def neukontakte_export_progress(job_id: str = Query(...)):
         "done": bool(job.done),
         "error": str(job.error) if job.error else None,
         "stats": dict(getattr(job, "stats", {}) or {}),
+        "detail": str(getattr(job, "detail", "") or ""),
+        "last_update_ms": int(getattr(job, "last_update_ms", 0) or 0),
+        "heartbeat": int(getattr(job, "heartbeat", 0) or 0),
 
         # optional – falls später genutzt
         "note_org_limit": getattr(job, "note_org_limit", 0),
@@ -4032,6 +4184,14 @@ tbody tr:hover{ background:#f1f5f9; }
   width:0%;
   background:linear-gradient(90deg,#0ea5e9,#38bdf8);
 }
+
+/* ---------- Live/Heartbeat ---------- */
+.pulse-dot{width:8px;height:8px;border-radius:50%;background:var(--primary);display:inline-block;animation:pulse 1.2s infinite;}
+@keyframes pulse{0%{transform:scale(.8);opacity:.5}50%{transform:scale(1);opacity:1}100%{transform:scale(.8);opacity:.5}}
+.bar-indet{position:relative;overflow:hidden;}
+.bar-indet::before{content:"";position:absolute;inset:0;background:linear-gradient(90deg,rgba(255,255,255,0) 0%,rgba(255,255,255,.55) 50%,rgba(255,255,255,0) 100%);transform:translateX(-100%);animation:indet 1.1s infinite;}
+@keyframes indet{0%{transform:translateX(-100%)}100%{transform:translateX(100%)}}
+
 </style>
 </head>
 
@@ -4380,6 +4540,14 @@ th{font-size:12px;font-weight:700;color:var(--muted);white-space:nowrap;}
 #status-info{margin-top:8px;color:#334155;font-size:13px;}
 .status-pill{display:inline-flex;gap:6px;align-items:center;margin-right:12px;}
 .status-pill b{font-weight:800;}
+
+/* ---------- Live/Heartbeat ---------- */
+.pulse-dot{width:8px;height:8px;border-radius:50%;background:var(--primary);display:inline-block;animation:pulse 1.2s infinite;}
+@keyframes pulse{0%{transform:scale(.8);opacity:.5}50%{transform:scale(1);opacity:1}100%{transform:scale(.8);opacity:.5}}
+.bar-indet{position:relative;overflow:hidden;}
+.bar-indet::before{content:"";position:absolute;inset:0;background:linear-gradient(90deg,rgba(255,255,255,0) 0%,rgba(255,255,255,.55) 50%,rgba(255,255,255,0) 100%);transform:translateX(-100%);animation:indet 1.1s infinite;}
+@keyframes indet{0%{transform:translateX(-100%)}100%{transform:translateX(100%)}}
+
 </style>
 
 </head>
@@ -4452,6 +4620,8 @@ th{font-size:12px;font-weight:700;color:var(--muted);white-space:nowrap;}
 <div id="overlay">
   <div class="box">
     <div id="overlay-phase"></div>
+    <div id="overlay-detail" class="muted" style="margin:-2px 0 10px 0;font-size:13px;"></div>
+    <div id="overlay-detail" class="muted" style="margin:-2px 0 10px 0;font-size:13px;"></div>
     <div id="overlay-bar-wrap"><div id="overlay-bar"></div></div>
   </div>
 </div>
@@ -4465,6 +4635,8 @@ th{font-size:12px;font-weight:700;color:var(--muted);white-space:nowrap;}
     </div>
     <div id="status-bar-wrap"><div id="status-bar"></div></div>
     <div id="status-info"></div>
+    <div id="status-meta" class="muted" style="margin-top:6px;display:flex;gap:10px;align-items:center;"></div>
+    <div id="status-meta" class="muted" style="margin-top:6px;display:flex;gap:10px;align-items:center;"></div>
   </div>
 </div>
 
@@ -4475,6 +4647,8 @@ const clampPct = (p)=>Math.min(100, Math.max(0, parseInt(p||0,10)));
 
 function showOverlay(msg){
   el("overlay-phase").textContent = msg || "Bitte warten …";
+  if(el("overlay-detail")) el("overlay-detail").textContent = "";
+  if(el("overlay-detail")) el("overlay-detail").textContent = "";
   el("overlay").style.display = "flex";
 }
 function hideOverlay(){ el("overlay").style.display = "none"; }
@@ -4506,7 +4680,107 @@ function showStatus(phase, percent, stats){
   el("status-bar").style.width = clampPct(percent||0) + "%";
   el("status-info").innerHTML = statsHtml(stats);
 }
+
+let _hbTimer = null;
+
+function formatTime(ms){
+  if(!ms) return "–";
+  try{
+    const d = new Date(ms);
+    return d.toLocaleTimeString([], {hour:"2-digit", minute:"2-digit", second:"2-digit"});
+  }catch(e){ return "–"; }
+}
+
+function setIndeterminate(on){
+  const sb = el("status-bar");
+  const ob = el("overlay-bar");
+  if(sb){
+    if(on){ sb.classList.add("bar-indet"); sb.style.width = "100%"; }
+    else{ sb.classList.remove("bar-indet"); }
+  }
+  if(ob){
+    if(on){ ob.classList.add("bar-indet"); ob.style.width = "100%"; }
+    else{ ob.classList.remove("bar-indet"); }
+  }
+}
+
+function updateHeartbeat(s){
+  const meta = el("status-meta");
+  if(!meta) return;
+  const lu = parseInt((s||{}).last_update_ms||0, 10) || 0;
+  const now = Date.now();
+  const age = lu ? (now - lu) : null;
+
+  let showPulse = false;
+  let indet = false;
+  let msg = `Letztes Update: ${formatTime(lu)}`;
+
+  if(s && !s.done && age !== null){
+    if(age > 25000){
+      showPulse = true; indet = true;
+      msg = `Letztes Update: ${formatTime(lu)} · Dauert länger als üblich – läuft weiter …`;
+    }else if(age > 4500){
+      showPulse = true; indet = true;
+      msg = `Letztes Update: ${formatTime(lu)} · Noch aktiv …`;
+    }
+  }
+
+  meta.innerHTML = `${showPulse ? '<span class="pulse-dot"></span>' : ''}<span>${msg}</span>`;
+  setIndeterminate(indet);
+}
+
+
+let _hbTimer = null;
+
+function formatTime(ms){
+  if(!ms) return "–";
+  try{
+    const d = new Date(ms);
+    return d.toLocaleTimeString([], {hour:"2-digit", minute:"2-digit", second:"2-digit"});
+  }catch(e){ return "–"; }
+}
+
+function setIndeterminate(on){
+  const sb = el("status-bar");
+  const ob = el("overlay-bar");
+  if(sb){
+    if(on){ sb.classList.add("bar-indet"); sb.style.width = "100%"; }
+    else{ sb.classList.remove("bar-indet"); }
+  }
+  if(ob){
+    if(on){ ob.classList.add("bar-indet"); ob.style.width = "100%"; }
+    else{ ob.classList.remove("bar-indet"); }
+  }
+}
+
+function updateHeartbeat(s){
+  const meta = el("status-meta");
+  if(!meta) return;
+  const lu = parseInt((s||{}).last_update_ms||0, 10) || 0;
+  const now = Date.now();
+  const age = lu ? (now - lu) : null;
+
+  let showPulse = false;
+  let indet = false;
+  let msg = `Letztes Update: ${formatTime(lu)}`;
+
+  if(s && !s.done && age !== null){
+    if(age > 25000){
+      showPulse = true; indet = true;
+      msg = `Letztes Update: ${formatTime(lu)} · Dauert länger als üblich – läuft weiter …`;
+    }else if(age > 4500){
+      showPulse = true; indet = true;
+      msg = `Letztes Update: ${formatTime(lu)} · Noch aktiv …`;
+    }
+  }
+
+  meta.innerHTML = `${showPulse ? '<span class="pulse-dot"></span>' : ''}<span>${msg}</span>`;
+  setIndeterminate(indet);
+}
+
 showStatus("Bereit", 0, {});
+updateHeartbeat({last_update_ms: Date.now(), done: true});
+updateHeartbeat({last_update_ms: Date.now(), done: true});
 </script>
 
 
@@ -4583,6 +4857,7 @@ async function startExport(){
     const s = await (await fetch("/nachfass/export_progress?job_id="+job_id)).json();
 
     if(s.error){
+      setIndeterminate(false);
       hideOverlay();
       showStatus("Fehler", 100, s.stats||{});
       alert(s.error);
@@ -4590,11 +4865,17 @@ async function startExport(){
     }
 
     // UI update
-    el("overlay-phase").textContent = `${s.phase} (${s.percent}%)`;
+    el("overlay-phase").textContent = `${s.phase}${s.detail ? " · " + s.detail : ""} (${s.percent}%)`;
+    if(el("overlay-detail")) el("overlay-detail").textContent = s.detail || "";
+    updateHeartbeat(s);
     setOverlayProgress(s.percent);
     showStatus(s.phase, s.percent, s.stats||{});
 
     if(s.download_ready){
+      setIndeterminate(false);
+      updateHeartbeat(s);
+      setIndeterminate(false);
+      updateHeartbeat(s);
       window.open("/nachfass/export_download?job_id="+job_id, "_blank");
       hideOverlay();
       await loadExcluded();
@@ -4747,6 +5028,14 @@ th{font-size:12px;font-weight:700;color:var(--muted);white-space:nowrap;}
 #status-info{margin-top:8px;color:#334155;font-size:13px;}
 .status-pill{display:inline-flex;gap:6px;align-items:center;margin-right:12px;}
 .status-pill b{font-weight:800;}
+
+/* ---------- Live/Heartbeat ---------- */
+.pulse-dot{width:8px;height:8px;border-radius:50%;background:var(--primary);display:inline-block;animation:pulse 1.2s infinite;}
+@keyframes pulse{0%{transform:scale(.8);opacity:.5}50%{transform:scale(1);opacity:1}100%{transform:scale(.8);opacity:.5}}
+.bar-indet{position:relative;overflow:hidden;}
+.bar-indet::before{content:"";position:absolute;inset:0;background:linear-gradient(90deg,rgba(255,255,255,0) 0%,rgba(255,255,255,.55) 50%,rgba(255,255,255,0) 100%);transform:translateX(-100%);animation:indet 1.1s infinite;}
+@keyframes indet{0%{transform:translateX(-100%)}100%{transform:translateX(100%)}}
+
 </style>
 
 </head>
@@ -4836,6 +5125,7 @@ th{font-size:12px;font-weight:700;color:var(--muted);white-space:nowrap;}
 <div id="overlay">
   <div class="box">
     <div id="overlay-phase"></div>
+    <div id="overlay-detail" class="muted" style="margin:-2px 0 10px 0;font-size:13px;"></div>
     <div id="overlay-bar-wrap"><div id="overlay-bar"></div></div>
   </div>
 </div>
@@ -4849,6 +5139,7 @@ th{font-size:12px;font-weight:700;color:var(--muted);white-space:nowrap;}
     </div>
     <div id="status-bar-wrap"><div id="status-bar"></div></div>
     <div id="status-info"></div>
+    <div id="status-meta" class="muted" style="margin-top:6px;display:flex;gap:10px;align-items:center;"></div>
   </div>
 </div>
 
@@ -4859,6 +5150,7 @@ const clampPct = (p)=>Math.min(100, Math.max(0, parseInt(p||0,10)));
 
 function showOverlay(msg){
   el("overlay-phase").textContent = msg || "Bitte warten …";
+  if(el("overlay-detail")) el("overlay-detail").textContent = "";
   el("overlay").style.display = "flex";
 }
 function hideOverlay(){ el("overlay").style.display = "none"; }
@@ -4890,7 +5182,57 @@ function showStatus(phase, percent, stats){
   el("status-bar").style.width = clampPct(percent||0) + "%";
   el("status-info").innerHTML = statsHtml(stats);
 }
+
+let _hbTimer = null;
+
+function formatTime(ms){
+  if(!ms) return "–";
+  try{
+    const d = new Date(ms);
+    return d.toLocaleTimeString([], {hour:"2-digit", minute:"2-digit", second:"2-digit"});
+  }catch(e){ return "–"; }
+}
+
+function setIndeterminate(on){
+  const sb = el("status-bar");
+  const ob = el("overlay-bar");
+  if(sb){
+    if(on){ sb.classList.add("bar-indet"); sb.style.width = "100%"; }
+    else{ sb.classList.remove("bar-indet"); }
+  }
+  if(ob){
+    if(on){ ob.classList.add("bar-indet"); ob.style.width = "100%"; }
+    else{ ob.classList.remove("bar-indet"); }
+  }
+}
+
+function updateHeartbeat(s){
+  const meta = el("status-meta");
+  if(!meta) return;
+  const lu = parseInt((s||{}).last_update_ms||0, 10) || 0;
+  const now = Date.now();
+  const age = lu ? (now - lu) : null;
+
+  let showPulse = false;
+  let indet = false;
+  let msg = `Letztes Update: ${formatTime(lu)}`;
+
+  if(s && !s.done && age !== null){
+    if(age > 25000){
+      showPulse = true; indet = true;
+      msg = `Letztes Update: ${formatTime(lu)} · Dauert länger als üblich – läuft weiter …`;
+    }else if(age > 4500){
+      showPulse = true; indet = true;
+      msg = `Letztes Update: ${formatTime(lu)} · Noch aktiv …`;
+    }
+  }
+
+  meta.innerHTML = `${showPulse ? '<span class="pulse-dot"></span>' : ''}<span>${msg}</span>`;
+  setIndeterminate(indet);
+}
+
 showStatus("Bereit", 0, {});
+updateHeartbeat({last_update_ms: Date.now(), done: true});
 </script>
 
 
@@ -4942,7 +5284,7 @@ async function loadOptions(){
 
 async function loadExcluded(){
   try{
-    const res = await fetch("/refresh/excluded/json");
+    const res = await fetch("/nachfass/excluded/json");
     const data = await res.json();
 
     const sum = (data.summary||[])
@@ -4997,17 +5339,22 @@ async function startExport(){
     const s = await (await fetch("/refresh/export_progress?job_id="+job_id)).json();
 
     if(s.error){
+      setIndeterminate(false);
       hideOverlay();
       showStatus("Fehler", 100, s.stats||{});
       alert(s.error);
       return;
     }
 
-    el("overlay-phase").textContent = `${s.phase} (${s.percent}%)`;
+    el("overlay-phase").textContent = `${s.phase}${s.detail ? " · " + s.detail : ""} (${s.percent}%)`;
+    if(el("overlay-detail")) el("overlay-detail").textContent = s.detail || "";
+    updateHeartbeat(s);
     setOverlayProgress(s.percent);
     showStatus(s.phase, s.percent, s.stats||{});
 
     if(s.download_ready){
+      setIndeterminate(false);
+      updateHeartbeat(s);
       window.open("/refresh/export_download?job_id="+job_id, "_blank");
       hideOverlay();
       await loadExcluded();
@@ -5079,38 +5426,48 @@ async def refresh_summary(job_id: str = Query(...)):
 # =============================================================================
 # Refresh – Excluded JSON / HTML
 # =============================================================================
-@app.get("/refresh/excluded/json")
-async def refresh_excluded_json():
+
+async def build_excluded_payload(prefix: str) -> dict:
+    """Einheitliches Payload für 'Entfernte Datensätze' (Summary + Zeilen).
+
+    Summary wird primär aus *_delete_log berechnet (tatsächlich entfernte Datensätze),
+    fallback auf *_excluded (falls delete_log leer ist).
+    """
     def flatten(v):
-        if v is None or (isinstance(v,float) and pd.isna(v)): return ""
-        if isinstance(v,list): return flatten(v[0] if v else "")
-        if isinstance(v,dict):
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return ""
+        if isinstance(v, list):
+            return flatten(v[0] if v else "")
+        if isinstance(v, dict):
             return flatten(v.get("value") or v.get("label") or v.get("name") or v.get("id") or "")
         return str(v)
 
-    excluded_df = await load_df_text("rf_excluded")
-    deleted_df  = await load_df_text("rf_delete_log")
+    excluded_df = await load_df_text(f"{prefix}_excluded")
+    deleted_df  = await load_df_text(f"{prefix}_delete_log")
 
-    excluded_summary=[]
-    # Summary wird aus dem Delete-Log berechnet (das sind die tatsächlich entfernten Datensätze)
+    # Summary
+    summary = []
     if not deleted_df.empty:
-        base_col = "Grund" if "Grund" in deleted_df.columns else ("extra" if "extra" in deleted_df.columns else ("reason" if "reason" in deleted_df.columns else None))
+        base_col = None
+        for c in ("Grund", "reason", "extra"):
+            if c in deleted_df.columns:
+                base_col = c
+                break
         if base_col:
             s = deleted_df[base_col].fillna("").astype(str).map(lambda x: x.strip())
             s = s[(s != "") & (s.str.lower() != "nan")]
             for grund, cnt in s.value_counts().items():
-                excluded_summary.append({"Grund": flatten(grund), "Anzahl": int(cnt)})
+                summary.append({"Grund": flatten(grund), "Anzahl": int(cnt)})
 
-    # Fallback: gespeicherte Summary-Tabelle (falls Delete-Log leer)
-    if (not excluded_summary) and (not excluded_df.empty):
-        for _,r in excluded_df.iterrows():
-            excluded_summary.append({"Grund":flatten(r.get("Grund")),"Anzahl":int(r.get("Anzahl") or 0)})
+    if (not summary) and (not excluded_df.empty):
+        for _, r in excluded_df.iterrows():
+            summary.append({"Grund": flatten(r.get("Grund")), "Anzahl": int(r.get("Anzahl") or 0)})
 
-
-    rows=[]
+    # Rows
+    rows = []
     if not deleted_df.empty:
-        deleted_df=deleted_df.replace({None:"",np.nan:""})
-        for _,r in deleted_df.iterrows():
+        deleted_df = deleted_df.replace({None: "", np.nan: ""})
+        for _, r in deleted_df.iterrows():
             rows.append({
                 "Kontakt ID": flatten(r.get("Kontakt ID") or r.get("id")),
                 "Name": flatten(r.get("Name") or r.get("name")),
@@ -5119,7 +5476,12 @@ async def refresh_excluded_json():
                 "Grund": flatten(r.get("Grund") or r.get("reason") or r.get("extra")),
             })
 
-    return JSONResponse({"summary":excluded_summary,"total":len(rows),"rows":rows})
+    return {"summary": summary, "total": len(rows), "rows": rows}
+
+
+@app.get("/refresh/excluded/json")
+async def refresh_excluded_json():
+    return JSONResponse(await build_excluded_payload("rf"))
 
 
 @app.get("/refresh/excluded", response_class=HTMLResponse)
@@ -5250,56 +5612,11 @@ async def nachfass_summary(job_id: str = Query(...)):
 # =============================================================================
 @app.get("/nachfass/excluded/json")
 async def nachfass_excluded_json():
+    return JSONResponse(await build_excluded_payload("nf"))
 
-    def flat(v):
-        if v is None: return ""
-        if isinstance(v, float) and pd.isna(v): return ""
-        return str(v)
-
-    # Tabellen laden
-    excluded_df = await load_df_text("nf_excluded")     # 2-Kontakte-Regel (Nachfass jetzt aktiviert)
-    delete_df   = await load_df_text("nf_delete_log")   # Fuzzy / ID / Activity / OrgaArt
-
-    summary = []
-    rows = []
-
-    # -----------------------------------------------------
-    # 1) Ausschlüsse wegen "nur 2 Kontakte pro Organisation"
-    # -----------------------------------------------------
-    if not excluded_df.empty:
-        for _, r in excluded_df.iterrows():
-            summary.append({
-                "Grund": flat(r.get("Grund")),
-                "Anzahl": int(r.get("Anzahl") or 0)
-            })
-
-    # -----------------------------------------------------
-    # 2) Ausschlüsse aus Abgleich (delete_log)
-    # -----------------------------------------------------
-    if not delete_df.empty:
-
-        for _, r in delete_df.iterrows():
-            rows.append({
-                "Kontakt ID":        flat(r.get("id") or r.get("Kontakt ID")),
-                "Name":              flat(r.get("name") or r.get("Name")),
-                "Organisation ID":   flat(r.get("org_id") or r.get("Organisation ID")),
-                "Organisationsname": flat(r.get("org_name") or r.get("Organisationsname")),
-                "Grund":             flat(r.get("Grund") or r.get("extra") or r.get("reason")),
-            })
-
-        # Summary aus dem Text-Feld "Grund" ableiten (konsistent zur Tabelle)
-        base_col = "Grund" if "Grund" in delete_df.columns else ("extra" if "extra" in delete_df.columns else ("reason" if "reason" in delete_df.columns else None))
-        if base_col:
-            s = delete_df[base_col].fillna("").astype(str).str.strip()
-            s = s[(s != "") & (s.str.lower() != "nan")]
-            for grund, cnt in s.value_counts().items():
-                summary.append({"Grund": grund, "Anzahl": int(cnt)})
-
-    return JSONResponse({
-        "summary": summary,
-        "total": len(rows),
-        "rows": rows
-    })
+@app.get("/neukontakte/excluded/json")
+async def neukontakte_excluded_json():
+    return JSONResponse(await build_excluded_payload("nk"))
 
 # =============================================================================
 # HTML-Seite (Excluded Viewer)
@@ -5762,6 +6079,9 @@ async def nachfass_export_progress(job_id: str):
         "done": bool(job.done),
         "error": str(job.error) if job.error else None,
         "stats": dict(getattr(job, "stats", {}) or {}),
+        "detail": str(getattr(job, "detail", "") or ""),
+        "last_update_ms": int(getattr(job, "last_update_ms", 0) or 0),
+        "heartbeat": int(getattr(job, "heartbeat", 0) or 0),
         "has_file": has_file,
         "download_ready": bool(job.done) and (job.error is None) and has_file
     })
@@ -5811,6 +6131,9 @@ async def refresh_export_progress(job_id: str = Query(...)):
         "done": bool(job.done),
         "error": str(job.error) if job.error else None,
         "stats": dict(getattr(job, "stats", {}) or {}),
+        "detail": str(getattr(job, "detail", "") or ""),
+        "last_update_ms": int(getattr(job, "last_update_ms", 0) or 0),
+        "heartbeat": int(getattr(job, "heartbeat", 0) or 0),
         "has_file": has_file,
         "download_ready": bool(job.done) and (job.error is None) and has_file
     })
