@@ -1,5 +1,3 @@
-
-
 import logging
 
 
@@ -599,8 +597,15 @@ async def save_df_text(df: pd.DataFrame, table: str):
     # EMPTY
     # ------------------------------
     if df.empty:
+        
+        # Leere DF sollen trotzdem vorhandene Daten entfernen.
+        # Wenn Spalten bekannt sind, Tabelle leer neu anlegen, sonst nur löschen.
+        async with get_pool().acquire() as conn:
+            await clear_table(conn, table)
+            cols = list(df.columns)
+            if cols:
+                await ensure_table_text(conn, table, cols)
         return
-
     async with get_pool().acquire() as conn:
         await clear_table(conn, table)
         await ensure_table_text(conn, table, list(df.columns))
@@ -683,7 +688,11 @@ async def load_df_text(table: str) -> pd.DataFrame:
         return str(v)
 
     async with get_pool().acquire() as conn:
-        rows = await conn.fetch(f'SELECT * FROM "{SCHEMA}"."{table}"')
+        try:
+            rows = await conn.fetch(f'SELECT * FROM "{SCHEMA}"."{table}"')
+        except Exception:
+            # Tabelle existiert evtl. noch nicht (z.B. nach Reset) → leeres DF
+            return pd.DataFrame()
         if not rows:
             return pd.DataFrame()
 
@@ -2639,6 +2648,22 @@ def fast_fuzzy(a: str, b: str) -> int:
 # =============================================================================
 # _reconcile_nf
 # =============================================================================
+# -----------------------------------------------------------------------------
+# Standard-Spalten für Delete-Logs (damit Tabellen auch leer korrekt zurückgesetzt werden)
+# -----------------------------------------------------------------------------
+DELETE_LOG_COLUMNS = [
+    "reason",
+    "Kontakt ID",
+    "Name",
+    "Organisation ID",
+    "Organisationsname",
+    "Grund",
+    "extra",
+    "id",
+    "name",
+    "org_name",
+]
+
 async def _reconcile(prefix: str) -> None:
     """
     Abgleich:
@@ -2665,7 +2690,7 @@ async def _reconcile(prefix: str) -> None:
 
     if df.empty:
         await save_df_text(pd.DataFrame(), t["ready"])
-        await save_df_text(pd.DataFrame(), t["log"])
+        await save_df_text(pd.DataFrame(columns=DELETE_LOG_COLUMNS), t["log"])
         # Bulletpoints IMMER schreiben (auch 0)
         await save_df_text(pd.DataFrame([
             {"Grund": "Max 2 Kontakte pro Organisation", "Anzahl": 0},
@@ -2799,7 +2824,7 @@ async def _reconcile(prefix: str) -> None:
 
     # READY + LOG speichern
     ready_df = df.drop(columns=[c for c in ["_orgid_sort", "_pid_sort"] if c in df.columns], errors="ignore")
-    log_df = pd.DataFrame(delete_rows) if delete_rows else pd.DataFrame()
+    log_df = pd.DataFrame(delete_rows, columns=DELETE_LOG_COLUMNS)
 
     await save_df_text(ready_df, t["ready"])
     await save_df_text(log_df, t["log"])
@@ -2955,7 +2980,11 @@ async def run_nachfass_job(
         job_obj.phase = "Baue Master (nf_master_final)"
         job_obj.percent = 55
 
-        batch_label_for_export = ",".join(sorted(user_batch_set))
+        export_batch_id = sanitize(getattr(job_obj, "batch_id", "") or "")
+        if not export_batch_id:
+            # Fallback (sollte selten passieren): nutze Eingabe-Batch-IDs
+            export_batch_id = ",".join(sorted(user_batch_set))
+        batch_label_for_export = export_batch_id
 
         master_final = await _build_nf_master_final(
             selected,
@@ -3362,9 +3391,9 @@ async def export_start_nk(
     job = Job()
     JOBS[job_id] = job
     # Reset entfernte Datensätze / Löschlog für neuen Lauf
-    t = tables("rf")
-    await save_df_text(pd.DataFrame(), t["log"])
-    await save_df_text(pd.DataFrame(), t["excluded"])
+    t = tables("nk")
+    await save_df_text(pd.DataFrame(columns=DELETE_LOG_COLUMNS), t["log"])
+    await save_df_text(pd.DataFrame(columns=["Grund","Anzahl"]), t["excluded"])
     job.phase = "Initialisiere …"
     job.percent = 1
     job.filename_base = slugify_filename(campaign or "BatchFlow_Export")
@@ -3435,6 +3464,10 @@ async def refresh_export_start(
     job_id = str(uuid.uuid4())
     job = Job()
     JOBS[job_id] = job
+    # Reset entfernte Datensätze / Löschlog für neuen Lauf
+    t = tables("rf")
+    await save_df_text(pd.DataFrame(columns=DELETE_LOG_COLUMNS), t["log"])
+    await save_df_text(pd.DataFrame(columns=["Grund","Anzahl"]), t["excluded"])
     job.phase = "Initialisiere Refresh …"
     job.percent = 1
     job.filename_base = slugify_filename(campaign or "Refresh_Export")
@@ -5689,8 +5722,8 @@ async def nachfass_export_start(req: Request):
     JOBS[job_id] = job
     # Reset entfernte Datensätze / Löschlog für neuen Lauf
     t = tables("nf")
-    await save_df_text(pd.DataFrame(), t["log"])
-    await save_df_text(pd.DataFrame(), t["excluded"])
+    await save_df_text(pd.DataFrame(columns=DELETE_LOG_COLUMNS), t["log"])
+    await save_df_text(pd.DataFrame(columns=["Grund","Anzahl"]), t["excluded"])
 
     # Job-Inputs speichern (optional, aber ok)
     job.nf_batch_ids = nf_batch_ids
