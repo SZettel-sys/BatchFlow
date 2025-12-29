@@ -14,7 +14,7 @@ from collections import defaultdict
 
 fuzz.default_processor = lambda s: s  # kein Vor-Preprocessing
 
-# -----------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
 # 
 # -----------------------------------------------------------------------------
 # PIPEDRIVE API - V2 
@@ -3610,9 +3610,9 @@ async def refresh_export_start(
     t = tables("rf")
     await save_df_text(pd.DataFrame(columns=DELETE_LOG_COLUMNS), t["log"])
     await save_df_text(pd.DataFrame(columns=["Grund","Anzahl"]), t["excluded"])
-    job.phase = "Initialisiere Refresh …"
+    job.phase = "Initialisiere Neukontakte …"
     job.percent = 1
-    job.filename_base = slugify_filename(campaign or "Refresh_Export")
+    job.filename_base = (campaign or "Neukontakte_Export")
 
     async def _run():
         try:
@@ -3778,9 +3778,9 @@ async def neukontakte_export_download(job_id: str = Query(...)):
         raise HTTPException(status_code=404, detail="Exportdatei nicht gefunden")
 
     return FileResponse(
-        path=job.path,
-        filename=os.path.basename(job.path),
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        job.path,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename=f"{slugify_filename(job.filename_base or 'Neukontakte_Export')}.xlsx"
     )
 
 # =============================================================================
@@ -4405,6 +4405,13 @@ async function loadExcluded(){
     const data = await r.json();
     const rows = data.rows || [];
     const summary = data.summary || [];
+    const pick = (obj, keys) => {
+      for(const k of keys){
+        const v = obj && obj[k];
+        if(v !== undefined && v !== null && String(v).trim() !== "") return v;
+      }
+      return "";
+    };
     const body = el("excluded-table-body");
     if(body){
       if(rows.length===0){
@@ -4412,11 +4419,11 @@ async function loadExcluded(){
       }else{
         body.innerHTML = rows.map(x=>`
           <tr>
-            <td>${x.person_id||""}</td>
-            <td>${x.name||""}</td>
-            <td>${x.org_id||""}</td>
-            <td>${x.org_name||""}</td>
-            <td>${x.reason||x.grund||""}</td>
+            <td>${pick(x, ["person_id","Kontakt ID","contact_id","id"])}</td>
+            <td>${pick(x, ["name","Name"])}</td>
+            <td>${pick(x, ["org_id","Organisation ID","organization_id"])}</td>
+            <td>${pick(x, ["org_name","Organisationsname","organisation_name"])}</td>
+            <td>${pick(x, ["reason","Grund","grund","extra","label"])}</td>
           </tr>`).join("");
       }
     }
@@ -4425,7 +4432,12 @@ async function loadExcluded(){
       if(summary.length===0){
         sumEl.innerHTML = "";
       }else{
-        sumEl.innerHTML = summary.map(s=>`<li><b>${s.count}</b> – ${s.label}</li>`).join("");
+        sumEl.innerHTML = summary.map(s=>{
+          const cnt = pick(s, ["count","Anzahl","anzahl"]);
+          const lbl = pick(s, ["label","Grund","grund","reason"]);
+          if(String(lbl).trim()==="") return "";
+          return `<li><b>${cnt}</b> – ${lbl}</li>`;
+        }).join("");
       }
     }
   }catch(e){ /* ignore */ }
@@ -4905,6 +4917,13 @@ async function loadExcluded(){
     const data = await r.json();
     const rows = data.rows || [];
     const summary = data.summary || [];
+    const pick = (obj, keys) => {
+      for(const k of keys){
+        const v = obj && obj[k];
+        if(v !== undefined && v !== null && String(v).trim() !== "") return v;
+      }
+      return "";
+    };
     const body = el("excluded-table-body");
     if(body){
       if(rows.length===0){
@@ -4912,11 +4931,11 @@ async function loadExcluded(){
       }else{
         body.innerHTML = rows.map(x=>`
           <tr>
-            <td>${x.person_id||""}</td>
-            <td>${x.name||""}</td>
-            <td>${x.org_id||""}</td>
-            <td>${x.org_name||""}</td>
-            <td>${x.reason||x.grund||""}</td>
+            <td>${pick(x, ["person_id","Kontakt ID","contact_id","id"])}</td>
+            <td>${pick(x, ["name","Name"])}</td>
+            <td>${pick(x, ["org_id","Organisation ID","organization_id"])}</td>
+            <td>${pick(x, ["org_name","Organisationsname","organisation_name"])}</td>
+            <td>${pick(x, ["reason","Grund","grund","extra","label"])}</td>
           </tr>`).join("");
       }
     }
@@ -4925,7 +4944,12 @@ async function loadExcluded(){
       if(summary.length===0){
         sumEl.innerHTML = "";
       }else{
-        sumEl.innerHTML = summary.map(s=>`<li><b>${s.count}</b> – ${s.label}</li>`).join("");
+        sumEl.innerHTML = summary.map(s=>{
+          const cnt = pick(s, ["count","Anzahl","anzahl"]);
+          const lbl = pick(s, ["label","Grund","grund","reason"]);
+          if(String(lbl).trim()==="") return "";
+          return `<li><b>${cnt}</b> – ${lbl}</li>`;
+        }).join("");
       }
     }
   }catch(e){ /* ignore */ }
@@ -5489,6 +5513,13 @@ async function loadExcluded(){
     const data = await r.json();
     const rows = data.rows || [];
     const summary = data.summary || [];
+    const pick = (obj, keys) => {
+      for(const k of keys){
+        const v = obj && obj[k];
+        if(v !== undefined && v !== null && String(v).trim() !== "") return v;
+      }
+      return "";
+    };
     const body = el("excluded-table-body");
     if(body){
       if(rows.length===0){
@@ -5496,11 +5527,11 @@ async function loadExcluded(){
       }else{
         body.innerHTML = rows.map(x=>`
           <tr>
-            <td>${x.person_id||""}</td>
-            <td>${x.name||""}</td>
-            <td>${x.org_id||""}</td>
-            <td>${x.org_name||""}</td>
-            <td>${x.reason||x.grund||""}</td>
+            <td>${pick(x, ["person_id","Kontakt ID","contact_id","id"])}</td>
+            <td>${pick(x, ["name","Name"])}</td>
+            <td>${pick(x, ["org_id","Organisation ID","organization_id"])}</td>
+            <td>${pick(x, ["org_name","Organisationsname","organisation_name"])}</td>
+            <td>${pick(x, ["reason","Grund","grund","extra","label"])}</td>
           </tr>`).join("");
       }
     }
@@ -5509,7 +5540,12 @@ async function loadExcluded(){
       if(summary.length===0){
         sumEl.innerHTML = "";
       }else{
-        sumEl.innerHTML = summary.map(s=>`<li><b>${s.count}</b> – ${s.label}</li>`).join("");
+        sumEl.innerHTML = summary.map(s=>{
+          const cnt = pick(s, ["count","Anzahl","anzahl"]);
+          const lbl = pick(s, ["label","Grund","grund","reason"]);
+          if(String(lbl).trim()==="") return "";
+          return `<li><b>${cnt}</b> – ${lbl}</li>`;
+        }).join("");
       }
     }
   }catch(e){ /* ignore */ }
@@ -5894,11 +5930,14 @@ async def build_excluded_payload(prefix: str) -> dict:
             s = deleted_df[base_col].fillna("").astype(str).map(lambda x: x.strip())
             s = s[(s != "") & (s.str.lower() != "nan")]
             for grund, cnt in s.value_counts().items():
-                summary.append({"Grund": flatten(grund), "Anzahl": int(cnt)})
+                summary.append({"label": flatten(grund), "count": int(cnt), "Grund": flatten(grund), "Anzahl": int(cnt)})
 
     if (not summary) and (not excluded_df.empty):
         for _, r in excluded_df.iterrows():
-            summary.append({"Grund": flatten(r.get("Grund")), "Anzahl": int(r.get("Anzahl") or 0)})
+            cnt0 = int(r.get("Anzahl") or 0)
+            if cnt0 > 0:
+                g0 = flatten(r.get("Grund"))
+                summary.append({"label": g0, "count": cnt0, "Grund": g0, "Anzahl": cnt0})
 
     # Rows
     rows = []
