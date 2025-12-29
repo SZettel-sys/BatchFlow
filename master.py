@@ -1,4 +1,3 @@
-
 import logging
 
 
@@ -15,7 +14,7 @@ from collections import defaultdict
 
 fuzz.default_processor = lambda s: s  # kein Vor-Preprocessing
 
-# ------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # 
 # -----------------------------------------------------------------------------
 # PIPEDRIVE API - V2 
@@ -4322,8 +4321,9 @@ const clampPct = (p)=>Math.min(100, Math.max(0, parseInt(p||0,10)));
 
 function setIndeterminate(on){
   const track = el("status-bar-wrap");
-  if(!track) return;
-  track.classList.toggle("indet", !!on);
+  if(track) track.classList.toggle("bar-indet", !!on);
+  const ov = el("overlay-bar-wrap");
+  if(ov) ov.classList.toggle("bar-indet", !!on);
 }
 
 function formatTime(ms){
@@ -4459,7 +4459,7 @@ async function loadOptions(){
       (data.options||[]).forEach(o=>{
         const opt = document.createElement("option");
         opt.value = o.value;
-        opt.textContent = o.label;
+        opt.textContent = (o.count === undefined ? o.label : (o.label + " (" + o.count + ")"));
         sel.appendChild(opt);
       });
       sel.onchange = ()=>{
@@ -4525,7 +4525,7 @@ async function startExport(){
       if(s.error) throw new Error(s.error);
 
       const pct = clampPct(s.progress || 0);
-      showOverlay(s.phase || "Bitte warten …");
+      showOverlay((s.phase || "Bitte warten …") + " (" + pct + "%)");
       if(el("overlay-detail")) el("overlay-detail").textContent = s.detail || "";
       setOverlayProgress(pct);
       showStatus(s.phase || "läuft …", pct, s.stats||{});
@@ -4821,8 +4821,9 @@ const clampPct = (p)=>Math.min(100, Math.max(0, parseInt(p||0,10)));
 
 function setIndeterminate(on){
   const track = el("status-bar-wrap");
-  if(!track) return;
-  track.classList.toggle("indet", !!on);
+  if(track) track.classList.toggle("bar-indet", !!on);
+  const ov = el("overlay-bar-wrap");
+  if(ov) ov.classList.toggle("bar-indet", !!on);
 }
 
 function formatTime(ms){
@@ -4974,7 +4975,7 @@ async function startExport(){
       if(s.error) throw new Error(s.error);
 
       const pct = clampPct(s.progress || 0);
-      showOverlay(s.phase || "Bitte warten …");
+      showOverlay((s.phase || "Bitte warten …") + " (" + pct + "%)");
       if(el("overlay-detail")) el("overlay-detail").textContent = s.detail || "";
       setOverlayProgress(pct);
       showStatus(s.phase || "läuft …", pct, s.stats||{});
@@ -5404,8 +5405,9 @@ const clampPct = (p)=>Math.min(100, Math.max(0, parseInt(p||0,10)));
 
 function setIndeterminate(on){
   const track = el("status-bar-wrap");
-  if(!track) return;
-  track.classList.toggle("indet", !!on);
+  if(track) track.classList.toggle("bar-indet", !!on);
+  const ov = el("overlay-bar-wrap");
+  if(ov) ov.classList.toggle("bar-indet", !!on);
 }
 
 function formatTime(ms){
@@ -5541,7 +5543,7 @@ async function loadOptions(){
       (data.options||[]).forEach(o=>{
         const opt = document.createElement("option");
         opt.value = o.value;
-        opt.textContent = o.label;
+        opt.textContent = (o.count === undefined ? o.label : (o.label + " (" + o.count + ")"));
         sel.appendChild(opt);
       });
       sel.onchange = ()=>{
@@ -5607,7 +5609,7 @@ async function startExport(){
       if(s.error) throw new Error(s.error);
 
       const pct = clampPct(s.progress || 0);
-      showOverlay(s.phase || "Bitte warten …");
+      showOverlay((s.phase || "Bitte warten …") + " (" + pct + "%)");
       if(el("overlay-detail")) el("overlay-detail").textContent = s.detail || "";
       setOverlayProgress(pct);
       showStatus(s.phase || "läuft …", pct, s.stats||{});
