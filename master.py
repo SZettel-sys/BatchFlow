@@ -1,5 +1,4 @@
 
-
 import logging
 
 
@@ -4187,6 +4186,22 @@ tbody tr:hover{ background:#f1f5f9; }
 .bar-indet::before{content:"";position:absolute;inset:0;background:linear-gradient(90deg,rgba(255,255,255,0) 0%,rgba(255,255,255,.55) 50%,rgba(255,255,255,0) 100%);transform:translateX(-100%);animation:indet 1.1s infinite;}
 @keyframes indet{0%{transform:translateX(-100%)}100%{transform:translateX(100%)}}
 
+
+
+/* --- Overlay (neu) --- */
+#overlay{display:none;position:fixed;inset:0;background:rgba(15,23,42,.35);align-items:center;justify-content:center;z-index:100}
+#overlay .box{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:18px 20px;width:min(520px,92vw);box-shadow:var(--shadow2)}
+#overlay-phase{font-weight:800}
+#overlay-bar-wrap{width:100%;height:10px;border-radius:999px;background:var(--line);overflow:hidden;margin-top:10px}
+#overlay-bar{height:100%;width:0%;background:linear-gradient(90deg,var(--brand),var(--brand2));transition:width .25s linear}
+
+/* --- Statusbar (neu) --- */
+.statusbar{position:fixed;left:0;right:0;bottom:0;background:rgba(247,249,252,.9);backdrop-filter:blur(8px);border-top:1px solid var(--line);padding:10px 14px;z-index:50}
+.status-inner{max-width:1100px;margin:0 auto}
+.status-top{display:flex;align-items:center;justify-content:space-between;gap:14px}
+#status-phase{font-weight:800}
+#status-percent{color:var(--muted);font-weight:800}
+
 </style>
 </head>
 
@@ -4294,151 +4309,270 @@ tbody tr:hover{ background:#f1f5f9; }
      OVERLAY
      ========================= -->
 <div id="overlay">
-  <div id="phase"></div>
-  <div class="barwrap"><div class="bar" id="bar"></div></div>
+  <div class="box">
+    <div id="overlay-phase">Bitte warten …</div>
+    <div id="overlay-detail" class="muted" style="margin-top:6px;font-size:14px"></div>
+    <div id="overlay-bar-wrap"><div id="overlay-bar"></div></div>
+  </div>
 </div>
 
 <script>
-const el = id => document.getElementById(id);
+const el = (id)=>document.getElementById(id);
+const clampPct = (p)=>Math.min(100, Math.max(0, parseInt(p||0,10)));
+
+function setIndeterminate(on){
+  const track = el("status-bar-wrap");
+  if(!track) return;
+  track.classList.toggle("indet", !!on);
+}
+
+function formatTime(ms){
+  try{
+    const d = new Date(ms);
+    return d.toLocaleTimeString('de-DE', {hour:'2-digit', minute:'2-digit', second:'2-digit'});
+  }catch(e){ return ""; }
+}
 
 function showOverlay(msg){
-  el('phase').textContent = msg;
-  el('overlay').style.display = 'flex';
+  const ov = el("overlay");
+  if(!ov) return;
+  if(el("overlay-phase")) el("overlay-phase").textContent = msg || "Bitte warten …";
+  if(el("overlay-detail")) el("overlay-detail").textContent = "";
+  ov.style.display = "flex";
 }
-function setProgress(p){
-  el('bar').style.width = Math.min(100, Math.max(0, p)) + '%';
+function hideOverlay(){ const ov = el("overlay"); if(ov) ov.style.display = "none"; }
+function setOverlayProgress(p){
+  const b = el("overlay-bar");
+  if(b) b.style.width = clampPct(p) + "%";
 }
 
-/* ---------- Optionen laden (robust) ---------- */
+function statsHtml(stats){
+  if(!stats) return "";
+  const items = [];
+  const push = (label, val)=>{ if(val===0 || val) items.push(`<span class="status-pill">${label}: <b>${val}</b></span>`); };
+
+  push("Geladen", stats.total);
+  push("Mit Batch", stats.with_any_batch);
+  push("Ausgewählt", stats.selected);
+  push("Entfernt", stats.removed);
+  push("Exportiert", stats.exported);
+  push("Löschlog", stats.delete_log);
+  push("Fuzzy geprüft", stats.fuzzy_checked);
+  push("Fuzzy entfernt", stats.fuzzy_removed);
+
+  return items.join(" ");
+}
+
+function showStatus(phase, pct, stats){
+  if(el("status-phase")) el("status-phase").textContent = phase || "";
+  if(el("status-percent")) el("status-percent").textContent = clampPct(pct) + "%";
+  const fill = el("status-bar");
+  if(fill) fill.style.width = clampPct(pct) + "%";
+  const info = el("status-info");
+  if(info) info.innerHTML = statsHtml(stats);
+}
+
+function updateHeartbeat(state){
+  const hb = el("status-meta");
+  if(!hb) return;
+
+  const lu = state?.last_update_ms || Date.now();
+  const age = Date.now() - lu;
+
+  let msg = `Letztes Update: ${formatTime(lu)}`;
+  let indet = false;
+  let pulse = false;
+
+  if(state?.running && age > 4500){
+    pulse = true;
+    indet = true;
+    msg = `Letztes Update: ${formatTime(lu)} · Noch aktiv …`;
+  }
+  if(state?.running && age > 25000){
+    pulse = true;
+    indet = true;
+    msg = `Dauert länger als üblich · läuft weiter · Letztes Update: ${formatTime(lu)}`;
+  }
+
+  setIndeterminate(indet);
+  hb.innerHTML = `${pulse ? '<span class="pulse-dot"></span>' : ''}<span>${msg}</span>`;
+}
+
+async function loadExcluded(){
+  try{
+    const r = await fetch("/neukontakte/excluded/json");
+    if(!r.ok) return;
+    const data = await r.json();
+    const rows = data.rows || [];
+    const summary = data.summary || [];
+    const body = el("excluded-table-body");
+    if(body){
+      if(rows.length===0){
+        body.innerHTML = `<tr><td colspan="5" style="text-align:center;color:#94a3b8">Noch keine Daten</td></tr>`;
+      }else{
+        body.innerHTML = rows.map(x=>`
+          <tr>
+            <td>${x.person_id||""}</td>
+            <td>${x.name||""}</td>
+            <td>${x.org_id||""}</td>
+            <td>${x.org_name||""}</td>
+            <td>${x.reason||x.grund||""}</td>
+          </tr>`).join("");
+      }
+    }
+    const sumEl = el("excluded-summary");
+    if(sumEl){
+      if(summary.length===0){
+        sumEl.innerHTML = "";
+      }else{
+        sumEl.innerHTML = summary.map(s=>`<li><b>${s.count}</b> – ${s.label}</li>`).join("");
+      }
+    }
+  }catch(e){ /* ignore */ }
+}
+
 async function loadOptions(){
   const box = el("fb-loading-box");
   const bar = el("fb-loading-bar");
+  const txt = el("fb-loading-text");
+  if(box) box.style.display = "block";
+  if(bar) bar.style.width = "0%";
+  if(txt) txt.textContent = "Fachbereiche werden geladen … bitte warten.";
 
-  box.style.display = "block";
-  bar.style.width = "0%";
+  let p=0;
+  const interval=setInterval(()=>{
+    p=Math.min(p+6,90);
+    if(bar) bar.style.width = p+"%";
+  },180);
 
-  let progress = 0;
-  const interval = setInterval(()=>{
-    progress = Math.min(progress + 6, 90);
-    bar.style.width = progress + "%";
-  }, 180);
-
-  let data;
   try{
-    const r = await fetch('/neukontakte/options');
-    if(!r.ok) throw new Error("HTTP " + r.status);
-    data = await r.json();
+    const r = await fetch("/neukontakte/options");
+    if(!r.ok) throw new Error("HTTP "+r.status);
+    const data = await r.json();
+    clearInterval(interval);
+    if(bar) bar.style.width = "100%";
+    setTimeout(()=>{ if(box) box.style.display="none"; }, 250);
+
+    const sel = el("fachbereich");
+    if(sel){
+      sel.innerHTML = '<option value="">– bitte auswählen –</option>';
+      (data.options||[]).forEach(o=>{
+        const opt = document.createElement("option");
+        opt.value = o.value;
+        opt.textContent = o.label;
+        sel.appendChild(opt);
+      });
+      sel.onchange = ()=>{
+        const btn = el("btnExport");
+        if(btn) btn.disabled = !sel.value;
+      };
+    }
   }catch(e){
     clearInterval(interval);
-    bar.style.width = "100%";
-    setTimeout(()=> box.style.display="none", 300);
+    if(bar) bar.style.width = "100%";
+    setTimeout(()=>{ if(box) box.style.display="none"; }, 250);
     alert("Fachbereiche konnten nicht geladen werden.");
-    return;
   }
-
-  clearInterval(interval);
-  bar.style.width = "100%";
-
-  const sel = el('fachbereich');
-  sel.innerHTML = '<option value="">– bitte auswählen –</option>';
-
-  (data.options || []).forEach(o=>{
-    const opt = document.createElement('option');
-    opt.value = o.value;
-    opt.textContent = `${o.label} (${o.count})`;
-    sel.appendChild(opt);
-  });
-
-  setTimeout(()=> box.style.display="none", 300);
-  sel.onchange = ()=> el('btnExport').disabled = !sel.value;
 }
 
-/* ---------- Export ---------- */
 async function startExport(){
-  const btn = document.getElementById("btnExport");
+  const btn = el("btnExport");
   try{
-    if(btn){ btn.disabled = true; btn.style.opacity = "0.7"; btn.style.pointerEvents = "none"; }
+    if(btn){ btn.disabled = true; btn.style.opacity="0.7"; btn.style.pointerEvents="none"; }
+    showOverlay("Starte Abgleich …");
+    showStatus("Starte …", 1, {});
+    updateHeartbeat({running:true, last_update_ms: Date.now()});
+    setOverlayProgress(3);
 
-    const fb = el('fachbereich').value;
+    
+    const fb = el('fachbereich')?.value || "";
     if(!fb) return alert('Bitte Fachbereich wählen');
 
     const batchVal = (el("batch_id")?.value||"").trim();
     if(!batchVal) return alert("Bitte Batch ID eintragen.");
-
-    showOverlay("Starte Abgleich …");
-    setOverlayProgress(0);
-    setIndeterminate(true);
-    showStatus("Starte Abgleich …", 0, {});
 
     const payload = {
       fachbereich: fb,
       take_count: (el("take_count")?.value||"").trim(),
       batch_id: batchVal,
       campaign: (el("campaign")?.value||"").trim()
-      // filter_id bleibt leer -> Backend nutzt FILTER_NEUKONTAKTE (=2998)
     };
 
+
+    await loadExcluded(); // clears current view (backend tables are cleared on export_start)
     const r = await fetch("/neukontakte/export_start", {
       method:"POST",
       headers:{"Content-Type":"application/json"},
       body: JSON.stringify(payload)
     });
     if(!r.ok){
-      const txt = await r.text();
-      throw new Error("Serverfehler ("+r.status+"): " + txt);
+      const t = await r.text();
+      throw new Error("Serverfehler ("+r.status+"): " + t);
     }
     const res = await r.json();
     const job_id = res.job_id;
     if(!job_id) throw new Error("Kein job_id vom Server erhalten.");
 
+    let last = Date.now();
     while(true){
       await new Promise(r=>setTimeout(r, 650));
       const pr = await fetch("/neukontakte/export_progress?job_id="+encodeURIComponent(job_id));
       if(!pr.ok){
-        const txt = await pr.text();
-        throw new Error("Progress-Fehler ("+pr.status+"): " + txt);
+        const t = await pr.text();
+        throw new Error("Progress-Fehler ("+pr.status+"): " + t);
       }
       const s = await pr.json();
+      if(s.error) throw new Error(s.error);
 
-      if(s.error){
-        setIndeterminate(false);
-        hideOverlay();
-        showStatus("Fehler", 100, s.stats||{});
-        alert(s.error);
-        return;
-      }
-
-      el("overlay-phase").textContent = `${s.phase}${s.detail ? " · " + s.detail : ""} (${s.percent}%)`;
+      const pct = clampPct(s.progress || 0);
+      showOverlay(s.phase || "Bitte warten …");
       if(el("overlay-detail")) el("overlay-detail").textContent = s.detail || "";
-      updateHeartbeat(s);
-      setOverlayProgress(s.percent);
-      showStatus(s.phase, s.percent, s.stats||{});
+      setOverlayProgress(pct);
+      showStatus(s.phase || "läuft …", pct, s.stats||{});
 
-      if(s.download_ready){
-        setIndeterminate(false);
+      const lu = s.last_update_ms || Date.now();
+      updateHeartbeat({running: !s.done, last_update_ms: lu});
+
+      if(s.done){
+        // Download
         window.open("/neukontakte/export_download?job_id="+encodeURIComponent(job_id), "_blank");
         hideOverlay();
         await loadExcluded();
-        showStatus("Fertig", 100, s.stats||{});
-        const card = document.querySelectorAll("section.card")[1];
-        if(card) card.scrollIntoView({behavior:"smooth"});
+        showStatus("Fertig – Download gestartet", 100, s.stats||{});
         return;
       }
     }
   }catch(e){
     console.error(e);
-    setIndeterminate(false);
     hideOverlay();
     showStatus("Fehler", 100, {});
     alert(e?.message || String(e));
   }finally{
-    if(btn){ btn.disabled = false; btn.style.opacity = "1"; btn.style.pointerEvents = "auto"; }
+    if(btn){ btn.disabled=false; btn.style.opacity="1"; btn.style.pointerEvents="auto"; }
   }
 }
 
 el('btnExport').onclick = startExport;
 loadOptions();
+showStatus("Bereit", 0, {});
+updateHeartbeat({running:false, last_update_ms: Date.now()});
+loadExcluded();
 </script>
+
+
+
+<!-- Statusbar -->
+<div class="statusbar">
+  <div class="status-inner">
+    <div class="status-top">
+      <div id="status-phase">Bereit</div>
+      <div id="status-percent">0%</div>
+    </div>
+    <div id="status-bar-wrap"><div id="status-bar"></div></div>
+    <div id="status-info"></div>
+    <div id="status-meta" class="muted" style="margin-top:6px;display:flex;gap:10px;align-items:center;"></div>
+  </div>
+</div>
 
 </body>
 </html>
@@ -4685,142 +4819,192 @@ th{font-size:12px;font-weight:700;color:var(--muted);white-space:nowrap;}
 const el = (id)=>document.getElementById(id);
 const clampPct = (p)=>Math.min(100, Math.max(0, parseInt(p||0,10)));
 
-function showOverlay(msg){
-  el("overlay-phase").textContent = msg || "Bitte warten …";
-  if(el("overlay-detail")) el("overlay-detail").textContent = "";
-  if(el("overlay-detail")) el("overlay-detail").textContent = "";
-  el("overlay").style.display = "flex";
+function setIndeterminate(on){
+  const track = el("status-bar-wrap");
+  if(!track) return;
+  track.classList.toggle("indet", !!on);
 }
-function hideOverlay(){ el("overlay").style.display = "none"; }
-function setOverlayProgress(p){ el("overlay-bar").style.width = clampPct(p) + "%"; }
+
+function formatTime(ms){
+  try{
+    const d = new Date(ms);
+    return d.toLocaleTimeString('de-DE', {hour:'2-digit', minute:'2-digit', second:'2-digit'});
+  }catch(e){ return ""; }
+}
+
+function showOverlay(msg){
+  const ov = el("overlay");
+  if(!ov) return;
+  if(el("overlay-phase")) el("overlay-phase").textContent = msg || "Bitte warten …";
+  if(el("overlay-detail")) el("overlay-detail").textContent = "";
+  ov.style.display = "flex";
+}
+function hideOverlay(){ const ov = el("overlay"); if(ov) ov.style.display = "none"; }
+function setOverlayProgress(p){
+  const b = el("overlay-bar");
+  if(b) b.style.width = clampPct(p) + "%";
+}
 
 function statsHtml(stats){
   if(!stats) return "";
   const items = [];
   const push = (label, val)=>{ if(val===0 || val) items.push(`<span class="status-pill">${label}: <b>${val}</b></span>`); };
 
-  // Standard Keys
   push("Geladen", stats.total);
   push("Mit Batch", stats.with_any_batch);
   push("Ausgewählt", stats.selected);
-  push("Entfernt", stats.excluded);
-  push("Exportiert", stats.ready);
+  push("Entfernt", stats.removed);
+  push("Exportiert", stats.exported);
   push("Löschlog", stats.delete_log);
+  push("Fuzzy geprüft", stats.fuzzy_checked);
+  push("Fuzzy entfernt", stats.fuzzy_removed);
 
-  // optional NK-notes
-  if(stats.note_org_limit) push("Org-Limit", stats.note_org_limit);
-  if(stats.note_date_invalid) push("Datumsregel", stats.note_date_invalid);
-
-  return items.length ? items.join("") : "";
+  return items.join(" ");
 }
 
-function showStatus(phase, percent, stats){
-  el("status-phase").textContent = phase || "Bereit";
-  el("status-percent").textContent = (percent===null || percent===undefined) ? "" : (clampPct(percent) + "%");
-  el("status-bar").style.width = clampPct(percent||0) + "%";
-  el("status-info").innerHTML = statsHtml(stats);
+function showStatus(phase, pct, stats){
+  if(el("status-phase")) el("status-phase").textContent = phase || "";
+  if(el("status-percent")) el("status-percent").textContent = clampPct(pct) + "%";
+  const fill = el("status-bar");
+  if(fill) fill.style.width = clampPct(pct) + "%";
+  const info = el("status-info");
+  if(info) info.innerHTML = statsHtml(stats);
 }
 
-let _hbTimer = null;
+function updateHeartbeat(state){
+  const hb = el("status-meta");
+  if(!hb) return;
 
-function formatTime(ms){
-  if(!ms) return "–";
-  try{
-    const d = new Date(ms);
-    return d.toLocaleTimeString([], {hour:"2-digit", minute:"2-digit", second:"2-digit"});
-  }catch(e){ return "–"; }
-}
+  const lu = state?.last_update_ms || Date.now();
+  const age = Date.now() - lu;
 
-function setIndeterminate(on){
-  const sb = el("status-bar");
-  const ob = el("overlay-bar");
-  if(sb){
-    if(on){ sb.classList.add("bar-indet"); sb.style.width = "100%"; }
-    else{ sb.classList.remove("bar-indet"); }
-  }
-  if(ob){
-    if(on){ ob.classList.add("bar-indet"); ob.style.width = "100%"; }
-    else{ ob.classList.remove("bar-indet"); }
-  }
-}
-
-function updateHeartbeat(s){
-  const meta = el("status-meta");
-  if(!meta) return;
-  const lu = parseInt((s||{}).last_update_ms||0, 10) || 0;
-  const now = Date.now();
-  const age = lu ? (now - lu) : null;
-
-  let showPulse = false;
-  let indet = false;
   let msg = `Letztes Update: ${formatTime(lu)}`;
-
-  if(s && !s.done && age !== null){
-    if(age > 25000){
-      showPulse = true; indet = true;
-      msg = `Letztes Update: ${formatTime(lu)} · Dauert länger als üblich – läuft weiter …`;
-    }else if(age > 4500){
-      showPulse = true; indet = true;
-      msg = `Letztes Update: ${formatTime(lu)} · Noch aktiv …`;
-    }
-  }
-
-  meta.innerHTML = `${showPulse ? '<span class="pulse-dot"></span>' : ''}<span>${msg}</span>`;
-  setIndeterminate(indet);
-}
-
-
-let _hbTimer = null;
-
-function formatTime(ms){
-  if(!ms) return "–";
-  try{
-    const d = new Date(ms);
-    return d.toLocaleTimeString([], {hour:"2-digit", minute:"2-digit", second:"2-digit"});
-  }catch(e){ return "–"; }
-}
-
-function setIndeterminate(on){
-  const sb = el("status-bar");
-  const ob = el("overlay-bar");
-  if(sb){
-    if(on){ sb.classList.add("bar-indet"); sb.style.width = "100%"; }
-    else{ sb.classList.remove("bar-indet"); }
-  }
-  if(ob){
-    if(on){ ob.classList.add("bar-indet"); ob.style.width = "100%"; }
-    else{ ob.classList.remove("bar-indet"); }
-  }
-}
-
-function updateHeartbeat(s){
-  const meta = el("status-meta");
-  if(!meta) return;
-  const lu = parseInt((s||{}).last_update_ms||0, 10) || 0;
-  const now = Date.now();
-  const age = lu ? (now - lu) : null;
-
-  let showPulse = false;
   let indet = false;
-  let msg = `Letztes Update: ${formatTime(lu)}`;
+  let pulse = false;
 
-  if(s && !s.done && age !== null){
-    if(age > 25000){
-      showPulse = true; indet = true;
-      msg = `Letztes Update: ${formatTime(lu)} · Dauert länger als üblich – läuft weiter …`;
-    }else if(age > 4500){
-      showPulse = true; indet = true;
-      msg = `Letztes Update: ${formatTime(lu)} · Noch aktiv …`;
-    }
+  if(state?.running && age > 4500){
+    pulse = true;
+    indet = true;
+    msg = `Letztes Update: ${formatTime(lu)} · Noch aktiv …`;
+  }
+  if(state?.running && age > 25000){
+    pulse = true;
+    indet = true;
+    msg = `Dauert länger als üblich · läuft weiter · Letztes Update: ${formatTime(lu)}`;
   }
 
-  meta.innerHTML = `${showPulse ? '<span class="pulse-dot"></span>' : ''}<span>${msg}</span>`;
   setIndeterminate(indet);
+  hb.innerHTML = `${pulse ? '<span class="pulse-dot"></span>' : ''}<span>${msg}</span>`;
 }
 
+async function loadExcluded(){
+  try{
+    const r = await fetch("/nachfass/excluded/json");
+    if(!r.ok) return;
+    const data = await r.json();
+    const rows = data.rows || [];
+    const summary = data.summary || [];
+    const body = el("excluded-table-body");
+    if(body){
+      if(rows.length===0){
+        body.innerHTML = `<tr><td colspan="5" style="text-align:center;color:#94a3b8">Noch keine Daten</td></tr>`;
+      }else{
+        body.innerHTML = rows.map(x=>`
+          <tr>
+            <td>${x.person_id||""}</td>
+            <td>${x.name||""}</td>
+            <td>${x.org_id||""}</td>
+            <td>${x.org_name||""}</td>
+            <td>${x.reason||x.grund||""}</td>
+          </tr>`).join("");
+      }
+    }
+    const sumEl = el("excluded-summary");
+    if(sumEl){
+      if(summary.length===0){
+        sumEl.innerHTML = "";
+      }else{
+        sumEl.innerHTML = summary.map(s=>`<li><b>${s.count}</b> – ${s.label}</li>`).join("");
+      }
+    }
+  }catch(e){ /* ignore */ }
+}
+
+async function startExport(){
+  const btn = el("btnExportNf");
+  try{
+    if(btn){ btn.disabled = true; btn.style.opacity="0.7"; btn.style.pointerEvents="none"; }
+    showOverlay("Starte Abgleich …");
+    showStatus("Starte …", 1, {});
+    updateHeartbeat({running:true, last_update_ms: Date.now()});
+    setOverlayProgress(3);
+
+    
+    const nf_raw = (el("nf_batch_ids")?.value || "").trim();
+    if(!nf_raw) return alert("Bitte mindestens eine Batch ID eintragen.");
+    const nf_batch_ids = nf_raw.split(/[,\s\n\r]+/).map(x=>x.trim()).filter(Boolean);
+    const batchVal = (el("batch_id")?.value||"").trim(); // Export Batch ID in UI
+    if(!batchVal) return alert("Bitte Export Batch ID eintragen.");
+    const payload = { nf_batch_ids, batch_id: batchVal, campaign: (el("campaign")?.value||"").trim() };
+
+
+    await loadExcluded(); // clears current view (backend tables are cleared on export_start)
+    const r = await fetch("/nachfass/export_start", {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify(payload)
+    });
+    if(!r.ok){
+      const t = await r.text();
+      throw new Error("Serverfehler ("+r.status+"): " + t);
+    }
+    const res = await r.json();
+    const job_id = res.job_id;
+    if(!job_id) throw new Error("Kein job_id vom Server erhalten.");
+
+    let last = Date.now();
+    while(true){
+      await new Promise(r=>setTimeout(r, 650));
+      const pr = await fetch("/nachfass/export_progress?job_id="+encodeURIComponent(job_id));
+      if(!pr.ok){
+        const t = await pr.text();
+        throw new Error("Progress-Fehler ("+pr.status+"): " + t);
+      }
+      const s = await pr.json();
+      if(s.error) throw new Error(s.error);
+
+      const pct = clampPct(s.progress || 0);
+      showOverlay(s.phase || "Bitte warten …");
+      if(el("overlay-detail")) el("overlay-detail").textContent = s.detail || "";
+      setOverlayProgress(pct);
+      showStatus(s.phase || "läuft …", pct, s.stats||{});
+
+      const lu = s.last_update_ms || Date.now();
+      updateHeartbeat({running: !s.done, last_update_ms: lu});
+
+      if(s.done){
+        // Download
+        window.open("/nachfass/export_download?job_id="+encodeURIComponent(job_id), "_blank");
+        hideOverlay();
+        await loadExcluded();
+        showStatus("Fertig – Download gestartet", 100, s.stats||{});
+        return;
+      }
+    }
+  }catch(e){
+    console.error(e);
+    hideOverlay();
+    showStatus("Fehler", 100, {});
+    alert(e?.message || String(e));
+  }finally{
+    if(btn){ btn.disabled=false; btn.style.opacity="1"; btn.style.pointerEvents="auto"; }
+  }
+}
+
+el('btnExportNf').onclick = startExport;
 showStatus("Bereit", 0, {});
-updateHeartbeat({last_update_ms: Date.now(), done: true});
-updateHeartbeat({last_update_ms: Date.now(), done: true});
+updateHeartbeat({running:false, last_update_ms: Date.now()});
+loadExcluded();
 </script>
 
 
@@ -5218,91 +5402,243 @@ th{font-size:12px;font-weight:700;color:var(--muted);white-space:nowrap;}
 const el = (id)=>document.getElementById(id);
 const clampPct = (p)=>Math.min(100, Math.max(0, parseInt(p||0,10)));
 
-function showOverlay(msg){
-  el("overlay-phase").textContent = msg || "Bitte warten …";
-  if(el("overlay-detail")) el("overlay-detail").textContent = "";
-  el("overlay").style.display = "flex";
+function setIndeterminate(on){
+  const track = el("status-bar-wrap");
+  if(!track) return;
+  track.classList.toggle("indet", !!on);
 }
-function hideOverlay(){ el("overlay").style.display = "none"; }
-function setOverlayProgress(p){ el("overlay-bar").style.width = clampPct(p) + "%"; }
+
+function formatTime(ms){
+  try{
+    const d = new Date(ms);
+    return d.toLocaleTimeString('de-DE', {hour:'2-digit', minute:'2-digit', second:'2-digit'});
+  }catch(e){ return ""; }
+}
+
+function showOverlay(msg){
+  const ov = el("overlay");
+  if(!ov) return;
+  if(el("overlay-phase")) el("overlay-phase").textContent = msg || "Bitte warten …";
+  if(el("overlay-detail")) el("overlay-detail").textContent = "";
+  ov.style.display = "flex";
+}
+function hideOverlay(){ const ov = el("overlay"); if(ov) ov.style.display = "none"; }
+function setOverlayProgress(p){
+  const b = el("overlay-bar");
+  if(b) b.style.width = clampPct(p) + "%";
+}
 
 function statsHtml(stats){
   if(!stats) return "";
   const items = [];
   const push = (label, val)=>{ if(val===0 || val) items.push(`<span class="status-pill">${label}: <b>${val}</b></span>`); };
 
-  // Standard Keys
   push("Geladen", stats.total);
   push("Mit Batch", stats.with_any_batch);
   push("Ausgewählt", stats.selected);
-  push("Entfernt", stats.excluded);
-  push("Exportiert", stats.ready);
+  push("Entfernt", stats.removed);
+  push("Exportiert", stats.exported);
   push("Löschlog", stats.delete_log);
+  push("Fuzzy geprüft", stats.fuzzy_checked);
+  push("Fuzzy entfernt", stats.fuzzy_removed);
 
-  // optional NK-notes
-  if(stats.note_org_limit) push("Org-Limit", stats.note_org_limit);
-  if(stats.note_date_invalid) push("Datumsregel", stats.note_date_invalid);
-
-  return items.length ? items.join("") : "";
+  return items.join(" ");
 }
 
-function showStatus(phase, percent, stats){
-  el("status-phase").textContent = phase || "Bereit";
-  el("status-percent").textContent = (percent===null || percent===undefined) ? "" : (clampPct(percent) + "%");
-  el("status-bar").style.width = clampPct(percent||0) + "%";
-  el("status-info").innerHTML = statsHtml(stats);
+function showStatus(phase, pct, stats){
+  if(el("status-phase")) el("status-phase").textContent = phase || "";
+  if(el("status-percent")) el("status-percent").textContent = clampPct(pct) + "%";
+  const fill = el("status-bar");
+  if(fill) fill.style.width = clampPct(pct) + "%";
+  const info = el("status-info");
+  if(info) info.innerHTML = statsHtml(stats);
 }
 
-let _hbTimer = null;
+function updateHeartbeat(state){
+  const hb = el("status-meta");
+  if(!hb) return;
 
-function formatTime(ms){
-  if(!ms) return "–";
-  try{
-    const d = new Date(ms);
-    return d.toLocaleTimeString([], {hour:"2-digit", minute:"2-digit", second:"2-digit"});
-  }catch(e){ return "–"; }
-}
+  const lu = state?.last_update_ms || Date.now();
+  const age = Date.now() - lu;
 
-function setIndeterminate(on){
-  const sb = el("status-bar");
-  const ob = el("overlay-bar");
-  if(sb){
-    if(on){ sb.classList.add("bar-indet"); sb.style.width = "100%"; }
-    else{ sb.classList.remove("bar-indet"); }
-  }
-  if(ob){
-    if(on){ ob.classList.add("bar-indet"); ob.style.width = "100%"; }
-    else{ ob.classList.remove("bar-indet"); }
-  }
-}
-
-function updateHeartbeat(s){
-  const meta = el("status-meta");
-  if(!meta) return;
-  const lu = parseInt((s||{}).last_update_ms||0, 10) || 0;
-  const now = Date.now();
-  const age = lu ? (now - lu) : null;
-
-  let showPulse = false;
-  let indet = false;
   let msg = `Letztes Update: ${formatTime(lu)}`;
+  let indet = false;
+  let pulse = false;
 
-  if(s && !s.done && age !== null){
-    if(age > 25000){
-      showPulse = true; indet = true;
-      msg = `Letztes Update: ${formatTime(lu)} · Dauert länger als üblich – läuft weiter …`;
-    }else if(age > 4500){
-      showPulse = true; indet = true;
-      msg = `Letztes Update: ${formatTime(lu)} · Noch aktiv …`;
-    }
+  if(state?.running && age > 4500){
+    pulse = true;
+    indet = true;
+    msg = `Letztes Update: ${formatTime(lu)} · Noch aktiv …`;
+  }
+  if(state?.running && age > 25000){
+    pulse = true;
+    indet = true;
+    msg = `Dauert länger als üblich · läuft weiter · Letztes Update: ${formatTime(lu)}`;
   }
 
-  meta.innerHTML = `${showPulse ? '<span class="pulse-dot"></span>' : ''}<span>${msg}</span>`;
   setIndeterminate(indet);
+  hb.innerHTML = `${pulse ? '<span class="pulse-dot"></span>' : ''}<span>${msg}</span>`;
 }
 
+async function loadExcluded(){
+  try{
+    const r = await fetch("/refresh/excluded/json");
+    if(!r.ok) return;
+    const data = await r.json();
+    const rows = data.rows || [];
+    const summary = data.summary || [];
+    const body = el("excluded-table-body");
+    if(body){
+      if(rows.length===0){
+        body.innerHTML = `<tr><td colspan="5" style="text-align:center;color:#94a3b8">Noch keine Daten</td></tr>`;
+      }else{
+        body.innerHTML = rows.map(x=>`
+          <tr>
+            <td>${x.person_id||""}</td>
+            <td>${x.name||""}</td>
+            <td>${x.org_id||""}</td>
+            <td>${x.org_name||""}</td>
+            <td>${x.reason||x.grund||""}</td>
+          </tr>`).join("");
+      }
+    }
+    const sumEl = el("excluded-summary");
+    if(sumEl){
+      if(summary.length===0){
+        sumEl.innerHTML = "";
+      }else{
+        sumEl.innerHTML = summary.map(s=>`<li><b>${s.count}</b> – ${s.label}</li>`).join("");
+      }
+    }
+  }catch(e){ /* ignore */ }
+}
+
+async function loadOptions(){
+  const box = el("fb-loading-box");
+  const bar = el("fb-loading-bar");
+  const txt = el("fb-loading-text");
+  if(box) box.style.display = "block";
+  if(bar) bar.style.width = "0%";
+  if(txt) txt.textContent = "Fachbereiche werden geladen … bitte warten.";
+
+  let p=0;
+  const interval=setInterval(()=>{
+    p=Math.min(p+6,90);
+    if(bar) bar.style.width = p+"%";
+  },180);
+
+  try{
+    const r = await fetch("/refresh/options");
+    if(!r.ok) throw new Error("HTTP "+r.status);
+    const data = await r.json();
+    clearInterval(interval);
+    if(bar) bar.style.width = "100%";
+    setTimeout(()=>{ if(box) box.style.display="none"; }, 250);
+
+    const sel = el("fachbereich");
+    if(sel){
+      sel.innerHTML = '<option value="">– bitte auswählen –</option>';
+      (data.options||[]).forEach(o=>{
+        const opt = document.createElement("option");
+        opt.value = o.value;
+        opt.textContent = o.label;
+        sel.appendChild(opt);
+      });
+      sel.onchange = ()=>{
+        const btn = el("btnExportRf");
+        if(btn) btn.disabled = !sel.value;
+      };
+    }
+  }catch(e){
+    clearInterval(interval);
+    if(bar) bar.style.width = "100%";
+    setTimeout(()=>{ if(box) box.style.display="none"; }, 250);
+    alert("Fachbereiche konnten nicht geladen werden.");
+  }
+}
+
+async function startExport(){
+  const btn = el("btnExportRf");
+  try{
+    if(btn){ btn.disabled = true; btn.style.opacity="0.7"; btn.style.pointerEvents="none"; }
+    showOverlay("Starte Abgleich …");
+    showStatus("Starte …", 1, {});
+    updateHeartbeat({running:true, last_update_ms: Date.now()});
+    setOverlayProgress(3);
+
+    
+    const fb = el('fachbereich')?.value || "";
+    if(!fb) return alert('Bitte Fachbereich wählen');
+
+    const batchVal = (el("batch_id")?.value||"").trim();
+    if(!batchVal) return alert("Bitte Batch ID eintragen.");
+
+    const payload = {
+      fachbereich: fb,
+      take_count: (el("take_count")?.value||"").trim(),
+      batch_id: batchVal,
+      campaign: (el("campaign")?.value||"").trim()
+    };
+
+
+    await loadExcluded(); // clears current view (backend tables are cleared on export_start)
+    const r = await fetch("/refresh/export_start", {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify(payload)
+    });
+    if(!r.ok){
+      const t = await r.text();
+      throw new Error("Serverfehler ("+r.status+"): " + t);
+    }
+    const res = await r.json();
+    const job_id = res.job_id;
+    if(!job_id) throw new Error("Kein job_id vom Server erhalten.");
+
+    let last = Date.now();
+    while(true){
+      await new Promise(r=>setTimeout(r, 650));
+      const pr = await fetch("/refresh/export_progress?job_id="+encodeURIComponent(job_id));
+      if(!pr.ok){
+        const t = await pr.text();
+        throw new Error("Progress-Fehler ("+pr.status+"): " + t);
+      }
+      const s = await pr.json();
+      if(s.error) throw new Error(s.error);
+
+      const pct = clampPct(s.progress || 0);
+      showOverlay(s.phase || "Bitte warten …");
+      if(el("overlay-detail")) el("overlay-detail").textContent = s.detail || "";
+      setOverlayProgress(pct);
+      showStatus(s.phase || "läuft …", pct, s.stats||{});
+
+      const lu = s.last_update_ms || Date.now();
+      updateHeartbeat({running: !s.done, last_update_ms: lu});
+
+      if(s.done){
+        // Download
+        window.open("/refresh/export_download?job_id="+encodeURIComponent(job_id), "_blank");
+        hideOverlay();
+        await loadExcluded();
+        showStatus("Fertig – Download gestartet", 100, s.stats||{});
+        return;
+      }
+    }
+  }catch(e){
+    console.error(e);
+    hideOverlay();
+    showStatus("Fehler", 100, {});
+    alert(e?.message || String(e));
+  }finally{
+    if(btn){ btn.disabled=false; btn.style.opacity="1"; btn.style.pointerEvents="auto"; }
+  }
+}
+
+el('btnExportRf').onclick = startExport;
+loadOptions();
 showStatus("Bereit", 0, {});
-updateHeartbeat({last_update_ms: Date.now(), done: true});
+updateHeartbeat({running:false, last_update_ms: Date.now()});
+loadExcluded();
 </script>
 
 
