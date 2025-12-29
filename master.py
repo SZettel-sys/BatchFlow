@@ -800,11 +800,6 @@ async def fetch_persons_by_filter_id_v2(
         if job_obj:
             job_obj.phase = f"Suche Personen (Filter {filter_id})"
             job_obj.detail = f"Seite {pages} · Anfrage an Pipedrive …"
-# ✅ FIX: richtiger Call (statt 'await ( ... )' )
-
-        if job_obj:
-            job_obj.phase = f"Lade IDs ({label} {filter_id})"
-            job_obj.detail = f"Seite · Anfrage an Pipedrive …"
         r = await pd_get_with_retry(
             http_client(),
             url,
@@ -4360,39 +4355,84 @@ async function loadOptions(){
 
 /* ---------- Export ---------- */
 async function startExport(){
-  const fb = el('fachbereich').value;
-  if (!fb) return alert('Bitte Fachbereich wählen');
+  const btn = document.getElementById("btnExport");
+  try{
+    if(btn){ btn.disabled = true; btn.style.opacity = "0.7"; btn.style.pointerEvents = "none"; }
 
-  showOverlay('Starte Export …');
-  setProgress(10);
+    const fb = el('fachbereich').value;
+    if(!fb) return alert('Bitte Fachbereich wählen');
 
-  const r = await fetch('/neukontakte/export_start',{
-    method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({
+    const batchVal = (el("batch_id")?.value||"").trim();
+    if(!batchVal) return alert("Bitte Batch ID eintragen.");
+
+    showOverlay("Starte Abgleich …");
+    setOverlayProgress(0);
+    setIndeterminate(true);
+    showStatus("Starte Abgleich …", 0, {});
+
+    const payload = {
       fachbereich: fb,
-      batch_id: el('batch_id').value,
-      campaign: el('campaign').value,
-      take_count: parseInt(el('take_count').value) || null
-    })
-  });
+      take_count: (el("take_count")?.value||"").trim(),
+      batch_id: batchVal,
+      campaign: (el("campaign")?.value||"").trim()
+      // filter_id bleibt leer -> Backend nutzt FILTER_NEUKONTAKTE (=2998)
+    };
 
-  const res = await r.json();
-  const job_id = res.job_id;
-
-  while(true){
-    await new Promise(r=>setTimeout(r,500));
-    const pr = await fetch('/neukontakte/export_progress?job_id='+job_id);
-    const s  = await pr.json();
-
-    el('phase').textContent = `${s.phase} (${s.percent}%)`;
-    setProgress(s.percent);
-
-    if(s.done){
-      window.location.href =
-        '/neukontakte/export_download?job_id='+job_id;
-      return;
+    const r = await fetch("/neukontakte/export_start", {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify(payload)
+    });
+    if(!r.ok){
+      const txt = await r.text();
+      throw new Error("Serverfehler ("+r.status+"): " + txt);
     }
+    const res = await r.json();
+    const job_id = res.job_id;
+    if(!job_id) throw new Error("Kein job_id vom Server erhalten.");
+
+    while(true){
+      await new Promise(r=>setTimeout(r, 650));
+      const pr = await fetch("/neukontakte/export_progress?job_id="+encodeURIComponent(job_id));
+      if(!pr.ok){
+        const txt = await pr.text();
+        throw new Error("Progress-Fehler ("+pr.status+"): " + txt);
+      }
+      const s = await pr.json();
+
+      if(s.error){
+        setIndeterminate(false);
+        hideOverlay();
+        showStatus("Fehler", 100, s.stats||{});
+        alert(s.error);
+        return;
+      }
+
+      el("overlay-phase").textContent = `${s.phase}${s.detail ? " · " + s.detail : ""} (${s.percent}%)`;
+      if(el("overlay-detail")) el("overlay-detail").textContent = s.detail || "";
+      updateHeartbeat(s);
+      setOverlayProgress(s.percent);
+      showStatus(s.phase, s.percent, s.stats||{});
+
+      if(s.download_ready){
+        setIndeterminate(false);
+        window.open("/neukontakte/export_download?job_id="+encodeURIComponent(job_id), "_blank");
+        hideOverlay();
+        await loadExcluded();
+        showStatus("Fertig", 100, s.stats||{});
+        const card = document.querySelectorAll("section.card")[1];
+        if(card) card.scrollIntoView({behavior:"smooth"});
+        return;
+      }
+    }
+  }catch(e){
+    console.error(e);
+    setIndeterminate(false);
+    hideOverlay();
+    showStatus("Fehler", 100, {});
+    alert(e?.message || String(e));
+  }finally{
+    if(btn){ btn.disabled = false; btn.style.opacity = "1"; btn.style.pointerEvents = "auto"; }
   }
 }
 
@@ -4831,63 +4871,93 @@ async function loadExcluded(){
 }
 
 async function startExport(){
-  const ids = parseBatchIds(el("nf_batch_ids").value);
-  if(!ids.length) return alert("Bitte mindestens eine Batch ID eintragen.");
-  const exportBatch = (el("batch_id").value||"").trim();
-  if(!exportBatch) return alert("Bitte Export Batch ID eintragen.");
+  const btn = document.getElementById("btnExportNf");
+  try{
+    if(btn){ btn.disabled = true; btn.style.opacity = "0.7"; btn.style.pointerEvents = "none"; }
+    const ids = parseBatchIds(el("nf_batch_ids")?.value || el("batch_ids")?.value || "");
+    // nach Prozess unterschiedlich: Nachfass nutzt nf_batch_ids, NK/RF nutzen batch_ids
+    // Validierung je nach vorhandenen Feldern:
+    const isNachfass = !!document.getElementById("nf_batch_ids");
+    if(isNachfass && !ids.length) return alert("Bitte mindestens eine Batch ID eintragen.");
+    const batchField = document.getElementById("batch_id");
+    const batchVal = (batchField ? (batchField.value||"").trim() : "");
+    if(!batchVal) return alert("Bitte Batch ID eintragen.");
 
-  showOverlay("Starte Abgleich …");
-  setOverlayProgress(5);
-  showStatus("Starte Abgleich …", 5, {selected: ids.length});
+    showOverlay("Starte Abgleich …");
+    setOverlayProgress(0);
+    setIndeterminate(true);
+    showStatus("Starte Abgleich …", 0, {});
 
-  const r = await fetch("/nachfass/export_start", {
-    method:"POST",
-    headers:{"Content-Type":"application/json"},
-    body: JSON.stringify({
-      nf_batch_ids: ids,
-      batch_id: exportBatch,
-      campaign: (el("campaign").value||"").trim()
-    })
-  });
-  const res = await r.json();
-  const job_id = res.job_id;
+    const payload = isNachfass
+      ? { nf_batch_ids: ids, batch_id: batchVal, campaign: (el("campaign").value||"").trim() }
+      : { filter_id: (el("filter_id")?.value || "").trim(), take_count: (el("take_count")?.value||"").trim(), batch_id: batchVal, campaign: (el("campaign").value||"").trim() };
 
-  while(true){
-    await new Promise(r=>setTimeout(r, 600));
-    const s = await (await fetch("/nachfass/export_progress?job_id="+job_id)).json();
-
-    if(s.error){
-      setIndeterminate(false);
-      hideOverlay();
-      showStatus("Fehler", 100, s.stats||{});
-      alert(s.error);
-      return;
+    // Bei NK/RF kommt Fachbereich aus select:
+    if(!isNachfass){
+      const fb = el("fachbereich")?.value || "";
+      payload.fachbereich = fb;
     }
 
-    // UI update
-    el("overlay-phase").textContent = `${s.phase}${s.detail ? " · " + s.detail : ""} (${s.percent}%)`;
-    if(el("overlay-detail")) el("overlay-detail").textContent = s.detail || "";
-    updateHeartbeat(s);
-    setOverlayProgress(s.percent);
-    showStatus(s.phase, s.percent, s.stats||{});
-
-    if(s.download_ready){
-      setIndeterminate(false);
-      updateHeartbeat(s);
-      setIndeterminate(false);
-      updateHeartbeat(s);
-      window.open("/nachfass/export_download?job_id="+job_id, "_blank");
-      hideOverlay();
-      await loadExcluded();
-      showStatus("Fertig – Download gestartet", 100, s.stats||{});
-      const card = document.querySelectorAll("section.card")[1];
-      if(card) card.scrollIntoView({behavior:"smooth"});
-      return;
+    const r = await fetch("/nachfass/export_start", {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify(payload)
+    });
+    if(!r.ok){
+      const txt = await r.text();
+      throw new Error("Serverfehler ("+r.status+"): " + txt);
     }
+    const res = await r.json();
+    const job_id = res.job_id;
+    if(!job_id) throw new Error("Kein job_id vom Server erhalten.");
+
+    while(true){
+      await new Promise(r=>setTimeout(r, 650));
+      const pr = await fetch("/nachfass/export_progress?job_id="+encodeURIComponent(job_id));
+      if(!pr.ok){
+        const txt = await pr.text();
+        throw new Error("Progress-Fehler ("+pr.status+"): " + txt);
+      }
+      const s = await pr.json();
+
+      if(s.error){
+        setIndeterminate(false);
+        hideOverlay();
+        showStatus("Fehler", 100, s.stats||{});
+        alert(s.error);
+        return;
+      }
+
+      // UI update
+      el("overlay-phase").textContent = `${s.phase}${s.detail ? " · " + s.detail : ""} (${s.percent}%)`;
+      if(el("overlay-detail")) el("overlay-detail").textContent = s.detail || "";
+      updateHeartbeat(s);
+      setOverlayProgress(s.percent);
+      showStatus(s.phase, s.percent, s.stats||{});
+
+      if(s.download_ready){
+        setIndeterminate(false);
+        window.open("/nachfass/export_download?job_id="+encodeURIComponent(job_id), "_blank");
+        hideOverlay();
+        await loadExcluded();
+        showStatus("Fertig", 100, s.stats||{});
+        const card = document.querySelectorAll("section.card")[1];
+        if(card) card.scrollIntoView({behavior:"smooth"});
+        return;
+      }
+    }
+  }catch(e){
+    console.error(e);
+    setIndeterminate(false);
+    hideOverlay();
+    showStatus("Fehler", 100, {});
+    alert(e?.message || String(e));
+  }finally{
+    if(btn){ btn.disabled = false; btn.style.opacity = "1"; btn.style.pointerEvents = "auto"; }
   }
 }
 
-window.addEventListener("load", ()=>resetExcludedUI("Noch kein Abgleich gestartet."));
+window.addEventListenerwindow.addEventListener("load", ()=>resetExcludedUI("Noch kein Abgleich gestartet."));
 el("btnExportNf").onclick = startExport;
 </script>
 
@@ -5314,64 +5384,93 @@ async function loadExcluded(){
 }
 
 async function startExport(){
-  const fb = el("fachbereich").value;
-  if(!fb) return alert("Bitte Fachbereich wählen.");
+  const btn = document.getElementById("btnExportRf");
+  try{
+    if(btn){ btn.disabled = true; btn.style.opacity = "0.7"; btn.style.pointerEvents = "none"; }
+    const ids = parseBatchIds(el("nf_batch_ids")?.value || el("batch_ids")?.value || "");
+    // nach Prozess unterschiedlich: Nachfass nutzt nf_batch_ids, NK/RF nutzen batch_ids
+    // Validierung je nach vorhandenen Feldern:
+    const isNachfass = !!document.getElementById("nf_batch_ids");
+    if(isNachfass && !ids.length) return alert("Bitte mindestens eine Batch ID eintragen.");
+    const batchField = document.getElementById("batch_id");
+    const batchVal = (batchField ? (batchField.value||"").trim() : "");
+    if(!batchVal) return alert("Bitte Batch ID eintragen.");
 
-  showOverlay("Starte Refresh …");
-  setOverlayProgress(5);
-  showStatus("Starte Refresh …", 5, {});
+    showOverlay("Starte Abgleich …");
+    setOverlayProgress(0);
+    setIndeterminate(true);
+    showStatus("Starte Abgleich …", 0, {});
 
-  const r = await fetch("/refresh/export_start", {
-    method:"POST",
-    headers:{"Content-Type":"application/json"},
-    body: JSON.stringify({
-      fachbereich: fb,
-      batch_id: (el("batch_id").value||"").trim(),
-      campaign: (el("campaign").value||"").trim(),
-      take_count: parseInt(el("take_count").value) || null
-    })
-  });
-  const res = await r.json();
-  const job_id = res.job_id;
+    const payload = isNachfass
+      ? { nf_batch_ids: ids, batch_id: batchVal, campaign: (el("campaign").value||"").trim() }
+      : { filter_id: (el("filter_id")?.value || "").trim(), take_count: (el("take_count")?.value||"").trim(), batch_id: batchVal, campaign: (el("campaign").value||"").trim() };
 
-  while(true){
-    await new Promise(r=>setTimeout(r, 600));
-    const s = await (await fetch("/refresh/export_progress?job_id="+job_id)).json();
-
-    if(s.error){
-      setIndeterminate(false);
-      hideOverlay();
-      showStatus("Fehler", 100, s.stats||{});
-      alert(s.error);
-      return;
+    // Bei NK/RF kommt Fachbereich aus select:
+    if(!isNachfass){
+      const fb = el("fachbereich")?.value || "";
+      payload.fachbereich = fb;
     }
 
-    el("overlay-phase").textContent = `${s.phase}${s.detail ? " · " + s.detail : ""} (${s.percent}%)`;
-    if(el("overlay-detail")) el("overlay-detail").textContent = s.detail || "";
-    updateHeartbeat(s);
-    setOverlayProgress(s.percent);
-    showStatus(s.phase, s.percent, s.stats||{});
+    const r = await fetch("/refresh/export_start", {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify(payload)
+    });
+    if(!r.ok){
+      const txt = await r.text();
+      throw new Error("Serverfehler ("+r.status+"): " + txt);
+    }
+    const res = await r.json();
+    const job_id = res.job_id;
+    if(!job_id) throw new Error("Kein job_id vom Server erhalten.");
 
-    if(s.download_ready){
-      setIndeterminate(false);
+    while(true){
+      await new Promise(r=>setTimeout(r, 650));
+      const pr = await fetch("/refresh/export_progress?job_id="+encodeURIComponent(job_id));
+      if(!pr.ok){
+        const txt = await pr.text();
+        throw new Error("Progress-Fehler ("+pr.status+"): " + txt);
+      }
+      const s = await pr.json();
+
+      if(s.error){
+        setIndeterminate(false);
+        hideOverlay();
+        showStatus("Fehler", 100, s.stats||{});
+        alert(s.error);
+        return;
+      }
+
+      // UI update
+      el("overlay-phase").textContent = `${s.phase}${s.detail ? " · " + s.detail : ""} (${s.percent}%)`;
+      if(el("overlay-detail")) el("overlay-detail").textContent = s.detail || "";
       updateHeartbeat(s);
-      window.open("/refresh/export_download?job_id="+job_id, "_blank");
-      hideOverlay();
-      await loadExcluded();
-      showStatus("Fertig – Download gestartet", 100, s.stats||{});
-      const card = document.querySelectorAll("section.card")[1];
-      if(card) card.scrollIntoView({behavior:"smooth"});
-      return;
+      setOverlayProgress(s.percent);
+      showStatus(s.phase, s.percent, s.stats||{});
+
+      if(s.download_ready){
+        setIndeterminate(false);
+        window.open("/refresh/export_download?job_id="+encodeURIComponent(job_id), "_blank");
+        hideOverlay();
+        await loadExcluded();
+        showStatus("Fertig", 100, s.stats||{});
+        const card = document.querySelectorAll("section.card")[1];
+        if(card) card.scrollIntoView({behavior:"smooth"});
+        return;
+      }
     }
+  }catch(e){
+    console.error(e);
+    setIndeterminate(false);
+    hideOverlay();
+    showStatus("Fehler", 100, {});
+    alert(e?.message || String(e));
+  }finally{
+    if(btn){ btn.disabled = false; btn.style.opacity = "1"; btn.style.pointerEvents = "auto"; }
   }
 }
 
-function resetExcludedUI(msg){
-  el("excluded-summary").innerHTML = `<span class='muted'>${msg||"Noch kein Abgleich gestartet."}</span>`;
-  el("excluded-table-body").innerHTML = `<tr><td colspan="5" style="text-align:center;color:#94a3b8">${msg||"Noch kein Abgleich gestartet."}</td></tr>`;
-}
-
-window.addEventListener("load", async ()=>{
+window.addEventListenerwindow.addEventListener("load", async ()=>{
   await loadOptions();
   resetExcludedUI("Noch kein Abgleich gestartet.");
 });
