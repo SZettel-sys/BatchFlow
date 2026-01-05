@@ -1,3 +1,5 @@
+
+
 import logging
 
 
@@ -3041,6 +3043,7 @@ async def run_nachfass_job(
 
         ready_df = await load_df_text(t["ready"])
         export_df = build_nf_export(ready_df)
+        export_df = excel_force_urls_as_text(export_df)
 
         safe_campaign = slugify_filename(campaign or "Nachfass")
 
@@ -3147,6 +3150,31 @@ def _df_to_excel_bytes_nf(df: pd.DataFrame) -> bytes:
     buf.seek(0)
     return buf.getvalue()
 
+
+def excel_force_urls_as_text(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Excel soll URLs (LinkedIn/XING/etc.) als reinen Text behandeln.
+    Dafür wird ein führendes Apostroph vor http(s) gesetzt.
+    Nur für den Export-DataFrame (DB bleibt unverändert).
+    """
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    for col in out.columns:
+        cl = str(col).lower()
+        if ("http" in cl) or ("linkedin" in cl) or ("xing" in cl):
+            def _fix(v):
+                try:
+                    if v is None or (isinstance(v, float) and pd.isna(v)):
+                        return v
+                    s = str(v)
+                    if s.startswith("'http"):
+                        return s
+                    return "'" + s if s.startswith("http") else s
+                except Exception:
+                    return v
+            out[col] = out[col].apply(_fix)
+    return out
 
 def export_to_excel(df: pd.DataFrame, prefix: str, job_id: str) -> str:
     """
@@ -3562,7 +3590,11 @@ async def export_start_nk(
             ready_df = await load_df_text(t["ready"])
             export_df = build_nf_export(ready_df)
 
-            out_path = export_to_excel(export_df, prefix="neukontakte_export", job_id=job_id)
+
+            export_df = excel_force_urls_as_text(export_df)
+            safe_campaign = slugify_filename(campaign or "Neukontakte")
+            job.filename_base = safe_campaign
+            out_path = export_to_excel(export_df, prefix=safe_campaign, job_id=job_id)
             job.path = out_path
             job.total_rows = len(export_df)
 
@@ -3703,12 +3735,8 @@ async def refresh_export_start(
             ready_df = await load_df_text(t["ready"])
             export_df = build_nf_export(ready_df)
 
-            # 🔥 URLs als reinen Text markieren → Excel erzeugt KEINE Hyperlinks
-            for col in export_df.columns:
-                if "http" in col.lower() or "linkedin" in col.lower() or "xing" in col.lower():
-                    export_df[col] = export_df[col].astype(str).apply(
-                        lambda v: "'" + v if v.startswith("http") else v
-                    )
+            # 🔥 URLs überall als reinen Text markieren (Excel erzeugt KEINE Hyperlinks)
+            export_df = excel_force_urls_as_text(export_df)
 
             # 🔥 Export mit NACHFASS-Logik (keine Hyperlinks, stabil, sauber)
             out_path = export_to_excel(export_df, prefix="refresh_export", job_id=job_id)
@@ -3742,6 +3770,8 @@ async def neukontakte_export_progress(job_id: str = Query(...)):
             status_code=404
         )
 
+    has_file = bool(getattr(job, "path", None)) and os.path.exists(str(getattr(job, "path", "")))
+
     return JSONResponse({
         "phase": str(job.phase),
         "percent": int(job.percent),
@@ -3751,6 +3781,8 @@ async def neukontakte_export_progress(job_id: str = Query(...)):
         "detail": str(getattr(job, "detail", "") or ""),
         "last_update_ms": int(getattr(job, "last_update_ms", 0) or 0),
         "heartbeat": int(getattr(job, "heartbeat", 0) or 0),
+
+        "download_ready": bool(job.done) and (job.error is None) and has_file,
 
         # optional – falls später genutzt
         "note_org_limit": getattr(job, "note_org_limit", 0),
@@ -4159,7 +4191,10 @@ async def neukontakte_page(request: Request):
       <div class="status-inner">
         <div class="status-top">
           <div id="status-phase">Bereit</div>
-          <div id="status-percent">0%</div>
+          <div style="display:flex;align-items:center;gap:12px;">
+            <div id="status-percent">0%</div>
+            <a id="downloadLink" href="#" target="_blank" rel="noopener" style="display:none;font-weight:800;color:var(--brand);text-decoration:underline;">Download</a>
+          </div>
         </div>
         <div id="status-bar-wrap"><div id="status-bar"></div></div>
         <div id="status-info"></div>
@@ -4170,6 +4205,29 @@ async def neukontakte_page(request: Request):
     <script>
     const el = (id)=>document.getElementById(id);
     const clampPct = (p)=>Math.min(100, Math.max(0, parseInt(p||0,10)));
+
+    // Download handling (popup-safe): open tab immediately on click, later navigate it to the file.
+    let downloadWin = null;
+    function openDownloadWindowNow(){
+      try{
+        const w = window.open("about:blank", "_blank");
+        if(w){
+          w.document.write("<title>Download wird vorbereitet…</title><div style='font-family:system-ui;padding:24px'>Die Exportdatei wird erstellt…<br/>Dieses Tab wird automatisch aktualisiert, sobald der Download bereit ist.</div>");
+          w.document.close();
+        }
+        return w;
+      }catch(e){ return null; }
+    }
+    function setDownloadReady(url){
+      const link = el("downloadLink");
+      if(link){
+        link.href = url;
+        link.style.display = "inline";
+      }
+      if(downloadWin && !downloadWin.closed){
+        try{ downloadWin.location = url; }catch(e){}
+      }
+    }
     
     function showOverlay(msg){
       el("overlay").style.display="flex";
@@ -4332,6 +4390,9 @@ async def neukontakte_page(request: Request):
         };
     
     
+        // Popup-safe: open download tab immediately (user gesture)
+        downloadWin = openDownloadWindowNow();
+
         const sr = await fetch("/neukontakte/export_start", {
           method:"POST",
           headers:{"Content-Type":"application/json"},
@@ -4361,10 +4422,14 @@ async def neukontakte_page(request: Request):
           if(tick % 5 === 0) loadExcluded();
     
           if(s.done){
-            if(s.download_ready) window.open("/neukontakte/export_download?job_id="+encodeURIComponent(job_id), "_blank");
+            if(s.download_ready){
+              setDownloadReady("/neukontakte/export_download?job_id="+encodeURIComponent(job_id));
+              showStatus("Fertig – Download gestartet", 100, s.stats||{});
+            }else{
+              showStatus("Fertig – Datei bereit", 100, s.stats||{});
+            }
             hideOverlay();
             await loadExcluded();
-            showStatus("Fertig – Download gestartet", 100, s.stats||{});
             updateHeartbeat({running:false, last_update_ms: Date.now()});
             return;
           }
@@ -4605,7 +4670,10 @@ async def nachfass_page(request: Request):
       <div class="status-inner">
         <div class="status-top">
           <div id="status-phase">Bereit</div>
-          <div id="status-percent">0%</div>
+          <div style="display:flex;align-items:center;gap:12px;">
+            <div id="status-percent">0%</div>
+            <a id="downloadLink" href="#" target="_blank" rel="noopener" style="display:none;font-weight:800;color:var(--brand);text-decoration:underline;">Download</a>
+          </div>
         </div>
         <div id="status-bar-wrap"><div id="status-bar"></div></div>
         <div id="status-info"></div>
@@ -4616,6 +4684,29 @@ async def nachfass_page(request: Request):
     <script>
     const el = (id)=>document.getElementById(id);
     const clampPct = (p)=>Math.min(100, Math.max(0, parseInt(p||0,10)));
+
+    // Download handling (popup-safe): open tab immediately on click, later navigate it to the file.
+    let downloadWin = null;
+    function openDownloadWindowNow(){
+      try{
+        const w = window.open("about:blank", "_blank");
+        if(w){
+          w.document.write("<title>Download wird vorbereitet…</title><div style='font-family:system-ui;padding:24px'>Die Exportdatei wird erstellt…<br/>Dieses Tab wird automatisch aktualisiert, sobald der Download bereit ist.</div>");
+          w.document.close();
+        }
+        return w;
+      }catch(e){ return null; }
+    }
+    function setDownloadReady(url){
+      const link = el("downloadLink");
+      if(link){
+        link.href = url;
+        link.style.display = "inline";
+      }
+      if(downloadWin && !downloadWin.closed){
+        try{ downloadWin.location = url; }catch(e){}
+      }
+    }
     
     function showOverlay(msg){
       el("overlay").style.display="flex";
@@ -4744,6 +4835,9 @@ async def nachfass_page(request: Request):
         const payload = { nf_batch_ids: ids, batch_id: batchVal, campaign: (el("campaign").value||"").trim() };
     
     
+        // Popup-safe: open download tab immediately (user gesture)
+        downloadWin = openDownloadWindowNow();
+
         const sr = await fetch("/nachfass/export_start", {
           method:"POST",
           headers:{"Content-Type":"application/json"},
@@ -4773,7 +4867,7 @@ async def nachfass_page(request: Request):
           if(tick % 5 === 0) loadExcluded();
     
           if(s.done){
-            if(s.download_ready) window.open("/nachfass/export_download?job_id="+encodeURIComponent(job_id), "_blank");
+            if(s.download_ready) setDownloadReady("/nachfass/export_download?job_id="+encodeURIComponent(job_id));
             hideOverlay();
             await loadExcluded();
             showStatus("Fertig – Download gestartet", 100, s.stats||{});
@@ -5022,7 +5116,10 @@ async def refresh_page(request: Request):
       <div class="status-inner">
         <div class="status-top">
           <div id="status-phase">Bereit</div>
-          <div id="status-percent">0%</div>
+          <div style="display:flex;align-items:center;gap:12px;">
+            <div id="status-percent">0%</div>
+            <a id="downloadLink" href="#" target="_blank" rel="noopener" style="display:none;font-weight:800;color:var(--brand);text-decoration:underline;">Download</a>
+          </div>
         </div>
         <div id="status-bar-wrap"><div id="status-bar"></div></div>
         <div id="status-info"></div>
@@ -5033,6 +5130,29 @@ async def refresh_page(request: Request):
     <script>
     const el = (id)=>document.getElementById(id);
     const clampPct = (p)=>Math.min(100, Math.max(0, parseInt(p||0,10)));
+
+    // Download handling (popup-safe): open tab immediately on click, later navigate it to the file.
+    let downloadWin = null;
+    function openDownloadWindowNow(){
+      try{
+        const w = window.open("about:blank", "_blank");
+        if(w){
+          w.document.write("<title>Download wird vorbereitet…</title><div style='font-family:system-ui;padding:24px'>Die Exportdatei wird erstellt…<br/>Dieses Tab wird automatisch aktualisiert, sobald der Download bereit ist.</div>");
+          w.document.close();
+        }
+        return w;
+      }catch(e){ return null; }
+    }
+    function setDownloadReady(url){
+      const link = el("downloadLink");
+      if(link){
+        link.href = url;
+        link.style.display = "inline";
+      }
+      if(downloadWin && !downloadWin.closed){
+        try{ downloadWin.location = url; }catch(e){}
+      }
+    }
     
     function showOverlay(msg){
       el("overlay").style.display="flex";
@@ -5195,6 +5315,9 @@ async def refresh_page(request: Request):
         };
     
     
+        // Popup-safe: open download tab immediately (user gesture)
+        downloadWin = openDownloadWindowNow();
+
         const sr = await fetch("/refresh/export_start", {
           method:"POST",
           headers:{"Content-Type":"application/json"},
@@ -5224,7 +5347,7 @@ async def refresh_page(request: Request):
           if(tick % 5 === 0) loadExcluded();
     
           if(s.done){
-            if(s.download_ready) window.open("/refresh/export_download?job_id="+encodeURIComponent(job_id), "_blank");
+            if(s.download_ready) setDownloadReady("/refresh/export_download?job_id="+encodeURIComponent(job_id));
             hideOverlay();
             await loadExcluded();
             showStatus("Fertig – Download gestartet", 100, s.stats||{});
