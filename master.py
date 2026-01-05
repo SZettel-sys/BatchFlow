@@ -1,5 +1,3 @@
-
-
 import logging
 
 
@@ -3168,6 +3166,8 @@ def excel_force_urls_as_text(df: pd.DataFrame) -> pd.DataFrame:
                     if v is None or (isinstance(v, float) and pd.isna(v)):
                         return v
                     s = str(v)
+                    if s.startswith("#http") or s.startswith("#https"):
+                        s = s[1:]
                     if s.startswith("'http"):
                         return s
                     return "'" + s if s.startswith("http") else s
@@ -4206,26 +4206,26 @@ async def neukontakte_page(request: Request):
     const el = (id)=>document.getElementById(id);
     const clampPct = (p)=>Math.min(100, Math.max(0, parseInt(p||0,10)));
 
-    // Download handling (popup-safe): open tab immediately on click, later navigate it to the file.
-    let downloadWin = null;
-    function openDownloadWindowNow(){
-      try{
-        const w = window.open("about:blank", "_blank");
-        if(w){
-          w.document.write("<title>Download wird vorbereitet…</title><div style='font-family:system-ui;padding:24px'>Die Exportdatei wird erstellt…<br/>Dieses Tab wird automatisch aktualisiert, sobald der Download bereit ist.</div>");
-          w.document.close();
-        }
-        return w;
-      }catch(e){ return null; }
-    }
+    // Download handling: kein neues Fenster öffnen
     function setDownloadReady(url){
       const link = el("downloadLink");
       if(link){
         link.href = url;
         link.style.display = "inline";
       }
-      if(downloadWin && !downloadWin.closed){
-        try{ downloadWin.location = url; }catch(e){}
+      // Download im selben Tab triggern (ohne neues Fenster)
+      try{
+        const a = document.createElement("a");
+        a.href = url;
+        a.style.display = "none";
+        a.rel = "noopener";
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+      }catch(e){
+        window.location.href = url;
+      }
+    }catch(e){}
       }
     }
     
@@ -4391,7 +4391,6 @@ async def neukontakte_page(request: Request):
     
     
         // Popup-safe: open download tab immediately (user gesture)
-        downloadWin = openDownloadWindowNow();
 
         const sr = await fetch("/neukontakte/export_start", {
           method:"POST",
@@ -4685,26 +4684,26 @@ async def nachfass_page(request: Request):
     const el = (id)=>document.getElementById(id);
     const clampPct = (p)=>Math.min(100, Math.max(0, parseInt(p||0,10)));
 
-    // Download handling (popup-safe): open tab immediately on click, later navigate it to the file.
-    let downloadWin = null;
-    function openDownloadWindowNow(){
-      try{
-        const w = window.open("about:blank", "_blank");
-        if(w){
-          w.document.write("<title>Download wird vorbereitet…</title><div style='font-family:system-ui;padding:24px'>Die Exportdatei wird erstellt…<br/>Dieses Tab wird automatisch aktualisiert, sobald der Download bereit ist.</div>");
-          w.document.close();
-        }
-        return w;
-      }catch(e){ return null; }
-    }
+    // Download handling: kein neues Fenster öffnen
     function setDownloadReady(url){
       const link = el("downloadLink");
       if(link){
         link.href = url;
         link.style.display = "inline";
       }
-      if(downloadWin && !downloadWin.closed){
-        try{ downloadWin.location = url; }catch(e){}
+      // Download im selben Tab triggern (ohne neues Fenster)
+      try{
+        const a = document.createElement("a");
+        a.href = url;
+        a.style.display = "none";
+        a.rel = "noopener";
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+      }catch(e){
+        window.location.href = url;
+      }
+    }catch(e){}
       }
     }
     
@@ -4836,7 +4835,6 @@ async def nachfass_page(request: Request):
     
     
         // Popup-safe: open download tab immediately (user gesture)
-        downloadWin = openDownloadWindowNow();
 
         const sr = await fetch("/nachfass/export_start", {
           method:"POST",
@@ -5131,26 +5129,26 @@ async def refresh_page(request: Request):
     const el = (id)=>document.getElementById(id);
     const clampPct = (p)=>Math.min(100, Math.max(0, parseInt(p||0,10)));
 
-    // Download handling (popup-safe): open tab immediately on click, later navigate it to the file.
-    let downloadWin = null;
-    function openDownloadWindowNow(){
-      try{
-        const w = window.open("about:blank", "_blank");
-        if(w){
-          w.document.write("<title>Download wird vorbereitet…</title><div style='font-family:system-ui;padding:24px'>Die Exportdatei wird erstellt…<br/>Dieses Tab wird automatisch aktualisiert, sobald der Download bereit ist.</div>");
-          w.document.close();
-        }
-        return w;
-      }catch(e){ return null; }
-    }
+    // Download handling: kein neues Fenster öffnen
     function setDownloadReady(url){
       const link = el("downloadLink");
       if(link){
         link.href = url;
         link.style.display = "inline";
       }
-      if(downloadWin && !downloadWin.closed){
-        try{ downloadWin.location = url; }catch(e){}
+      // Download im selben Tab triggern (ohne neues Fenster)
+      try{
+        const a = document.createElement("a");
+        a.href = url;
+        a.style.display = "none";
+        a.rel = "noopener";
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+      }catch(e){
+        window.location.href = url;
+      }
+    }catch(e){}
       }
     }
     
@@ -5316,7 +5314,6 @@ async def refresh_page(request: Request):
     
     
         // Popup-safe: open download tab immediately (user gesture)
-        downloadWin = openDownloadWindowNow();
 
         const sr = await fetch("/refresh/export_start", {
           method:"POST",
