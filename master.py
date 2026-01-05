@@ -4078,7 +4078,7 @@ async def neukontakte_page(request: Request):
     th{font-size:12px;font-weight:800;color:var(--muted);white-space:nowrap;}
     tbody tr:hover{background:#f1f5f9;}
     
-    #fb-loading-box{display:none;margin-top:10px}
+    #fb-loading-box{display:block;margin-top:10px}
     #fb-loading-text{font-size:13px;color:var(--brand);margin-bottom:6px}
     #fb-loading-bar-wrap{width:100%;height:8px;border-radius:999px;background:var(--line);overflow:hidden}
     #fb-loading-bar{height:100%;width:0%;background:linear-gradient(90deg,var(--brand),var(--brand2));transition:width .25s linear;}
@@ -4325,6 +4325,7 @@ async def neukontakte_page(request: Request):
       const wrap = el("fb-loading-bar-wrap");
       const txt = el("fb-loading-text");
       box.style.display = "block";
+      const shownAt = Date.now();
       wrap.classList.add("bar-indet");
       txt.textContent = "Fachbereiche werden geladen … bitte warten.";
       let p = 0;
@@ -4336,9 +4337,9 @@ async def neukontakte_page(request: Request):
         clearInterval(t);
         bar.style.width = "100%";
         wrap.classList.remove("bar-indet");
-        setTimeout(()=>{ box.style.display="none"; }, 250);
-    
-        const sel = el("fachbereich");
+                const minVisibleMs = 600;
+        const wait = Math.max(0, minVisibleMs - (Date.now() - shownAt));
+        setTimeout(()=>{ box.style.display="none"; }, 250 + wait);const sel = el("fachbereich");
         sel.innerHTML = '<option value="">– bitte auswählen –</option>';
         (data.options||[]).forEach(o=>{
           const opt = document.createElement("option");
@@ -4351,8 +4352,9 @@ async def neukontakte_page(request: Request):
         clearInterval(t);
         wrap.classList.remove("bar-indet");
         bar.style.width="100%";
-        setTimeout(()=>{ box.style.display="none"; }, 250);
-        alert("Fachbereiche konnten nicht geladen werden.");
+                const minVisibleMs = 600;
+        const wait = Math.max(0, minVisibleMs - (Date.now() - shownAt));
+        setTimeout(()=>{ box.style.display="none"; }, 250 + wait);alert("Fachbereiche konnten nicht geladen werden.");
       }
     }
     
@@ -4565,7 +4567,7 @@ async def nachfass_page(request: Request):
     th{font-size:12px;font-weight:800;color:var(--muted);white-space:nowrap;}
     tbody tr:hover{background:#f1f5f9;}
     
-    #fb-loading-box{display:none;margin-top:10px}
+    #fb-loading-box{display:block;margin-top:10px}
     #fb-loading-text{font-size:13px;color:var(--brand);margin-bottom:6px}
     #fb-loading-bar-wrap{width:100%;height:8px;border-radius:999px;background:var(--line);overflow:hidden}
     #fb-loading-bar{height:100%;width:0%;background:linear-gradient(90deg,var(--brand),var(--brand2));transition:width .25s linear;}
@@ -5001,7 +5003,7 @@ async def refresh_page(request: Request):
     th{font-size:12px;font-weight:800;color:var(--muted);white-space:nowrap;}
     tbody tr:hover{background:#f1f5f9;}
     
-    #fb-loading-box{display:none;margin-top:10px}
+    #fb-loading-box{display:block;margin-top:10px}
     #fb-loading-text{font-size:13px;color:var(--brand);margin-bottom:6px}
     #fb-loading-bar-wrap{width:100%;height:8px;border-radius:999px;background:var(--line);overflow:hidden}
     #fb-loading-bar{height:100%;width:0%;background:linear-gradient(90deg,var(--brand),var(--brand2));transition:width .25s linear;}
@@ -5248,6 +5250,7 @@ async def refresh_page(request: Request):
       const wrap = el("fb-loading-bar-wrap");
       const txt = el("fb-loading-text");
       box.style.display = "block";
+      const shownAt = Date.now();
       wrap.classList.add("bar-indet");
       txt.textContent = "Fachbereiche werden geladen … bitte warten.";
       let p = 0;
@@ -5259,9 +5262,9 @@ async def refresh_page(request: Request):
         clearInterval(t);
         bar.style.width = "100%";
         wrap.classList.remove("bar-indet");
-        setTimeout(()=>{ box.style.display="none"; }, 250);
-    
-        const sel = el("fachbereich");
+                const minVisibleMs = 600;
+        const wait = Math.max(0, minVisibleMs - (Date.now() - shownAt));
+        setTimeout(()=>{ box.style.display="none"; }, 250 + wait);const sel = el("fachbereich");
         sel.innerHTML = '<option value="">– bitte auswählen –</option>';
         (data.options||[]).forEach(o=>{
           const opt = document.createElement("option");
@@ -5274,8 +5277,9 @@ async def refresh_page(request: Request):
         clearInterval(t);
         wrap.classList.remove("bar-indet");
         bar.style.width="100%";
-        setTimeout(()=>{ box.style.display="none"; }, 250);
-        alert("Fachbereiche konnten nicht geladen werden.");
+                const minVisibleMs = 600;
+        const wait = Math.max(0, minVisibleMs - (Date.now() - shownAt));
+        setTimeout(()=>{ box.style.display="none"; }, 250 + wait);alert("Fachbereiche konnten nicht geladen werden.");
       }
     }
     
