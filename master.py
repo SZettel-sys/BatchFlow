@@ -1,3 +1,5 @@
+
+
 import logging
 
 
@@ -85,6 +87,7 @@ user_tokens: Dict[str, str] = {}
 _PERSON_FIELDS_CACHE: Optional[List[dict]] = None
 _OPTIONS_CACHE: Dict[int, dict] = {}
 _ORG_CACHE: Dict[int, List[str]] = {}
+_FB_OPTIONS_CACHE: Dict[str, tuple[float, List[dict]]] = {}  # cache für Fachbereich-Optionen inkl. Counts
 
 # -----------------------------------------------------------------------------
 # Template-Spalten
@@ -1154,6 +1157,73 @@ async def get_fachbereich_label_map() -> Dict[str, str]:
 
     _OPTIONS_CACHE[field_key] = mapping
     return mapping
+
+
+async def get_cached_fachbereich_options(
+    *,
+    filter_id: int,
+    cache_key: str,
+    timeout_s: float = 8.0,
+    ttl_s: float = 600.0,
+    max_pages: int = 25,
+) -> List[dict]:
+    """Fachbereich-Optionen inkl. Counts (best effort, mit Timeout + Cache)."""
+    now = time.time()
+    cached = _FB_OPTIONS_CACHE.get(cache_key)
+    if cached and (now - cached[0]) < ttl_s:
+        return cached[1]
+
+    label_map = get_fachbereich_label_map() or {}
+    field_key = PD_PERSON_FIELDS.get("Fachbereich - Kampagne")
+    if not field_key:
+        _FB_OPTIONS_CACHE[cache_key] = (now, [])
+        return []
+
+    counts: Dict[str, int] | None = {}
+    try:
+        persons = await asyncio.wait_for(
+            fetch_persons_by_filter_id_v2(
+                filter_id=filter_id,
+                limit=500,
+                job_obj=None,
+                max_pages=max_pages,
+                max_empty_growth=2,
+            ),
+            timeout=timeout_s,
+        )
+        counts = {}
+        for p in persons or []:
+            v = p.get(field_key)
+            if v is None:
+                continue
+            if isinstance(v, list):
+                for vv in v:
+                    if vv is None:
+                        continue
+                    k = str(vv)
+                    counts[k] = counts.get(k, 0) + 1
+            else:
+                k = str(v)
+                counts[k] = counts.get(k, 0) + 1
+    except Exception:
+        counts = None  # zu langsam oder Fehler → ohne Counts
+
+    keys = set(label_map.keys())
+    if counts:
+        keys.update(counts.keys())
+
+    def s_key(k: str) -> str:
+        return (label_map.get(k) or k).strip().lower()
+
+    options: List[dict] = []
+    for k in sorted(keys, key=s_key):
+        opt = {"value": k, "label": label_map.get(k, k)}
+        if counts is not None:
+            opt["count"] = int(counts.get(k, 0))
+        options.append(opt)
+
+    _FB_OPTIONS_CACHE[cache_key] = (now, options)
+    return options
 
 
 # =============================================================================
@@ -3323,83 +3393,15 @@ async def refresh_options():
     if not field_key:
         return JSONResponse({"options": []})
 
-    # -------------------------------------------------------------------------
-    # 1) Personen laden (Turbo: große Pages + fewer max_pages)
-    # -------------------------------------------------------------------------
-    persons = await fetch_persons_by_filter_id_v2(
+    options = await get_cached_fachbereich_options(
         filter_id=FILTER_REFRESH,
-        limit=500,
-        job_obj=None,
-        max_pages=60,
-        max_empty_growth=2,
+        cache_key="rf",
+        timeout_s=8.0,
+        ttl_s=600.0,
+        max_pages=25,
     )
-
-    # -------------------------------------------------------------------------
-    # 2) Alle möglichen Fachbereichs-Labels laden
-    # -------------------------------------------------------------------------
-    label_map = await get_fachbereich_label_map()
-
-    # Liste aller verfügbaren Dropdown-Werte (z. B. "marketing", "crm", ...)
-    all_possible_values = list(label_map.keys())
-
-    # Ergebnisse
-    per_fach_counts: Dict[str, int] = {k: 0 for k in all_possible_values}
-    fach_org_counts: Dict[str, Dict[str, int]] = {k: {} for k in all_possible_values}
-
-    # -------------------------------------------------------------------------
-    # 3) Personen bereinigen wie im Export:
-    #    - Fachbereich muss gesetzt sein
-    #    - Next activity darf nicht blockiert sein
-    #    - Max 2 Kontakte pro Organisation
-    # -------------------------------------------------------------------------
-    for p in persons:
-        if not isinstance(p, dict):
-            continue
-
-        fach_val = sanitize(cf_value_v2(p, field_key))
-        if not fach_val:
-            continue
-        if fach_val not in all_possible_values:
-            continue
-
-        org_id = extract_org_id_from_person(p)
-        if not org_id:
-            continue
-
-        next_date = sanitize(p.get("next_activity_date"))
-        if next_date and is_forbidden_activity_date(next_date):
-            continue
-
-        # Organisationslimit: max 2 Kontakte
-        orgs = fach_org_counts[fach_val]
-        if orgs.get(org_id, 0) >= PER_ORG_DEFAULT_LIMIT:
-            continue
-
-        orgs[org_id] = orgs.get(org_id, 0) + 1
-        per_fach_counts[fach_val] += 1
-
-    # -------------------------------------------------------------------------
-    # 4) Ausgabe sortieren + auch 0-Werte anzeigen
-    # -------------------------------------------------------------------------
-    options = []
-    for fach_val in all_possible_values:
-        label = label_map.get(fach_val) or fach_val
-        count = per_fach_counts.get(fach_val, 0)
-        options.append({
-            "value": fach_val,
-            "label": label,
-            "count": count,
-        })
-
-    options.sort(key=lambda o: o["label"].lower())
     return JSONResponse({"options": options})
 
-# =============================================================================
-# NEUKONTAKTE - OPTIONS
-# =============================================================================
-# =============================================================================
-# /neukontakte/options – identisch zu /refresh/options
-# =============================================================================
 @app.get("/neukontakte/options")
 async def neukontakte_options():
 
@@ -3407,75 +3409,15 @@ async def neukontakte_options():
     if not field_key:
         return JSONResponse({"options": []})
 
-    # -------------------------------------------------------------------------
-    # 1) Personen laden (identisch zu Refresh, anderer Filter)
-    # -------------------------------------------------------------------------
-    persons = await fetch_persons_by_filter_id_v2(
+    options = await get_cached_fachbereich_options(
         filter_id=FILTER_NEUKONTAKTE,
-        limit=500,
-        job_obj=None,
-        max_pages=60,
-        max_empty_growth=2,
+        cache_key="nk",
+        timeout_s=8.0,
+        ttl_s=600.0,
+        max_pages=25,
     )
-
-    # -------------------------------------------------------------------------
-    # 2) Alle möglichen Fachbereichs-Labels laden
-    # -------------------------------------------------------------------------
-    label_map = await get_fachbereich_label_map()
-    all_possible_values = list(label_map.keys())
-
-    per_fach_counts: Dict[str, int] = {k: 0 for k in all_possible_values}
-    fach_org_counts: Dict[str, Dict[str, int]] = {k: {} for k in all_possible_values}
-
-    # -------------------------------------------------------------------------
-    # 3) Personen bereinigen (EXAKT wie bei Refresh!)
-    # -------------------------------------------------------------------------
-    for p in persons:
-        if not isinstance(p, dict):
-            continue
-
-        fach_val = sanitize(cf_value_v2(p, field_key))
-        if not fach_val:
-            continue
-        if fach_val not in all_possible_values:
-            continue
-
-        org_id = extract_org_id_from_person(p)
-        if not org_id:
-            continue
-
-        next_date = sanitize(p.get("next_activity_date"))
-        if next_date and is_forbidden_activity_date(next_date):
-            continue
-
-        # Organisationslimit: max 2 Kontakte
-        orgs = fach_org_counts[fach_val]
-        if orgs.get(org_id, 0) >= PER_ORG_DEFAULT_LIMIT:
-            continue
-
-        orgs[org_id] = orgs.get(org_id, 0) + 1
-        per_fach_counts[fach_val] += 1
-
-    # -------------------------------------------------------------------------
-    # 4) Ausgabe – sortiert, inkl. 0-Werte
-    # -------------------------------------------------------------------------
-    options = []
-    for fach_val in all_possible_values:
-        label = label_map.get(fach_val) or fach_val
-        count = per_fach_counts.get(fach_val, 0)
-        options.append({
-            "value": fach_val,
-            "label": label,
-            "count": count,
-        })
-
-    options.sort(key=lambda o: o["label"].lower())
     return JSONResponse({"options": options})
 
-
-# =============================================================================
-# EXPORT-START – NEUKONTAKTE
-# =============================================================================
 @app.post("/neukontakte/export_start")
 async def export_start_nk(
     fachbereich: str = Body(...),
@@ -4367,6 +4309,9 @@ async def neukontakte_page(request: Request):
     }
     el("fachbereich").addEventListener("change", updateBtn);
     el("batch_id").addEventListener("input", updateBtn);
+    el("batch_id").addEventListener("change", updateBtn);
+    el("batch_id").addEventListener("keyup", updateBtn);
+    el("batch_id").addEventListener("paste", updateBtn);
     
     
     async function startExport(){
@@ -4815,7 +4760,13 @@ async def nachfass_page(request: Request):
       el("btnExportNf").disabled = !(ids.length && batch);
     }
     el("nf_batch_ids").addEventListener("input", updateBtn);
+    el("nf_batch_ids").addEventListener("change", updateBtn);
+    el("nf_batch_ids").addEventListener("keyup", updateBtn);
+    el("nf_batch_ids").addEventListener("paste", updateBtn);
     el("batch_id").addEventListener("input", updateBtn);
+    el("batch_id").addEventListener("change", updateBtn);
+    el("batch_id").addEventListener("keyup", updateBtn);
+    el("batch_id").addEventListener("paste", updateBtn);
     
     
     async function startExport(){
@@ -4892,7 +4843,7 @@ async def nachfass_page(request: Request):
       showStatus("Bereit", 0, {});
       updateHeartbeat({running:false, last_update_ms: Date.now()});
       resetExcludedUI("Noch kein Abgleich gestartet.");
-      
+      updateBtn();
     });
     </script>
     
@@ -5292,6 +5243,9 @@ async def refresh_page(request: Request):
     }
     el("fachbereich").addEventListener("change", updateBtn);
     el("batch_id").addEventListener("input", updateBtn);
+    el("batch_id").addEventListener("change", updateBtn);
+    el("batch_id").addEventListener("keyup", updateBtn);
+    el("batch_id").addEventListener("paste", updateBtn);
     
     
     async function startExport(){
