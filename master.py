@@ -2556,16 +2556,14 @@ async def _build_nf_master_final(
             # --- IDs als Zahlen speichern ---
             "Batch ID": int(batch_id) if str(batch_id).isdigit() else batch_id,
             "Channel": DEFAULT_CHANNEL,
-            "Cold-Mailing Import": campaign,
-        
-            "Person ID": int(pid) if pid.isdigit() else pid,
+            "Cold-Mailing Import": campaign,      
+            "Person ID": int(p.get("id")) if str(p.get("id")).isdigit() else p.get("id"),
             "Person Vorname": first,
             "Person Nachname": last,
             "Person Titel": p.get(FIELD_TITLE) or "",
             "Person Geschlecht": p.get(FIELD_GENDER) or "",
             "Person Position": p.get(FIELD_POSITION) or "",
             "Person E-Mail": email,
-        
             "Prospect ID": p.get(FIELD_PROSPECT_ID) or "",
         
             # --- Organisation ---
