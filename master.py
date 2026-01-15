@@ -94,7 +94,7 @@ _ORG_CACHE: Dict[int, List[str]] = {}
 TEMPLATE_COLUMNS = [
     "Batch ID","Channel","Cold-Mailing Import","Prospect ID","Organisation ID","Organisation Name",
     "Person ID","Person Vorname","Person Nachname","Person Titel","Person Geschlecht","Person Position",
-    "Person E-Mail","XING Profil","LinkedIn URL"
+    "Person E-Mail","LinkedIn URL"
 ]
 
 # -----------------------------------------------------------------------------
@@ -2340,7 +2340,6 @@ NF_EXPORT_COLUMNS = [
     "Person Geschlecht",
     "Person Position",
     "Person E-Mail",
-    "XING Profil",
     "LinkedIn URL",
 ]
 
@@ -2554,27 +2553,30 @@ async def _build_nf_master_final(
         batch_out = sanitize(batch_id_label or (batch_id or ""))
 
         rows.append({
-            # Export-Spalten
-            "Batch ID": batch_out,
+            # --- IDs als Zahlen speichern ---
+            "Batch ID": int(batch_id) if str(batch_id).isdigit() else batch_id,
             "Channel": DEFAULT_CHANNEL,
-            "Cold-Mailing Import": sanitize(campaign),
-            "Prospect ID": prospect_id,
-            "Organisation ID": sanitize(org_id),
-            "Organisation Name": sanitize(org_name_for_person(p)),
-            "Person ID": person_id,
-            "Person Vorname": first_name,
-            "Person Nachname": last_name,
-            "Person Titel": title_raw,
-            "Person Geschlecht": gender,
-            "Person Position": pos_raw,
-            "Person E-Mail": primary_email(p),
-            "XING Profil": xing_raw,
-            "LinkedIn URL": li_raw,
-
-            # Interne Spalten für Regeln/Log
-            "Organisationsart": org_art_for_person(p),
-            "Datum nächste Aktivität": next_activity_for_person(p),
+            "Cold-Mailing Import": campaign,
+        
+            "Person ID": int(pid) if pid.isdigit() else pid,
+            "Person Vorname": first,
+            "Person Nachname": last,
+            "Person Titel": p.get(FIELD_TITLE) or "",
+            "Person Geschlecht": p.get(FIELD_GENDER) or "",
+            "Person Position": p.get(FIELD_POSITION) or "",
+            "Person E-Mail": email,
+        
+            "Prospect ID": p.get(FIELD_PROSPECT_ID) or "",
+        
+            # --- Organisation ---
+            "Organisation Name": org_name,
+            "Organisation ID": int(org_id) if str(org_id).isdigit() else org_id,
+        
+            # --- Social Links ---
+            # XING wird entfernt → kein Feld mehr
+            "LinkedIn URL": (p.get(FIELD_LINKEDIN) or "").lstrip("'"),
         })
+
 
     df_final = pd.DataFrame(rows)
 
@@ -3098,7 +3100,6 @@ NF_EXPORT_COLUMNS = [
     "Person Geschlecht",
     "Person Position",
     "Person E-Mail",
-    "XING Profil",
     "LinkedIn URL",
 ]
 
