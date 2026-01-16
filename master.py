@@ -2552,28 +2552,30 @@ async def _build_nf_master_final(
         # Für den Export soll immer die vom Nutzer angegebene Export-Batch-ID verwendet werden
         batch_out = sanitize(batch_id_label or (batch_id or ""))
 
-        rows.append({
-            # --- IDs als Zahlen speichern ---
-            "Batch ID": int(batch_id) if str(batch_id).isdigit() else batch_id,
-            "Channel": DEFAULT_CHANNEL,
-            "Cold-Mailing Import": campaign,      
-            "Person ID": int(p.get("id")) if str(p.get("id")).isdigit() else p.get("id"),
-            "Person Vorname": first,
-            "Person Nachname": last,
-            "Person Titel": p.get(FIELD_TITLE) or "",
-            "Person Geschlecht": p.get(FIELD_GENDER) or "",
-            "Person Position": p.get(FIELD_POSITION) or "",
-            "Person E-Mail": email,
-            "Prospect ID": p.get(FIELD_PROSPECT_ID) or "",
+        # direkt vor rows.append(...)
+        email = primary_email(p)
+        org_name = org_name_for_person(p)
         
-            # --- Organisation ---
+        rows.append({
+            "Batch ID": int(batch_out) if str(batch_out).isdigit() else batch_out,
+            "Channel": DEFAULT_CHANNEL,
+            "Cold-Mailing Import": campaign,
+        
             "Organisation Name": org_name,
             "Organisation ID": int(org_id) if str(org_id).isdigit() else org_id,
         
-            # --- Social Links ---
-            # XING wird entfernt → kein Feld mehr
-            "LinkedIn URL": (p.get(FIELD_LINKEDIN) or "").lstrip("'"),
+            "Person ID": int(p.get("id")) if str(p.get("id")).isdigit() else p.get("id"),
+            "Person Vorname": first_name,
+            "Person Nachname": last_name,
+            "Person Titel": title_raw,
+            "Person Geschlecht": gender,
+            "Person Position": pos_raw,
+            "Person E-Mail": email,
+            "Prospect ID": prospect_id,
+        
+            "LinkedIn URL": (li_raw or "").lstrip("'"),
         })
+
 
 
     df_final = pd.DataFrame(rows)
