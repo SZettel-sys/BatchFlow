@@ -3105,17 +3105,26 @@ def build_nf_export(df: pd.DataFrame) -> pd.DataFrame:
     """
     Erzwingt die finale Export-Struktur (Spalten + Reihenfolge).
     Fehlende Spalten werden angelegt.
+
+    WICHTIG für Excel:
+    - Batch ID, Organisation ID, Person ID als Zahl (nullable Int64), damit Excel echte Zahlenzellen bekommt.
     """
     out = pd.DataFrame()
 
     for col in NF_EXPORT_COLUMNS:
         out[col] = df[col] if col in df.columns else ""
 
-    # IDs als string, nan raus
-    for c in ("Person ID", "Organisation ID"):
-        out[c] = out[c].astype(str).replace("nan", "").fillna("")
+    # IDs als Zahl (Excel soll Zahlenzellen bekommen). Leere/ungültige Werte bleiben leer.
+    for c in ("Batch ID", "Organisation ID", "Person ID"):
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce").astype("Int64")
+
+    # LinkedIn URL ohne führendes Apostroph (falls irgendwo vorhanden)
+    if "LinkedIn URL" in out.columns:
+        out["LinkedIn URL"] = out["LinkedIn URL"].astype(str).str.lstrip("'").replace("nan", "").fillna("")
 
     return out
+
 
 
 # ------------------------------------------------------------
@@ -3134,15 +3143,15 @@ def _df_to_excel_bytes_nf(df: pd.DataFrame) -> bytes:
 
         ws = writer.sheets["Nachfass"]
 
-        # IDs in Excel als TEXT formatieren
-        id_cols = ["Organisation ID", "Person ID"]
+        # IDs in Excel als ZAHL formatieren (statt Text)
+        id_cols = ["Batch ID", "Organisation ID", "Person ID"]
         col_index = {col: i + 1 for i, col in enumerate(df.columns)}
 
         for name in id_cols:
             if name in col_index:
                 j = col_index[name]
                 for i in range(2, len(df) + 2):
-                    ws.cell(i, j).number_format = "@"
+                    ws.cell(i, j).number_format = "0"
 
         writer.book.properties.creator = "BatchFlow"
 
@@ -3150,30 +3159,32 @@ def _df_to_excel_bytes_nf(df: pd.DataFrame) -> bytes:
     return buf.getvalue()
 
 
+
+
 def excel_force_urls_as_text(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Excel soll URLs (LinkedIn/XING/etc.) als reinen Text behandeln.
-    Dafür wird ein führendes Apostroph vor http(s) gesetzt.
-    Nur für den Export-DataFrame (DB bleibt unverändert).
+    Entfernt ein evtl. vorhandenes führendes Apostroph vor URLs (z.B. 'https://...),
+    damit die Zellen in Excel mit https://... beginnen.
+    (DB bleibt unverändert; wirkt nur auf den Export-DataFrame.)
     """
     if df is None or df.empty:
         return df
     out = df.copy()
     for col in out.columns:
         cl = str(col).lower()
-        if ("http" in cl) or ("linkedin" in cl) or ("xing" in cl):
+        if ("http" in cl) or ("linkedin" in cl) or ("xing" in cl) or ("url" in cl):
             def _fix(v):
                 try:
                     if v is None or (isinstance(v, float) and pd.isna(v)):
                         return v
                     s = str(v)
-                    if s.startswith("'http"):
-                        return s
-                    return "'" + s if s.startswith("http") else s
+                    return s.lstrip("'")
                 except Exception:
                     return v
             out[col] = out[col].apply(_fix)
     return out
+
+
 
 def export_to_excel(df: pd.DataFrame, prefix: str, job_id: str) -> str:
     """
