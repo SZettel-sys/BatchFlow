@@ -2722,6 +2722,23 @@ async def _reconcile(prefix: str, job_obj=None) -> None:
             return flatten(v.get("value") or v.get("label") or v.get("name") or v.get("id") or "")
         return str(v).strip()
 
+    # --- FIX: Organisation-ID robust kanonisieren (z.B. "12318.0" -> "12318") ---
+    def canon_org_id(v) -> str:
+        s = flatten(v)
+        if not s:
+            return ""
+        # häufige Excel/Pandas-Fälle: 12318.0, 12318.00, etc.
+        try:
+            # Komma als Dezimaltrenner abfangen (falls mal drin)
+            s2 = s.replace(",", ".")
+            num = float(s2)
+            if num.is_integer():
+                return str(int(num))
+        except Exception:
+            pass
+        # fallback: String (ohne weitere Logikänderung)
+        return s
+
     # alles einmal säubern
     df = df.replace({None: "", np.nan: ""}).copy()
     for c in df.columns:
@@ -2791,7 +2808,7 @@ async def _reconcile(prefix: str, job_obj=None) -> None:
 
         fuzzy_checked += 1
         if job_obj and (fuzzy_checked % 200 == 0):
-            job_obj.detail = f"Fuzzy-Abgleich … geprüft {fuzzy_checked}" 
+            job_obj.detail = f"Fuzzy-Abgleich … geprüft {fuzzy_checked}"
 
         key = bucket_key(norm)
         bucket = buckets_all.get(key)
@@ -2821,7 +2838,6 @@ async def _reconcile(prefix: str, job_obj=None) -> None:
             pass
 
     # (4) Person-ID bereits in Filtern 1216/1708 -> raus
-  
     suspect_ids: set[str] = set()
     for fid in (1216, 1708):
         async for ids in stream_person_ids_by_filter_cursor(fid, page_limit=PAGE_LIMIT, job_obj=job_obj, label="Kontaktierte Personen"):
@@ -2838,7 +2854,8 @@ async def _reconcile(prefix: str, job_obj=None) -> None:
     limit = int(PER_ORG_DEFAULT_LIMIT or 2)
     if col_orgid in df.columns and col_pid in df.columns:
         df = df.copy()
-        df["_orgid_sort"] = df[col_orgid].astype(str)
+        # --- FIX: hier kanonisieren (verhindert "12318" vs "12318.0" als zwei Gruppen) ---
+        df["_orgid_sort"] = df[col_orgid].map(canon_org_id)
         df["_pid_sort"] = pd.to_numeric(df[col_pid], errors="coerce").fillna(10**18).astype(np.int64)
         df = df.sort_values(by=["_orgid_sort", "_pid_sort"], kind="mergesort")
 
